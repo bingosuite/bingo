@@ -36,3 +36,12 @@ pre-push:
 
     build:
       run: go env -w GOOS=windows GOARCH=amd64 && go build -o ./build/BinGo/BinGo.exe ./cmd/BinGo
+
+commit-msg:
+  commands:
+    check-message:
+      run: |
+        if [ ! -f githook/bin/commitlint ]; then
+          go build -o githook/bin/commitlint githook/commitlint.go
+        fi
+        githook/bin/commitlint {1}
