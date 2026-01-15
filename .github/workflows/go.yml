@@ -5,30 +5,31 @@ name: Go
 
 on:
   push:
-    branches: [ "dev", "main"]
+    branches: ["dev", "main"]
   pull_request:
-    branches: [ "dev", "main"]
+    branches: ["dev", "main"]
 
 jobs:
-
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Lint
-      uses: golangci/golangci-lint-action@v9.2.0
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9.2.0
 
-    - name: Magic Number Check
-      uses: tommy-muehle/go-mnd@v2.5.1
+      - name: Magic Number Check
+        uses: tommy-muehle/go-mnd@v2.5.1
 
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.25.5'
+      - name: Set up Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: "1.25.5"
 
-    - name: Build
-      run: go build -v ./...
+      - name: Build
+        run: go build -v ./...
 
-    - name: Test
-      run: go test -v ./...
+      - name: Test
+        run: go test -v ./...
