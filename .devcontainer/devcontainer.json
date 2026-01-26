@@ -12,12 +12,7 @@
   // "forwardPorts": [],
 
   // Use 'postCreateCommand' to run commands after the container is created.
-  "postCreateCommand": [
-    "go version",
-    "go get -tool github.com/evilmartians/lefthook",
-    "go install golang.org/x/tools/cmd/goimports@latest",
-    "go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest"
-  ]
+  "postCreateCommand": "go version && go get -tool github.com/evilmartians/lefthook && go install golang.org/x/tools/cmd/goimports@latest && go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest"
 
   // Configure tool-specific properties.
   // "customizations": {},
