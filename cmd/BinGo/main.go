@@ -24,7 +24,7 @@ var (
 
 func main() {
 	procName := os.Args[1]
-	path := "/home/xcppl/dev/BinGo/bin/%s"
+	path := "/workspaces/BinGo/bin/%s"
 	binLocation := fmt.Sprintf(path, procName)
 
 	// Load Go symbol table from ELF
