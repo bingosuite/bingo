@@ -178,4 +178,7 @@ func getSymbolTable(proc string) *gosym.Table {
 =======
 	fmt.Println("hello world")
 }
+<<<<<<< HEAD
 >>>>>>> 32c2da9 (chore: fix naming):cmd/bingo/main.go
+=======
+>>>>>>> a12d6d2 (chore: setup filestructure for tests, packages, executables, etc)
