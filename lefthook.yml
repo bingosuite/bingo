@@ -30,6 +30,9 @@ pre-push:
   commands:
     test:
       run: go test ./...
+  
+    integration:
+      run: make integration
 
     vet:
       run: go vet ./cmd/bingo
