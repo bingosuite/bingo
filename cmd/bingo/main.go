@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/bingosuite/bingo/pkg/cli"
+	websocket "github.com/bingosuite/bingo/pkg/ws"
 )
 
 var (
@@ -25,6 +26,14 @@ var (
 )
 
 func main() {
+
+	// websocket
+	srv := websocket.NewServer(":8123")
+    go srv.Serve()
+    //hub := srv.GetOrCreateHub("test-session")
+    
+
+
 	procName := os.Args[1]
 	path := "/workspaces/BinGo/bin/%s"
 	binLocation := fmt.Sprintf(path, procName)
@@ -34,6 +43,8 @@ func main() {
 	fn = symTable.LookupFunc("main.main")
 	targetFile, line, fn = symTable.PCToLine(fn.Entry)
 	run(binLocation)
+
+	
 }
 
 func run(target string) {
