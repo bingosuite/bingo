@@ -23,6 +23,7 @@ var (
 )
 
 func main() {
+<<<<<<< HEAD:cmd/BinGo/main.go
 	procName := os.Args[1]
 	path := "/workspaces/BinGo/bin/%s"
 	binLocation := fmt.Sprintf(path, procName)
@@ -174,3 +175,7 @@ func getSymbolTable(proc string) *gosym.Table {
 
 	return symTable
 }
+=======
+	fmt.Println("hello world")
+}
+>>>>>>> 32c2da9 (chore: fix naming):cmd/bingo/main.go

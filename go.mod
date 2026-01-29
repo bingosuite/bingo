@@ -1,4 +1,4 @@
-module github.com/BinGoSuite/BinGo
+module github.com/bingosuite/bingo
 
 go 1.25.5
 
