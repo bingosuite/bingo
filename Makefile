@@ -3,10 +3,10 @@
 TFN ?= target
 
 build: 
-	go build -o ./bin/ ./cmd/BinGo
+	go build -o ./bin/ ./cmd/bingo
 
 run:
-	./bin/BinGo ${TFN}
+	./bin/bingo ${TFN}
 
 go: build-target build run
 

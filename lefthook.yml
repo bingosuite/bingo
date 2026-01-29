@@ -10,7 +10,7 @@ pre-commit:
 
     vet:
       glob: "*.go"
-      run: go vet ./cmd/BinGo
+      run: go vet ./cmd/bingo
 
     imports:
       glob: "*.go"
@@ -23,7 +23,7 @@ pre-commit:
       glob: "*.go"
       run: |
         if command -v golangci-lint &> /dev/null; then
-          golangci-lint run ./cmd/BinGo
+          golangci-lint run ./cmd/bingo
         fi
 
 pre-push:
@@ -32,7 +32,7 @@ pre-push:
       run: go test ./...
 
     vet:
-      run: go vet ./cmd/BinGo
+      run: go vet ./cmd/bingo
 
     build:
       run: make build

@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+
+	"github.com/bingosuite/bingo/pkg/cli"
 )
 
 var (
@@ -23,7 +25,6 @@ var (
 )
 
 func main() {
-<<<<<<< HEAD:cmd/BinGo/main.go
 	procName := os.Args[1]
 	path := "/workspaces/BinGo/bin/%s"
 	binLocation := fmt.Sprintf(path, procName)
@@ -65,7 +66,9 @@ func run(target string) {
 		panic(err)
 	}
 
-	if resume(pid) {
+	cont := false
+	cont, breakpointSet, originalCode, line = cli.Resume(pid, targetFile, line, breakpointSet, originalCode, setBreak)
+	if cont {
 		if err := syscall.PtraceCont(pid, 0); err != nil {
 			panic(err)
 		}
@@ -103,7 +106,8 @@ func run(target string) {
 
 				}
 
-				if resume(wpid) {
+				cont, breakpointSet, originalCode, line = cli.Resume(wpid, targetFile, line, breakpointSet, originalCode, setBreak)
+				if cont {
 					if err := syscall.PtraceCont(wpid, 0); err != nil {
 						panic(err)
 					}
@@ -175,10 +179,3 @@ func getSymbolTable(proc string) *gosym.Table {
 
 	return symTable
 }
-=======
-	fmt.Println("hello world")
-}
-<<<<<<< HEAD
->>>>>>> 32c2da9 (chore: fix naming):cmd/bingo/main.go
-=======
->>>>>>> a12d6d2 (chore: setup filestructure for tests, packages, executables, etc)

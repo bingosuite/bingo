@@ -1,4 +1,4 @@
-package main
+package cli
 
 import (
 	"bufio"
@@ -8,7 +8,14 @@ import (
 	"strings"
 )
 
-func resume(pid int) bool {
+func Resume(
+	pid int,
+	targetFile string,
+	currentLine int,
+	breakpointSet bool,
+	originalCode []byte,
+	setBreak func(int, string, int) (bool, []byte),
+) (bool, bool, []byte, int) {
 	sub := false
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Printf("\n(C)ontinue, (S)tep, set (B)reakpoint or (Q)uit >")
@@ -17,9 +24,9 @@ func resume(pid int) bool {
 		input := scanner.Text()
 		switch strings.ToUpper(input) {
 		case "C":
-			return true
+			return true, breakpointSet, originalCode, currentLine
 		case "S":
-			return false
+			return false, breakpointSet, originalCode, currentLine
 		case "B":
 			fmt.Printf("\nEnter line number in %s: >", targetFile)
 			sub = true
@@ -27,9 +34,9 @@ func resume(pid int) bool {
 			os.Exit(0)
 		default:
 			if sub {
-				line, _ = strconv.Atoi(input)
+				line, _ := strconv.Atoi(input)
 				breakpointSet, originalCode = setBreak(pid, targetFile, line)
-				return true
+				return true, breakpointSet, originalCode, line
 			}
 			fmt.Printf("Unexpected input %s\n", input)
 			fmt.Printf("\n(C)ontinue, (S)tep, set (B)reakpoint or (Q)uit? > ")
