@@ -1,4 +1,4 @@
-.PHONY: build run go build-target run-target go-target
+.PHONY: build run go build-target run-target go-target integration
 
 TFN ?= target
 
@@ -18,3 +18,5 @@ run-target:
 
 go-target: build-target run-target
 	
+integration:
+	go run github.com/onsi/ginkgo/v2/ginkgo -r ./test/integration/.
