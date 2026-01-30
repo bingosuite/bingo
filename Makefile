@@ -1,20 +1,18 @@
 .PHONY: build run go build-target run-target go-target integration
 
-TFN ?= target
-
 build: 
-	go build -o ./bin/ ./cmd/bingo
+	go build -o ./build/bingo/bingo ./cmd/bingo
 
 run:
-	./bin/bingo ${TFN}
+	./build/bingo/bingo target
 
 go: build-target build run
 
 build-target:
-	go build --gcflags="all=-N -l" -o ./bin/ ./cmd/${TFN}
+	go build --gcflags="all=-N -l" -o ./build/target/target ./cmd/target
 
 run-target:
-	./bin/${TFN}
+	./build/target/target
 
 go-target: build-target run-target
 	

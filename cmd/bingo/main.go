@@ -8,8 +8,8 @@ import (
 	"os/exec"
 	"syscall"
 
-	"github.com/bingosuite/bingo/pkg/cli"
-	websocket "github.com/bingosuite/bingo/pkg/ws"
+	"github.com/bingosuite/bingo/internal/cli"
+	websocket "github.com/bingosuite/bingo/internal/ws"
 )
 
 var (
@@ -29,13 +29,11 @@ func main() {
 
 	// websocket
 	srv := websocket.NewServer(":8123")
-    go srv.Serve()
-    //hub := srv.GetOrCreateHub("test-session")
-    
-
+	go srv.Serve()
+	//hub := srv.GetOrCreateHub("test-session")
 
 	procName := os.Args[1]
-	path := "/workspaces/BinGo/bin/%s"
+	path := "/workspaces/bingo/build/target/%s"
 	binLocation := fmt.Sprintf(path, procName)
 
 	// Load Go symbol table from ELF
@@ -44,7 +42,6 @@ func main() {
 	targetFile, line, fn = symTable.PCToLine(fn.Entry)
 	run(binLocation)
 
-	
 }
 
 func run(target string) {
