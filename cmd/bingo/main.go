@@ -165,7 +165,11 @@ func getSymbolTable(proc string) *gosym.Table {
 	if err != nil {
 		panic(err)
 	}
-	defer exe.Close()
+	defer func() {
+		if err := exe.Close(); err != nil {
+			panic(err)
+		}
+	}()
 
 	addr := exe.Section(".text").Addr
 
