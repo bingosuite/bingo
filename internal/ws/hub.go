@@ -6,6 +6,12 @@ import (
 	"time"
 )
 
+const (
+	clientSendBufferSize = 256
+	eventBufferSize      = 256
+	commandBufferSize    = 32
+)
+
 type Hub struct {
 	sessionID string
 	clients   map[*Client]struct{}
@@ -31,8 +37,8 @@ func NewHub(sessionID string, idleTimeout time.Duration) *Hub {
 		clients:      make(map[*Client]struct{}),
 		register:     make(chan *Client),
 		unregister:   make(chan *Client),
-		events:       make(chan Message, 256),
-		commands:     make(chan Message, 32),
+		events:       make(chan Message, eventBufferSize),
+		commands:     make(chan Message, commandBufferSize),
 		idleTimeout:  idleTimeout,
 		lastActivity: time.Now(),
 	}
@@ -59,14 +65,14 @@ func (h *Hub) Run() {
 			h.clients[client] = struct{}{}
 			h.lastActivity = time.Now()
 			h.mu.Unlock()
-			log.Printf("Client connected to hub %s (%d total)", h.sessionID, len(h.clients))
+			log.Printf("Client %s connected to hub %s (%d total)", client.id, h.sessionID, len(h.clients))
 
 		case client := <-h.unregister:
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
 				close(client.send)
-				log.Printf("Client disconnected from hub %s (%d remaining)", h.sessionID, len(h.clients))
+				log.Printf("Client %s disconnected from hub %s (%d remaining)", client.id, h.sessionID, len(h.clients))
 
 				// When last client leaves, shutdown hub
 				if len(h.clients) == 0 {
@@ -82,14 +88,19 @@ func (h *Hub) Run() {
 		case event := <-h.events:
 			h.lastActivity = time.Now()
 			h.mu.RLock()
+			var slowClients []*Client
 			for client := range h.clients {
 				select {
 				case client.send <- event:
-				default:
-					// drop client if too slow or err
+				default: // if event buffer is full, unregister the client to protect hub
+					slowClients = append(slowClients, client)
 				}
 			}
 			h.mu.RUnlock()
+			for _, client := range slowClients {
+				log.Printf("Client %s is slow; unregistering from hub %s", client.id, h.sessionID)
+				h.Unregister(client)
+			}
 
 		case cmd := <-h.commands:
 			log.Printf("Hub %s command: %s", h.sessionID, cmd.Type)

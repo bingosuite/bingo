@@ -7,16 +7,18 @@ import (
 )
 
 type Client struct {
+	id   string
 	conn *websocket.Conn
 	hub  *Hub
 	send chan Message
 }
 
-func NewClient(conn *websocket.Conn, hub *Hub) *Client {
+func NewClient(conn *websocket.Conn, hub *Hub, id string) *Client {
 	return &Client{
+		id:   id,
 		conn: conn,
 		hub:  hub,
-		send: make(chan Message, 256),
+		send: make(chan Message, clientSendBufferSize),
 	}
 }
 
@@ -24,7 +26,7 @@ func (c *Client) ReadPump() {
 	defer func() {
 		c.hub.Unregister(c)
 		if err := c.conn.Close(); err != nil {
-			log.Printf("Client close error: %v", err)
+			log.Printf("Client %s close error: %v", c.id, err)
 		}
 	}()
 
@@ -32,7 +34,7 @@ func (c *Client) ReadPump() {
 		var msg Message
 		err := c.conn.ReadJSON(&msg)
 		if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-			log.Printf("Client unexpected close: %v", err)
+			log.Printf("Client %s unexpected close: %v", c.id, err)
 			break
 		}
 		if err != nil {
@@ -45,13 +47,13 @@ func (c *Client) ReadPump() {
 func (c *Client) WritePump() {
 	defer func() {
 		if err := c.conn.Close(); err != nil {
-			log.Printf("Client close error: %v", err)
+			log.Printf("Client %s close error: %v", c.id, err)
 		}
 	}()
 
 	for message := range c.send {
 		if err := c.conn.WriteJSON(message); err != nil {
-			log.Printf("Client write error: %v", err)
+			log.Printf("Client %s write error: %v", c.id, err)
 			return
 		}
 	}
