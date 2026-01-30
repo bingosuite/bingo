@@ -23,7 +23,9 @@ func NewClient(conn *websocket.Conn, hub *Hub) *Client {
 func (c *Client) ReadPump() {
 	defer func() {
 		c.hub.Unregister(c)
-		c.conn.Close()
+		if err := c.conn.Close(); err != nil {
+			log.Printf("Client close error: %v", err)
+		}
 	}()
 
 	for {
@@ -41,7 +43,11 @@ func (c *Client) ReadPump() {
 }
 
 func (c *Client) WritePump() {
-	defer c.conn.Close()
+	defer func() {
+		if err := c.conn.Close(); err != nil {
+			log.Printf("Client close error: %v", err)
+		}
+	}()
 
 	for message := range c.send {
 		if err := c.conn.WriteJSON(message); err != nil {
