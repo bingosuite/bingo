@@ -23,7 +23,7 @@ pre-commit:
       glob: "*.go"
       run: |
         if command -v golangci-lint &> /dev/null; then
-          golangci-lint run --no-cache ./...
+          golangci-lint run ./...
         fi
 
 pre-push:

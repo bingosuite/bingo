@@ -29,7 +29,11 @@ func main() {
 
 	// websocket
 	srv := websocket.NewServer(":8123")
-	go srv.Serve()
+	go func() {
+		if err := srv.Serve(); err != nil {
+			panic(err)
+		}
+	}()
 	//hub := srv.GetOrCreateHub("test-session")
 
 	procName := os.Args[1]
