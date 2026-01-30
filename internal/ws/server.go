@@ -5,19 +5,26 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/bingosuite/bingo/config"
 	"github.com/gorilla/websocket"
 )
 
 type Server struct {
-	addr string
-	hubs map[string]*Hub
-	mu   sync.RWMutex
+	addr   string
+	hubs   map[string]*Hub
+	config config.WebSocketConfig
+	mu     sync.RWMutex
 }
 
 func NewServer(addr string) *Server {
+	return NewServerWithConfig(addr, config.Default().WebSocket)
+}
+
+func NewServerWithConfig(addr string, cfg config.WebSocketConfig) *Server {
 	s := &Server{
-		addr: addr,
-		hubs: make(map[string]*Hub),
+		addr:   addr,
+		hubs:   make(map[string]*Hub),
+		config: cfg,
 	}
 	http.HandleFunc("/ws/", s.serveWebSocket)
 	return s
@@ -64,10 +71,26 @@ func (s *Server) GetOrCreateHub(sessionID string) *Hub {
 
 	if !exists {
 		s.mu.Lock()
-		hub = NewHub(sessionID)
+		// Check max sessions limit
+		if s.config.MaxSessions > 0 && len(s.hubs) >= s.config.MaxSessions {
+			s.mu.Unlock()
+			log.Printf("Max sessions (%d) reached, rejecting session: %s", s.config.MaxSessions, sessionID)
+			return nil
+		}
+
+		hub = NewHub(sessionID, s.config.IdleTimeout)
+		hub.onShutdown = s.removeHub // Set callback for cleanup
 		s.hubs[sessionID] = hub
+		go hub.Run()
 		s.mu.Unlock()
 		log.Printf("Created hub for session: %s", sessionID)
 	}
 	return hub
+}
+
+func (s *Server) removeHub(sessionID string) {
+	s.mu.Lock()
+	delete(s.hubs, sessionID)
+	s.mu.Unlock()
+	log.Printf("Removed hub for session: %s", sessionID)
 }

@@ -4,10 +4,12 @@ import (
 	"debug/elf"
 	"debug/gosym"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"syscall"
 
+	config "github.com/bingosuite/bingo/config"
 	"github.com/bingosuite/bingo/internal/cli"
 	websocket "github.com/bingosuite/bingo/internal/ws"
 )
@@ -26,15 +28,20 @@ var (
 )
 
 func main() {
+	cfg, err := config.Load("config/config.yml")
+	if err != nil {
+		log.Printf("Failed to load config: %v", err)
+		panic(err)
+	}
 
-	// websocket
-	srv := websocket.NewServer(":8123")
+	server := websocket.NewServerWithConfig(cfg.Server.Addr, cfg.WebSocket)
+
 	go func() {
-		if err := srv.Serve(); err != nil {
+		if err := server.Serve(); err != nil {
+			log.Printf("WebSocket server error: %v", err)
 			panic(err)
 		}
 	}()
-	//hub := srv.GetOrCreateHub("test-session")
 
 	procName := os.Args[1]
 	path := "/workspaces/bingo/build/target/%s"

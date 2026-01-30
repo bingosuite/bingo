@@ -1,0 +1,9 @@
+websocket:
+  max_sessions: 10
+  idle_timeout: 1h
+
+server:
+  addr: ":8080"
+  
+logging:
+  level: info
