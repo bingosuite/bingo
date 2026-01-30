@@ -1,11 +1,11 @@
-package debugger
+package main
 
 import (
 	"fmt"
 	"time"
 )
 
-func RunTarget() {
+func main() {
 	var count int
 	for {
 		fmt.Println("Hello, World")
