@@ -27,6 +27,8 @@ var (
 	interruptCode = []byte{0xCC}
 )
 
+const PTRACE_O_EXITKILL = 0x100000 // Option to kill the target process when Bingo exits
+
 func main() {
 	cfg, err := config.Load("config/config.yml")
 	if err != nil {
@@ -80,11 +82,31 @@ func run(target string) {
 		fmt.Fprintf(os.Stderr, "Error getting PGID: %v\n", err)
 	}
 	fmt.Printf("Starting process with PID: %d and PGID: %d\n", pid, pgid)
+
+	// Verify process is actually stopped and alive
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		log.Printf("Failed to find process: %v", err)
+		panic(err)
+	}
+
 	//Enables thead tracking
-	if err := syscall.PtraceSetOptions(pid, syscall.PTRACE_O_TRACECLONE); err != nil {
+	if err := syscall.PtraceSetOptions(pid, syscall.PTRACE_O_TRACECLONE|PTRACE_O_EXITKILL); err != nil {
 		log.Printf("Failed to enable Ptrace on clones: %v", err)
 		panic(err)
 	}
+
+	// Ensure we can detach on exit
+	defer func() {
+		if err := syscall.PtraceDetach(pid); err != nil {
+			log.Printf("Failed to detach from target: %v", err)
+			panic(err)
+		}
+		if err := process.Kill(); err != nil {
+			log.Printf("Failed to kill target: %v", err)
+			panic(err)
+		}
+	}()
 
 	cont := false
 	cont, breakpointSet, originalCode, line = cli.Resume(pid, targetFile, line, breakpointSet, originalCode, setBreak)
