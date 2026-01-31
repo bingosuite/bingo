@@ -58,6 +58,7 @@ func (c *Client) WritePump() {
 		}
 	}
 	if err := c.conn.WriteMessage(websocket.CloseMessage, []byte{}); err != nil {
+		log.Printf("Failed to close websocket: %v", err)
 		panic(err)
 	}
 }
