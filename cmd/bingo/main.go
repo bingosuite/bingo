@@ -1,33 +1,21 @@
 package main
 
 import (
-	"debug/elf"
-	"debug/gosym"
 	"fmt"
 	"log"
 	"os"
 	"os/exec"
 	"syscall"
 
-	"github.com/bingosuite/bingo/config"
-	"github.com/bingosuite/bingo/internal/cli"
+	config "github.com/bingosuite/bingo/config"
+	"github.com/bingosuite/bingo/internal/debugger"
+	debuginfo "github.com/bingosuite/bingo/internal/debuginfo"
 	websocket "github.com/bingosuite/bingo/internal/ws"
 )
 
-var (
-	targetFile    string
-	line          int
-	pc            uint64
-	fn            *gosym.Func
-	symTable      *gosym.Table
-	regs          syscall.PtraceRegs
-	ws            syscall.WaitStatus
-	originalCode  []byte
-	breakpointSet bool
-	interruptCode = []byte{0xCC}
+const (
+	PTRACE_O_EXITKILL = 0x100000 // Set option to kill the target process when Bingo exits to true
 )
-
-const PTRACE_O_EXITKILL = 0x100000 // Option to kill the target process when Bingo exits
 
 func main() {
 	cfg, err := config.Load("config/config.yml")
@@ -46,196 +34,120 @@ func main() {
 	}()
 
 	procName := os.Args[1]
-	path := "/workspaces/bingo/build/target/%s"
-	binLocation := fmt.Sprintf(path, procName)
+	binLocation := fmt.Sprintf("/workspaces/bingo/build/target/%s", procName)
 
-	// Load Go symbol table from ELF
-	symTable = getSymbolTable(binLocation)
-	fn = symTable.LookupFunc("main.main")
-	targetFile, line, fn = symTable.PCToLine(fn.Entry)
-	run(binLocation)
-
-}
-
-func run(target string) {
-	var filename string
-
-	cmd := exec.Command(target)
+	// Set up target for execution
+	cmd := exec.Command(binLocation)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true}
 
-	// Start the target
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "Error starting process: %v\n", err)
+		handleError("Failed to start target: %v", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		log.Printf("Received SIGTRAP from process creation: %v", err)
 	}
 
-	if err := cmd.Wait(); err != nil { // Will catch the SIGTRAP generated from starting a new process
-		fmt.Fprintf(os.Stderr, "Wait returned: %v\n", err)
-	}
-
-	pid := cmd.Process.Pid
-	// Need this to wait on threads
-	pgid, err := syscall.Getpgid(pid)
+	db, err := debuginfo.NewDebugInfo(binLocation, cmd.Process.Pid)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error getting PGID: %v\n", err)
-	}
-	fmt.Printf("Starting process with PID: %d and PGID: %d\n", pid, pgid)
-
-	// Verify process is actually stopped and alive
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		log.Printf("Failed to find process: %v", err)
+		log.Printf("Failed to create debug info: %v", err)
 		panic(err)
 	}
+	log.Printf("Started process with PID: %d and PGID: %d\n", db.Target.PID, db.Target.PGID)
 
-	//Enables thead tracking
-	if err := syscall.PtraceSetOptions(pid, syscall.PTRACE_O_TRACECLONE|PTRACE_O_EXITKILL); err != nil {
-		log.Printf("Failed to enable Ptrace on clones: %v", err)
-		panic(err)
+	// Enable tracking threads spawned from target and killing target once Bingo exits
+	if err := syscall.PtraceSetOptions(db.Target.PID, syscall.PTRACE_O_TRACECLONE|PTRACE_O_EXITKILL); err != nil {
+		handleError("Failed to set TRACECLONE and EXITKILL options on target: %v", err)
 	}
 
-	// Ensure we can detach on exit
-	defer func() {
-		if err := syscall.PtraceDetach(pid); err != nil {
-			log.Printf("Failed to detach from target: %v", err)
-			panic(err)
-		}
-		if err := process.Kill(); err != nil {
-			log.Printf("Failed to kill target: %v", err)
-			panic(err)
-		}
-	}()
+	pc, _, err := db.LineToPC(db.Target.Path, 11)
+	if err != nil {
+		handleError("Failed to get PC of line 11: %v", err)
+	}
 
-	cont := false
-	cont, breakpointSet, originalCode, line = cli.Resume(pid, targetFile, line, breakpointSet, originalCode, setBreak)
-	if cont {
-		if err := syscall.PtraceCont(pid, 0); err != nil {
-			log.Printf("Failed to continue execution after breakpoint: %v", err)
-			panic(err)
-		}
-	} else {
-		if err := syscall.PtraceSingleStep(pid); err != nil {
-			log.Printf("Failed to step after breakpoint: %v", err)
-			panic(err)
-		}
+	if err := debugger.SetBreakpoint(db, pc); err != nil {
+		handleError("Failed to set breakpoint: %v", err)
+	}
+
+	// Continue after the initial SIGTRAP, normally would ask the user what they want to do
+	if err := syscall.PtraceCont(db.Target.PID, 0); err != nil {
+		handleError("Failed to resume target execution: %v", err)
 	}
 
 	for {
-		// Wait until next breakpoint
-		wpid, err := syscall.Wait4(-1*pgid, &ws, 0, nil)
+		// Wait until any of the child processes of the target is interrupted or ends
+		var ws syscall.WaitStatus
+		wpid, err := syscall.Wait4(-1*db.Target.PGID, &ws, 0, nil)
 		if err != nil {
-			log.Printf("Failed to wait for next breakpoint: %v", err)
-			panic(err)
+			handleError("Failed to wait for the target or any of its threads: %v", err)
 		}
 
 		if ws.Exited() {
-			if wpid == pid {
+			if wpid == db.Target.PID { // If target exited, terminate
 				break
 			}
 		} else {
-			//Tracing only if stopped by breakpoint we set. Cloning child process creates trap so we want to ignore it
+			// Only stop on breakpoints caused by our debugger, ignore any other event like spawning of new threads
 			if ws.StopSignal() == syscall.SIGTRAP && ws.TrapCause() != syscall.PTRACE_EVENT_CLONE {
+
+				//TODO: import error handling and messages and pull logic out to debugger package
+
+				// Read registers
+				var regs syscall.PtraceRegs
 				if err := syscall.PtraceGetRegs(wpid, &regs); err != nil {
-					log.Printf("Failed to get registers: %v", err)
-					panic(err)
+					handleError("Failed to get registers: %v", err)
 				}
-				filename, line, fn = symTable.PCToLine(regs.Rip) // TODO: chat says interrupt advances RIP by 1 so it should be -1, check if true
+				filename, line, fn := db.PCToLine(regs.Rip - 1) // Interrupt advances PC by 1 on x86, so we need to rewind
 				fmt.Printf("Stopped at %s at %d in %s\n", fn.Name, line, filename)
-				//outputStack(symTable, wpid, regs.Rip, regs.Rsp, regs.Rbp)
 
-				if breakpointSet {
-					// TODO: chat says should step past breakpoint instead. normally: restore instruction, step, reinsert breakpoint
-					replaceCode(wpid, pc, originalCode)
-					breakpointSet = false
+				// Remove the breakpoint
+				bpAddr := regs.Rip - 1
+				if err := debugger.ClearBreakpoint(db, bpAddr); err != nil {
+					handleError("Failed to clear breakpoint: %v", err)
+				}
+				regs.Rip = bpAddr
 
+				// Rewind Rip by 1
+				if err := syscall.PtraceSetRegs(wpid, &regs); err != nil {
+					handleError("Failed to restore registers: %v", err)
 				}
 
-				cont, breakpointSet, originalCode, line = cli.Resume(wpid, targetFile, line, breakpointSet, originalCode, setBreak)
-				if cont {
-					if err := syscall.PtraceCont(wpid, 0); err != nil {
-						log.Printf("Failed to continue after breakpoint: %v", err)
-						panic(err)
-					}
-				} else {
-					if err := syscall.PtraceSingleStep(wpid); err != nil {
-						log.Printf("Failed to step over after breakpoint: %v", err)
-						panic(err)
-					}
+				// Step over the instruction we previously removed to put the breakpoint
+				if err := syscall.PtraceSingleStep(wpid); err != nil {
+					handleError("Failed to single-step: %v", err)
 				}
+
+				// Wait until the program lets us know we stepped over (handle cases where we get another signal which Wait4 would consume)
+				var stepSig syscall.WaitStatus
+				if _, err := syscall.Wait4(wpid, &stepSig, 0, nil); err != nil {
+					handleError("Failed to wait for the single-step: %v", err)
+				}
+
+				// Put the breakpoint back
+				if err := debugger.SetBreakpoint(db, bpAddr); err != nil {
+					handleError("Failed to set breakpoint: %v", err)
+				}
+
+				// Resume execution
+				if err := syscall.PtraceCont(wpid, 0); err != nil {
+					handleError("Failed to resume target execution: %v", err)
+				}
+
 			} else {
 				if err := syscall.PtraceCont(wpid, 0); err != nil {
-					log.Printf("Failed to continue after breakpoint: %v", err)
-					panic(err)
+					handleError("Failed to resume target execution: %v", err)
 				}
 			}
 		}
+
 	}
+
 }
 
-func setBreak(pid int, filename string, line int) (bool, []byte) {
-	var err error
+func handleError(msg string, err error) {
+	log.Printf(msg, err)
+	panic(err)
 
-	// Map source (actual lines in the code) to the program counter
-	pc, _, err = symTable.LineToPC(filename, line)
-	if err != nil {
-		fmt.Printf("Can't find breakpoint for %s, %d\n", filename, line)
-		return false, []byte{}
-	}
-
-	return true, replaceCode(pid, pc, interruptCode)
-}
-
-func replaceCode(pid int, breakpoint uint64, code []byte) []byte {
-	og := make([]byte, len(code))
-	_, err := syscall.PtracePeekData(pid, uintptr(breakpoint), og) // Save old data at breakpoint
-	if err != nil {
-		log.Printf("Failed to peek at instruction while setting breakpoint: %v", err)
-		panic(err)
-	}
-	_, err = syscall.PtracePokeData(pid, uintptr(breakpoint), code) // replace with interrupt code
-	if err != nil {
-		log.Printf("Failed to continue after breakpoint: %v", err)
-		panic(err)
-	}
-	return og
-}
-
-func getSymbolTable(proc string) *gosym.Table {
-
-	exe, err := elf.Open(proc)
-	if err != nil {
-		log.Printf("Failed to open ELF file: %v", err)
-		panic(err)
-	}
-	defer func() {
-		if err := exe.Close(); err != nil {
-			log.Printf("Failed to close ELF file: %v", err)
-			panic(err)
-		}
-	}()
-
-	addr := exe.Section(".text").Addr
-
-	lineTableData, err := exe.Section(".gopclntab").Data()
-	if err != nil {
-		log.Printf("Failed to get PC Line Table from ELF: %v", err)
-		panic(err)
-	}
-	lineTable := gosym.NewLineTable(lineTableData, addr)
-
-	symTableData, err := exe.Section(".gosymtab").Data()
-	if err != nil {
-		log.Printf("Failed to get Symbol Table from ELF: %v", err)
-		panic(err)
-	}
-
-	symTable, err := gosym.NewTable(symTableData, lineTable)
-	if err != nil {
-		log.Printf("Failed to create new Symbol Table: %v", err)
-		panic(err)
-	}
-
-	return symTable
 }
