@@ -82,6 +82,7 @@ func run(target string) {
 	fmt.Printf("Starting process with PID: %d and PGID: %d\n", pid, pgid)
 	//Enables thead tracking
 	if err := syscall.PtraceSetOptions(pid, syscall.PTRACE_O_TRACECLONE); err != nil {
+		log.Printf("Failed to enable Ptrace on clones: %v", err)
 		panic(err)
 	}
 
@@ -89,10 +90,12 @@ func run(target string) {
 	cont, breakpointSet, originalCode, line = cli.Resume(pid, targetFile, line, breakpointSet, originalCode, setBreak)
 	if cont {
 		if err := syscall.PtraceCont(pid, 0); err != nil {
+			log.Printf("Failed to continue execution after breakpoint: %v", err)
 			panic(err)
 		}
 	} else {
 		if err := syscall.PtraceSingleStep(pid); err != nil {
+			log.Printf("Failed to step after breakpoint: %v", err)
 			panic(err)
 		}
 	}
@@ -101,6 +104,7 @@ func run(target string) {
 		// Wait until next breakpoint
 		wpid, err := syscall.Wait4(-1*pgid, &ws, 0, nil)
 		if err != nil {
+			log.Printf("Failed to wait for next breakpoint: %v", err)
 			panic(err)
 		}
 
@@ -112,6 +116,7 @@ func run(target string) {
 			//Tracing only if stopped by breakpoint we set. Cloning child process creates trap so we want to ignore it
 			if ws.StopSignal() == syscall.SIGTRAP && ws.TrapCause() != syscall.PTRACE_EVENT_CLONE {
 				if err := syscall.PtraceGetRegs(wpid, &regs); err != nil {
+					log.Printf("Failed to get registers: %v", err)
 					panic(err)
 				}
 				filename, line, fn = symTable.PCToLine(regs.Rip) // TODO: chat says interrupt advances RIP by 1 so it should be -1, check if true
@@ -128,15 +133,18 @@ func run(target string) {
 				cont, breakpointSet, originalCode, line = cli.Resume(wpid, targetFile, line, breakpointSet, originalCode, setBreak)
 				if cont {
 					if err := syscall.PtraceCont(wpid, 0); err != nil {
+						log.Printf("Failed to continue after breakpoint: %v", err)
 						panic(err)
 					}
 				} else {
 					if err := syscall.PtraceSingleStep(wpid); err != nil {
+						log.Printf("Failed to step over after breakpoint: %v", err)
 						panic(err)
 					}
 				}
 			} else {
 				if err := syscall.PtraceCont(wpid, 0); err != nil {
+					log.Printf("Failed to continue after breakpoint: %v", err)
 					panic(err)
 				}
 			}
@@ -161,10 +169,12 @@ func replaceCode(pid int, breakpoint uint64, code []byte) []byte {
 	og := make([]byte, len(code))
 	_, err := syscall.PtracePeekData(pid, uintptr(breakpoint), og) // Save old data at breakpoint
 	if err != nil {
+		log.Printf("Failed to peek at instruction while setting breakpoint: %v", err)
 		panic(err)
 	}
 	_, err = syscall.PtracePokeData(pid, uintptr(breakpoint), code) // replace with interrupt code
 	if err != nil {
+		log.Printf("Failed to continue after breakpoint: %v", err)
 		panic(err)
 	}
 	return og
@@ -174,10 +184,12 @@ func getSymbolTable(proc string) *gosym.Table {
 
 	exe, err := elf.Open(proc)
 	if err != nil {
+		log.Printf("Failed to open ELF file: %v", err)
 		panic(err)
 	}
 	defer func() {
 		if err := exe.Close(); err != nil {
+			log.Printf("Failed to close ELF file: %v", err)
 			panic(err)
 		}
 	}()
@@ -186,17 +198,20 @@ func getSymbolTable(proc string) *gosym.Table {
 
 	lineTableData, err := exe.Section(".gopclntab").Data()
 	if err != nil {
+		log.Printf("Failed to get PC Line Table from ELF: %v", err)
 		panic(err)
 	}
 	lineTable := gosym.NewLineTable(lineTableData, addr)
 
 	symTableData, err := exe.Section(".gosymtab").Data()
 	if err != nil {
+		log.Printf("Failed to get Symbol Table from ELF: %v", err)
 		panic(err)
 	}
 
 	symTable, err := gosym.NewTable(symTableData, lineTable)
 	if err != nil {
+		log.Printf("Failed to create new Symbol Table: %v", err)
 		panic(err)
 	}
 
