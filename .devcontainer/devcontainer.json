@@ -1,6 +1,19 @@
 {
   "name": "Go",
   "image": "mcr.microsoft.com/devcontainers/go:2-1.25-trixie",
-  "runArgs": ["--platform=linux/amd64"],
-  "postCreateCommand": "go version && go get -tool github.com/evilmartians/lefthook && go install golang.org/x/tools/cmd/goimports@latest && go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest && go tool lefthook install && LAZYGIT_VERSION=$(curl -s \"https://api.github.com/repos/jesseduffield/lazygit/releases/latest\" | grep -Po '\"tag_name\": \"v\\K[^\"]*') && curl -Lo lazygit.tar.gz \"https://github.com/jesseduffield/lazygit/releases/latest/download/lazygit_${LAZYGIT_VERSION}_Linux_x86_64.tar.gz\" && tar xf lazygit.tar.gz lazygit && sudo install lazygit /usr/local/bin && rm lazygit lazygit.tar.gz"
+  "runArgs": [
+    "--platform=linux/amd64"
+  ],
+  "features": {
+    "ghcr.io/thediveo/devcontainer-features/lazygit": {}
+  },
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "go.toolsManagement.checkForUpdates": "local",
+        "go.useLanguageServer": true
+      }
+    }
+  }
 }
