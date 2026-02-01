@@ -92,7 +92,7 @@ func (h *Hub) Run() {
 			for client := range h.clients {
 				select {
 				case client.send <- event:
-				default: // if event buffer is full, unregister the client to protect hub
+				default: // when a send operation blocks (client consuming too slowly or reader goroutine died), discard the client
 					slowClients = append(slowClients, client)
 				}
 			}
