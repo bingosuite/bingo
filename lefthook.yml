@@ -29,7 +29,7 @@ pre-commit:
 pre-push:
   commands:
     test:
-      run: go test ./...
+      run: make test
   
     integration:
       run: make integration
