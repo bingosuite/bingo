@@ -30,8 +30,8 @@ var (
 func main() {
 	cfg, err := config.Load("config/config.yml")
 	if err != nil {
-		log.Printf("Failed to load config: %v", err)
-		panic(err)
+		log.Printf("Failed to load config: %v, using defaults", err)
+		cfg = config.Default()
 	}
 
 	server := websocket.NewServer(cfg.Server.Addr, &cfg.WebSocket)
