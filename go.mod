@@ -5,8 +5,10 @@ go 1.25.5
 tool github.com/evilmartians/lefthook
 
 require (
+	github.com/gorilla/websocket v1.5.3
 	github.com/onsi/ginkgo/v2 v2.27.5
 	github.com/onsi/gomega v1.39.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -33,7 +35,6 @@ require (
 	github.com/goccy/go-yaml v1.18.0 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/pprof v0.0.0-20250403155104-27863c87afa6 // indirect
-	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/kaptinlin/go-i18n v0.1.7 // indirect
 	github.com/kaptinlin/jsonschema v0.4.14 // indirect
@@ -69,5 +70,4 @@ require (
 	golang.org/x/term v0.34.0 // indirect
 	golang.org/x/text v0.29.0 // indirect
 	golang.org/x/tools v0.36.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
