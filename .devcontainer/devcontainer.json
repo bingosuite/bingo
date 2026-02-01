@@ -12,8 +12,30 @@
     "vscode": {
       "settings": {
         "go.toolsManagement.checkForUpdates": "local",
-        "go.useLanguageServer": true
-      }
+        "go.useLanguageServer": true,
+        "go.lintTool": "golangci-lint-v2",
+        "go.lintOnSave": "workspace",
+        "go.formatTool": "gofmt",
+        "go.formatOnSave": true,
+        "go.testOnSave": false,
+        "go.coverOnSave": false,
+        "go.inlayHints.assignVariableTypes": true,
+        "go.inlayHints.compositeLiteralFields": true,
+        "go.inlayHints.compositeLiteralTypes": true,
+        "go.inlayHints.constantValues": true,
+        "go.inlayHints.functionTypeParameters": true,
+        "go.inlayHints.ignoredError": true,
+        "go.inlayHints.parameterNames": true,
+        "go.inlayHints.rangeVariableTypes": true,
+        "go.vetOnSave": "workspace",
+        "go.testFlags": [
+          "-v"
+        ],
+        "go.testTimeout": "30s"
+      },
+      "extensions": [
+        "golang.go"
+      ]
     }
   }
 }
