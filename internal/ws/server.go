@@ -16,11 +16,14 @@ type Server struct {
 	mu     sync.RWMutex
 }
 
-func NewServer(addr string) *Server {
-	return NewServerWithConfig(addr, config.Default().WebSocket)
+func NewServer(addr string, cfg *config.WebSocketConfig) *Server {
+	if cfg == nil {
+		cfg = &config.Default().WebSocket
+	}
+	return newServerWithConfig(addr, *cfg)
 }
 
-func NewServerWithConfig(addr string, cfg config.WebSocketConfig) *Server {
+func newServerWithConfig(addr string, cfg config.WebSocketConfig) *Server {
 	s := &Server{
 		addr:   addr,
 		hubs:   make(map[string]*Hub),
