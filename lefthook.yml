@@ -10,7 +10,7 @@ pre-commit:
 
     vet:
       glob: "*.go"
-      run: go vet {staged_files}
+      run: go vet ./...
 
     imports:
       glob: "*.go"
@@ -23,7 +23,7 @@ pre-commit:
       glob: "*.go"
       run: |
         if command -v golangci-lint &> /dev/null; then
-          golangci-lint run {staged_files}
+          golangci-lint run ./...
         fi
 
 pre-push:
