@@ -10,8 +10,8 @@ go version
 # Install Go tools
 echo "🔧 Installing Go development tools..."
 go install github.com/evilmartians/lefthook@latest
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
 go install golang.org/x/tools/cmd/goimports@latest
-go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
 
 # Install all dependencies
 echo "Installing Go dependencies..."
