@@ -10,6 +10,7 @@ const (
 	clientSendBufferSize = 256
 	eventBufferSize      = 256
 	commandBufferSize    = 32
+	hubTickerInterval    = 1 * time.Minute
 )
 
 type Hub struct {
@@ -45,7 +46,7 @@ func NewHub(sessionID string, idleTimeout time.Duration) *Hub {
 }
 
 func (h *Hub) Run() {
-	ticker := time.NewTicker(1 * time.Minute)
+	ticker := time.NewTicker(hubTickerInterval)
 	defer ticker.Stop()
 
 	for {
