@@ -1,4 +1,4 @@
-.PHONY: build run go build-target run-target go-target integration
+.PHONY: build run go build-target run-target go-target test integration
 
 build: 
 	go build -o ./build/bingo/bingo ./cmd/bingo
@@ -15,6 +15,9 @@ run-target:
 	./build/target/target
 
 go-target: build-target run-target
+
+test:
+	go test -v ./...
 	
 integration:
 	go run github.com/onsi/ginkgo/v2/ginkgo -r ./test/integration/.
