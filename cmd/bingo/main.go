@@ -9,7 +9,7 @@ import (
 	"os/exec"
 	"syscall"
 
-	config "github.com/bingosuite/bingo/config"
+	"github.com/bingosuite/bingo/config"
 	"github.com/bingosuite/bingo/internal/cli"
 	websocket "github.com/bingosuite/bingo/internal/ws"
 )
@@ -34,7 +34,7 @@ func main() {
 		panic(err)
 	}
 
-	server := websocket.NewServerWithConfig(cfg.Server.Addr, cfg.WebSocket)
+	server := websocket.NewServer(cfg.Server.Addr, &cfg.WebSocket)
 
 	go func() {
 		if err := server.Serve(); err != nil {
