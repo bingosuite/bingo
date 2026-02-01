@@ -1,6 +1,12 @@
 {
   "name": "Go",
-  "image": "mcr.microsoft.com/devcontainers/go:2-1.25-trixie",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".",
+    "options": [
+      "--platform=linux/amd64"
+    ]
+  },
   "runArgs": [
     "--platform=linux/amd64"
   ],
