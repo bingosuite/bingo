@@ -23,42 +23,57 @@ func TestWebSocket(t *testing.T) {
 }
 
 var _ = Describe("Hub", func() {
+	var (
+		hub            *Hub
+		server         *httptest.Server
+		wsURL          string
+		shutdownCalled *atomic.Bool
+	)
+
+	BeforeEach(func() {
+		hub = NewHub("test-session", time.Minute)
+		shutdownCalled = &atomic.Bool{}
+		hub.onShutdown = func(sessionID string) {
+			shutdownCalled.Store(true)
+		}
+
+		go hub.Run()
+
+		server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			upgrader := websocket.Upgrader{}
+			conn, _ := upgrader.Upgrade(w, r, nil)
+			defer func() { _ = conn.Close() }()
+		}))
+
+		wsURL = "ws" + strings.TrimPrefix(server.URL, "http")
+	})
+
+	AfterEach(func() {
+		if server != nil {
+			server.Close()
+		}
+	})
+
 	Describe("NewHub", func() {
 		It("should create a new hub with correct properties", func() {
 			sessionID := "test-session"
 			idleTimeout := 5 * time.Minute
 
-			hub := NewHub(sessionID, idleTimeout)
+			testHub := NewHub(sessionID, idleTimeout)
 
-			Expect(hub.sessionID).To(Equal(sessionID))
-			Expect(hub.idleTimeout).To(Equal(idleTimeout))
-			Expect(hub.clients).To(BeEmpty())
-			Expect(hub.register).NotTo(BeNil())
-			Expect(hub.unregister).NotTo(BeNil())
-			Expect(hub.events).NotTo(BeNil())
-			Expect(hub.commands).NotTo(BeNil())
+			Expect(testHub.sessionID).To(Equal(sessionID))
+			Expect(testHub.idleTimeout).To(Equal(idleTimeout))
+			Expect(testHub.clients).To(BeEmpty())
+			Expect(testHub.register).NotTo(BeNil())
+			Expect(testHub.unregister).NotTo(BeNil())
+			Expect(testHub.events).NotTo(BeNil())
+			Expect(testHub.commands).NotTo(BeNil())
 		})
 	})
 
 	Describe("RegisterClient", func() {
 		It("should register a client with hub", func() {
-			hub := NewHub("test-session", time.Minute)
-			done := make(chan struct{})
-
-			go func() {
-				hub.Run()
-				done <- struct{}{}
-			}()
-
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				upgrader := websocket.Upgrader{}
-				conn, _ := upgrader.Upgrade(w, r, nil)
-				defer func() { _ = conn.Close() }()
-			}))
-			defer server.Close()
-
 			dialer := websocket.Dialer{}
-			wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 			conn, _, err := dialer.Dial(wsURL, nil)
 			Expect(err).NotTo(HaveOccurred())
 			defer func() { _ = conn.Close() }()
@@ -78,27 +93,7 @@ var _ = Describe("Hub", func() {
 
 	Describe("UnregisterClient", func() {
 		It("should unregister a client from hub", func() {
-			hub := NewHub("test-session", time.Minute)
-			shutdownCalled := atomic.Bool{}
-			hub.onShutdown = func(sessionID string) {
-				shutdownCalled.Store(true)
-			}
-
-			done := make(chan struct{})
-			go func() {
-				hub.Run()
-				done <- struct{}{}
-			}()
-
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				upgrader := websocket.Upgrader{}
-				conn, _ := upgrader.Upgrade(w, r, nil)
-				defer func() { _ = conn.Close() }()
-			}))
-			defer server.Close()
-
 			dialer := websocket.Dialer{}
-			wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 			conn, _, err := dialer.Dial(wsURL, nil)
 			Expect(err).NotTo(HaveOccurred())
 			defer func() { _ = conn.Close() }()
@@ -123,23 +118,7 @@ var _ = Describe("Hub", func() {
 
 	Describe("Broadcast", func() {
 		It("should broadcast messages to all clients", func() {
-			hub := NewHub("test-session", time.Minute)
-
-			done := make(chan struct{})
-			go func() {
-				hub.Run()
-				done <- struct{}{}
-			}()
-
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				upgrader := websocket.Upgrader{}
-				conn, _ := upgrader.Upgrade(w, r, nil)
-				defer func() { _ = conn.Close() }()
-			}))
-			defer server.Close()
-
 			dialer := websocket.Dialer{}
-			wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 
 			conn1, _, _ := dialer.Dial(wsURL, nil)
 			defer func() { _ = conn1.Close() }()
@@ -175,14 +154,6 @@ var _ = Describe("Hub", func() {
 
 	Describe("SendCommand", func() {
 		It("should send commands to hub", func() {
-			hub := NewHub("test-session", time.Minute)
-
-			done := make(chan struct{})
-			go func() {
-				hub.Run()
-				done <- struct{}{}
-			}()
-
 			cmdData, _ := json.Marshal(ContinueCmd{
 				Type:      CmdContinue,
 				SessionID: "test-session",
@@ -265,14 +236,6 @@ var _ = Describe("Hub", func() {
 
 	Describe("LastActivityUpdate", func() {
 		It("should update lastActivity on events", func() {
-			hub := NewHub("test-session", time.Minute)
-
-			done := make(chan struct{})
-			go func() {
-				hub.Run()
-				done <- struct{}{}
-			}()
-
 			initialTime := hub.lastActivity
 
 			time.Sleep(100 * time.Millisecond)
@@ -294,22 +257,37 @@ var _ = Describe("Hub", func() {
 })
 
 var _ = Describe("Client", func() {
+	var (
+		hub    *Hub
+		server *httptest.Server
+		wsURL  string
+	)
+
+	BeforeEach(func() {
+		hub = NewHub("test-session", time.Minute)
+
+		server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			upgrader := websocket.Upgrader{}
+			conn, _ := upgrader.Upgrade(w, r, nil)
+			defer func() { _ = conn.Close() }()
+		}))
+
+		wsURL = "ws" + strings.TrimPrefix(server.URL, "http")
+	})
+
+	AfterEach(func() {
+		if server != nil {
+			server.Close()
+		}
+	})
+
 	Describe("NewClient", func() {
 		It("should create a new client with correct properties", func() {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				upgrader := websocket.Upgrader{}
-				conn, _ := upgrader.Upgrade(w, r, nil)
-				defer func() { _ = conn.Close() }()
-			}))
-			defer server.Close()
-
 			dialer := websocket.Dialer{}
-			wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
 			conn, _, err := dialer.Dial(wsURL, nil)
 			Expect(err).NotTo(HaveOccurred())
 			defer func() { _ = conn.Close() }()
 
-			hub := NewHub("test-session", time.Minute)
 			client := NewClient(conn, hub, "client-1")
 
 			Expect(client.id).To(Equal("client-1"))
@@ -321,15 +299,9 @@ var _ = Describe("Client", func() {
 
 	Describe("ReadPump", func() {
 		It("should read from connection", func() {
-			hub := NewHub("test-session", time.Minute)
-			done := make(chan struct{})
+			go hub.Run()
 
-			go func() {
-				hub.Run()
-				done <- struct{}{}
-			}()
-
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				upgrader := websocket.Upgrader{}
 				conn, _ := upgrader.Upgrade(w, r, nil)
 				defer func() { _ = conn.Close() }()
@@ -339,11 +311,11 @@ var _ = Describe("Client", func() {
 
 				client.ReadPump()
 			}))
-			defer server.Close()
+			defer testServer.Close()
 
 			dialer := websocket.Dialer{}
-			wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-			clientConn, _, err := dialer.Dial(wsURL, nil)
+			testURL := "ws" + strings.TrimPrefix(testServer.URL, "http")
+			clientConn, _, err := dialer.Dial(testURL, nil)
 			Expect(err).NotTo(HaveOccurred())
 			defer func() { _ = clientConn.Close() }()
 
@@ -360,23 +332,26 @@ var _ = Describe("Client", func() {
 	})
 
 	Describe("WritePump", func() {
-		It("should write to connection", func() {
-			hub := NewHub("test-session", time.Minute)
-
-			done := make(chan struct{})
-			go func() {
-				hub.Run()
-				done <- struct{}{}
-			}()
-
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var upgradeAndDial = func(handler func(*websocket.Conn)) (*httptest.Server, *websocket.Conn) {
+			testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				upgrader := websocket.Upgrader{}
 				conn, _ := upgrader.Upgrade(w, r, nil)
 				defer func() { _ = conn.Close() }()
+				handler(conn)
+			}))
 
-				client := NewClient(conn, hub, r.RemoteAddr)
+			testURL := "ws" + strings.TrimPrefix(testServer.URL, "http")
+			clientConn, _, err := websocket.DefaultDialer.Dial(testURL, nil)
+			Expect(err).NotTo(HaveOccurred())
+			return testServer, clientConn
+		}
+
+		It("should write to connection", func() {
+			go hub.Run()
+
+			testServer, clientConn := upgradeAndDial(func(conn *websocket.Conn) {
+				client := NewClient(conn, hub, "test-client")
 				hub.Register(client)
-
 				go client.WritePump()
 
 				var msg Message
@@ -385,29 +360,19 @@ var _ = Describe("Client", func() {
 						break
 					}
 				}
-			}))
-			defer server.Close()
-
-			dialer := websocket.Dialer{}
-			wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-			clientConn, _, err := dialer.Dial(wsURL, nil)
-			Expect(err).NotTo(HaveOccurred())
+			})
+			defer testServer.Close()
 
 			time.Sleep(100 * time.Millisecond)
-
 			_ = clientConn.Close()
-
 			time.Sleep(50 * time.Millisecond)
 		})
 
 		It("should write messages successfully", func() {
 			received := make(chan Message, 1)
 			done := make(chan struct{})
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				upgrader := websocket.Upgrader{}
-				conn, _ := upgrader.Upgrade(w, r, nil)
-				defer func() { _ = conn.Close() }()
 
+			testServer, clientConn := upgradeAndDial(func(conn *websocket.Conn) {
 				_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 				var msg Message
 				if err := conn.ReadJSON(&msg); err == nil {
@@ -420,13 +385,8 @@ var _ = Describe("Client", func() {
 						return
 					}
 				}
-			}))
-			defer server.Close()
-
-			dialer := websocket.Dialer{}
-			wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-			clientConn, _, err := dialer.Dial(wsURL, nil)
-			Expect(err).NotTo(HaveOccurred())
+			})
+			defer testServer.Close()
 
 			client := NewClient(clientConn, nil, "client-1")
 			go client.WritePump()
@@ -455,18 +415,12 @@ var _ = Describe("Client", func() {
 
 		It("should handle write errors", func() {
 			serverClosed := make(chan struct{})
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				upgrader := websocket.Upgrader{}
-				conn, _ := upgrader.Upgrade(w, r, nil)
+
+			testServer, clientConn := upgradeAndDial(func(conn *websocket.Conn) {
 				_ = conn.Close()
 				close(serverClosed)
-			}))
-			defer server.Close()
-
-			dialer := websocket.Dialer{}
-			wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-			clientConn, _, err := dialer.Dial(wsURL, nil)
-			Expect(err).NotTo(HaveOccurred())
+			})
+			defer testServer.Close()
 
 			client := NewClient(clientConn, nil, "client-1")
 			go client.WritePump()
@@ -485,24 +439,16 @@ var _ = Describe("Client", func() {
 
 		It("should send close when channel closes", func() {
 			done := make(chan struct{})
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				upgrader := websocket.Upgrader{}
-				conn, _ := upgrader.Upgrade(w, r, nil)
-				defer func() { _ = conn.Close() }()
 
+			testServer, clientConn := upgradeAndDial(func(conn *websocket.Conn) {
 				for {
 					if _, _, err := conn.ReadMessage(); err != nil {
 						close(done)
 						return
 					}
 				}
-			}))
-			defer server.Close()
-
-			dialer := websocket.Dialer{}
-			wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-			clientConn, _, err := dialer.Dial(wsURL, nil)
-			Expect(err).NotTo(HaveOccurred())
+			})
+			defer testServer.Close()
 
 			client := NewClient(clientConn, nil, "client-1")
 			go client.WritePump()
@@ -522,15 +468,9 @@ var _ = Describe("Client", func() {
 
 	Describe("ConcurrentOperations", func() {
 		It("should handle concurrent client operations", func() {
-			hub := NewHub("test-session", time.Minute)
+			go hub.Run()
 
-			done := make(chan struct{})
-			go func() {
-				hub.Run()
-				done <- struct{}{}
-			}()
-
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				upgrader := websocket.Upgrader{}
 				conn, _ := upgrader.Upgrade(w, r, nil)
 				defer func() { _ = conn.Close() }()
@@ -545,10 +485,10 @@ var _ = Describe("Client", func() {
 					}
 				}
 			}))
-			defer server.Close()
+			defer testServer.Close()
 
 			dialer := websocket.Dialer{}
-			wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+			testURL := "ws" + strings.TrimPrefix(testServer.URL, "http")
 
 			var wg sync.WaitGroup
 			numClients := 5
@@ -557,7 +497,7 @@ var _ = Describe("Client", func() {
 				wg.Add(1)
 				go func() {
 					defer wg.Done()
-					conn, _, _ := dialer.Dial(wsURL, nil)
+					conn, _, _ := dialer.Dial(testURL, nil)
 					if conn != nil {
 						defer func() { _ = conn.Close() }()
 						time.Sleep(50 * time.Millisecond)
@@ -578,15 +518,9 @@ var _ = Describe("Client", func() {
 
 	Describe("SlowClientHandling", func() {
 		It("should handle slow clients", func() {
-			hub := NewHub("test-session", time.Minute)
+			go hub.Run()
 
-			done := make(chan struct{})
-			go func() {
-				hub.Run()
-				done <- struct{}{}
-			}()
-
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				upgrader := websocket.Upgrader{}
 				conn, _ := upgrader.Upgrade(w, r, nil)
 				defer func() { _ = conn.Close() }()
@@ -596,11 +530,11 @@ var _ = Describe("Client", func() {
 
 				select {}
 			}))
-			defer server.Close()
+			defer testServer.Close()
 
 			dialer := websocket.Dialer{}
-			wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-			conn, _, _ := dialer.Dial(wsURL, nil)
+			testURL := "ws" + strings.TrimPrefix(testServer.URL, "http")
+			conn, _, _ := dialer.Dial(testURL, nil)
 			if conn != nil {
 				defer func() { _ = conn.Close() }()
 			}
