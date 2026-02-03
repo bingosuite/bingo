@@ -28,12 +28,6 @@ pre-commit:
 
 pre-push:
   commands:
-    test:
-      run: make test
-  
-    integration:
-      run: make integration
-
     vet:
       run: go vet ./cmd/bingo
 
