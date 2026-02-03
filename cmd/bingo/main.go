@@ -7,14 +7,14 @@ import (
 	"os/exec"
 	"syscall"
 
-	config "github.com/bingosuite/bingo/config"
+	"github.com/bingosuite/bingo/config"
 	"github.com/bingosuite/bingo/internal/debugger"
-	debuginfo "github.com/bingosuite/bingo/internal/debuginfo"
+	"github.com/bingosuite/bingo/internal/debuginfo"
 	websocket "github.com/bingosuite/bingo/internal/ws"
 )
 
 const (
-	PTRACE_O_EXITKILL = 0x100000 // Set option to kill the target process when Bingo exits to true
+	ptraceOExitKill = 0x100000 // Set option to kill the target process when Bingo exits to true
 )
 
 func main() {
@@ -46,6 +46,9 @@ func main() {
 	if err := cmd.Start(); err != nil {
 		handleError("Failed to start target: %v", err)
 	}
+
+	// We want to catch the initial SIGTRAP sent by process creation. When this is caught, we know that the target just started and we can ask the user where they want to set their breakpoints
+	// The message we print to the console will be removed in the future, it's just for debugging purposes for now.
 	if err := cmd.Wait(); err != nil {
 		log.Printf("Received SIGTRAP from process creation: %v", err)
 	}
@@ -58,10 +61,11 @@ func main() {
 	log.Printf("Started process with PID: %d and PGID: %d\n", db.Target.PID, db.Target.PGID)
 
 	// Enable tracking threads spawned from target and killing target once Bingo exits
-	if err := syscall.PtraceSetOptions(db.Target.PID, syscall.PTRACE_O_TRACECLONE|PTRACE_O_EXITKILL); err != nil {
+	if err := syscall.PtraceSetOptions(db.Target.PID, syscall.PTRACE_O_TRACECLONE|ptraceOExitKill); err != nil {
 		handleError("Failed to set TRACECLONE and EXITKILL options on target: %v", err)
 	}
 
+	//TODO: client should send over what line we need to set breakpoint at, not hardcoded line 11
 	pc, _, err := db.LineToPC(db.Target.Path, 11)
 	if err != nil {
 		handleError("Failed to get PC of line 11: %v", err)
@@ -71,35 +75,38 @@ func main() {
 		handleError("Failed to set breakpoint: %v", err)
 	}
 
-	// Continue after the initial SIGTRAP, normally would ask the user what they want to do
+	// Continue after the initial SIGTRAP
+	// TODO: tell client to display the initial setup menu so the user can choose to set breakpoint, continue or single-step
 	if err := syscall.PtraceCont(db.Target.PID, 0); err != nil {
 		handleError("Failed to resume target execution: %v", err)
 	}
 
 	for {
 		// Wait until any of the child processes of the target is interrupted or ends
-		var ws syscall.WaitStatus
-		wpid, err := syscall.Wait4(-1*db.Target.PGID, &ws, 0, nil)
+		var waitStatus syscall.WaitStatus
+		wpid, err := syscall.Wait4(-1*db.Target.PGID, &waitStatus, 0, nil) // TODO: handle concurrency
 		if err != nil {
 			handleError("Failed to wait for the target or any of its threads: %v", err)
 		}
 
-		if ws.Exited() {
+		if waitStatus.Exited() {
 			if wpid == db.Target.PID { // If target exited, terminate
+				log.Printf("Target %v execution completed", db.Target.Path)
 				break
+			} else {
+				log.Printf("Thread exited with PID: %v", wpid)
 			}
 		} else {
 			// Only stop on breakpoints caused by our debugger, ignore any other event like spawning of new threads
-			if ws.StopSignal() == syscall.SIGTRAP && ws.TrapCause() != syscall.PTRACE_EVENT_CLONE {
-
-				//TODO: import error handling and messages and pull logic out to debugger package
+			if waitStatus.StopSignal() == syscall.SIGTRAP && waitStatus.TrapCause() != syscall.PTRACE_EVENT_CLONE {
+				//TODO: improve error handling and messages and pull logic out to debugger package
 
 				// Read registers
 				var regs syscall.PtraceRegs
 				if err := syscall.PtraceGetRegs(wpid, &regs); err != nil {
 					handleError("Failed to get registers: %v", err)
 				}
-				filename, line, fn := db.PCToLine(regs.Rip - 1) // Interrupt advances PC by 1 on x86, so we need to rewind
+				filename, line, fn := db.PCToLine(regs.Rip - 1) // Breakpoint advances PC by 1 on x86, so we need to rewind
 				fmt.Printf("Stopped at %s at %d in %s\n", fn.Name, line, filename)
 
 				// Remove the breakpoint
@@ -119,9 +126,9 @@ func main() {
 					handleError("Failed to single-step: %v", err)
 				}
 
+				// TODO: only trigger for step over signal
 				// Wait until the program lets us know we stepped over (handle cases where we get another signal which Wait4 would consume)
-				var stepSig syscall.WaitStatus
-				if _, err := syscall.Wait4(wpid, &stepSig, 0, nil); err != nil {
+				if _, err := syscall.Wait4(wpid, &waitStatus, 0, nil); err != nil {
 					handleError("Failed to wait for the single-step: %v", err)
 				}
 
