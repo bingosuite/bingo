@@ -33,6 +33,7 @@ func main() {
 		}
 	}()
 
+	// TODO: receive this information from client
 	procName := os.Args[1]
 	binLocation := fmt.Sprintf("/workspaces/bingo/build/target/%s", procName)
 
@@ -53,45 +54,45 @@ func main() {
 		log.Printf("Received SIGTRAP from process creation: %v", err)
 	}
 
-	db, err := debuginfo.NewDebugInfo(binLocation, cmd.Process.Pid)
+	dbInf, err := debuginfo.NewDebugInfo(binLocation, cmd.Process.Pid)
 	if err != nil {
 		log.Printf("Failed to create debug info: %v", err)
 		panic(err)
 	}
-	log.Printf("Started process with PID: %d and PGID: %d\n", db.Target.PID, db.Target.PGID)
+	log.Printf("Started process with PID: %d and PGID: %d\n", dbInf.Target.PID, dbInf.Target.PGID)
 
 	// Enable tracking threads spawned from target and killing target once Bingo exits
-	if err := syscall.PtraceSetOptions(db.Target.PID, syscall.PTRACE_O_TRACECLONE|ptraceOExitKill); err != nil {
+	if err := syscall.PtraceSetOptions(dbInf.Target.PID, syscall.PTRACE_O_TRACECLONE|ptraceOExitKill); err != nil {
 		handleError("Failed to set TRACECLONE and EXITKILL options on target: %v", err)
 	}
 
 	//TODO: client should send over what line we need to set breakpoint at, not hardcoded line 11
-	pc, _, err := db.LineToPC(db.Target.Path, 11)
+	pc, _, err := dbInf.LineToPC(dbInf.Target.Path, 11)
 	if err != nil {
 		handleError("Failed to get PC of line 11: %v", err)
 	}
 
-	if err := debugger.SetBreakpoint(db, pc); err != nil {
+	if err := debugger.SetBreakpoint(dbInf, pc); err != nil {
 		handleError("Failed to set breakpoint: %v", err)
 	}
 
 	// Continue after the initial SIGTRAP
 	// TODO: tell client to display the initial setup menu so the user can choose to set breakpoint, continue or single-step
-	if err := syscall.PtraceCont(db.Target.PID, 0); err != nil {
+	if err := syscall.PtraceCont(dbInf.Target.PID, 0); err != nil {
 		handleError("Failed to resume target execution: %v", err)
 	}
 
 	for {
 		// Wait until any of the child processes of the target is interrupted or ends
 		var waitStatus syscall.WaitStatus
-		wpid, err := syscall.Wait4(-1*db.Target.PGID, &waitStatus, 0, nil) // TODO: handle concurrency
+		wpid, err := syscall.Wait4(-1*dbInf.Target.PGID, &waitStatus, 0, nil) // TODO: handle concurrency
 		if err != nil {
 			handleError("Failed to wait for the target or any of its threads: %v", err)
 		}
 
 		if waitStatus.Exited() {
-			if wpid == db.Target.PID { // If target exited, terminate
-				log.Printf("Target %v execution completed", db.Target.Path)
+			if wpid == dbInf.Target.PID { // If target exited, terminate
+				log.Printf("Target %v execution completed", dbInf.Target.Path)
 				break
 			} else {
 				log.Printf("Thread exited with PID: %v", wpid)
@@ -106,12 +107,12 @@ func main() {
 				if err := syscall.PtraceGetRegs(wpid, &regs); err != nil {
 					handleError("Failed to get registers: %v", err)
 				}
-				filename, line, fn := db.PCToLine(regs.Rip - 1) // Breakpoint advances PC by 1 on x86, so we need to rewind
+				filename, line, fn := dbInf.PCToLine(regs.Rip - 1) // Breakpoint advances PC by 1 on x86, so we need to rewind
 				fmt.Printf("Stopped at %s at %d in %s\n", fn.Name, line, filename)
 
 				// Remove the breakpoint
 				bpAddr := regs.Rip - 1
-				if err := debugger.ClearBreakpoint(db, bpAddr); err != nil {
+				if err := debugger.ClearBreakpoint(dbInf, bpAddr); err != nil {
 					handleError("Failed to clear breakpoint: %v", err)
 				}
 				regs.Rip = bpAddr
@@ -133,7 +134,7 @@ func main() {
 				}
 
 				// Put the breakpoint back
-				if err := debugger.SetBreakpoint(db, bpAddr); err != nil {
+				if err := debugger.SetBreakpoint(dbInf, bpAddr); err != nil {
 					handleError("Failed to set breakpoint: %v", err)
 				}
 

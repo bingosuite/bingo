@@ -11,7 +11,8 @@
     "--platform=linux/amd64"
   ],
   "features": {
-    "ghcr.io/thediveo/devcontainer-features/lazygit": {}
+    "ghcr.io/thediveo/devcontainer-features/lazygit": {},
+    "ghcr.io/jsburckhardt/devcontainer-features/just:1": {}
   },
   "postCreateCommand": "bash .devcontainer/setup.sh",
   "customizations": {
