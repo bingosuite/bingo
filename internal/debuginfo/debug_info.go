@@ -46,7 +46,8 @@ func NewDebugInfo(path string, pid int) (*DebugInfo, error) {
 		return nil, fmt.Errorf("failed to create Symbol Table: %v", err)
 	}
 
-	targetFile, _, _ := symTable.PCToLine(symTable.LookupFunc("main.main").Entry)
+	//Need to get this to dynamically get the path to the main source Go file (ex. target.exe's source might be called /workspaces/bingo/cmd/target/target.go or /workspaces/bingo/cmd/target/main.go)
+	sourceFile, _, _ := symTable.PCToLine(symTable.LookupFunc("main.main").Entry)
 
 	// Need this to wait on threads
 	pgid, err := syscall.Getpgid(pid)
@@ -59,7 +60,7 @@ func NewDebugInfo(path string, pid int) (*DebugInfo, error) {
 		LineTable:   lineTable,
 		Breakpoints: make(map[uint64][]byte),
 		Target: Target{
-			Path: targetFile, PID: pid, PGID: pgid,
+			Path: sourceFile, PID: pid, PGID: pgid,
 		},
 	}, nil
 }
