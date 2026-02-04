@@ -7,51 +7,53 @@ type Message struct {
 	Data json.RawMessage `json:"data,omitempty"`
 }
 
+type State string
+
+const (
+	StateExecuting  State = "executing"
+	StateBreakpoint State = "breakpoint"
+)
+
 // Event messages (server -> client)
 type EventType string
 
 const (
 	EventSessionStarted EventType = "sessionStarted"
 	EventStateUpdate    EventType = "stateUpdate"
-	EventGoroutineEvent EventType = "goroutineEvent"
-	EventInspectResult  EventType = "inspectResult"
 )
 
-type GoroutineEvent struct {
-	Type        EventType `json:"type"`
-	SessionID   string    `json:"sessionId"`
-	GoroutineID uint64    `json:"goroutineId"`
-	State       string    `json:"state"`
-	PC          string    `json:"pc"`
-	Source      struct {
-		File string `json:"file"`
-		Line int    `json:"line"`
-	} `json:"source"`
+type SessionStartedEvent struct {
+	Type      EventType `json:"type"`
+	SessionID string    `json:"sessionId"`
+	PID       int       `json:"pid"`
 }
 
-type InspectResult struct {
-	Type        EventType         `json:"type"`
-	SessionID   string            `json:"sessionId"`
-	GoroutineID uint64            `json:"goroutineId"`
-	Vars        map[string]string `json:"vars"`
+type StateUpdateEvent struct {
+	Type      EventType `json:"type"`
+	SessionID string    `json:"sessionId"`
+	NewState  State     `json:"newState"`
 }
 
 // Command messages (client -> server)
 type CommandType string
 
 const (
-	CmdContinue         CommandType = "continue"
-	CmdStepOver         CommandType = "stepOver"
-	CmdInspectGoroutine CommandType = "inspectGoroutine"
+	CmdContinue CommandType = "continue"
+	CmdStepOver CommandType = "stepOver"
+	CmdExit     CommandType = "exit"
 )
 
-type InspectGoroutineCmd struct {
-	Type        CommandType `json:"type"`
-	SessionID   string      `json:"sessionId"`
-	GoroutineID uint64      `json:"goroutineId"`
+type ContinueCmd struct {
+	Type      CommandType `json:"type"`
+	SessionID string      `json:"sessionId"`
 }
 
-type ContinueCmd struct {
+type StepOverCmd struct {
+	Type      CommandType `json:"type"`
+	SessionID string      `json:"sessionId"`
+}
+
+type ExitCmd struct {
 	Type      CommandType `json:"type"`
 	SessionID string      `json:"sessionId"`
 }
