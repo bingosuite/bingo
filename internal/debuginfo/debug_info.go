@@ -14,10 +14,9 @@ type Target struct {
 }
 
 type DebugInfo struct {
-	SymTable    *gosym.Table
-	LineTable   *gosym.LineTable
-	Breakpoints map[uint64][]byte
-	Target      Target
+	SymTable  *gosym.Table
+	LineTable *gosym.LineTable
+	Target    Target
 }
 
 func NewDebugInfo(path string, pid int) (*DebugInfo, error) {
@@ -56,9 +55,8 @@ func NewDebugInfo(path string, pid int) (*DebugInfo, error) {
 	}
 
 	return &DebugInfo{
-		SymTable:    symTable,
-		LineTable:   lineTable,
-		Breakpoints: make(map[uint64][]byte),
+		SymTable:  symTable,
+		LineTable: lineTable,
 		Target: Target{
 			Path: sourceFile, PID: pid, PGID: pgid,
 		},

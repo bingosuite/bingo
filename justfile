@@ -3,8 +3,8 @@ build:
     go build -o ./build/bingo/bingo ./cmd/bingo
 
 # Run the BinGo binary with TARGET (defaults to "target")
-run TARGET="target":
-	./build/bingo/bingo {{TARGET}}
+run:
+	./build/bingo/bingo
 
 # Build the Target, build BinGo and run the Target
 go: build-target build run
@@ -32,3 +32,6 @@ coverage PKG="./...":
 # Run integration tests
 integration:
 	go run github.com/onsi/ginkgo/v2/ginkgo -r ./test/integration/.
+
+client:
+    go run ./cmd/client/client.go -server localhost:8080 -session test-session

@@ -6,11 +6,7 @@ import (
 )
 
 func main() {
-	var count int
-	for {
-		fmt.Println("Hello, World")
-		count = count + 1
-		count = count * 1
-		time.Sleep(2 * time.Second)
-	}
+	fmt.Println("Hello, World")
+	time.Sleep(2 * time.Second)
+
 }
