@@ -6,15 +6,15 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-type Client struct {
+type Connection struct {
 	id   string
 	conn *websocket.Conn
 	hub  *Hub
 	send chan Message
 }
 
-func NewClient(conn *websocket.Conn, hub *Hub, id string) *Client {
-	return &Client{
+func NewConnection(conn *websocket.Conn, hub *Hub, id string) *Connection {
+	return &Connection{
 		id:   id,
 		conn: conn,
 		hub:  hub,
@@ -22,11 +22,11 @@ func NewClient(conn *websocket.Conn, hub *Hub, id string) *Client {
 	}
 }
 
-func (c *Client) ReadPump() {
+func (c *Connection) ReadPump() {
 	defer func() {
 		c.hub.Unregister(c)
 		if err := c.conn.Close(); err != nil {
-			log.Printf("Client %s close error: %v", c.id, err)
+			log.Printf("Connection %s close error: %v", c.id, err)
 		}
 	}()
 
@@ -34,7 +34,7 @@ func (c *Client) ReadPump() {
 		var msg Message
 		err := c.conn.ReadJSON(&msg)
 		if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
-			log.Printf("Client %s unexpected close: %v", c.id, err)
+			log.Printf("Connection %s unexpected close: %v", c.id, err)
 			break
 		}
 		if err != nil {
@@ -44,16 +44,16 @@ func (c *Client) ReadPump() {
 	}
 }
 
-func (c *Client) WritePump() {
+func (c *Connection) WritePump() {
 	defer func() {
 		if err := c.conn.Close(); err != nil {
-			log.Printf("Client %s close error: %v", c.id, err)
+			log.Printf("Connection %s close error: %v", c.id, err)
 		}
 	}()
 
 	for message := range c.send {
 		if err := c.conn.WriteJSON(message); err != nil {
-			log.Printf("Client %s write error: %v", c.id, err)
+			log.Printf("Connection %s write error: %v", c.id, err)
 			return
 		}
 	}

@@ -14,12 +14,12 @@ const (
 )
 
 type Hub struct {
-	sessionID string
-	clients   map[*Client]struct{}
+	sessionID   string
+	connections map[*Connection]struct{}
 
 	// Channels for register/unregister clients and broadcast msgs
-	register   chan *Client
-	unregister chan *Client
+	register   chan *Connection
+	unregister chan *Connection
 	events     chan Message
 	commands   chan Message
 
@@ -35,9 +35,9 @@ type Hub struct {
 func NewHub(sessionID string, idleTimeout time.Duration) *Hub {
 	return &Hub{
 		sessionID:    sessionID,
-		clients:      make(map[*Client]struct{}),
-		register:     make(chan *Client),
-		unregister:   make(chan *Client),
+		connections:  make(map[*Connection]struct{}),
+		register:     make(chan *Connection),
+		unregister:   make(chan *Connection),
 		events:       make(chan Message, eventBufferSize),
 		commands:     make(chan Message, commandBufferSize),
 		idleTimeout:  idleTimeout,
@@ -53,7 +53,7 @@ func (h *Hub) Run() {
 		select {
 		case <-ticker.C:
 			// Check idle timeout
-			if h.idleTimeout > 0 && len(h.clients) == 0 {
+			if h.idleTimeout > 0 && len(h.connections) == 0 {
 				if time.Since(h.lastActivity) > h.idleTimeout {
 					log.Printf("Session %s idle for %v, shutting down", h.sessionID, h.idleTimeout)
 					h.shutdown()
@@ -63,20 +63,20 @@ func (h *Hub) Run() {
 
 		case client := <-h.register:
 			h.mu.Lock()
-			h.clients[client] = struct{}{}
+			h.connections[client] = struct{}{}
 			h.lastActivity = time.Now()
 			h.mu.Unlock()
-			log.Printf("Client %s connected to hub %s (%d total)", client.id, h.sessionID, len(h.clients))
+			log.Printf("Client %s connected to hub %s (%d total)", client.id, h.sessionID, len(h.connections))
 
 		case client := <-h.unregister:
 			h.mu.Lock()
-			if _, ok := h.clients[client]; ok {
-				delete(h.clients, client)
+			if _, ok := h.connections[client]; ok {
+				delete(h.connections, client)
 				close(client.send)
-				log.Printf("Client %s disconnected from hub %s (%d remaining)", client.id, h.sessionID, len(h.clients))
+				log.Printf("Client %s disconnected from hub %s (%d remaining)", client.id, h.sessionID, len(h.connections))
 
 				// When last client leaves, shutdown hub
-				if len(h.clients) == 0 {
+				if len(h.connections) == 0 {
 					h.mu.Unlock()
 					log.Printf("Session %s has no clients, shutting down hub", h.sessionID)
 					h.shutdown()
@@ -89,18 +89,18 @@ func (h *Hub) Run() {
 		case event := <-h.events:
 			h.lastActivity = time.Now()
 			h.mu.RLock()
-			var slowClients []*Client
-			for client := range h.clients {
+			var slowConnections []*Connection
+			for connection := range h.connections {
 				select {
-				case client.send <- event:
-				default: // when a send operation blocks (client consuming too slowly or reader goroutine died), discard the client
-					slowClients = append(slowClients, client)
+				case connection.send <- event:
+				default: // when a send operation blocks (connection consuming too slowly or reader goroutine died), discard the connection
+					slowConnections = append(slowConnections, connection)
 				}
 			}
 			h.mu.RUnlock()
-			for _, client := range slowClients {
-				log.Printf("Client %s is slow; unregistering from hub %s", client.id, h.sessionID)
-				h.Unregister(client)
+			for _, connection := range slowConnections {
+				log.Printf("Connection %s is slow; unregistering from hub %s", connection.id, h.sessionID)
+				h.Unregister(connection)
 			}
 
 		case cmd := <-h.commands:
@@ -111,12 +111,12 @@ func (h *Hub) Run() {
 }
 
 // Public APIs
-func (h *Hub) Register(client *Client) {
-	h.register <- client
+func (h *Hub) Register(connection *Connection) {
+	h.register <- connection
 }
 
-func (h *Hub) Unregister(client *Client) {
-	h.unregister <- client
+func (h *Hub) Unregister(connection *Connection) {
+	h.unregister <- connection
 }
 
 func (h *Hub) Broadcast(event Message) {
