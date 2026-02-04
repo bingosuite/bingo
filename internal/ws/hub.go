@@ -1,9 +1,12 @@
 package ws
 
 import (
+	"encoding/json"
 	"log"
 	"sync"
 	"time"
+
+	"github.com/bingosuite/bingo/internal/debugger"
 )
 
 const (
@@ -29,10 +32,12 @@ type Hub struct {
 	idleTimeout  time.Duration
 	lastActivity time.Time
 
+	debugger *debugger.Debugger
+
 	mu sync.RWMutex
 }
 
-func NewHub(sessionID string, idleTimeout time.Duration) *Hub {
+func NewHub(sessionID string, idleTimeout time.Duration, dbg *debugger.Debugger) *Hub {
 	return &Hub{
 		sessionID:    sessionID,
 		connections:  make(map[*Connection]struct{}),
@@ -42,6 +47,7 @@ func NewHub(sessionID string, idleTimeout time.Duration) *Hub {
 		commands:     make(chan Message, commandBufferSize),
 		idleTimeout:  idleTimeout,
 		lastActivity: time.Now(),
+		debugger:     dbg,
 	}
 }
 
@@ -105,7 +111,11 @@ func (h *Hub) Run() {
 
 		case cmd := <-h.commands:
 			log.Printf("Hub %s command: %s", h.sessionID, cmd.Type)
-			//TODO: forward commands to debugger
+			h.handleCommand(cmd)
+
+		case <-h.debugger.EndDebugSession:
+			log.Printf("Debugger signaled end of session %s, shutting down hub", h.sessionID)
+			h.shutdown()
 		}
 	}
 }
@@ -130,5 +140,53 @@ func (h *Hub) SendCommand(cmd Message) {
 func (h *Hub) shutdown() {
 	if h.onShutdown != nil {
 		h.onShutdown(h.sessionID)
+	}
+}
+
+func (h *Hub) handleCommand(cmd Message) {
+	if h.debugger == nil {
+		log.Printf("No debugger attached to hub %s, ignoring command", h.sessionID)
+		return
+	}
+
+	switch CommandType(cmd.Type) {
+	case CmdStartDebug:
+		var startDebugCmd StartDebugCmd
+		if err := json.Unmarshal(cmd.Data, &startDebugCmd); err != nil {
+			log.Printf("Failed to unmarshal startDebug command: %v", err)
+			return
+		}
+		log.Printf("Starting debug session for %s in session %s", startDebugCmd.TargetPath, h.sessionID)
+		go h.debugger.StartWithDebug(startDebugCmd.TargetPath)
+
+	case CmdContinue:
+		var continueCmd ContinueCmd
+		if err := json.Unmarshal(cmd.Data, &continueCmd); err != nil {
+			log.Printf("Failed to unmarshal continue command: %v", err)
+			return
+		}
+		log.Printf("Forwarding continue command to debugger for session %s", h.sessionID)
+		h.debugger.Continue(h.debugger.DebugInfo.Target.PID)
+
+	case CmdStepOver:
+		var stepOverCmd StepOverCmd
+		if err := json.Unmarshal(cmd.Data, &stepOverCmd); err != nil {
+			log.Printf("Failed to unmarshal stepOver command: %v", err)
+			return
+		}
+		log.Printf("Forwarding stepOver command to debugger for session %s", h.sessionID)
+		h.debugger.SingleStep(h.debugger.DebugInfo.Target.PID)
+
+	case CmdExit:
+		var exitCmd ExitCmd
+		if err := json.Unmarshal(cmd.Data, &exitCmd); err != nil {
+			log.Printf("Failed to unmarshal exit command: %v", err)
+			return
+		}
+		log.Printf("Forwarding exit command to debugger for session %s", h.sessionID)
+		h.debugger.StopDebug()
+
+	default:
+		log.Printf("Unknown command type: %s", cmd.Type)
 	}
 }

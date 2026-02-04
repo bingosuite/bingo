@@ -6,14 +6,16 @@ import (
 	"sync"
 
 	"github.com/bingosuite/bingo/config"
+	"github.com/bingosuite/bingo/internal/debugger"
 	"github.com/gorilla/websocket"
 )
 
 type Server struct {
-	addr   string
-	hubs   map[string]*Hub
-	config config.WebSocketConfig
-	mu     sync.RWMutex
+	addr       string
+	hubs       map[string]*Hub
+	config     config.WebSocketConfig
+	mu         sync.RWMutex
+	KillServer chan bool
 }
 
 func NewServer(addr string, cfg *config.WebSocketConfig) *Server {
@@ -25,9 +27,10 @@ func NewServer(addr string, cfg *config.WebSocketConfig) *Server {
 
 func newServerWithConfig(addr string, cfg config.WebSocketConfig) *Server {
 	s := &Server{
-		addr:   addr,
-		hubs:   make(map[string]*Hub),
-		config: cfg,
+		addr:       addr,
+		hubs:       make(map[string]*Hub),
+		config:     cfg,
+		KillServer: make(chan bool),
 	}
 	http.HandleFunc("/ws/", s.serveWebSocket)
 	return s
@@ -81,7 +84,8 @@ func (s *Server) GetOrCreateHub(sessionID string) *Hub {
 			return nil
 		}
 
-		hub = NewHub(sessionID, s.config.IdleTimeout)
+		d := debugger.NewDebugger()
+		hub = NewHub(sessionID, s.config.IdleTimeout, d)
 		hub.onShutdown = s.removeHub // Set callback for cleanup
 		s.hubs[sessionID] = hub
 		go hub.Run()
@@ -96,4 +100,29 @@ func (s *Server) removeHub(sessionID string) {
 	delete(s.hubs, sessionID)
 	s.mu.Unlock()
 	log.Printf("Removed hub for session: %s", sessionID)
+}
+
+func (s *Server) Shutdown() {
+	log.Printf("Shutting down server, closing %d hub(s)", len(s.hubs))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Close all hubs
+	for sessionID, hub := range s.hubs {
+		log.Printf("Shutting down hub for session: %s", sessionID)
+
+		// Close all connections in the hub
+		for c := range hub.connections {
+			close(c.send)
+			if err := c.conn.Close(); err != nil {
+				log.Printf("Error closing connection %s: %v", c.id, err)
+				panic(err)
+			}
+		}
+
+		delete(s.hubs, sessionID)
+	}
+
+	log.Println("All hubs and debuggers closed")
 }
