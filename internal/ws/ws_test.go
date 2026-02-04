@@ -63,7 +63,7 @@ var _ = Describe("Hub", func() {
 
 			Expect(testHub.sessionID).To(Equal(sessionID))
 			Expect(testHub.idleTimeout).To(Equal(idleTimeout))
-			Expect(testHub.clients).To(BeEmpty())
+			Expect(testHub.connections).To(BeEmpty())
 			Expect(testHub.register).NotTo(BeNil())
 			Expect(testHub.unregister).NotTo(BeNil())
 			Expect(testHub.events).NotTo(BeNil())
@@ -71,47 +71,46 @@ var _ = Describe("Hub", func() {
 		})
 	})
 
-	Describe("RegisterClient", func() {
-		It("should register a client with hub", func() {
+	Describe("RegisterConnection", func() {
+		It("should register a connection with hub", func() {
 			dialer := websocket.Dialer{}
 			conn, _, err := dialer.Dial(wsURL, nil)
 			Expect(err).NotTo(HaveOccurred())
 			defer func() { _ = conn.Close() }()
 
-			client := NewClient(conn, hub, "client-1")
-			hub.Register(client)
+			connection := NewConnection(conn, hub, "connection-1")
+			hub.Register(connection)
 
 			time.Sleep(100 * time.Millisecond)
 
 			hub.mu.RLock()
-			clientCount := len(hub.clients)
+			connectionCount := len(hub.connections)
 			hub.mu.RUnlock()
 
-			Expect(clientCount).To(Equal(1))
+			Expect(connectionCount).To(Equal(1))
 		})
 	})
 
-	Describe("UnregisterClient", func() {
-		It("should unregister a client from hub", func() {
+	Describe("UnregisterConnection", func() {
+		It("should unregister a connection from hub", func() {
 			dialer := websocket.Dialer{}
 			conn, _, err := dialer.Dial(wsURL, nil)
 			Expect(err).NotTo(HaveOccurred())
 			defer func() { _ = conn.Close() }()
 
-			client := NewClient(conn, hub, "client-1")
-			hub.Register(client)
+			connection := NewConnection(conn, hub, "connection-1")
+			hub.Register(connection)
 
 			time.Sleep(50 * time.Millisecond)
 
-			hub.Unregister(client)
-
+			hub.Unregister(connection)
 			time.Sleep(100 * time.Millisecond)
 
 			hub.mu.RLock()
-			clientCount := len(hub.clients)
+			connectionCount := len(hub.connections)
 			hub.mu.RUnlock()
 
-			Expect(clientCount).To(Equal(0))
+			Expect(connectionCount).To(Equal(0))
 			Expect(shutdownCalled.Load()).To(BeTrue())
 		})
 	})
@@ -152,7 +151,7 @@ var _ = Describe("Hub", func() {
 				for {
 					select {
 					case <-ticker.C:
-						if hub.idleTimeout > 0 && len(hub.clients) == 0 {
+						if hub.idleTimeout > 0 && len(hub.connections) == 0 {
 							if time.Since(hub.lastActivity) > hub.idleTimeout {
 								hub.shutdown()
 								done <- struct{}{}
@@ -162,16 +161,16 @@ var _ = Describe("Hub", func() {
 
 					case client := <-hub.register:
 						hub.mu.Lock()
-						hub.clients[client] = struct{}{}
+						hub.connections[client] = struct{}{}
 						hub.lastActivity = time.Now()
 						hub.mu.Unlock()
 
 					case client := <-hub.unregister:
 						hub.mu.Lock()
-						if _, ok := hub.clients[client]; ok {
-							delete(hub.clients, client)
+						if _, ok := hub.connections[client]; ok {
+							delete(hub.connections, client)
 							close(client.send)
-							if len(hub.clients) == 0 {
+							if len(hub.connections) == 0 {
 								hub.mu.Unlock()
 								hub.shutdown()
 								done <- struct{}{}
@@ -220,7 +219,7 @@ var _ = Describe("Hub", func() {
 	})
 })
 
-var _ = Describe("Client", func() {
+var _ = Describe("Connection", func() {
 	var (
 		hub    *Hub
 		server *httptest.Server
@@ -245,19 +244,19 @@ var _ = Describe("Client", func() {
 		}
 	})
 
-	Describe("NewClient", func() {
+	Describe("NewConnection", func() {
 		It("should create a new client with correct properties", func() {
 			dialer := websocket.Dialer{}
 			conn, _, err := dialer.Dial(wsURL, nil)
 			Expect(err).NotTo(HaveOccurred())
 			defer func() { _ = conn.Close() }()
 
-			client := NewClient(conn, hub, "client-1")
+			connection := NewConnection(conn, hub, "connection-1")
 
-			Expect(client.id).To(Equal("client-1"))
-			Expect(client.hub).To(Equal(hub))
-			Expect(client.conn).To(Equal(conn))
-			Expect(client.send).NotTo(BeNil())
+			Expect(connection.id).To(Equal("connection-1"))
+			Expect(connection.hub).To(Equal(hub))
+			Expect(connection.conn).To(Equal(conn))
+			Expect(connection.send).NotTo(BeNil())
 		})
 	})
 
@@ -270,10 +269,10 @@ var _ = Describe("Client", func() {
 				conn, _ := upgrader.Upgrade(w, r, nil)
 				defer func() { _ = conn.Close() }()
 
-				client := NewClient(conn, hub, r.RemoteAddr)
-				hub.Register(client)
+				connection := NewConnection(conn, hub, r.RemoteAddr)
+				hub.Register(connection)
 
-				client.ReadPump()
+				connection.ReadPump()
 			}))
 			defer testServer.Close()
 
@@ -314,7 +313,7 @@ var _ = Describe("Client", func() {
 			go hub.Run()
 
 			testServer, clientConn := upgradeAndDial(func(conn *websocket.Conn) {
-				client := NewClient(conn, hub, "test-client")
+				client := NewConnection(conn, hub, "test-client")
 				hub.Register(client)
 				go client.WritePump()
 
@@ -352,12 +351,11 @@ var _ = Describe("Client", func() {
 			})
 			defer testServer.Close()
 
-			client := NewClient(clientConn, nil, "client-1")
-			go client.WritePump()
+			connection := NewConnection(clientConn, nil, "connection-1")
+			go connection.WritePump()
 
-			client.send <- Message{Type: string(EventStateUpdate), Data: json.RawMessage(`{"ok":true}`)}
-			close(client.send)
-
+			connection.send <- Message{Type: string(EventStateUpdate), Data: json.RawMessage(`{"ok":true}`)}
+			close(connection.send)
 			Eventually(func() bool {
 				select {
 				case <-received:
@@ -386,10 +384,10 @@ var _ = Describe("Client", func() {
 			})
 			defer testServer.Close()
 
-			client := NewClient(clientConn, nil, "client-1")
-			go client.WritePump()
+			connection := NewConnection(clientConn, nil, "connection-1")
+			go connection.WritePump()
 
-			client.send <- Message{Type: string(EventStateUpdate), Data: json.RawMessage(`{"ok":true}`)}
+			connection.send <- Message{Type: string(EventStateUpdate), Data: json.RawMessage(`{"ok":true}`)}
 
 			Eventually(func() bool {
 				select {
@@ -414,10 +412,10 @@ var _ = Describe("Client", func() {
 			})
 			defer testServer.Close()
 
-			client := NewClient(clientConn, nil, "client-1")
-			go client.WritePump()
+			connection := NewConnection(clientConn, nil, "connection-1")
+			go connection.WritePump()
 
-			close(client.send)
+			close(connection.send)
 
 			Eventually(func() bool {
 				select {
@@ -431,7 +429,7 @@ var _ = Describe("Client", func() {
 	})
 
 	Describe("ConcurrentOperations", func() {
-		It("should handle concurrent client operations", func() {
+		It("should handle concurrent connection operations", func() {
 			go hub.Run()
 
 			testServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -439,8 +437,8 @@ var _ = Describe("Client", func() {
 				conn, _ := upgrader.Upgrade(w, r, nil)
 				defer func() { _ = conn.Close() }()
 
-				client := NewClient(conn, hub, r.RemoteAddr)
-				hub.Register(client)
+				connection := NewConnection(conn, hub, r.RemoteAddr)
+				hub.Register(connection)
 
 				var msg Message
 				for {
@@ -473,7 +471,7 @@ var _ = Describe("Client", func() {
 			time.Sleep(200 * time.Millisecond)
 
 			hub.mu.RLock()
-			clientCount := len(hub.clients)
+			clientCount := len(hub.connections)
 			hub.mu.RUnlock()
 
 			Expect(clientCount).To(BeNumerically(">=", 0))
@@ -489,8 +487,8 @@ var _ = Describe("Client", func() {
 				conn, _ := upgrader.Upgrade(w, r, nil)
 				defer func() { _ = conn.Close() }()
 
-				client := NewClient(conn, hub, r.RemoteAddr)
-				hub.Register(client)
+				connection := NewConnection(conn, hub, r.RemoteAddr)
+				hub.Register(connection)
 
 				select {}
 			}))
@@ -674,7 +672,7 @@ var _ = Describe("Server", func() {
 			Expect(hubCount).To(Equal(0))
 		})
 
-		It("should create hub and register client", func() {
+		It("should create hub and register connection", func() {
 			wsConfig := config.WebSocketConfig{
 				MaxSessions: 10,
 				IdleTimeout: time.Minute,
@@ -704,7 +702,7 @@ var _ = Describe("Server", func() {
 				}
 				hub.mu.RLock()
 				defer hub.mu.RUnlock()
-				return len(hub.clients)
+				return len(hub.connections)
 			}, 2*time.Second, 50*time.Millisecond).Should(BeNumerically(">=", 1))
 		})
 	})
