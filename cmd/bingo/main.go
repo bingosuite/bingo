@@ -2,9 +2,11 @@ package main
 
 import (
 	"log"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/bingosuite/bingo/config"
-	"github.com/bingosuite/bingo/internal/debugger"
 	websocket "github.com/bingosuite/bingo/internal/ws"
 )
 
@@ -24,8 +26,15 @@ func main() {
 		}
 	}()
 
-	d := debugger.NewDebugger()
-	// TODO: server tells debugger how to start the debugging session by passing path to start with debug or pid to attach
-	go d.StartWithDebug("/workspaces/bingo/build/target/target")
-	<-d.EndDebugSession
+	// Set up signal handling for graceful shutdown
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	// Wait for shutdown signal
+	<-sigChan
+	log.Println("Received interrupt signal, shutting down gracefully...")
+
+	// Graceful shutdown
+	server.Shutdown()
+	log.Println("Server shutdown complete, exiting")
 }
