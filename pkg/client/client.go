@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
-	"sync/atomic"
+	"sync"
 
 	"github.com/bingosuite/bingo/internal/ws"
 	"github.com/gorilla/websocket"
@@ -17,7 +17,8 @@ type Client struct {
 	conn      *websocket.Conn
 	send      chan ws.Message
 	done      chan struct{}
-	state     atomic.Value // ws.State
+	stateMu   sync.RWMutex
+	state     ws.State
 }
 
 func NewClient(serverURL, sessionID string) *Client {
@@ -26,8 +27,8 @@ func NewClient(serverURL, sessionID string) *Client {
 		sessionID: sessionID,
 		send:      make(chan ws.Message, 256),
 		done:      make(chan struct{}),
+		state:     ws.StateExecuting,
 	}
-	c.state.Store(ws.StateExecuting)
 	return c
 }
 
@@ -95,7 +96,7 @@ func (c *Client) writePump() {
 		log.Printf("Failed to close websocket: %v", err)
 		return
 	}
-	c.state.Store(ws.StateExecuting)
+	c.setState(ws.StateExecuting)
 }
 
 func (c *Client) handleMessage(msg ws.Message) {
@@ -119,7 +120,7 @@ func (c *Client) handleMessage(msg ws.Message) {
 	}
 }
 
-func unmarshalData(data []byte, v interface{}) error {
+func unmarshalData(data []byte, v any) error {
 	// Handle empty data
 	if len(data) == 0 {
 		return nil
@@ -127,11 +128,15 @@ func unmarshalData(data []byte, v interface{}) error {
 	return unmarshalJSON(data, v)
 }
 
-func unmarshalJSON(data []byte, v interface{}) error {
+func unmarshalJSON(data []byte, v any) error {
 	return json.Unmarshal(data, v)
 }
 
 func (c *Client) SendCommand(cmdType string, payload []byte) error {
+	// TODO: decide which states allow which commands
+	if c.State() != ws.StateBreakpoint {
+		return fmt.Errorf("cannot send command in state: %s", c.State())
+	}
 	msg := ws.Message{
 		Type: cmdType,
 		Data: payload,
@@ -170,16 +175,20 @@ func (c *Client) StepOver() error {
 	return c.SendCommand(string(ws.CmdStepOver), payload)
 }
 
-func marshalJSON(v interface{}) ([]byte, error) {
+func marshalJSON(v any) ([]byte, error) {
 	return json.Marshal(v)
 }
 
 func (c *Client) setState(state ws.State) {
-	c.state.Store(state)
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	c.state = state
 }
 
 func (c *Client) State() ws.State {
-	return c.state.Load().(ws.State)
+	c.stateMu.RLock()
+	defer c.stateMu.RUnlock()
+	return c.state
 }
 
 func (c *Client) Close() error {
@@ -189,6 +198,7 @@ func (c *Client) Close() error {
 	return nil
 }
 
+// Example usage:
 // func main() {
 // 	serverAddr := flag.String("server", "localhost:8080", "Server address")
 // 	sessionID := flag.String("session", "test-session", "Session ID")
