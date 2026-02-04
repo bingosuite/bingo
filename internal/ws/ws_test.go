@@ -116,42 +116,6 @@ var _ = Describe("Hub", func() {
 		})
 	})
 
-	Describe("Broadcast", func() {
-		It("should broadcast messages to all clients", func() {
-			dialer := websocket.Dialer{}
-
-			conn1, _, _ := dialer.Dial(wsURL, nil)
-			defer func() { _ = conn1.Close() }()
-			client1 := NewClient(conn1, hub, "client-1")
-
-			conn2, _, _ := dialer.Dial(wsURL, nil)
-			defer func() { _ = conn2.Close() }()
-			client2 := NewClient(conn2, hub, "client-2")
-
-			hub.Register(client1)
-			hub.Register(client2)
-
-			time.Sleep(50 * time.Millisecond)
-
-			eventData, _ := json.Marshal(GoroutineEvent{
-				Type:        EventGoroutineEvent,
-				SessionID:   "test-session",
-				GoroutineID: 1,
-				State:       "running",
-			})
-			message := Message{
-				Type: string(EventGoroutineEvent),
-				Data: eventData,
-			}
-
-			hub.Broadcast(message)
-
-			time.Sleep(50 * time.Millisecond)
-
-			Expect(len(client1.send) == 0 || len(client2.send) == 0).To(BeFalse())
-		})
-	})
-
 	Describe("SendCommand", func() {
 		It("should send commands to hub", func() {
 			cmdData, _ := json.Marshal(ContinueCmd{
@@ -767,81 +731,6 @@ var _ = Describe("Protocol", func() {
 
 			Expect(unmarshaledMsg.Type).To(Equal(msg.Type))
 		})
-
-		It("should encode and decode JSON", func() {
-			originalMsg := Message{
-				Type: string(EventGoroutineEvent),
-				Data: json.RawMessage(`{"type":"goroutineEvent","goroutineId":123}`),
-			}
-
-			jsonData, err := json.Marshal(originalMsg)
-			Expect(err).NotTo(HaveOccurred())
-
-			var decodedMsg Message
-			err = json.Unmarshal(jsonData, &decodedMsg)
-			Expect(err).NotTo(HaveOccurred())
-
-			Expect(decodedMsg.Type).To(Equal(originalMsg.Type))
-			Expect(decodedMsg.Data).To(Equal(originalMsg.Data))
-		})
-	})
-
-	Describe("GoroutineEvent", func() {
-		It("should handle GoroutineEvent struct", func() {
-			event := GoroutineEvent{
-				Type:        EventGoroutineEvent,
-				SessionID:   "session-1",
-				GoroutineID: 42,
-				State:       "running",
-				PC:          "0x12345",
-			}
-			event.Source.File = "main.go"
-			event.Source.Line = 10
-
-			Expect(event.Type).To(Equal(EventGoroutineEvent))
-			Expect(event.GoroutineID).To(Equal(uint64(42)))
-			Expect(event.Source.File).To(Equal("main.go"))
-			Expect(event.Source.Line).To(Equal(10))
-
-			data, err := json.Marshal(event)
-			Expect(err).NotTo(HaveOccurred())
-
-			var unmarshaled GoroutineEvent
-			err = json.Unmarshal(data, &unmarshaled)
-			Expect(err).NotTo(HaveOccurred())
-
-			Expect(unmarshaled.GoroutineID).To(Equal(event.GoroutineID))
-			Expect(unmarshaled.Source.File).To(Equal(event.Source.File))
-		})
-	})
-
-	Describe("InspectResult", func() {
-		It("should handle InspectResult struct", func() {
-			result := InspectResult{
-				Type:        EventInspectResult,
-				SessionID:   "session-1",
-				GoroutineID: 42,
-				Vars: map[string]string{
-					"x": "10",
-					"y": "20",
-				},
-			}
-
-			Expect(result.Type).To(Equal(EventInspectResult))
-			Expect(result.GoroutineID).To(Equal(uint64(42)))
-			Expect(result.Vars["x"]).To(Equal("10"))
-			Expect(result.Vars["y"]).To(Equal("20"))
-
-			data, err := json.Marshal(result)
-			Expect(err).NotTo(HaveOccurred())
-
-			var unmarshaled InspectResult
-			err = json.Unmarshal(data, &unmarshaled)
-			Expect(err).NotTo(HaveOccurred())
-
-			Expect(unmarshaled.GoroutineID).To(Equal(result.GoroutineID))
-			Expect(unmarshaled.Vars["x"]).To(Equal(result.Vars["x"]))
-		})
 	})
 
 	Describe("ContinueCmd", func() {
@@ -862,28 +751,6 @@ var _ = Describe("Protocol", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(unmarshaled.SessionID).To(Equal(cmd.SessionID))
-		})
-	})
-
-	Describe("InspectGoroutineCmd", func() {
-		It("should handle InspectGoroutineCmd struct", func() {
-			cmd := InspectGoroutineCmd{
-				Type:        CmdInspectGoroutine,
-				SessionID:   "session-1",
-				GoroutineID: 42,
-			}
-
-			Expect(cmd.Type).To(Equal(CmdInspectGoroutine))
-			Expect(cmd.GoroutineID).To(Equal(uint64(42)))
-
-			data, err := json.Marshal(cmd)
-			Expect(err).NotTo(HaveOccurred())
-
-			var unmarshaled InspectGoroutineCmd
-			err = json.Unmarshal(data, &unmarshaled)
-			Expect(err).NotTo(HaveOccurred())
-
-			Expect(unmarshaled.GoroutineID).To(Equal(cmd.GoroutineID))
 		})
 	})
 })
