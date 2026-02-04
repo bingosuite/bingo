@@ -38,10 +38,17 @@ type StateUpdateEvent struct {
 type CommandType string
 
 const (
-	CmdContinue CommandType = "continue"
-	CmdStepOver CommandType = "stepOver"
-	CmdExit     CommandType = "exit"
+	CmdStartDebug CommandType = "startDebug"
+	CmdContinue   CommandType = "continue"
+	CmdStepOver   CommandType = "stepOver"
+	CmdExit       CommandType = "exit"
 )
+
+type StartDebugCmd struct {
+	Type       CommandType `json:"type"`
+	SessionID  string      `json:"sessionId"`
+	TargetPath string      `json:"targetPath"`
+}
 
 type ContinueCmd struct {
 	Type      CommandType `json:"type"`
