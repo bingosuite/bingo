@@ -197,37 +197,3 @@ func (c *Client) Close() error {
 	}
 	return nil
 }
-
-// Example usage:
-// func main() {
-// 	serverAddr := flag.String("server", "localhost:8080", "Server address")
-// 	sessionID := flag.String("session", "test-session", "Session ID")
-// 	flag.Parse()
-
-// 	client := NewClient(*serverAddr, *sessionID)
-
-// 	// Connect to the server
-// 	if err := client.Connect(); err != nil {
-// 		log.Fatalf("Failed to connect: %v", err)
-// 	}
-// 	if err := client.Run(); err != nil {
-// 		log.Fatalf("Failed to start client: %v", err)
-// 	}
-// 	defer func() {
-// 		if err := client.Close(); err != nil {
-// 			log.Printf("Client close error: %v", err)
-// 		}
-// 	}()
-
-// 	// Set up interrupt handler
-// 	interrupt := make(chan os.Signal, 1)
-// 	signal.Notify(interrupt, os.Interrupt)
-
-// 	// Wait for interrupt or server close
-// 	select {
-// 	case <-interrupt:
-// 		log.Println("Interrupt signal received")
-// 	case <-client.done:
-// 		log.Println("Server closed connection")
-// 	}
-// }
