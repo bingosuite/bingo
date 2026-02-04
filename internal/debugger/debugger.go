@@ -45,13 +45,6 @@ func (d *Debugger) StartWithDebug(path string) {
 		panic(err)
 	}
 
-	/*
-		// We want to catch the initial SIGTRAP sent by process creation. When this is caught, we know that the target just started and we can ask the user where they want to set their breakpoints
-		// The message we print to the console will be removed in the future, it's just for debugging purposes for now.
-		if err := cmd.Wait(); err != nil {
-			log.Printf("Received SIGTRAP from process creation: %v", err)
-		}*/
-
 	dbInf, err := debuginfo.NewDebugInfo(path, cmd.Process.Pid)
 	if err != nil {
 		log.Printf("Failed to create debug info: %v", err)
@@ -228,7 +221,11 @@ func (d *Debugger) initialBreakpointHit() {
 	log.Println("INITIAL BREAKPOINT HIT")
 
 	//TODO: tell server we hit the initial breakpoint and need to know what to do (continue, set bp, step over, quit)
-	if err := d.SetBreakpoint(9); err != nil {
+	if err := d.SetBreakpoint(11); err != nil {
+		log.Printf("Failed to set breakpoint: %v", err)
+		panic(err)
+	}
+	if err := d.SetBreakpoint(13); err != nil {
 		log.Printf("Failed to set breakpoint: %v", err)
 		panic(err)
 	}
