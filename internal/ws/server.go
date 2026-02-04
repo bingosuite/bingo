@@ -59,7 +59,7 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hub := s.GetOrCreateHub(sessionID)
-	client := NewClient(conn, hub, r.RemoteAddr)
+	client := NewConnection(conn, hub, r.RemoteAddr)
 
 	go client.ReadPump()
 	go client.WritePump()
