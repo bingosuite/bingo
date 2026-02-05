@@ -1,0 +1,10 @@
+default: build
+
+build:
+    go build -o bingo ./cmd/bingo
+
+run: build
+    ./bingo
+
+clean:
+    rm -f ./bingo
