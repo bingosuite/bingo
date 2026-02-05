@@ -1,30 +1,41 @@
 package cli
 
 import (
+	"bingo-cli/internal/commands"
 	"fmt"
 	"os"
+	"time"
 
+	"github.com/briandowns/spinner"
 	"github.com/spf13/cobra"
 )
 
 var rootCmd = &cobra.Command{
 	Use:   "bingo",
-	Short: "Bingo CLI - A command-line interface for playing Bingo",
-	Long:  `Bingo CLI is a command-line application that allows users to play Bingo and manage their games.`,
+	Short: "Bingo CLI - Go Concurrency Debugger",
+	Long:  `Bingo CLI is a command-line interface for debugging Go concurrency issues with real-time visualization.`,
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("Welcome to Bingo CLI! Use the help command to see available options.")
+		// create a new spinner with dots animation
+		s := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
+		s.Suffix = " Waiting for Bingo server connection..."
+		s.Start()
+
+		// TODO: replace with actual connection logic
+		time.Sleep(3 * time.Second)
+
+		s.Stop()
+		fmt.Println("✓ Connected successfully!")
 	},
 }
 
-// Execute runs the root command.
-func Execute() {
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
+func init() {
+	// Add subcommands
+	rootCmd.AddCommand(commands.HelpCommand)
 }
 
-// init initializes the root command and its subcommands.
-func init() {
-	// Here you can add subcommands to the root command
+func Execute() {
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }
