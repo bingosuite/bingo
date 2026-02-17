@@ -549,14 +549,17 @@ var _ = Describe("Server", func() {
 				config: wsConfig,
 			}
 
-			hub1 := server.GetOrCreateHub("session-1")
+			hub1, err := server.GetOrCreateHub("session-1")
+			Expect(err).NotTo(HaveOccurred())
 			Expect(hub1).NotTo(BeNil())
 			Expect(hub1.sessionID).To(Equal("session-1"))
 
-			hub2 := server.GetOrCreateHub("session-1")
+			hub2, err := server.GetOrCreateHub("session-1")
+			Expect(err).NotTo(HaveOccurred())
 			Expect(hub2).To(Equal(hub1))
 
-			hub3 := server.GetOrCreateHub("session-2")
+			hub3, err := server.GetOrCreateHub("session-2")
+			Expect(err).NotTo(HaveOccurred())
 			Expect(hub3).NotTo(BeNil())
 			Expect(hub3).NotTo(Equal(hub1))
 		})
@@ -575,15 +578,18 @@ var _ = Describe("Server", func() {
 				config: wsConfig,
 			}
 
-			hub1 := server.GetOrCreateHub("session-1")
+			hub1, err := server.GetOrCreateHub("session-1")
+			Expect(err).NotTo(HaveOccurred())
 			hub1.onShutdown = server.removeHub
 			Expect(hub1).NotTo(BeNil())
 
-			hub2 := server.GetOrCreateHub("session-2")
+			hub2, err := server.GetOrCreateHub("session-2")
+			Expect(err).NotTo(HaveOccurred())
 			hub2.onShutdown = server.removeHub
 			Expect(hub2).NotTo(BeNil())
 
-			hub3 := server.GetOrCreateHub("session-3")
+			hub3, err := server.GetOrCreateHub("session-3")
+			Expect(err).To(HaveOccurred())
 			Expect(hub3).To(BeNil())
 
 			server.mu.RLock()
@@ -606,7 +612,8 @@ var _ = Describe("Server", func() {
 				config: wsConfig,
 			}
 
-			hub := server.GetOrCreateHub("session-1")
+			hub, err := server.GetOrCreateHub("session-1")
+			Expect(err).NotTo(HaveOccurred())
 			Expect(hub).NotTo(BeNil())
 
 			server.removeHub("session-1")
@@ -619,7 +626,7 @@ var _ = Describe("Server", func() {
 	})
 
 	Describe("serveWebSocket", func() {
-		It("should reject connections without session", func() {
+		It("should create session and ack when session is missing", func() {
 			wsConfig := config.WebSocketConfig{
 				MaxSessions: 10,
 				IdleTimeout: time.Minute,
@@ -638,14 +645,25 @@ var _ = Describe("Server", func() {
 			wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/"
 			conn, _, err := dialer.Dial(wsURL, nil)
 			Expect(err).NotTo(HaveOccurred())
+
+			var msg Message
+			_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			Expect(conn.ReadJSON(&msg)).To(Succeed())
+			Expect(msg.Type).To(Equal(string(EventSessionStarted)))
+
+			var started SessionStartedEvent
+			Expect(json.Unmarshal(msg.Data, &started)).To(Succeed())
+			Expect(started.SessionID).NotTo(BeEmpty())
+
 			_ = conn.Close()
 
-			time.Sleep(50 * time.Millisecond)
+			Eventually(func() int {
+				s.mu.RLock()
+				defer s.mu.RUnlock()
+				return len(s.hubs)
+			}, 2*time.Second, 50*time.Millisecond).Should(BeNumerically(">=", 1))
 
-			s.mu.RLock()
-			hubCount := len(s.hubs)
-			s.mu.RUnlock()
-			Expect(hubCount).To(Equal(0))
+			time.Sleep(50 * time.Millisecond)
 		})
 
 		It("should return on upgrade error", func() {
