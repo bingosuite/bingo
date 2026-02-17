@@ -24,8 +24,9 @@ type Debugger struct {
 	EndDebugSession chan bool
 
 	// Communication with hub
-	BreakpointHit chan BreakpointEvent
-	DebugCommand  chan DebugCommand
+	BreakpointHit        chan BreakpointEvent
+	InitialBreakpointHit chan InitialBreakpointEvent
+	DebugCommand         chan DebugCommand
 }
 
 // BreakpointEvent represents a breakpoint hit event
@@ -36,18 +37,24 @@ type BreakpointEvent struct {
 	Function string `json:"function"`
 }
 
+// InitialBreakpointEvent represents the initial breakpoint hit when debugging starts
+type InitialBreakpointEvent struct {
+	PID int `json:"pid"`
+}
+
 // DebugCommand represents commands that can be sent to the debugger
 type DebugCommand struct {
-	Type string      `json:"type"` // "continue", "step", "quit"
+	Type string      `json:"type"` // "continue", "step", "quit", "setBreakpoint"
 	Data interface{} `json:"data,omitempty"`
 }
 
 func NewDebugger() *Debugger {
 	return &Debugger{
-		Breakpoints:     make(map[uint64][]byte),
-		EndDebugSession: make(chan bool, 1),
-		BreakpointHit:   make(chan BreakpointEvent, 1),
-		DebugCommand:    make(chan DebugCommand, 1),
+		Breakpoints:          make(map[uint64][]byte),
+		EndDebugSession:      make(chan bool, 1),
+		BreakpointHit:        make(chan BreakpointEvent, 1),
+		InitialBreakpointHit: make(chan InitialBreakpointEvent, 1),
+		DebugCommand:         make(chan DebugCommand, 1),
 	}
 }
 
@@ -237,21 +244,52 @@ func (d *Debugger) debug() {
 }
 
 func (d *Debugger) initialBreakpointHit() {
-	// TODO: NUKE, forward necessary information to the server instead
-	log.Println("INITIAL BREAKPOINT HIT")
+	// Create initial breakpoint event
+	event := InitialBreakpointEvent{
+		PID: d.DebugInfo.Target.PID,
+	}
 
-	if err := d.SetBreakpoint(11); err != nil {
-		log.Printf("Failed to set breakpoint: %v", err)
-		panic(err)
-	}
-	if err := d.SetBreakpoint(13); err != nil {
-		log.Printf("Failed to set breakpoint: %v", err)
-		panic(err)
-	}
-	// When initial breakpoint is hit, resume execution like this instead of d.Continue() after receiving continue from the server
-	if err := syscall.PtraceCont(d.DebugInfo.Target.PID, 0); err != nil {
-		log.Printf("Failed to resume target execution: %v", err)
-		panic(err)
+	// Send initial breakpoint hit event to hub
+	log.Println("Initial breakpoint hit, debugger ready for commands")
+	d.InitialBreakpointHit <- event
+
+	// Wait for commands from hub (typically to set breakpoints)
+	for {
+		select {
+		case cmd := <-d.DebugCommand:
+			log.Printf("Initial state - received command: %s", cmd.Type)
+			switch cmd.Type {
+			case "setBreakpoint":
+				if data, ok := cmd.Data.(map[string]interface{}); ok {
+					if line, ok := data["line"].(float64); ok { // JSON numbers are float64
+						if err := d.SetBreakpoint(int(line)); err != nil {
+							log.Printf("Failed to set breakpoint at line %d: %v", int(line), err)
+						} else {
+							log.Printf("Breakpoint set at line %d", int(line))
+						}
+					}
+				}
+			case "continue":
+				log.Println("Continuing from initial breakpoint")
+				if err := syscall.PtraceCont(d.DebugInfo.Target.PID, 0); err != nil {
+					log.Printf("Failed to resume target execution: %v", err)
+					panic(err)
+				}
+				return // Exit initial breakpoint handling
+			case "step":
+				log.Println("Stepping from initial breakpoint")
+				d.SingleStep(d.DebugInfo.Target.PID)
+				return // Exit initial breakpoint handling
+			case "quit":
+				d.StopDebug()
+				return
+			default:
+				log.Printf("Unknown command during initial breakpoint: %s", cmd.Type)
+			}
+		case <-d.EndDebugSession:
+			log.Println("Debug session ending during initial breakpoint")
+			return
+		}
 	}
 }
 
@@ -287,6 +325,18 @@ func (d *Debugger) breakpointHit(pid int) {
 			d.Continue(pid)
 		case "step":
 			d.SingleStep(pid)
+		case "setBreakpoint":
+			if data, ok := cmd.Data.(map[string]interface{}); ok {
+				if line, ok := data["line"].(float64); ok { // JSON numbers are float64
+					if err := d.SetBreakpoint(int(line)); err != nil {
+						log.Printf("Failed to set breakpoint at line %d: %v", int(line), err)
+					} else {
+						log.Printf("Breakpoint set at line %d while at breakpoint", int(line))
+					}
+				}
+			}
+			// After setting breakpoint, continue waiting for next command
+			d.Continue(pid)
 		case "quit":
 			d.StopDebug()
 			return
