@@ -55,6 +55,11 @@ func (h *Hub) Run() {
 	ticker := time.NewTicker(hubTickerInterval)
 	defer ticker.Stop()
 
+	// Start listening for debugger events if debugger is attached
+	if h.debugger != nil {
+		go h.listenForDebuggerEvents()
+	}
+
 	for {
 		select {
 		case <-ticker.C:
@@ -143,6 +148,64 @@ func (h *Hub) shutdown() {
 	}
 }
 
+// Listen for events from the debugger (breakpoint hits)
+func (h *Hub) listenForDebuggerEvents() {
+	for {
+		select {
+		case bpEvent := <-h.debugger.BreakpointHit:
+			log.Printf("Received breakpoint event from debugger: %s:%d", bpEvent.Filename, bpEvent.Line)
+
+			// Create and send breakpoint hit event to all clients
+			event := BreakpointHitEvent{
+				Type:      EventBreakpointHit,
+				SessionID: h.sessionID,
+				PID:       bpEvent.PID,
+				Filename:  bpEvent.Filename,
+				Line:      bpEvent.Line,
+				Function:  bpEvent.Function,
+			}
+
+			eventData, err := json.Marshal(event)
+			if err != nil {
+				log.Printf("Failed to marshal breakpoint event: %v", err)
+				continue
+			}
+
+			message := Message{
+				Type: string(EventBreakpointHit),
+				Data: eventData,
+			}
+
+			h.Broadcast(message)
+
+			// Also send state update to indicate we're at a breakpoint
+			stateEvent := StateUpdateEvent{
+				Type:      EventStateUpdate,
+				SessionID: h.sessionID,
+				NewState:  StateBreakpoint,
+			}
+
+			stateData, err := json.Marshal(stateEvent)
+			if err != nil {
+				log.Printf("Failed to marshal state update event: %v", err)
+				continue
+			}
+
+			stateMessage := Message{
+				Type: string(EventStateUpdate),
+				Data: stateData,
+			}
+
+			h.Broadcast(stateMessage)
+
+		case <-h.debugger.EndDebugSession:
+			log.Println("Debugger event listener ending")
+			return
+		}
+	}
+}
+
+// Forward commands from client to debugger
 func (h *Hub) handleCommand(cmd Message) {
 	if h.debugger == nil {
 		log.Printf("No debugger attached to hub %s, ignoring command", h.sessionID)
@@ -165,8 +228,20 @@ func (h *Hub) handleCommand(cmd Message) {
 			log.Printf("Failed to unmarshal continue command: %v", err)
 			return
 		}
-		log.Printf("Forwarding continue command to debugger for session %s", h.sessionID)
-		h.debugger.Continue(h.debugger.DebugInfo.Target.PID)
+		log.Printf("Sending continue command to debugger for session %s", h.sessionID)
+
+		// Send executing state update
+		h.sendStateUpdate(StateExecuting)
+
+		// Send command to debugger
+		debugCmd := debugger.DebugCommand{
+			Type: "continue",
+		}
+		select {
+		case h.debugger.DebugCommand <- debugCmd:
+		default:
+			log.Printf("Failed to send continue command to debugger - channel full")
+		}
 
 	case CmdStepOver:
 		var stepOverCmd StepOverCmd
@@ -174,8 +249,20 @@ func (h *Hub) handleCommand(cmd Message) {
 			log.Printf("Failed to unmarshal stepOver command: %v", err)
 			return
 		}
-		log.Printf("Forwarding stepOver command to debugger for session %s", h.sessionID)
-		h.debugger.SingleStep(h.debugger.DebugInfo.Target.PID)
+		log.Printf("Sending step command to debugger for session %s", h.sessionID)
+
+		// Send executing state update
+		h.sendStateUpdate(StateExecuting)
+
+		// Send command to debugger
+		debugCmd := debugger.DebugCommand{
+			Type: "step",
+		}
+		select {
+		case h.debugger.DebugCommand <- debugCmd:
+		default:
+			log.Printf("Failed to send step command to debugger - channel full")
+		}
 
 	case CmdExit:
 		var exitCmd ExitCmd
@@ -183,10 +270,41 @@ func (h *Hub) handleCommand(cmd Message) {
 			log.Printf("Failed to unmarshal exit command: %v", err)
 			return
 		}
-		log.Printf("Forwarding exit command to debugger for session %s", h.sessionID)
-		h.debugger.StopDebug()
+		log.Printf("Sending quit command to debugger for session %s", h.sessionID)
+
+		// Send command to debugger
+		debugCmd := debugger.DebugCommand{
+			Type: "quit",
+		}
+		select {
+		case h.debugger.DebugCommand <- debugCmd:
+		default:
+			log.Printf("Failed to send quit command to debugger - channel full")
+		}
 
 	default:
 		log.Printf("Unknown command type: %s", cmd.Type)
 	}
+}
+
+// Helper method to send state updates
+func (h *Hub) sendStateUpdate(state State) {
+	stateEvent := StateUpdateEvent{
+		Type:      EventStateUpdate,
+		SessionID: h.sessionID,
+		NewState:  state,
+	}
+
+	stateData, err := json.Marshal(stateEvent)
+	if err != nil {
+		log.Printf("Failed to marshal state update event: %v", err)
+		return
+	}
+
+	stateMessage := Message{
+		Type: string(EventStateUpdate),
+		Data: stateData,
+	}
+
+	h.Broadcast(stateMessage)
 }
