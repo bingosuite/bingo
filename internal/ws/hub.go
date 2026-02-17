@@ -153,7 +153,7 @@ func (h *Hub) listenForDebuggerEvents() {
 	for {
 		select {
 		case bpEvent := <-h.debugger.BreakpointHit:
-			log.Printf("Received breakpoint event from debugger: %s:%d", bpEvent.Filename, bpEvent.Line)
+			log.Printf("[Debugger Event] Breakpoint hit at %s:%d in %s", bpEvent.Filename, bpEvent.Line, bpEvent.Function)
 
 			// Create and send breakpoint hit event to all clients
 			event := BreakpointHitEvent{
@@ -199,7 +199,7 @@ func (h *Hub) listenForDebuggerEvents() {
 			h.Broadcast(stateMessage)
 
 		case initialBpEvent := <-h.debugger.InitialBreakpointHit:
-			log.Printf("Received initial breakpoint event from debugger for PID %d", initialBpEvent.PID)
+			log.Printf("[Debugger Event] Initial breakpoint hit (PID: %d, session: %s)", initialBpEvent.PID, h.sessionID)
 
 			// Create and send initial breakpoint event to all clients
 			event := InitialBreakpointEvent{
@@ -222,6 +222,7 @@ func (h *Hub) listenForDebuggerEvents() {
 			h.Broadcast(message)
 
 			// Also send state update to indicate we're at a breakpoint
+			log.Printf("[State Change] Transitioning to breakpoint state (session: %s)", h.sessionID)
 			stateEvent := StateUpdateEvent{
 				Type:      EventStateUpdate,
 				SessionID: h.sessionID,
@@ -262,7 +263,7 @@ func (h *Hub) handleCommand(cmd Message) {
 			log.Printf("Failed to unmarshal startDebug command: %v", err)
 			return
 		}
-		log.Printf("Starting debug session for %s in session %s", startDebugCmd.TargetPath, h.sessionID)
+		log.Printf("[Command] StartDebug received: %s (session: %s)", startDebugCmd.TargetPath, h.sessionID)
 		go h.debugger.StartWithDebug(startDebugCmd.TargetPath)
 
 	case CmdContinue:
@@ -271,7 +272,8 @@ func (h *Hub) handleCommand(cmd Message) {
 			log.Printf("Failed to unmarshal continue command: %v", err)
 			return
 		}
-		log.Printf("Sending continue command to debugger for session %s", h.sessionID)
+		log.Printf("[Command] Continue received (session: %s)", h.sessionID)
+		log.Printf("[State Change] Transitioning to executing state (session: %s)", h.sessionID)
 
 		// Send executing state update
 		h.sendStateUpdate(StateExecuting)
@@ -282,8 +284,9 @@ func (h *Hub) handleCommand(cmd Message) {
 		}
 		select {
 		case h.debugger.DebugCommand <- debugCmd:
+			log.Printf("[Command] Continue command sent to debugger (session: %s)", h.sessionID)
 		default:
-			log.Printf("Failed to send continue command to debugger - channel full")
+			log.Printf("[Error] Failed to send continue command to debugger - channel full")
 		}
 
 	case CmdStepOver:
@@ -292,7 +295,8 @@ func (h *Hub) handleCommand(cmd Message) {
 			log.Printf("Failed to unmarshal stepOver command: %v", err)
 			return
 		}
-		log.Printf("Sending step command to debugger for session %s", h.sessionID)
+		log.Printf("[Command] StepOver received (session: %s)", h.sessionID)
+		log.Printf("[State Change] Transitioning to executing state (session: %s)", h.sessionID)
 
 		// Send executing state update
 		h.sendStateUpdate(StateExecuting)
@@ -303,8 +307,9 @@ func (h *Hub) handleCommand(cmd Message) {
 		}
 		select {
 		case h.debugger.DebugCommand <- debugCmd:
+			log.Printf("[Command] StepOver command sent to debugger (session: %s)", h.sessionID)
 		default:
-			log.Printf("Failed to send step command to debugger - channel full")
+			log.Printf("[Error] Failed to send step command to debugger - channel full")
 		}
 
 	case CmdSetBreakpoint:
@@ -313,7 +318,7 @@ func (h *Hub) handleCommand(cmd Message) {
 			log.Printf("Failed to unmarshal setBreakpoint command: %v", err)
 			return
 		}
-		log.Printf("Sending set breakpoint command for line %d in session %s", setBreakpointCmd.Line, h.sessionID)
+		log.Printf("[Command] SetBreakpoint received: %s:%d (session: %s)", setBreakpointCmd.Filename, setBreakpointCmd.Line, h.sessionID)
 
 		// Send command to debugger
 		debugCmd := debugger.DebugCommand{
@@ -325,8 +330,9 @@ func (h *Hub) handleCommand(cmd Message) {
 		}
 		select {
 		case h.debugger.DebugCommand <- debugCmd:
+			log.Printf("[Command] SetBreakpoint command sent to debugger (session: %s)", h.sessionID)
 		default:
-			log.Printf("Failed to send set breakpoint command to debugger - channel full")
+			log.Printf("[Error] Failed to send set breakpoint command to debugger - channel full")
 		}
 
 	case CmdExit:
@@ -335,7 +341,7 @@ func (h *Hub) handleCommand(cmd Message) {
 			log.Printf("Failed to unmarshal exit command: %v", err)
 			return
 		}
-		log.Printf("Sending quit command to debugger for session %s", h.sessionID)
+		log.Printf("[Command] Exit received (session: %s)", h.sessionID)
 
 		// Send command to debugger
 		debugCmd := debugger.DebugCommand{
@@ -343,17 +349,19 @@ func (h *Hub) handleCommand(cmd Message) {
 		}
 		select {
 		case h.debugger.DebugCommand <- debugCmd:
+			log.Printf("[Command] Exit command sent to debugger (session: %s)", h.sessionID)
 		default:
-			log.Printf("Failed to send quit command to debugger - channel full")
+			log.Printf("[Error] Failed to send quit command to debugger - channel full")
 		}
 
 	default:
-		log.Printf("Unknown command type: %s", cmd.Type)
+		log.Printf("[Error] Unknown command type: %s", cmd.Type)
 	}
 }
 
 // Helper method to send state updates
 func (h *Hub) sendStateUpdate(state State) {
+	log.Printf("[State Update] Broadcasting state '%s' to all clients (session: %s)", state, h.sessionID)
 	stateEvent := StateUpdateEvent{
 		Type:      EventStateUpdate,
 		SessionID: h.sessionID,
