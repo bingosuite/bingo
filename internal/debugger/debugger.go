@@ -22,12 +22,32 @@ type Debugger struct {
 	DebugInfo       debuginfo.DebugInfo
 	Breakpoints     map[uint64][]byte
 	EndDebugSession chan bool
+
+	// Communication with hub
+	BreakpointHit chan BreakpointEvent
+	DebugCommand  chan DebugCommand
+}
+
+// BreakpointEvent represents a breakpoint hit event
+type BreakpointEvent struct {
+	PID      int    `json:"pid"`
+	Filename string `json:"filename"`
+	Line     int    `json:"line"`
+	Function string `json:"function"`
+}
+
+// DebugCommand represents commands that can be sent to the debugger
+type DebugCommand struct {
+	Type string      `json:"type"` // "continue", "step", "quit"
+	Data interface{} `json:"data,omitempty"`
 }
 
 func NewDebugger() *Debugger {
 	return &Debugger{
 		Breakpoints:     make(map[uint64][]byte),
 		EndDebugSession: make(chan bool, 1),
+		BreakpointHit:   make(chan BreakpointEvent, 1),
+		DebugCommand:    make(chan DebugCommand, 1),
 	}
 }
 
@@ -220,7 +240,6 @@ func (d *Debugger) initialBreakpointHit() {
 	// TODO: NUKE, forward necessary information to the server instead
 	log.Println("INITIAL BREAKPOINT HIT")
 
-	//TODO: tell server we hit the initial breakpoint and need to know what to do (continue, set bp, step over, quit)
 	if err := d.SetBreakpoint(11); err != nil {
 		log.Printf("Failed to set breakpoint: %v", err)
 		panic(err)
@@ -237,9 +256,46 @@ func (d *Debugger) initialBreakpointHit() {
 }
 
 func (d *Debugger) breakpointHit(pid int) {
-	// TODO: NUKE, forward necessary information to the server instead
-	log.Println("BREAKPOINT HIT")
+	// Get register information to determine location
+	var regs syscall.PtraceRegs
+	if err := syscall.PtraceGetRegs(pid, &regs); err != nil {
+		log.Printf("Failed to get registers: %v", err)
+		return
+	}
 
-	//TODO: select with channels from server that tell the debugger whether to continue, single step, set breakpoint or quite
-	d.Continue(pid)
+	// Get location information
+	filename, line, fn := d.DebugInfo.PCToLine(regs.Rip - 1)
+
+	// Create breakpoint event
+	event := BreakpointEvent{
+		PID:      pid,
+		Filename: filename,
+		Line:     line,
+		Function: fn.Name,
+	}
+
+	// Send breakpoint hit event to hub
+	log.Printf("Breakpoint hit at %s:%d in %s, waiting for command", filename, line, fn.Name)
+	d.BreakpointHit <- event
+
+	// Wait for command from hub
+	select {
+	case cmd := <-d.DebugCommand:
+		log.Printf("Received command: %s", cmd.Type)
+		switch cmd.Type {
+		case "continue":
+			d.Continue(pid)
+		case "step":
+			d.SingleStep(pid)
+		case "quit":
+			d.StopDebug()
+			return
+		default:
+			log.Printf("Unknown command: %s", cmd.Type)
+			d.Continue(pid) // Default to continue
+		}
+	case <-d.EndDebugSession:
+		log.Println("Debug session ending, stopping breakpoint handler")
+		return
+	}
 }
