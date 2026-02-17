@@ -98,6 +98,7 @@ func (c *Client) writePump() {
 		log.Printf("Failed to close websocket: %v", err)
 		return
 	}
+	log.Println("Closing send channel, transitioning to executing state")
 	c.setState(ws.StateExecuting)
 }
 
@@ -124,8 +125,9 @@ func (c *Client) handleMessage(msg ws.Message) {
 			log.Printf("Error parsing stateUpdate: %v", err)
 			return
 		}
+		oldState := c.State()
 		c.setState(update.NewState)
-		log.Printf("State updated: %s", update.NewState)
+		log.Printf("[State Change] %s -> %s", oldState, update.NewState)
 
 	case ws.EventBreakpointHit:
 		var hit ws.BreakpointHitEvent
@@ -133,7 +135,9 @@ func (c *Client) handleMessage(msg ws.Message) {
 			log.Printf("Error parsing breakpointHit: %v", err)
 			return
 		}
+		oldState := c.State()
 		c.setState(ws.StateBreakpoint)
+		log.Printf("[State Change] %s -> breakpoint", oldState)
 		log.Printf("Breakpoint hit at %s:%d in %s", hit.Filename, hit.Line, hit.Function)
 
 	case ws.EventInitialBreakpoint:
@@ -142,7 +146,9 @@ func (c *Client) handleMessage(msg ws.Message) {
 			log.Printf("Error parsing initialBreakpoint: %v", err)
 			return
 		}
+		oldState := c.State()
 		c.setState(ws.StateBreakpoint)
+		log.Printf("[State Change] %s -> breakpoint", oldState)
 		log.Printf("Initial breakpoint hit (pid=%d)", initial.PID)
 
 	default:
@@ -164,8 +170,9 @@ func unmarshalJSON(data []byte, v any) error {
 
 func (c *Client) SendCommand(cmdType string, payload []byte) error {
 	// TODO: decide which states allow which commands
-	if c.State() != ws.StateBreakpoint {
-		return fmt.Errorf("cannot send command in state: %s", c.State())
+	currentState := c.State()
+	if currentState != ws.StateBreakpoint {
+		return fmt.Errorf("cannot send command '%s' in state '%s' (must be in 'breakpoint' state)", cmdType, currentState)
 	}
 	msg := ws.Message{
 		Type: cmdType,
@@ -174,7 +181,7 @@ func (c *Client) SendCommand(cmdType string, payload []byte) error {
 
 	select {
 	case c.send <- msg:
-		log.Printf("Queued command: %s", cmdType)
+		log.Printf("[Command] Sent %s command (state: %s)", cmdType, c.State())
 		return nil
 	case <-c.done:
 		return fmt.Errorf("connection closed")
