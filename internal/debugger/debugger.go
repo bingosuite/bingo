@@ -261,7 +261,7 @@ func (d *Debugger) initialBreakpointHit() {
 			switch cmd.Type {
 			case "setBreakpoint":
 				if data, ok := cmd.Data.(map[string]interface{}); ok {
-					if line, ok := data["line"].(float64); ok { // JSON numbers are float64
+					if line, ok := data["line"].(int); ok { // JSON numbers are float64
 						if err := d.SetBreakpoint(int(line)); err != nil {
 							log.Printf("Failed to set breakpoint at line %d: %v", int(line), err)
 						} else {
