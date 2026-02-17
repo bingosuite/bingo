@@ -17,6 +17,7 @@ type Client struct {
 	conn      *websocket.Conn
 	send      chan ws.Message
 	done      chan struct{}
+	sessionMu sync.RWMutex
 	stateMu   sync.RWMutex
 	state     ws.State
 }
@@ -34,11 +35,12 @@ func NewClient(serverURL, sessionID string) *Client {
 
 func (c *Client) Connect() error {
 	// Build WebSocket URL with session ID
+	sessionID := c.SessionID()
 	u := url.URL{
 		Scheme:   "ws",
 		Host:     c.serverURL,
 		Path:     "/ws/",
-		RawQuery: "session=" + c.sessionID,
+		RawQuery: "session=" + sessionID,
 	}
 	log.Printf("Connecting to %s", u.String())
 
@@ -104,6 +106,16 @@ func (c *Client) handleMessage(msg ws.Message) {
 
 	switch ws.EventType(msg.Type) {
 	case ws.EventSessionStarted:
+		var started ws.SessionStartedEvent
+		if err := unmarshalData(msg.Data, &started); err != nil {
+			log.Printf("Error parsing sessionStarted: %v", err)
+			return
+		}
+		if started.SessionID != "" {
+			c.setSessionID(started.SessionID)
+			log.Printf("Session ID set: %s", started.SessionID)
+			return
+		}
 		log.Println("Debug session started")
 
 	case ws.EventStateUpdate:
@@ -154,7 +166,7 @@ func (c *Client) SendCommand(cmdType string, payload []byte) error {
 func (c *Client) Continue() error {
 	cmd := ws.ContinueCmd{
 		Type:      ws.CmdContinue,
-		SessionID: c.sessionID,
+		SessionID: c.SessionID(),
 	}
 	payload, err := marshalJSON(cmd)
 	if err != nil {
@@ -166,7 +178,7 @@ func (c *Client) Continue() error {
 func (c *Client) StepOver() error {
 	cmd := ws.StepOverCmd{
 		Type:      ws.CmdStepOver,
-		SessionID: c.sessionID,
+		SessionID: c.SessionID(),
 	}
 	payload, err := marshalJSON(cmd)
 	if err != nil {
@@ -183,6 +195,18 @@ func (c *Client) setState(state ws.State) {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
 	c.state = state
+}
+
+func (c *Client) setSessionID(sessionID string) {
+	c.sessionMu.Lock()
+	defer c.sessionMu.Unlock()
+	c.sessionID = sessionID
+}
+
+func (c *Client) SessionID() string {
+	c.sessionMu.RLock()
+	defer c.sessionMu.RUnlock()
+	return c.sessionID
 }
 
 func (c *Client) State() ws.State {
