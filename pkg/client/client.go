@@ -127,6 +127,24 @@ func (c *Client) handleMessage(msg ws.Message) {
 		c.setState(update.NewState)
 		log.Printf("State updated: %s", update.NewState)
 
+	case ws.EventBreakpointHit:
+		var hit ws.BreakpointHitEvent
+		if err := unmarshalData(msg.Data, &hit); err != nil {
+			log.Printf("Error parsing breakpointHit: %v", err)
+			return
+		}
+		c.setState(ws.StateBreakpoint)
+		log.Printf("Breakpoint hit at %s:%d in %s", hit.Filename, hit.Line, hit.Function)
+
+	case ws.EventInitialBreakpoint:
+		var initial ws.InitialBreakpointEvent
+		if err := unmarshalData(msg.Data, &initial); err != nil {
+			log.Printf("Error parsing initialBreakpoint: %v", err)
+			return
+		}
+		c.setState(ws.StateBreakpoint)
+		log.Printf("Initial breakpoint hit (pid=%d)", initial.PID)
+
 	default:
 		log.Printf("Unknown message type: %s", msg.Type)
 	}
@@ -185,6 +203,44 @@ func (c *Client) StepOver() error {
 		return err
 	}
 	return c.SendCommand(string(ws.CmdStepOver), payload)
+}
+
+func (c *Client) StartDebug(targetPath string) error {
+	cmd := ws.StartDebugCmd{
+		Type:       ws.CmdStartDebug,
+		SessionID:  c.SessionID(),
+		TargetPath: targetPath,
+	}
+	payload, err := marshalJSON(cmd)
+	if err != nil {
+		return err
+	}
+	msg := ws.Message{
+		Type: string(ws.CmdStartDebug),
+		Data: payload,
+	}
+
+	select {
+	case c.send <- msg:
+		log.Printf("Queued command: %s", msg.Type)
+		return nil
+	case <-c.done:
+		return fmt.Errorf("connection closed")
+	}
+}
+
+func (c *Client) SetBreakpoint(filename string, line int) error {
+	cmd := ws.SetBreakpointCmd{
+		Type:      ws.CmdSetBreakpoint,
+		SessionID: c.SessionID(),
+		Filename:  filename,
+		Line:      line,
+	}
+	payload, err := marshalJSON(cmd)
+	if err != nil {
+		return err
+	}
+	return c.SendCommand(string(ws.CmdSetBreakpoint), payload)
 }
 
 func marshalJSON(v any) ([]byte, error) {
