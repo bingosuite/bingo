@@ -265,9 +265,13 @@ func (d *Debugger) initialBreakpointHit() {
 						if err := d.SetBreakpoint(int(line)); err != nil {
 							log.Printf("Failed to set breakpoint at line %d: %v", int(line), err)
 						} else {
-							log.Printf("Breakpoint set at line %d", int(line))
+							log.Printf("Breakpoint set at line %d, waiting for next command", int(line))
 						}
+					} else {
+						log.Printf("Invalid setBreakpoint command: line field missing or wrong type")
 					}
+				} else {
+					log.Printf("Invalid setBreakpoint command: data field missing or wrong format")
 				}
 			case "continue":
 				log.Println("Continuing from initial breakpoint")
