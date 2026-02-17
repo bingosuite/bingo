@@ -198,6 +198,29 @@ func (h *Hub) listenForDebuggerEvents() {
 
 			h.Broadcast(stateMessage)
 
+		case initialBpEvent := <-h.debugger.InitialBreakpointHit:
+			log.Printf("Received initial breakpoint event from debugger for PID %d", initialBpEvent.PID)
+
+			// Create and send initial breakpoint event to all clients
+			event := InitialBreakpointEvent{
+				Type:      EventInitialBreakpoint,
+				SessionID: h.sessionID,
+				PID:       initialBpEvent.PID,
+			}
+
+			eventData, err := json.Marshal(event)
+			if err != nil {
+				log.Printf("Failed to marshal initial breakpoint event: %v", err)
+				continue
+			}
+
+			message := Message{
+				Type: string(EventInitialBreakpoint),
+				Data: eventData,
+			}
+
+			h.Broadcast(message)
+
 		case <-h.debugger.EndDebugSession:
 			log.Println("Debugger event listener ending")
 			return
@@ -262,6 +285,28 @@ func (h *Hub) handleCommand(cmd Message) {
 		case h.debugger.DebugCommand <- debugCmd:
 		default:
 			log.Printf("Failed to send step command to debugger - channel full")
+		}
+
+	case CmdSetBreakpoint:
+		var setBreakpointCmd SetBreakpointCmd
+		if err := json.Unmarshal(cmd.Data, &setBreakpointCmd); err != nil {
+			log.Printf("Failed to unmarshal setBreakpoint command: %v", err)
+			return
+		}
+		log.Printf("Sending set breakpoint command for line %d in session %s", setBreakpointCmd.Line, h.sessionID)
+
+		// Send command to debugger
+		debugCmd := debugger.DebugCommand{
+			Type: "setBreakpoint",
+			Data: map[string]interface{}{
+				"line":     setBreakpointCmd.Line,
+				"filename": setBreakpointCmd.Filename,
+			},
+		}
+		select {
+		case h.debugger.DebugCommand <- debugCmd:
+		default:
+			log.Printf("Failed to send set breakpoint command to debugger - channel full")
 		}
 
 	case CmdExit:
