@@ -32,7 +32,7 @@ pre-push:
       run: go vet ./cmd/bingo
 
     build:
-      run: make build
+      run: just build
 
 commit-msg:
   commands:
