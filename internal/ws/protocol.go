@@ -20,6 +20,7 @@ type EventType string
 const (
 	EventSessionStarted EventType = "sessionStarted"
 	EventStateUpdate    EventType = "stateUpdate"
+	EventBreakpointHit  EventType = "breakpointHit"
 )
 
 type SessionStartedEvent struct {
@@ -32,6 +33,15 @@ type StateUpdateEvent struct {
 	Type      EventType `json:"type"`
 	SessionID string    `json:"sessionId"`
 	NewState  State     `json:"newState"`
+}
+
+type BreakpointHitEvent struct {
+	Type      EventType `json:"type"`
+	SessionID string    `json:"sessionId"`
+	PID       int       `json:"pid"`
+	Filename  string    `json:"filename"`
+	Line      int       `json:"line"`
+	Function  string    `json:"function"`
 }
 
 // Command messages (client -> server)
