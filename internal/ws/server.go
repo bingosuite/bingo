@@ -8,6 +8,7 @@ import (
 
 	"github.com/bingosuite/bingo/config"
 	"github.com/bingosuite/bingo/internal/debugger"
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
 
@@ -72,11 +73,8 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	sessionID := r.URL.Query().Get("session")
 	if sessionID == "" {
-		log.Println("No session ID provided")
-		if err := conn.Close(); err != nil {
-			log.Printf("WebSocket close error: %v", err)
-		}
-		return
+		log.Println("No session ID provided, generating...")
+		sessionID = uuid.New().String()
 	}
 
 	hub := s.GetOrCreateHub(sessionID)
