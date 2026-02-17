@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bingosuite/bingo/config"
 	"github.com/bingosuite/bingo/pkg/client"
@@ -43,6 +44,7 @@ func main() {
 	log.Println("Connected. Commands: start <path>, c=continue, s=step, b=<file> <line>, state, q=quit")
 	scanner := bufio.NewScanner(os.Stdin)
 	for {
+		time.Sleep(100 * time.Millisecond)
 		fmt.Printf("[%s] > ", c.State())
 		if !scanner.Scan() {
 			break
@@ -54,8 +56,10 @@ func main() {
 		switch input {
 		case "c", "continue":
 			cmdErr = c.Continue()
+			time.Sleep(100 * time.Millisecond)
 		case "s", "step", "stepover":
 			cmdErr = c.StepOver()
+			time.Sleep(100 * time.Millisecond)
 		case "state":
 			fmt.Printf("state=%s session=%s\n", c.State(), c.SessionID())
 		case "q", "quit", "exit":
@@ -71,6 +75,8 @@ func main() {
 					cmdErr = nil
 					break
 				}
+				// Give async state updates time to arrive before showing next prompt
+				time.Sleep(100 * time.Millisecond)
 				break
 			}
 			cmdErr = handleBreakpointCommand(c, raw)
