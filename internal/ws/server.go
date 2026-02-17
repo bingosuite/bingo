@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"sync"
@@ -33,12 +34,29 @@ func newServerWithConfig(addr string, cfg config.WebSocketConfig) *Server {
 		KillServer: make(chan bool),
 	}
 	http.HandleFunc("/ws/", s.serveWebSocket)
+	http.HandleFunc("/sessions", s.getSessions)
 	return s
 }
 
 func (s *Server) Serve() error {
 	log.Printf("Bingo WebSocket server on %s", s.addr)
 	return http.ListenAndServe(s.addr, nil)
+}
+
+func (s *Server) getSessions(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	sessions := make([]string, 0, len(s.hubs))
+	for sessionID := range s.hubs {
+		sessions = append(sessions, sessionID)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(sessions); err != nil {
+		log.Printf("Error encoding sessions: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	}
 }
 
 func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
