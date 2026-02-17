@@ -2,6 +2,7 @@ package ws
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"sync"
@@ -77,16 +78,37 @@ func (s *Server) serveWebSocket(w http.ResponseWriter, r *http.Request) {
 		sessionID = uuid.New().String()
 	}
 
-	hub := s.GetOrCreateHub(sessionID)
+	hub, err := s.GetOrCreateHub(sessionID)
+	if err != nil {
+		log.Printf("Unable to create hub for session %s: %v", sessionID, err)
+		if err := conn.Close(); err != nil {
+			log.Printf("WebSocket close error: %v", err)
+		}
+		return
+	}
 	client := NewConnection(conn, hub, r.RemoteAddr)
 
 	go client.ReadPump()
 	go client.WritePump()
 
 	hub.Register(client)
+	ack := SessionStartedEvent{
+		Type:      EventSessionStarted,
+		SessionID: sessionID,
+		PID:       0,
+	}
+	data, err := json.Marshal(ack)
+	if err != nil {
+		log.Printf("Failed to marshal sessionStarted: %v", err)
+		return
+	}
+	client.send <- Message{
+		Type: string(EventSessionStarted),
+		Data: data,
+	}
 }
 
-func (s *Server) GetOrCreateHub(sessionID string) *Hub {
+func (s *Server) GetOrCreateHub(sessionID string) (*Hub, error) {
 	s.mu.RLock()
 	hub, exists := s.hubs[sessionID]
 	s.mu.RUnlock()
@@ -97,7 +119,7 @@ func (s *Server) GetOrCreateHub(sessionID string) *Hub {
 		if s.config.MaxSessions > 0 && len(s.hubs) >= s.config.MaxSessions {
 			s.mu.Unlock()
 			log.Printf("Max sessions (%d) reached, rejecting session: %s", s.config.MaxSessions, sessionID)
-			return nil
+			return nil, fmt.Errorf("max sessions (%d) reached", s.config.MaxSessions)
 		}
 
 		d := debugger.NewDebugger()
@@ -108,7 +130,7 @@ func (s *Server) GetOrCreateHub(sessionID string) *Hub {
 		s.mu.Unlock()
 		log.Printf("Created hub for session: %s", sessionID)
 	}
-	return hub
+	return hub, nil
 }
 
 func (s *Server) removeHub(sessionID string) {
