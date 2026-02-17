@@ -10,6 +10,7 @@ type Message struct {
 type State string
 
 const (
+	StateReady      State = "ready"
 	StateExecuting  State = "executing"
 	StateBreakpoint State = "breakpoint"
 )

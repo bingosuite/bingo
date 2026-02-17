@@ -28,7 +28,7 @@ func NewClient(serverURL, sessionID string) *Client {
 		sessionID: sessionID,
 		send:      make(chan ws.Message, 256),
 		done:      make(chan struct{}),
-		state:     ws.StateExecuting,
+		state:     ws.StateReady,
 	}
 	return c
 }
@@ -126,8 +126,10 @@ func (c *Client) handleMessage(msg ws.Message) {
 			return
 		}
 		oldState := c.State()
-		c.setState(update.NewState)
-		log.Printf("[State Change] %s -> %s", oldState, update.NewState)
+		if oldState != update.NewState {
+			c.setState(update.NewState)
+			log.Printf("[State Change] %s -> %s", oldState, update.NewState)
+		}
 
 	case ws.EventBreakpointHit:
 		var hit ws.BreakpointHitEvent
@@ -229,7 +231,7 @@ func (c *Client) StartDebug(targetPath string) error {
 
 	select {
 	case c.send <- msg:
-		log.Printf("Queued command: %s", msg.Type)
+		log.Printf("[Command] Sent %s command (state: %s)", msg.Type, c.State())
 		return nil
 	case <-c.done:
 		return fmt.Errorf("connection closed")
