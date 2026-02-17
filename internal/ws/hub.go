@@ -221,6 +221,26 @@ func (h *Hub) listenForDebuggerEvents() {
 
 			h.Broadcast(message)
 
+			// Also send state update to indicate we're at a breakpoint
+			stateEvent := StateUpdateEvent{
+				Type:      EventStateUpdate,
+				SessionID: h.sessionID,
+				NewState:  StateBreakpoint,
+			}
+
+			stateData, err := json.Marshal(stateEvent)
+			if err != nil {
+				log.Printf("Failed to marshal state update event: %v", err)
+				continue
+			}
+
+			stateMessage := Message{
+				Type: string(EventStateUpdate),
+				Data: stateData,
+			}
+
+			h.Broadcast(stateMessage)
+
 		case <-h.debugger.EndDebugSession:
 			log.Println("Debugger event listener ending")
 			return
