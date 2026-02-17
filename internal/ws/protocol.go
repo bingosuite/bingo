@@ -18,9 +18,10 @@ const (
 type EventType string
 
 const (
-	EventSessionStarted EventType = "sessionStarted"
-	EventStateUpdate    EventType = "stateUpdate"
-	EventBreakpointHit  EventType = "breakpointHit"
+	EventSessionStarted    EventType = "sessionStarted"
+	EventStateUpdate       EventType = "stateUpdate"
+	EventBreakpointHit     EventType = "breakpointHit"
+	EventInitialBreakpoint EventType = "initialBreakpoint"
 )
 
 type SessionStartedEvent struct {
@@ -44,14 +45,21 @@ type BreakpointHitEvent struct {
 	Function  string    `json:"function"`
 }
 
+type InitialBreakpointEvent struct {
+	Type      EventType `json:"type"`
+	SessionID string    `json:"sessionId"`
+	PID       int       `json:"pid"`
+}
+
 // Command messages (client -> server)
 type CommandType string
 
 const (
-	CmdStartDebug CommandType = "startDebug"
-	CmdContinue   CommandType = "continue"
-	CmdStepOver   CommandType = "stepOver"
-	CmdExit       CommandType = "exit"
+	CmdStartDebug    CommandType = "startDebug"
+	CmdSetBreakpoint CommandType = "setBreakpoint"
+	CmdContinue      CommandType = "continue"
+	CmdStepOver      CommandType = "stepOver"
+	CmdExit          CommandType = "exit"
 )
 
 type StartDebugCmd struct {
@@ -68,6 +76,13 @@ type ContinueCmd struct {
 type StepOverCmd struct {
 	Type      CommandType `json:"type"`
 	SessionID string      `json:"sessionId"`
+}
+
+type SetBreakpointCmd struct {
+	Type      CommandType `json:"type"`
+	SessionID string      `json:"sessionId"`
+	Filename  string      `json:"filename"`
+	Line      int         `json:"line"`
 }
 
 type ExitCmd struct {
