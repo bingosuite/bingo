@@ -23,12 +23,18 @@ func main() {
 		log.Printf("Failed to load config: %v", err)
 	}
 
-	defaultAddr := "localhost:8080"
-	if cfg != nil && cfg.Server.Addr != "" {
-		if strings.HasPrefix(cfg.Server.Addr, ":") {
-			defaultAddr = "localhost" + cfg.Server.Addr
-		} else {
-			defaultAddr = cfg.Server.Addr
+	if cfg == nil {
+		cfg = config.Default()
+	}
+
+	defaultAddr := cfg.CLI.Host
+	if cfg.CLI.Host == "" {
+		if cfg.Server.Addr != "" {
+			if strings.HasPrefix(cfg.Server.Addr, ":") {
+				defaultAddr = "localhost" + cfg.Server.Addr
+			} else {
+				defaultAddr = cfg.Server.Addr
+			}
 		}
 	}
 
