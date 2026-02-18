@@ -55,10 +55,13 @@ func (h *Hub) Run() {
 	ticker := time.NewTicker(hubTickerInterval)
 	defer ticker.Stop()
 
-	// Start listening for debugger events if debugger is attached
+	// Start listening for debugger events if debugger is already attached at startup
+	// (for compatibility with existing tests/code that pass a debugger at creation)
+	h.mu.RLock()
 	if h.debugger != nil {
 		go h.listenForDebuggerEvents()
 	}
+	h.mu.RUnlock()
 
 	for {
 		select {
@@ -83,7 +86,7 @@ func (h *Hub) Run() {
 			h.mu.Lock()
 			if _, ok := h.connections[client]; ok {
 				delete(h.connections, client)
-				close(client.send)
+				client.CloseSend()
 				log.Printf("Client %s disconnected from hub %s (%d remaining)", client.id, h.sessionID, len(h.connections))
 
 				// When last client leaves, shutdown hub
@@ -243,7 +246,8 @@ func (h *Hub) listenForDebuggerEvents() {
 			h.Broadcast(stateMessage)
 
 		case <-h.debugger.EndDebugSession:
-			log.Println("Debugger event listener ending")
+			log.Println("Debugger event listener ending, sending state update to ready")
+			h.sendStateUpdate(StateReady)
 			return
 		}
 	}
@@ -264,6 +268,16 @@ func (h *Hub) handleCommand(cmd Message) {
 			return
 		}
 		log.Printf("[Command] StartDebug received: %s (session: %s)", startDebugCmd.TargetPath, h.sessionID)
+
+		// Create a new debugger instance for this debug session
+		h.mu.Lock()
+		h.debugger = debugger.NewDebugger()
+		h.mu.Unlock()
+
+		// Start listening for events from this new debugger
+		go h.listenForDebuggerEvents()
+
+		// Start the debug session
 		go h.debugger.StartWithDebug(startDebugCmd.TargetPath)
 
 	case CmdContinue:
@@ -273,6 +287,15 @@ func (h *Hub) handleCommand(cmd Message) {
 			return
 		}
 		log.Printf("[Command] Continue received (session: %s)", h.sessionID)
+
+		h.mu.RLock()
+		if h.debugger == nil {
+			h.mu.RUnlock()
+			log.Printf("[Error] No active debug session to continue (session: %s)", h.sessionID)
+			return
+		}
+		h.mu.RUnlock()
+
 		log.Printf("[State Change] Transitioning to executing state (session: %s)", h.sessionID)
 
 		// Send executing state update
@@ -296,6 +319,15 @@ func (h *Hub) handleCommand(cmd Message) {
 			return
 		}
 		log.Printf("[Command] StepOver received (session: %s)", h.sessionID)
+
+		h.mu.RLock()
+		if h.debugger == nil {
+			h.mu.RUnlock()
+			log.Printf("[Error] No active debug session to step (session: %s)", h.sessionID)
+			return
+		}
+		h.mu.RUnlock()
+
 		log.Printf("[State Change] Transitioning to executing state (session: %s)", h.sessionID)
 
 		// Send executing state update
@@ -320,6 +352,14 @@ func (h *Hub) handleCommand(cmd Message) {
 		}
 		log.Printf("[Command] SetBreakpoint received: %s:%d (session: %s)", setBreakpointCmd.Filename, setBreakpointCmd.Line, h.sessionID)
 
+		h.mu.RLock()
+		if h.debugger == nil {
+			h.mu.RUnlock()
+			log.Printf("[Error] No active debug session to set breakpoint (session: %s)", h.sessionID)
+			return
+		}
+		h.mu.RUnlock()
+
 		// Send command to debugger
 		debugCmd := debugger.DebugCommand{
 			Type: "setBreakpoint",
@@ -343,6 +383,16 @@ func (h *Hub) handleCommand(cmd Message) {
 		}
 		log.Printf("[Command] Exit received (session: %s)", h.sessionID)
 
+		h.mu.RLock()
+		if h.debugger == nil {
+			h.mu.RUnlock()
+			log.Printf("[Info] No active debug session to stop (session: %s)", h.sessionID)
+			// Still send state update to ready in case client is confused
+			h.sendStateUpdate(StateReady)
+			return
+		}
+		h.mu.RUnlock()
+
 		// Send command to debugger
 		debugCmd := debugger.DebugCommand{
 			Type: "quit",
@@ -353,6 +403,7 @@ func (h *Hub) handleCommand(cmd Message) {
 		default:
 			log.Printf("[Error] Failed to send quit command to debugger - channel full")
 		}
+		// Note: State update to 'ready' will be sent by listenForDebuggerEvents when EndDebugSession is received
 
 	default:
 		log.Printf("[Error] Unknown command type: %s", cmd.Type)

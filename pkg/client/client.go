@@ -2,9 +2,11 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/bingosuite/bingo/internal/ws"
@@ -20,7 +22,10 @@ type Client struct {
 	sessionMu sync.RWMutex
 	stateMu   sync.RWMutex
 	state     ws.State
+	closeOnce sync.Once
 }
+
+var ErrDisconnected = errors.New("server disconnected")
 
 func NewClient(serverURL, sessionID string) *Client {
 	c := &Client{
@@ -69,9 +74,7 @@ func (c *Client) Run() error {
 func (c *Client) readPump() {
 	defer func() {
 		close(c.done)
-		if err := c.conn.Close(); err != nil {
-			log.Printf("Close error: %v", err)
-		}
+		c.closeConn()
 	}()
 
 	for {
@@ -88,6 +91,8 @@ func (c *Client) readPump() {
 }
 
 func (c *Client) writePump() {
+	defer c.closeConn()
+
 	for message := range c.send {
 		if err := c.conn.WriteJSON(message); err != nil {
 			log.Printf("Write error: %v", err)
@@ -95,11 +100,11 @@ func (c *Client) writePump() {
 		}
 	}
 	if err := c.conn.WriteMessage(websocket.CloseMessage, []byte{}); err != nil {
-		log.Printf("Failed to close websocket: %v", err)
-		return
+		if !isConnectionClosedError(err) {
+			log.Printf("Failed to send close message: %v", err)
+		}
 	}
-	log.Println("Closing send channel, transitioning to executing state")
-	c.setState(ws.StateExecuting)
+	log.Println("Write pump closing gracefully")
 }
 
 func (c *Client) handleMessage(msg ws.Message) {
@@ -238,6 +243,30 @@ func (c *Client) StartDebug(targetPath string) error {
 	}
 }
 
+func (c *Client) Stop() error {
+	cmd := ws.ExitCmd{
+		Type:      ws.CmdExit,
+		SessionID: c.SessionID(),
+	}
+	payload, err := marshalJSON(cmd)
+	if err != nil {
+		return err
+	}
+	msg := ws.Message{
+		Type: string(ws.CmdExit),
+		Data: payload,
+	}
+
+	select {
+	case c.send <- msg:
+		log.Printf("[Command] Sent %s command (state: %s)", msg.Type, c.State())
+		// State will be updated to 'ready' when server confirms debug session has stopped
+		return nil
+	case <-c.done:
+		return fmt.Errorf("connection closed")
+	}
+}
+
 func (c *Client) SetBreakpoint(filename string, line int) error {
 	cmd := ws.SetBreakpointCmd{
 		Type:      ws.CmdSetBreakpoint,
@@ -280,9 +309,43 @@ func (c *Client) State() ws.State {
 	return c.state
 }
 
+func (c *Client) Done() <-chan struct{} {
+	return c.done
+}
+
+func (c *Client) Wait() error {
+	<-c.done
+	return ErrDisconnected
+}
+
 func (c *Client) Close() error {
-	if c.conn != nil {
-		return c.conn.Close()
+	var err error
+	c.closeOnce.Do(func() {
+		if c.conn != nil {
+			err = c.conn.Close()
+		}
+	})
+	return err
+}
+
+func (c *Client) closeConn() {
+	c.closeOnce.Do(func() {
+		if c.conn != nil {
+			if err := c.conn.Close(); err != nil {
+				if !isConnectionClosedError(err) {
+					log.Printf("Close error: %v", err)
+				}
+			}
+		}
+	})
+}
+
+func isConnectionClosedError(err error) bool {
+	if err == nil {
+		return false
 	}
-	return nil
+	errMsg := err.Error()
+	return websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
+		strings.Contains(errMsg, "use of closed network connection") ||
+		strings.Contains(errMsg, "broken pipe")
 }
