@@ -49,8 +49,14 @@ func main() {
 	if err := c.Run(); err != nil {
 		log.Fatalf("Failed to start client: %v", err)
 	}
+	go func() {
+		if err := c.Wait(); err != nil {
+			log.Println("Server disconnected")
+			os.Exit(1)
+		}
+	}()
 
-	log.Println("Connected. Commands: start <path>, c=continue, s=step, b=<file> <line>, state, q=quit")
+	log.Println("Connected. Commands: start <path>, stop, c=continue, s=step, b=<file> <line>, state, q=quit")
 
 	inputReader := bufio.NewReader(os.Stdin)
 	useRawInput := term.IsTerminal(int(os.Stdin.Fd()))
@@ -114,6 +120,9 @@ func main() {
 			time.Sleep(100 * time.Millisecond)
 		case "state":
 			fmt.Printf("state=%s session=%s\n", c.State(), c.SessionID())
+		case "stop":
+			cmdErr = c.Stop()
+			time.Sleep(100 * time.Millisecond)
 		case "q", "quit", "exit":
 			_ = c.Close()
 			return

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+	"time"
 
 	"github.com/bingosuite/bingo/internal/debuginfo"
 )
@@ -96,12 +97,20 @@ func (d *Debugger) StartWithDebug(path string) {
 	// Set initial breakpoints while the process is stopped at the initial SIGTRAP
 	d.initialBreakpointHit()
 
+	// Check if we were stopped during initial breakpoint
+	select {
+	case <-d.EndDebugSession:
+		log.Println("Debug session ended during initial breakpoint, cleaning up")
+		return
+	default:
+		// Continue to debug loop
+	}
+
 	log.Println("STARTING DEBUG LOOP")
 
 	d.debug()
 
-	// Wait until debug session exits
-	d.EndDebugSession <- true
+	log.Println("Debug loop ended, signaling completion")
 
 }
 
@@ -174,7 +183,19 @@ func (d *Debugger) SingleStep(pid int) {
 }
 
 func (d *Debugger) StopDebug() {
-	d.EndDebugSession <- true
+	// Detach from the target process, letting it continue running
+	if d.DebugInfo.Target.PID > 0 {
+		log.Printf("Detaching from target process (PID: %d)", d.DebugInfo.Target.PID)
+		if err := syscall.PtraceDetach(d.DebugInfo.Target.PID); err != nil {
+			log.Printf("Failed to detach from target process: %v (might have already exited)", err)
+		}
+	}
+	// Signal the debug loop to exit
+	select {
+	case d.EndDebugSession <- true:
+	default:
+		// Channel might be full, that's ok
+	}
 }
 
 func (d *Debugger) SetBreakpoint(line int) error {
@@ -211,12 +232,29 @@ func (d *Debugger) ClearBreakpoint(line int) error {
 
 func (d *Debugger) debug() {
 	for {
+		// Check if we should stop debugging
+		select {
+		case <-d.EndDebugSession:
+			log.Println("Debug session ending, exiting debug loop")
+			return
+		default:
+			// Continue with wait
+		}
+
 		// Wait until any of the child processes of the target is interrupted or ends
 		var waitStatus syscall.WaitStatus
-		wpid, err := syscall.Wait4(-1*d.DebugInfo.Target.PGID, &waitStatus, 0, nil) // TODO: handle concurrency
+		wpid, err := syscall.Wait4(-1*d.DebugInfo.Target.PGID, &waitStatus, syscall.WNOHANG, nil)
 		if err != nil {
 			log.Printf("Failed to wait for the target or any of its threads: %v", err)
-			panic(err)
+			// Don't panic, just exit gracefully
+			return
+		}
+
+		// No process state changed yet
+		if wpid == 0 {
+			// Sleep briefly to avoid busy waiting
+			time.Sleep(10 * time.Millisecond)
+			continue
 		}
 
 		if waitStatus.Exited() {
@@ -233,10 +271,19 @@ func (d *Debugger) debug() {
 
 				d.breakpointHit(wpid)
 
+				// Check if we were signaled to stop during breakpoint handling
+				select {
+				case <-d.EndDebugSession:
+					log.Println("Debug session ending after breakpoint handling")
+					return
+				default:
+				}
+
 			} else {
 				if err := syscall.PtraceCont(wpid, 0); err != nil {
 					log.Printf("Failed to resume target execution: %v", err)
-					panic(err)
+					// Don't panic, might have been detached
+					return
 				}
 			}
 		}
