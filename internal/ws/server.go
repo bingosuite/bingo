@@ -152,11 +152,8 @@ func (s *Server) Shutdown() {
 
 		// Close all connections in the hub
 		for c := range hub.connections {
-			close(c.send)
-			if err := c.conn.Close(); err != nil {
-				log.Printf("Error closing connection %s: %v", c.id, err)
-				panic(err)
-			}
+			c.CloseSend()
+			c.Close()
 		}
 
 		delete(s.hubs, sessionID)
