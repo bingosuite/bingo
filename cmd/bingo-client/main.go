@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strconv"
@@ -12,6 +13,8 @@ import (
 
 	"github.com/bingosuite/bingo/config"
 	"github.com/bingosuite/bingo/pkg/client"
+	"github.com/peterh/liner"
+	"golang.org/x/term"
 )
 
 func main() {
@@ -42,14 +45,57 @@ func main() {
 	}
 
 	log.Println("Connected. Commands: start <path>, c=continue, s=step, b=<file> <line>, state, q=quit")
-	scanner := bufio.NewScanner(os.Stdin)
+
+	inputReader := bufio.NewReader(os.Stdin)
+	useRawInput := term.IsTerminal(int(os.Stdin.Fd()))
+	var lineEditor *liner.State
+	if useRawInput {
+		lineEditor = liner.NewLiner()
+		lineEditor.SetCtrlCAborts(true)
+		lineEditor.SetTabCompletionStyle(liner.TabPrints)
+		defer func() {
+			_ = lineEditor.Close()
+		}()
+	}
+
+	history := make([]string, 0, 64)
+
 	for {
 		time.Sleep(100 * time.Millisecond)
-		fmt.Printf("[%s] > ", c.State())
-		if !scanner.Scan() {
+		prompt := fmt.Sprintf("[%s] > ", c.State())
+		var rawLine string
+		var readErr error
+		if useRawInput {
+			rawLine, readErr = lineEditor.Prompt(prompt)
+		} else {
+			fmt.Print(prompt)
+			line, err := inputReader.ReadString('\n')
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("Stdin error: %v", err)
+				}
+				break
+			}
+			rawLine = strings.TrimRight(line, "\r\n")
+		}
+		if readErr != nil {
+			if readErr == liner.ErrPromptAborted || readErr == io.EOF {
+				break
+			}
+			log.Printf("Stdin error: %v", readErr)
 			break
 		}
-		raw := strings.TrimSpace(scanner.Text())
+
+		raw := strings.TrimSpace(rawLine)
+		if raw != "" {
+			if len(history) == 0 || history[len(history)-1] != rawLine {
+				history = append(history, rawLine)
+				if lineEditor != nil {
+					lineEditor.AppendHistory(rawLine)
+				}
+			}
+		}
+
 		input := strings.ToLower(raw)
 		fields := strings.Fields(raw)
 		var cmdErr error
@@ -90,9 +136,6 @@ func main() {
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		log.Printf("Stdin error: %v", err)
-	}
 	_ = c.Close()
 }
 
