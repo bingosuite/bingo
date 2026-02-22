@@ -77,8 +77,7 @@ func main() {
 	history := make([]string, 0, 64)
 
 	for {
-		time.Sleep(100 * time.Millisecond)
-		prompt := fmt.Sprintf("[%s] > ", c.State())
+		prompt := ""
 		var rawLine string
 		var readErr error
 		if useRawInput {
