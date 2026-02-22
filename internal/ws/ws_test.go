@@ -112,7 +112,7 @@ var _ = Describe("Hub", func() {
 			hub.mu.RUnlock()
 
 			Expect(connectionCount).To(Equal(0))
-			Expect(shutdownCalled.Load()).To(BeTrue())
+			Expect(shutdownCalled.Load()).To(BeFalse())
 		})
 	})
 
@@ -171,12 +171,7 @@ var _ = Describe("Hub", func() {
 						if _, ok := hub.connections[client]; ok {
 							delete(hub.connections, client)
 							close(client.send)
-							if len(hub.connections) == 0 {
-								hub.mu.Unlock()
-								hub.shutdown()
-								done <- struct{}{}
-								return
-							}
+							hub.lastActivity = time.Now()
 						}
 						hub.mu.Unlock()
 

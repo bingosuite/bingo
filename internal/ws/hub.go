@@ -87,16 +87,8 @@ func (h *Hub) Run() {
 			if _, ok := h.connections[client]; ok {
 				delete(h.connections, client)
 				client.CloseSend()
+				h.lastActivity = time.Now()
 				log.Printf("Client %s disconnected from hub %s (%d remaining)", client.id, h.sessionID, len(h.connections))
-
-				// When last client leaves, shutdown hub
-				if len(h.connections) == 0 {
-					h.mu.Unlock()
-					log.Printf("Session %s has no clients, shutting down hub", h.sessionID)
-					h.shutdown()
-					return
-				}
-
 			}
 			h.mu.Unlock()
 
