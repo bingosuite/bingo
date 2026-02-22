@@ -233,7 +233,7 @@ func (d *Debugger) ClearBreakpoint(line int) error {
 		panic(err)
 	}
 	if _, err := syscall.PtracePokeData(d.DebugInfo.Target.PID, uintptr(pc), d.Breakpoints[pc]); err != nil {
-		return fmt.Errorf("failed to write breakpoint into memory: %v", err)
+		return fmt.Errorf("failed to write breakpoint ndinto memory: %v", err)
 	}
 	return nil
 }
@@ -268,7 +268,13 @@ func (d *Debugger) debug() {
 		if waitStatus.Exited() {
 			if wpid == d.DebugInfo.Target.PID { // If target exited, terminate
 				log.Printf("Target %v execution completed", d.DebugInfo.Target.Path)
-				break
+				// Signal the end of debug session to hub
+				select {
+				case d.EndDebugSession <- true:
+				default:
+					// Channel might be full or already closed, that's ok
+				}
+				return
 			} else {
 				log.Printf("Thread exited with PID: %v", wpid)
 			}
