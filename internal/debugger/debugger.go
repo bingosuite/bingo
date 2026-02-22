@@ -135,7 +135,14 @@ func (d *Debugger) Continue(pid int) {
 		return // Process likely exited, gracefully return
 	}
 	filename, line, fn := d.DebugInfo.PCToLine(regs.Rip - 1) // Breakpoint advances PC by 1 on x86, so we need to rewind
-	fmt.Printf("Stopped at %s at %d in %s\n", fn.Name, line, filename)
+	fnName := "unknown"
+	if fn != nil {
+		fnName = fn.Name
+	}
+	if filename == "" {
+		filename = "unknown"
+	}
+	fmt.Printf("Stopped at %s at %d in %s\n", fnName, line, filename)
 
 	// Remove the breakpoint
 	bpAddr := regs.Rip - 1
@@ -367,19 +374,36 @@ func (d *Debugger) breakpointHit(pid int) {
 		return
 	}
 
+	// Only treat SIGTRAPs that land on our breakpoints as breakpoint hits.
+	bpAddr := uint64(regs.Rip - 1)
+	if _, ok := d.Breakpoints[bpAddr]; !ok {
+		log.Printf("SIGTRAP at 0x%x is not a known breakpoint; resuming", bpAddr)
+		if err := syscall.PtraceCont(pid, 0); err != nil {
+			log.Printf("Failed to resume target execution: %v", err)
+		}
+		return
+	}
+
 	// Get location information
-	filename, line, fn := d.DebugInfo.PCToLine(regs.Rip - 1)
+	filename, line, fn := d.DebugInfo.PCToLine(bpAddr)
+	fnName := "unknown"
+	if fn != nil {
+		fnName = fn.Name
+	}
+	if filename == "" {
+		filename = "unknown"
+	}
 
 	// Create breakpoint event
 	event := BreakpointEvent{
 		PID:      pid,
 		Filename: filename,
 		Line:     line,
-		Function: fn.Name,
+		Function: fnName,
 	}
 
 	// Send breakpoint hit event to hub
-	log.Printf("Breakpoint hit at %s:%d in %s, waiting for command", filename, line, fn.Name)
+	log.Printf("Breakpoint hit at %s:%d in %s, waiting for command", filename, line, fnName)
 	d.BreakpointHit <- event
 
 	// Wait for command from hub

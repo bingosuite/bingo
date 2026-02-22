@@ -31,22 +31,41 @@ func NewDebugInfo(path string, pid int) (*DebugInfo, error) {
 		}
 	}()
 	// Read line table (mapping between memory addresses and source file + line number)
-	lineTableData, err := exe.Section(".gopclntab").Data()
+	lineTableSection := exe.Section(".gopclntab")
+	if lineTableSection == nil {
+		return nil, fmt.Errorf("missing .gopclntab section")
+	}
+	lineTableData, err := lineTableSection.Data()
 	if err != nil {
 		return nil, fmt.Errorf("failed to read Line Table data into memory: %v", err)
 	}
 	// Address where the machine code for the target starts
-	addr := exe.Section(".text").Addr
+	textSection := exe.Section(".text")
+	if textSection == nil {
+		return nil, fmt.Errorf("missing .text section")
+	}
+	addr := textSection.Addr
 	// Create line table object for PCToLine and LineToPC translation
 	lineTable := gosym.NewLineTable(lineTableData, addr)
 	// Create symbol table object for looking up functions, variables and types
-	symTable, err := gosym.NewTable([]byte{}, lineTable)
+	var symTableData []byte
+	if symSection := exe.Section(".gosymtab"); symSection != nil {
+		symTableData, err = symSection.Data()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read Symbol Table data into memory: %v", err)
+		}
+	}
+	symTable, err := gosym.NewTable(symTableData, lineTable)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Symbol Table: %v", err)
 	}
 
 	//Need to get this to dynamically get the path to the main source Go file (ex. target.exe's source might be called /workspaces/bingo/cmd/target/target.go or /workspaces/bingo/cmd/target/main.go)
-	sourceFile, _, _ := symTable.PCToLine(symTable.LookupFunc("main.main").Entry)
+	mainFunc := symTable.LookupFunc("main.main")
+	if mainFunc == nil {
+		return nil, fmt.Errorf("missing main.main symbol; build without -s -w and with debug info")
+	}
+	sourceFile, _, _ := symTable.PCToLine(mainFunc.Entry)
 
 	// Need this to wait on threads
 	pgid, err := syscall.Getpgid(pid)
