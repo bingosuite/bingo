@@ -8,7 +8,9 @@
     ]
   },
   "runArgs": [
-    "--platform=linux/amd64"
+    "--platform=linux/amd64",
+    "--cap-add=SYS_PTRACE",
+    "--security-opt=apparmor=unconfined"
   ],
   "features": {
     "ghcr.io/thediveo/devcontainer-features/lazygit": {},
