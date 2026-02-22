@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -60,6 +61,13 @@ func NewDebugger() *Debugger {
 }
 
 func (d *Debugger) StartWithDebug(path string) {
+	// Lock this goroutine to the current OS thread.
+	// Linux ptrace requires that all ptrace calls for a given traced process
+	// originate from the same OS thread that performed the initial attach.
+	// Without this, the Go scheduler may migrate the goroutine to a different
+	// OS thread, causing ptrace calls to fail with ESRCH ("no such process").
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
 	// Set up target for execution
 	cmd := exec.Command(path)
@@ -208,7 +216,7 @@ func (d *Debugger) SetBreakpoint(line int) error {
 
 	original := make([]byte, len(bpCode))
 	if _, err := syscall.PtracePeekData(d.DebugInfo.Target.PID, uintptr(pc), original); err != nil {
-		return fmt.Errorf("failed to read original machine code into memory: %v", err)
+		return fmt.Errorf("failed to read original machine code into memory: %v for PID: %d", err, d.DebugInfo.Target.PID)
 	}
 	if _, err := syscall.PtracePokeData(d.DebugInfo.Target.PID, uintptr(pc), bpCode); err != nil {
 		return fmt.Errorf("failed to write breakpoint into memory: %v", err)
@@ -281,7 +289,7 @@ func (d *Debugger) debug() {
 
 			} else {
 				if err := syscall.PtraceCont(wpid, 0); err != nil {
-					log.Printf("Failed to resume target execution: %v", err)
+					log.Printf("Failed to resume target execution: %v for PID: %d", err, wpid)
 					// Don't panic, might have been detached
 					return
 				}
@@ -305,6 +313,7 @@ func (d *Debugger) initialBreakpointHit() {
 		select {
 		case cmd := <-d.DebugCommand:
 			log.Printf("Initial state - received command: %s", cmd.Type)
+
 			switch cmd.Type {
 			case "setBreakpoint":
 				if data, ok := cmd.Data.(map[string]interface{}); ok {
