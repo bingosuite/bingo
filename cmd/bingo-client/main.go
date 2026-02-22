@@ -49,12 +49,6 @@ func main() {
 	if err := c.Run(); err != nil {
 		log.Fatalf("Failed to start client: %v", err)
 	}
-	go func() {
-		if err := c.Wait(); err != nil {
-			log.Println("Server disconnected")
-			os.Exit(1)
-		}
-	}()
 
 	log.Println("Connected. Commands: start <path>, stop, c=continue, s=step, b=<file> <line>, state, q=quit")
 
@@ -69,6 +63,16 @@ func main() {
 			_ = lineEditor.Close()
 		}()
 	}
+
+	go func() {
+		if err := c.Wait(); err != nil {
+			log.Println("Server disconnected")
+			if lineEditor != nil {
+				_ = lineEditor.Close()
+			}
+			os.Exit(1)
+		}
+	}()
 
 	history := make([]string, 0, 64)
 
