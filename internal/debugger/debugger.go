@@ -5,7 +5,9 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -60,6 +62,40 @@ func NewDebugger() *Debugger {
 	}
 }
 
+// validateTargetPath resolves path to an absolute path, ensures it stays
+// within the current working directory, and confirms it is a regular
+// executable file. This prevents command injection from user-supplied input.
+func validateTargetPath(path string) (string, error) {
+	// Resolve to absolute path to eliminate any relative traversal tricks
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", fmt.Errorf("invalid target path: %w", err)
+	}
+
+	// Restrict execution to paths within the working directory
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("could not determine working directory: %w", err)
+	}
+	if !strings.HasPrefix(abs, cwd+string(filepath.Separator)) {
+		return "", fmt.Errorf("target path %q is outside the working directory %q", abs, cwd)
+	}
+
+	// Confirm it exists and is a regular file (not a directory or device)
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("target path %q not accessible: %w", abs, err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("target path %q is not a regular file", abs)
+	}
+	if info.Mode()&0111 == 0 {
+		return "", fmt.Errorf("target path %q is not executable", abs)
+	}
+
+	return abs, nil
+}
+
 func (d *Debugger) StartWithDebug(path string) {
 	// Lock this goroutine to the current OS thread.
 	// Linux ptrace requires that all ptrace calls for a given traced process
@@ -69,8 +105,15 @@ func (d *Debugger) StartWithDebug(path string) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
+	// Validate and sanitise the user-supplied path before passing it to exec.
+	validatedPath, err := validateTargetPath(path)
+	if err != nil {
+		log.Printf("Rejected target path %q: %v", path, err)
+		return
+	}
+
 	// Set up target for execution
-	cmd := exec.Command(path)
+	cmd := exec.Command(validatedPath)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -81,7 +124,7 @@ func (d *Debugger) StartWithDebug(path string) {
 		panic(err)
 	}
 
-	dbInf, err := debuginfo.NewDebugInfo(path, cmd.Process.Pid)
+	dbInf, err := debuginfo.NewDebugInfo(validatedPath, cmd.Process.Pid)
 	if err != nil {
 		log.Printf("Failed to create debug info: %v", err)
 		panic(err)
