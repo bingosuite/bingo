@@ -27,15 +27,9 @@ func main() {
 		cfg = config.Default()
 	}
 
-	defaultAddr := cfg.CLI.Host
-	if cfg.CLI.Host == "" {
-		if cfg.Server.Addr != "" {
-			if strings.HasPrefix(cfg.Server.Addr, ":") {
-				defaultAddr = "localhost" + cfg.Server.Addr
-			} else {
-				defaultAddr = cfg.Server.Addr
-			}
-		}
+	defaultAddr := cfg.Server.Addr
+	if strings.HasPrefix(defaultAddr, ":") {
+		defaultAddr = "localhost" + defaultAddr
 	}
 
 	server := flag.String("server", defaultAddr, "WebSocket server host:port")
