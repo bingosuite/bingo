@@ -55,14 +55,6 @@ func (h *Hub) Run() {
 	ticker := time.NewTicker(hubTickerInterval)
 	defer ticker.Stop()
 
-	// Start listening for debugger events if debugger is already attached at startup
-	// (for compatibility with existing tests/code that pass a debugger at creation)
-	h.mu.RLock()
-	if h.debugger != nil {
-		go h.listenForDebuggerEvents()
-	}
-	h.mu.RUnlock()
-
 	for {
 		select {
 		case <-ticker.C:
