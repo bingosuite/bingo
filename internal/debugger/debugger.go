@@ -165,11 +165,6 @@ func (d *Debugger) StartWithDebug(path string) {
 
 }
 
-// TODO: figure out how to do
-func (d *Debugger) AttachAndDebug(pid int) {
-
-}
-
 func (d *Debugger) Continue(pid int) {
 	// Read registers
 	var regs syscall.PtraceRegs
