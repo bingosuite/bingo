@@ -29,7 +29,7 @@ type Debugger struct {
 
 	// Communication with hub
 	BreakpointHit        chan BreakpointEvent
-	InitialBreakpointHit chan InitialBreakpointEvent
+	InitialBreakpointHit chan InitialBreakpointHitEvent
 	DebugCommand         chan DebugCommand
 }
 
@@ -41,8 +41,8 @@ type BreakpointEvent struct {
 	Function string `json:"function"`
 }
 
-// InitialBreakpointEvent represents the initial breakpoint hit when debugging starts
-type InitialBreakpointEvent struct {
+// InitialBreakpointHitEvent represents the initial breakpoint hit when debugging starts
+type InitialBreakpointHitEvent struct {
 	PID int `json:"pid"`
 }
 
@@ -57,7 +57,7 @@ func NewDebugger() *Debugger {
 		Breakpoints:          make(map[uint64][]byte),
 		EndDebugSession:      make(chan bool, 1),
 		BreakpointHit:        make(chan BreakpointEvent, 1),
-		InitialBreakpointHit: make(chan InitialBreakpointEvent, 1),
+		InitialBreakpointHit: make(chan InitialBreakpointHitEvent, 1),
 		DebugCommand:         make(chan DebugCommand, 1),
 	}
 }
@@ -349,7 +349,7 @@ func (d *Debugger) debug() {
 
 func (d *Debugger) initialBreakpointHit() {
 	// Create initial breakpoint event
-	event := InitialBreakpointEvent{
+	event := InitialBreakpointHitEvent{
 		PID: d.DebugInfo.Target.PID,
 	}
 
@@ -365,18 +365,14 @@ func (d *Debugger) initialBreakpointHit() {
 
 			switch cmd.Type {
 			case "setBreakpoint":
-				if data, ok := cmd.Data.(map[string]interface{}); ok {
-					if line, ok := data["line"].(int); ok { // JSON numbers are float64
+				if data, ok := cmd.Data.(map[string]any); ok {
+					if line, ok := data["line"].(int); ok {
 						if err := d.SetBreakpoint(int(line)); err != nil {
 							log.Printf("Failed to set breakpoint at line %d: %v", int(line), err)
 						} else {
-							log.Printf("Breakpoint set at line %d, waiting for next command", int(line))
+							log.Printf("Breakpoint set at line %d while at breakpoint", int(line))
 						}
-					} else {
-						log.Printf("Invalid setBreakpoint command: line field missing or wrong type")
 					}
-				} else {
-					log.Printf("Invalid setBreakpoint command: data field missing or wrong format")
 				}
 			case "continue":
 				log.Println("Continuing from initial breakpoint")
@@ -386,9 +382,7 @@ func (d *Debugger) initialBreakpointHit() {
 				}
 				return // Exit initial breakpoint handling
 			case "step":
-				log.Println("Stepping from initial breakpoint")
-				d.SingleStep(d.DebugInfo.Target.PID)
-				return // Exit initial breakpoint handling
+				log.Println("Cannot single-step from initial breakpoint")
 			case "quit":
 				d.StopDebug()
 				return
@@ -435,8 +429,8 @@ func (d *Debugger) breakpointHit(pid int) {
 		case "step":
 			d.SingleStep(pid)
 		case "setBreakpoint":
-			if data, ok := cmd.Data.(map[string]interface{}); ok {
-				if line, ok := data["line"].(float64); ok { // JSON numbers are float64
+			if data, ok := cmd.Data.(map[string]any); ok {
+				if line, ok := data["line"].(int); ok {
 					if err := d.SetBreakpoint(int(line)); err != nil {
 						log.Printf("Failed to set breakpoint at line %d: %v", int(line), err)
 					} else {
@@ -444,8 +438,6 @@ func (d *Debugger) breakpointHit(pid int) {
 					}
 				}
 			}
-			// After setting breakpoint, continue waiting for next command
-			d.Continue(pid)
 		case "quit":
 			d.StopDebug()
 			return
