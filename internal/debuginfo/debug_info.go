@@ -20,7 +20,6 @@ type DebugInfo struct {
 }
 
 func NewDebugInfo(path string, pid int) (*DebugInfo, error) {
-
 	exe, err := elf.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open target ELF file: %v", err)
