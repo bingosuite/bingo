@@ -11,3 +11,7 @@
 ## Meeting 2: February 9th, 2025
 
 - Second meeting with Robert Laganière. We presented our plan for the architecture of our debugger and did some system design together on a collaborative whiteboard. We used to opportunity to ask questions about idiomatic patterns in go, such as how to handle errors and how to structure the codebase for a project like this. We agreed to have set bi-weekly goals for the project to keep us on track and ensure we are making progress towards our milestones. Our goal for next meeting is to have a working prototype debugger that uses the websocket pipe to communicate with a client.
+
+## Meeting 3: February 23rd, 2025
+
+- Third meeting with Robert Lagnière. We presented the prototype on a basic go program and discussed issues we faced related to os thread swaping and goroutines. We discussed performance influences from our architecture decisions, and everything seems to make sense and work well so far. For the next meeting, we will enhance the client experience and program tests, as well as make the debugger work on a more complex program.
