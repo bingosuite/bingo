@@ -5,8 +5,5 @@ websocket:
 server:
   addr: ":8080"
 
-cli:
-  host: "localhost:8080"
-  
 logging:
   level: info
