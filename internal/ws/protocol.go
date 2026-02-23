@@ -46,7 +46,7 @@ type BreakpointHitEvent struct {
 	Function  string    `json:"function"`
 }
 
-type InitialBreakpointEvent struct {
+type InitialBreakpointHitEvent struct {
 	Type      EventType `json:"type"`
 	SessionID string    `json:"sessionId"`
 	PID       int       `json:"pid"`

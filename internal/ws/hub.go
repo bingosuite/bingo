@@ -205,7 +205,7 @@ func (h *Hub) listenForDebuggerEvents() {
 			log.Printf("[Debugger Event] Initial breakpoint hit (PID: %d, session: %s)", initialBpEvent.PID, h.sessionID)
 
 			// Create and send initial breakpoint event to all clients
-			event := InitialBreakpointEvent{
+			event := InitialBreakpointHitEvent{
 				Type:      EventInitialBreakpoint,
 				SessionID: h.sessionID,
 				PID:       initialBpEvent.PID,
