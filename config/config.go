@@ -11,7 +11,6 @@ import (
 type Config struct {
 	WebSocket WebSocketConfig `yaml:"websocket"`
 	Server    ServerConfig    `yaml:"server"`
-	CLI       CLIConfig       `yaml:"cli"`
 	Logging   LoggingConfig   `yaml:"logging"`
 }
 
@@ -22,10 +21,6 @@ type WebSocketConfig struct {
 
 type ServerConfig struct {
 	Addr string `yaml:"addr"`
-}
-
-type CLIConfig struct {
-	Host string `yaml:"host"`
 }
 
 type LoggingConfig struct {
@@ -40,9 +35,6 @@ func Default() *Config {
 		},
 		Server: ServerConfig{
 			Addr: ":8080",
-		},
-		CLI: CLIConfig{
-			Host: "localhost:8080",
 		},
 		Logging: LoggingConfig{
 			Level: "info",
