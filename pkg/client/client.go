@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/url"
-	"strings"
 	"sync"
 
 	"github.com/bingosuite/bingo/internal/ws"
@@ -177,10 +176,6 @@ func unmarshalJSON(data []byte, v any) error {
 
 func (c *Client) SendCommand(cmdType string, payload []byte) error {
 	// TODO: decide which states allow which commands
-	currentState := c.State()
-	if currentState != ws.StateBreakpoint {
-		return fmt.Errorf("cannot send command '%s' in state '%s' (must be in 'breakpoint' state)", cmdType, currentState)
-	}
 	msg := ws.Message{
 		Type: cmdType,
 		Data: payload,
@@ -229,18 +224,7 @@ func (c *Client) StartDebug(targetPath string) error {
 	if err != nil {
 		return err
 	}
-	msg := ws.Message{
-		Type: string(ws.CmdStartDebug),
-		Data: payload,
-	}
-
-	select {
-	case c.send <- msg:
-		log.Printf("[Command] Sent %s command (state: %s)", msg.Type, c.State())
-		return nil
-	case <-c.done:
-		return fmt.Errorf("connection closed")
-	}
+	return c.SendCommand(string(ws.CmdStartDebug), payload)
 }
 
 func (c *Client) Stop() error {
@@ -252,19 +236,8 @@ func (c *Client) Stop() error {
 	if err != nil {
 		return err
 	}
-	msg := ws.Message{
-		Type: string(ws.CmdExit),
-		Data: payload,
-	}
-
-	select {
-	case c.send <- msg:
-		log.Printf("[Command] Sent %s command (state: %s)", msg.Type, c.State())
-		// State will be updated to 'ready' when server confirms debug session has stopped
-		return nil
-	case <-c.done:
-		return fmt.Errorf("connection closed")
-	}
+	// State will be updated to 'ready' when server confirms debug session has stopped
+	return c.SendCommand(string(ws.CmdExit), payload)
 }
 
 func (c *Client) SetBreakpoint(filename string, line int) error {
@@ -340,12 +313,10 @@ func (c *Client) closeConn() {
 	})
 }
 
+// TODO: refactor
 func isConnectionClosedError(err error) bool {
 	if err == nil {
 		return false
 	}
-	errMsg := err.Error()
-	return websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
-		strings.Contains(errMsg, "use of closed network connection") ||
-		strings.Contains(errMsg, "broken pipe")
+	return websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway)
 }

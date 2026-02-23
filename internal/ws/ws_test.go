@@ -536,8 +536,8 @@ var _ = Describe("Server", func() {
 		})
 	})
 
-	Describe("GetOrCreateHub", func() {
-		It("should create and retrieve hubs", func() {
+	Describe("CreateHub", func() {
+		It("should create a new hub", func() {
 			wsConfig := config.WebSocketConfig{
 				MaxSessions: 100,
 				IdleTimeout: time.Minute,
@@ -549,19 +549,80 @@ var _ = Describe("Server", func() {
 				config: wsConfig,
 			}
 
-			hub1, err := server.GetOrCreateHub("session-1")
+			hub1, err := server.CreateHub("session-1")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(hub1).NotTo(BeNil())
 			Expect(hub1.sessionID).To(Equal("session-1"))
 
-			hub2, err := server.GetOrCreateHub("session-1")
+			hub2, err := server.CreateHub("session-2")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(hub2).NotTo(BeNil())
+			Expect(hub2).NotTo(Equal(hub1))
+		})
+
+		It("should return error if session already exists", func() {
+			wsConfig := config.WebSocketConfig{
+				MaxSessions: 100,
+				IdleTimeout: time.Minute,
+			}
+
+			server := &Server{
+				addr:   "localhost:0",
+				hubs:   make(map[string]*Hub),
+				config: wsConfig,
+			}
+
+			hub1, err := server.CreateHub("session-1")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(hub1).NotTo(BeNil())
+
+			// Try to create the same session again
+			hub2, err := server.CreateHub("session-1")
+			Expect(err).To(HaveOccurred())
+			Expect(hub2).To(BeNil())
+			Expect(err.Error()).To(ContainSubstring("session already exists"))
+		})
+	})
+
+	Describe("GetHub", func() {
+		It("should retrieve an existing hub", func() {
+			wsConfig := config.WebSocketConfig{
+				MaxSessions: 100,
+				IdleTimeout: time.Minute,
+			}
+
+			server := &Server{
+				addr:   "localhost:0",
+				hubs:   make(map[string]*Hub),
+				config: wsConfig,
+			}
+
+			hub1, err := server.CreateHub("session-1")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(hub1).NotTo(BeNil())
+
+			// Retrieve the same hub
+			hub2, err := server.GetHub("session-1")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(hub2).To(Equal(hub1))
+		})
 
-			hub3, err := server.GetOrCreateHub("session-2")
-			Expect(err).NotTo(HaveOccurred())
-			Expect(hub3).NotTo(BeNil())
-			Expect(hub3).NotTo(Equal(hub1))
+		It("should return error if session does not exist", func() {
+			wsConfig := config.WebSocketConfig{
+				MaxSessions: 100,
+				IdleTimeout: time.Minute,
+			}
+
+			server := &Server{
+				addr:   "localhost:0",
+				hubs:   make(map[string]*Hub),
+				config: wsConfig,
+			}
+
+			hub, err := server.GetHub("nonexistent")
+			Expect(err).To(HaveOccurred())
+			Expect(hub).To(BeNil())
+			Expect(err.Error()).To(ContainSubstring("session not found"))
 		})
 	})
 
@@ -578,17 +639,17 @@ var _ = Describe("Server", func() {
 				config: wsConfig,
 			}
 
-			hub1, err := server.GetOrCreateHub("session-1")
+			hub1, err := server.CreateHub("session-1")
 			Expect(err).NotTo(HaveOccurred())
 			hub1.onShutdown = server.removeHub
 			Expect(hub1).NotTo(BeNil())
 
-			hub2, err := server.GetOrCreateHub("session-2")
+			hub2, err := server.CreateHub("session-2")
 			Expect(err).NotTo(HaveOccurred())
 			hub2.onShutdown = server.removeHub
 			Expect(hub2).NotTo(BeNil())
 
-			hub3, err := server.GetOrCreateHub("session-3")
+			hub3, err := server.CreateHub("session-3")
 			Expect(err).To(HaveOccurred())
 			Expect(hub3).To(BeNil())
 
@@ -612,7 +673,7 @@ var _ = Describe("Server", func() {
 				config: wsConfig,
 			}
 
-			hub, err := server.GetOrCreateHub("session-1")
+			hub, err := server.CreateHub("session-1")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(hub).NotTo(BeNil())
 
@@ -638,7 +699,7 @@ var _ = Describe("Server", func() {
 				config: wsConfig,
 			}
 
-			server := httptest.NewServer(http.HandlerFunc(s.serveWebSocket))
+			server := httptest.NewServer(http.HandlerFunc(s.getOrCreateSession))
 			defer server.Close()
 
 			dialer := websocket.Dialer{}
@@ -678,7 +739,7 @@ var _ = Describe("Server", func() {
 				config: wsConfig,
 			}
 
-			server := httptest.NewServer(http.HandlerFunc(s.serveWebSocket))
+			server := httptest.NewServer(http.HandlerFunc(s.getOrCreateSession))
 			defer server.Close()
 
 			resp, err := http.Get(server.URL + "/ws/?session=session-1")
@@ -691,7 +752,7 @@ var _ = Describe("Server", func() {
 			Expect(hubCount).To(Equal(0))
 		})
 
-		It("should create hub and register connection", func() {
+		It("should reject connection with provided session ID that does not exist", func() {
 			wsConfig := config.WebSocketConfig{
 				MaxSessions: 10,
 				IdleTimeout: time.Minute,
@@ -703,7 +764,46 @@ var _ = Describe("Server", func() {
 				config: wsConfig,
 			}
 
-			server := httptest.NewServer(http.HandlerFunc(s.serveWebSocket))
+			server := httptest.NewServer(http.HandlerFunc(s.getOrCreateSession))
+			defer server.Close()
+
+			dialer := websocket.Dialer{}
+			wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws/?session=nonexistent"
+			conn, resp, _ := dialer.Dial(wsURL, nil)
+			if conn != nil {
+				_ = conn.Close()
+			}
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+
+			// Either dial fails or connection is immediately closed
+			// Either way, no hub should be created
+			s.mu.RLock()
+			hubCount := len(s.hubs)
+			s.mu.RUnlock()
+			Expect(hubCount).To(Equal(0))
+		})
+
+		It("should accept connection with provided session ID that exists", func() {
+			wsConfig := config.WebSocketConfig{
+				MaxSessions: 10,
+				IdleTimeout: time.Minute,
+			}
+
+			s := &Server{
+				addr:   "localhost:0",
+				hubs:   make(map[string]*Hub),
+				config: wsConfig,
+			}
+
+			// Pre-create the hub
+			hub, err := s.CreateHub("session-1")
+			Expect(err).NotTo(HaveOccurred())
+			hub.onShutdown = s.removeHub
+			go hub.Run()
+
+			server := httptest.NewServer(http.HandlerFunc(s.getOrCreateSession))
 			defer server.Close()
 
 			dialer := websocket.Dialer{}

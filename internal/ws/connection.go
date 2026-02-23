@@ -38,7 +38,7 @@ func (c *Connection) ReadPump() {
 		if err != nil {
 			// Only log truly unexpected errors, not normal client disconnects
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure, websocket.CloseAbnormalClosure) {
-				log.Printf("Connection %s unexpected close: %v", c.id, err)
+				log.Printf("[Connection] Connection %s unexpected close: %v", c.id, err)
 			}
 			break
 		}
@@ -51,7 +51,7 @@ func (c *Connection) WritePump() {
 
 	for message := range c.send {
 		if err := c.conn.WriteJSON(message); err != nil {
-			log.Printf("Connection %s write error: %v", c.id, err)
+			log.Printf("[Connection] Connection %s write error: %v", c.id, err)
 			return
 		}
 	}
@@ -60,7 +60,7 @@ func (c *Connection) WritePump() {
 	if err := c.conn.WriteMessage(websocket.CloseMessage, []byte{}); err != nil {
 		// Don't log if connection was already closed
 		if !isConnectionClosedError(err) {
-			log.Printf("Connection %s: failed to send close message: %v", c.id, err)
+			log.Printf("[Connection] Connection %s: failed to send close message: %v", c.id, err)
 		}
 	}
 }
@@ -70,7 +70,7 @@ func (c *Connection) closeConn() {
 		if err := c.conn.Close(); err != nil {
 			// Don't log if connection was already closed
 			if !isConnectionClosedError(err) {
-				log.Printf("Connection %s close error: %v", c.id, err)
+				log.Printf("[Connection] Connection %s close error: %v", c.id, err)
 			}
 		}
 	})
