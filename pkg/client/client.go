@@ -148,7 +148,7 @@ func (c *Client) handleMessage(msg ws.Message) {
 		log.Printf("Breakpoint hit at %s:%d in %s", hit.Filename, hit.Line, hit.Function)
 
 	case ws.EventInitialBreakpoint:
-		var initial ws.InitialBreakpointEvent
+		var initial ws.InitialBreakpointHitEvent
 		if err := unmarshalData(msg.Data, &initial); err != nil {
 			log.Printf("Error parsing initialBreakpoint: %v", err)
 			return
