@@ -269,9 +269,6 @@ func (d *Debugger) ClearBreakpoint(pid int, line int) error {
 	if err != nil {
 		return fmt.Errorf("failed to get PC of line %v: %v", line, err)
 	}
-	// if _, err := syscall.PtracePokeData(d.DebugInfo.Target.PID, uintptr(pc), d.Breakpoints[pc]); err != nil {
-	// 	return fmt.Errorf("failed to write breakpoint into memory: %v", err)
-	// }
 	if _, err := syscall.PtracePokeData(pid, uintptr(pc), d.Breakpoints[pc]); err != nil {
 		return fmt.Errorf("failed to write breakpoint into memory: %v", err)
 	}
@@ -422,7 +419,7 @@ func (d *Debugger) breakpointHit(pid int) {
 		case "setBreakpoint":
 			if data, ok := cmd.Data.(map[string]any); ok {
 				if line, ok := data["line"].(int); ok {
-					if err := d.SetBreakpoint(d.DebugInfo.Target.PID, int(line)); err != nil {
+					if err := d.SetBreakpoint(pid, int(line)); err != nil {
 						log.Printf("[Debugger] Failed to set breakpoint at line %d: %v", int(line), err)
 					} else {
 						log.Printf("[Debugger] Breakpoint set at line %d while at breakpoint", int(line))
