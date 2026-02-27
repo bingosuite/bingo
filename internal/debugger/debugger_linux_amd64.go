@@ -12,7 +12,7 @@ import (
 
 	"github.com/bingosuite/bingo/internal/debuginfo"
 
-	sys "golang.org/x/sys/unix"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -116,7 +116,7 @@ func (d *Debugger) StartWithDebug(path string) {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = &sys.SysProcAttr{Ptrace: true}
+	cmd.SysProcAttr = &unix.SysProcAttr{Ptrace: true}
 
 	if err := cmd.Start(); err != nil {
 		log.Printf("[Debugger] Failed to start target: %v", err)
@@ -131,7 +131,7 @@ func (d *Debugger) StartWithDebug(path string) {
 	log.Printf("[Debugger] Started process with PID: %d and PGID: %d\n", dbInf.Target.PID, dbInf.Target.PGID)
 
 	// Enable tracking threads spawned from target and killing target once Bingo exits
-	if err := sys.PtraceSetOptions(dbInf.Target.PID, sys.PTRACE_O_TRACECLONE|ptraceOExitKill); err != nil {
+	if err := unix.PtraceSetOptions(dbInf.Target.PID, unix.PTRACE_O_TRACECLONE|ptraceOExitKill); err != nil {
 		log.Printf("[Debugger] Failed to set TRACECLONE and EXITKILL options on target: %v", err)
 		panic(err)
 	}
@@ -141,8 +141,8 @@ func (d *Debugger) StartWithDebug(path string) {
 	// We want to catch the initial SIGTRAP sent by process creation. When this is caught, we know that the target just started and we can ask the user where they want to set their breakpoints
 	// The message we print to the console will be removed in the future, it's just for debugging purposes for now.
 
-	var waitStatus sys.WaitStatus
-	if _, status := sys.Wait4(d.DebugInfo.Target.PID, &waitStatus, 0, nil); status != nil {
+	var waitStatus unix.WaitStatus
+	if _, status := unix.Wait4(d.DebugInfo.Target.PID, &waitStatus, 0, nil); status != nil {
 		log.Printf("[Debugger] Received SIGTRAP from process creation: %v", status)
 	}
 
@@ -168,8 +168,8 @@ func (d *Debugger) StartWithDebug(path string) {
 
 func (d *Debugger) Continue(pid int) {
 	// Read registers
-	var regs sys.PtraceRegs
-	if err := sys.PtraceGetRegs(pid, &regs); err != nil {
+	var regs unix.PtraceRegs
+	if err := unix.PtraceGetRegs(pid, &regs); err != nil {
 		log.Printf("[Debugger] Failed to get registers: %v", err)
 		panic(err)
 	}
@@ -185,22 +185,22 @@ func (d *Debugger) Continue(pid int) {
 	regs.Rip = bpAddr
 
 	// Rewind Rip by 1
-	if err := sys.PtraceSetRegs(pid, &regs); err != nil {
+	if err := unix.PtraceSetRegs(pid, &regs); err != nil {
 		log.Printf("[Debugger] Failed to restore registers: %v", err)
 		panic(err)
 	}
 
 	// Step over the instruction we previously removed to put the breakpoint
 	// TODO: decide if we want to call debugger.SingleStep() for this or just the system
-	if err := sys.PtraceSingleStep(pid); err != nil {
+	if err := unix.PtraceSingleStep(pid); err != nil {
 		log.Printf("[Debugger] Failed to single-step: %v", err)
 		panic(err)
 	}
 
 	// TODO: only trigger for step over signal
-	var waitStatus sys.WaitStatus
+	var waitStatus unix.WaitStatus
 	// Wait until the program lets us know we stepped over (handle cases where we get another signal which Wait4 would consume)
-	if _, err := sys.Wait4(pid, &waitStatus, 0, nil); err != nil {
+	if _, err := unix.Wait4(pid, &waitStatus, 0, nil); err != nil {
 		log.Printf("[Debugger] Failed to wait for the single-step: %v", err)
 		panic(err)
 	}
@@ -213,7 +213,7 @@ func (d *Debugger) Continue(pid int) {
 
 	// Resume execution
 	// TODO: decide if we want to call debugger.Continue() for this or just the system call
-	if err := sys.PtraceCont(pid, 0); err != nil {
+	if err := unix.PtraceCont(pid, 0); err != nil {
 		log.Printf("[Debugger] Failed to resume target execution: %v", err)
 		panic(err)
 	}
@@ -222,7 +222,7 @@ func (d *Debugger) Continue(pid int) {
 
 func (d *Debugger) SingleStep(pid int) {
 
-	if err := sys.PtraceSingleStep(pid); err != nil {
+	if err := unix.PtraceSingleStep(pid); err != nil {
 		log.Printf("[Debugger] Failed to single-step: %v", err)
 		panic(err)
 	}
@@ -233,7 +233,7 @@ func (d *Debugger) StopDebug() {
 	// Detach from the target process, letting it continue running
 	if d.DebugInfo.Target.PID > 0 {
 		log.Printf("[Debugger] Detaching from target process (PID: %d)", d.DebugInfo.Target.PID)
-		if err := sys.PtraceDetach(d.DebugInfo.Target.PID); err != nil {
+		if err := unix.PtraceDetach(d.DebugInfo.Target.PID); err != nil {
 			log.Printf("[Debugger] Failed to detach from target process: %v (might have already exited)", err)
 			panic(err)
 		}
@@ -254,10 +254,10 @@ func (d *Debugger) SetBreakpoint(pid int, line int) error {
 	}
 
 	original := make([]byte, len(bpCode))
-	if _, err := sys.PtracePeekData(pid, uintptr(pc), original); err != nil {
+	if _, err := unix.PtracePeekData(pid, uintptr(pc), original); err != nil {
 		return fmt.Errorf("failed to read original machine code into memory: %v for PID: %d", err, pid)
 	}
-	if _, err := sys.PtracePokeData(pid, uintptr(pc), bpCode); err != nil {
+	if _, err := unix.PtracePokeData(pid, uintptr(pc), bpCode); err != nil {
 		return fmt.Errorf("failed to write breakpoint into memory: %v", err)
 	}
 	d.Breakpoints[pc] = original
@@ -270,7 +270,7 @@ func (d *Debugger) ClearBreakpoint(pid int, line int) error {
 	if err != nil {
 		return fmt.Errorf("failed to get PC of line %v: %v", line, err)
 	}
-	if _, err := sys.PtracePokeData(pid, uintptr(pc), d.Breakpoints[pc]); err != nil {
+	if _, err := unix.PtracePokeData(pid, uintptr(pc), d.Breakpoints[pc]); err != nil {
 		return fmt.Errorf("failed to write breakpoint into memory: %v", err)
 	}
 	return nil
@@ -289,8 +289,8 @@ func (d *Debugger) mainDebugLoop() {
 		}
 
 		// Wait until any of the child processes of the target is interrupted or ends
-		var waitStatus sys.WaitStatus
-		wpid, err := sys.Wait4(-1*d.DebugInfo.Target.PGID, &waitStatus, sys.WNOHANG, nil)
+		var waitStatus unix.WaitStatus
+		wpid, err := unix.Wait4(-1*d.DebugInfo.Target.PGID, &waitStatus, unix.WNOHANG, nil)
 		if err != nil {
 			log.Printf("[Debugger] Failed to wait for the target or any of its threads: %v", err)
 			// Don't panic, just exit gracefully
@@ -318,13 +318,13 @@ func (d *Debugger) mainDebugLoop() {
 			}
 		} else {
 			// Only stop on breakpoints caused by our debugger, ignore any other event like spawning of new threads
-			if waitStatus.StopSignal() == sys.SIGTRAP && waitStatus.TrapCause() != sys.PTRACE_EVENT_CLONE {
+			if waitStatus.StopSignal() == unix.SIGTRAP && waitStatus.TrapCause() != unix.PTRACE_EVENT_CLONE {
 				//TODO: improve error handling and messages
 
 				d.breakpointHit(wpid)
 
 			} else {
-				if err := sys.PtraceCont(wpid, 0); err != nil {
+				if err := unix.PtraceCont(wpid, 0); err != nil {
 					log.Printf("[Debugger] Failed to resume target execution: %v for PID: %d", err, wpid)
 					// Don't panic, might have been detached
 					return
@@ -365,7 +365,7 @@ func (d *Debugger) initialBreakpointHit() {
 				}
 			case "continue":
 				log.Println("[Debugger] Continuing from initial breakpoint")
-				if err := sys.PtraceCont(d.DebugInfo.Target.PID, 0); err != nil {
+				if err := unix.PtraceCont(d.DebugInfo.Target.PID, 0); err != nil {
 					log.Printf("[Debugger] Failed to resume target execution: %v", err)
 					panic(err)
 				}
@@ -387,8 +387,8 @@ func (d *Debugger) initialBreakpointHit() {
 
 func (d *Debugger) breakpointHit(pid int) {
 	// Get register information to determine location
-	var regs sys.PtraceRegs
-	if err := sys.PtraceGetRegs(pid, &regs); err != nil {
+	var regs unix.PtraceRegs
+	if err := unix.PtraceGetRegs(pid, &regs); err != nil {
 		log.Printf("[Debugger] Failed to get registers: %v", err)
 		panic(err)
 	}
