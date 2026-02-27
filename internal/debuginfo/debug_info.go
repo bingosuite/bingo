@@ -5,7 +5,7 @@ import (
 	"debug/gosym"
 	"fmt"
 
-	sys "golang.org/x/sys/unix"
+	"golang.org/x/sys/unix"
 )
 
 type Target struct {
@@ -49,7 +49,7 @@ func NewDebugInfo(path string, pid int) (*DebugInfo, error) {
 	sourceFile, _, _ := symTable.PCToLine(symTable.LookupFunc("main.main").Entry)
 
 	// Need this to wait on threads
-	pgid, err := sys.Getpgid(pid)
+	pgid, err := unix.Getpgid(pid)
 	if err != nil {
 		return nil, fmt.Errorf("error getting PGID: %v", err)
 	}

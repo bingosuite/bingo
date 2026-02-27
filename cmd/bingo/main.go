@@ -5,7 +5,7 @@ import (
 	"os"
 	"os/signal"
 
-	sys "golang.org/x/sys/unix"
+	"golang.org/x/sys/unix"
 
 	"github.com/bingosuite/bingo/config"
 	websocket "github.com/bingosuite/bingo/internal/ws"
@@ -29,7 +29,7 @@ func main() {
 
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, sys.SIGTERM)
+	signal.Notify(sigChan, os.Interrupt, unix.SIGTERM)
 
 	// Wait for shutdown signal
 	<-sigChan
