@@ -6,7 +6,8 @@ system-info:
 
 # Build the BinGo binary
 build OS="linux" ARCH="amd64":
-    env GOOS={{OS}} GOARCH={{ARCH}} go build -o ./build/bingo/bingo_{{OS}}_{{ARCH}}{{ if OS == "windows" { ".exe" } else { "" } }} ./cmd/bingo
+	mkdir -p ./build/bingo
+	env GOOS={{OS}} GOARCH={{ARCH}} go build -o ./build/bingo/bingo_{{OS}}_{{ARCH}}{{ if OS == "windows" { ".exe" } else { "" } }} ./cmd/bingo
 
 # Build BinGo for all supported platforms (just example for now, we do not support all of these)
 build-all:
@@ -39,6 +40,7 @@ cli server="" session="":
 
 # Build the Target with maximum debugging information
 build-target: 
+	mkdir -p ./build/target
 	go build --gcflags="all=-N -l" -o ./build/target/target ./cmd/target
 
 # Run the target by itself
