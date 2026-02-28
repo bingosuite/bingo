@@ -109,21 +109,21 @@ func (d *linuxAMD64Debugger) StartWithDebug(path string) {
 		log.Printf("[Debugger] Failed to create debug info: %v", err)
 		panic(err)
 	}
-	log.Printf("[Debugger] Started process with PID: %d and PGID: %d\n", dbInf.Target.PID, dbInf.Target.PGID)
+	log.Printf("[Debugger] Started process with PID: %d and PGID: %d\n", dbInf.GetTarget().PID, dbInf.GetTarget().PGID)
 
 	// Enable tracking threads spawned from target and killing target once Bingo exits
-	if err := unix.PtraceSetOptions(dbInf.Target.PID, unix.PTRACE_O_TRACECLONE|ptraceOExitKill); err != nil {
+	if err := unix.PtraceSetOptions(dbInf.GetTarget().PID, unix.PTRACE_O_TRACECLONE|ptraceOExitKill); err != nil {
 		log.Printf("[Debugger] Failed to set TRACECLONE and EXITKILL options on target: %v", err)
 		panic(err)
 	}
 
-	d.DebugInfo = *dbInf
+	d.DebugInfo = dbInf
 
 	// We want to catch the initial SIGTRAP sent by process creation. When this is caught, we know that the target just started and we can ask the user where they want to set their breakpoints
 	// The message we print to the console will be removed in the future, it's just for debugging purposes for now.
 
 	var waitStatus unix.WaitStatus
-	if _, status := unix.Wait4(d.DebugInfo.Target.PID, &waitStatus, 0, nil); status != nil {
+	if _, status := unix.Wait4(d.DebugInfo.GetTarget().PID, &waitStatus, 0, nil); status != nil {
 		log.Printf("[Debugger] Received SIGTRAP from process creation: %v", status)
 	}
 
@@ -212,9 +212,9 @@ func (d *linuxAMD64Debugger) SingleStep(pid int) {
 
 func (d *linuxAMD64Debugger) StopDebug() {
 	// Detach from the target process, letting it continue running
-	if d.DebugInfo.Target.PID > 0 {
-		log.Printf("[Debugger] Detaching from target process (PID: %d)", d.DebugInfo.Target.PID)
-		if err := unix.PtraceDetach(d.DebugInfo.Target.PID); err != nil {
+	if d.DebugInfo.GetTarget().PID > 0 {
+		log.Printf("[Debugger] Detaching from target process (PID: %d)", d.DebugInfo.GetTarget().PID)
+		if err := unix.PtraceDetach(d.DebugInfo.GetTarget().PID); err != nil {
 			log.Printf("[Debugger] Failed to detach from target process: %v (might have already exited)", err)
 			panic(err)
 		}
@@ -229,7 +229,7 @@ func (d *linuxAMD64Debugger) StopDebug() {
 
 func (d *linuxAMD64Debugger) SetBreakpoint(pid int, line int) error {
 
-	pc, _, err := d.DebugInfo.LineToPC(d.DebugInfo.Target.Path, line)
+	pc, _, err := d.DebugInfo.LineToPC(d.DebugInfo.GetTarget().Path, line)
 	if err != nil {
 		return fmt.Errorf("failed to get PC of line %v: %v", line, err)
 	}
@@ -247,7 +247,7 @@ func (d *linuxAMD64Debugger) SetBreakpoint(pid int, line int) error {
 
 func (d *linuxAMD64Debugger) ClearBreakpoint(pid int, line int) error {
 
-	pc, _, err := d.DebugInfo.LineToPC(d.DebugInfo.Target.Path, line)
+	pc, _, err := d.DebugInfo.LineToPC(d.DebugInfo.GetTarget().Path, line)
 	if err != nil {
 		return fmt.Errorf("failed to get PC of line %v: %v", line, err)
 	}
@@ -271,7 +271,7 @@ func (d *linuxAMD64Debugger) mainDebugLoop() {
 
 		// Wait until any of the child processes of the target is interrupted or ends
 		var waitStatus unix.WaitStatus
-		wpid, err := unix.Wait4(-1*d.DebugInfo.Target.PGID, &waitStatus, unix.WNOHANG, nil)
+		wpid, err := unix.Wait4(-1*d.DebugInfo.GetTarget().PGID, &waitStatus, unix.WNOHANG, nil)
 		if err != nil {
 			log.Printf("[Debugger] Failed to wait for the target or any of its threads: %v", err)
 			// Don't panic, just exit gracefully
@@ -285,8 +285,8 @@ func (d *linuxAMD64Debugger) mainDebugLoop() {
 		}
 
 		if waitStatus.Exited() {
-			if wpid == d.DebugInfo.Target.PID { // If target exited, terminate
-				log.Printf("[Debugger] Target %v execution completed", d.DebugInfo.Target.Path)
+			if wpid == d.DebugInfo.GetTarget().PID { // If target exited, terminate
+				log.Printf("[Debugger] Target %v execution completed", d.DebugInfo.GetTarget().Path)
 				// Signal the end of debug session to hub
 				select {
 				case d.EndDebugSession <- true:
@@ -319,7 +319,7 @@ func (d *linuxAMD64Debugger) mainDebugLoop() {
 func (d *linuxAMD64Debugger) initialBreakpointHit() {
 	// Create initial breakpoint event
 	event := InitialBreakpointHitEvent{
-		PID: d.DebugInfo.Target.PID,
+		PID: d.DebugInfo.GetTarget().PID,
 	}
 
 	// Send initial breakpoint hit event to hub
@@ -336,7 +336,7 @@ func (d *linuxAMD64Debugger) initialBreakpointHit() {
 			case "setBreakpoint":
 				if data, ok := cmd.Data.(map[string]any); ok {
 					if line, ok := data["line"].(int); ok {
-						if err := d.SetBreakpoint(d.DebugInfo.Target.PID, int(line)); err != nil {
+						if err := d.SetBreakpoint(d.DebugInfo.GetTarget().PID, int(line)); err != nil {
 							log.Printf("[Debugger] Failed to set breakpoint at line %d: %v", int(line), err)
 							panic(err)
 						} else {
@@ -346,7 +346,7 @@ func (d *linuxAMD64Debugger) initialBreakpointHit() {
 				}
 			case "continue":
 				log.Println("[Debugger] Continuing from initial breakpoint")
-				if err := unix.PtraceCont(d.DebugInfo.Target.PID, 0); err != nil {
+				if err := unix.PtraceCont(d.DebugInfo.GetTarget().PID, 0); err != nil {
 					log.Printf("[Debugger] Failed to resume target execution: %v", err)
 					panic(err)
 				}
