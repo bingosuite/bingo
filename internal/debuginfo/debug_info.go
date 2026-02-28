@@ -8,6 +8,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// TODO: maybe put all of this under the debugger package. either way will need to refactor to account for cross-compilation
+
 type Target struct {
 	Path string
 	PID  int
