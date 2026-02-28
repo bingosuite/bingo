@@ -23,7 +23,7 @@ const (
 	ptraceOExitKill = 0x100000 // Set option to kill the target process when Bingo exits to true
 )
 
-type Debugger struct {
+type linuxAMD64Debugger struct {
 	DebugInfo       debuginfo.DebugInfo
 	Breakpoints     map[uint64][]byte
 	EndDebugSession chan bool
@@ -34,32 +34,13 @@ type Debugger struct {
 	DebugCommand         chan DebugCommand
 }
 
-// BreakpointEvent represents a breakpoint hit event
-type BreakpointEvent struct {
-	PID      int    `json:"pid"`
-	Filename string `json:"filename"`
-	Line     int    `json:"line"`
-	Function string `json:"function"`
-}
-
-// InitialBreakpointHitEvent represents the initial breakpoint hit when debugging starts
-type InitialBreakpointHitEvent struct {
-	PID int `json:"pid"`
-}
-
-// DebugCommand represents commands that can be sent to the debugger
-type DebugCommand struct {
-	Type string `json:"type"` // "continue", "step", "quit", "setBreakpoint"
-	Data any    `json:"data,omitempty"`
-}
-
-func NewDebugger() *Debugger {
-	return &Debugger{
+func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan InitialBreakpointHitEvent, debugCommand chan DebugCommand, endDebugSession chan bool) Debugger {
+	return &linuxAMD64Debugger{
 		Breakpoints:          make(map[uint64][]byte),
-		EndDebugSession:      make(chan bool, 1),
-		BreakpointHit:        make(chan BreakpointEvent, 1),
-		InitialBreakpointHit: make(chan InitialBreakpointHitEvent, 1),
-		DebugCommand:         make(chan DebugCommand, 1),
+		EndDebugSession:      endDebugSession,
+		BreakpointHit:        breakpointHit,
+		InitialBreakpointHit: initialBreakpointHit,
+		DebugCommand:         debugCommand,
 	}
 }
 
@@ -97,7 +78,7 @@ func validateTargetPath(path string) (string, error) {
 	return abs, nil
 }
 
-func (d *Debugger) StartWithDebug(path string) {
+func (d *linuxAMD64Debugger) StartWithDebug(path string) {
 	// Lock this goroutine to the current OS thread.
 	// Linux ptrace requires that all ptrace calls for a given traced process originate from the same OS thread that performed the initial attach.
 	// Without this, the Go scheduler may migrate the goroutine to a different OS thread, causing ptrace calls to fail with ESRCH ("no such process").
@@ -107,7 +88,7 @@ func (d *Debugger) StartWithDebug(path string) {
 	// Validate and sanitise the user-supplied path before passing it to exec.
 	validatedPath, err := validateTargetPath(path)
 	if err != nil {
-		log.Printf("[Debugger] Rejected target path %q: %v", path, err)
+		log.Printf("[linuxAMD64Debugger] Rejected target path %q: %v", path, err)
 		panic(err)
 	}
 
@@ -166,7 +147,7 @@ func (d *Debugger) StartWithDebug(path string) {
 
 }
 
-func (d *Debugger) Continue(pid int) {
+func (d *linuxAMD64Debugger) Continue(pid int) {
 	// Read registers
 	var regs unix.PtraceRegs
 	if err := unix.PtraceGetRegs(pid, &regs); err != nil {
@@ -220,7 +201,7 @@ func (d *Debugger) Continue(pid int) {
 
 }
 
-func (d *Debugger) SingleStep(pid int) {
+func (d *linuxAMD64Debugger) SingleStep(pid int) {
 
 	if err := unix.PtraceSingleStep(pid); err != nil {
 		log.Printf("[Debugger] Failed to single-step: %v", err)
@@ -229,7 +210,7 @@ func (d *Debugger) SingleStep(pid int) {
 
 }
 
-func (d *Debugger) StopDebug() {
+func (d *linuxAMD64Debugger) StopDebug() {
 	// Detach from the target process, letting it continue running
 	if d.DebugInfo.Target.PID > 0 {
 		log.Printf("[Debugger] Detaching from target process (PID: %d)", d.DebugInfo.Target.PID)
@@ -246,7 +227,7 @@ func (d *Debugger) StopDebug() {
 	}
 }
 
-func (d *Debugger) SetBreakpoint(pid int, line int) error {
+func (d *linuxAMD64Debugger) SetBreakpoint(pid int, line int) error {
 
 	pc, _, err := d.DebugInfo.LineToPC(d.DebugInfo.Target.Path, line)
 	if err != nil {
@@ -264,7 +245,7 @@ func (d *Debugger) SetBreakpoint(pid int, line int) error {
 	return nil
 }
 
-func (d *Debugger) ClearBreakpoint(pid int, line int) error {
+func (d *linuxAMD64Debugger) ClearBreakpoint(pid int, line int) error {
 
 	pc, _, err := d.DebugInfo.LineToPC(d.DebugInfo.Target.Path, line)
 	if err != nil {
@@ -277,7 +258,7 @@ func (d *Debugger) ClearBreakpoint(pid int, line int) error {
 }
 
 // TODO: pass the correct pid to the debugger methods, keep an eye on this
-func (d *Debugger) mainDebugLoop() {
+func (d *linuxAMD64Debugger) mainDebugLoop() {
 	for {
 		// Check if we should stop debugging
 		select {
@@ -335,7 +316,7 @@ func (d *Debugger) mainDebugLoop() {
 }
 
 // TODO: maybe refactor later
-func (d *Debugger) initialBreakpointHit() {
+func (d *linuxAMD64Debugger) initialBreakpointHit() {
 	// Create initial breakpoint event
 	event := InitialBreakpointHitEvent{
 		PID: d.DebugInfo.Target.PID,
@@ -385,7 +366,7 @@ func (d *Debugger) initialBreakpointHit() {
 	}
 }
 
-func (d *Debugger) breakpointHit(pid int) {
+func (d *linuxAMD64Debugger) breakpointHit(pid int) {
 	// Get register information to determine location
 	var regs unix.PtraceRegs
 	if err := unix.PtraceGetRegs(pid, &regs); err != nil {

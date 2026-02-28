@@ -8,7 +8,6 @@ import (
 	"sync"
 
 	"github.com/bingosuite/bingo/config"
-	"github.com/bingosuite/bingo/internal/debugger"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 )
@@ -150,8 +149,7 @@ func (s *Server) CreateHub(sessionID string) (*Hub, error) {
 		return nil, fmt.Errorf("max sessions (%d) reached", s.config.MaxSessions)
 	}
 
-	d := debugger.NewDebugger()
-	hub := NewHub(sessionID, s.config.IdleTimeout, d)
+	hub := NewHub(sessionID, s.config.IdleTimeout)
 	hub.onShutdown = s.removeHub // Set callback for cleanup
 	s.hubs[sessionID] = hub
 	go hub.Run()
