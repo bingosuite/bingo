@@ -4,8 +4,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
-
-	"golang.org/x/sys/unix"
+	"syscall"
 
 	"github.com/bingosuite/bingo/config"
 	websocket "github.com/bingosuite/bingo/internal/ws"
@@ -29,7 +28,8 @@ func main() {
 
 	// Set up signal handling for graceful shutdown
 	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, unix.SIGTERM)
+	// Use syscall.SIGTERM to handle graceful shutdown from docker, kill, systemctl stop, etc
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	// Wait for shutdown signal
 	<-sigChan
