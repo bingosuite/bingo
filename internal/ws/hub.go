@@ -32,22 +32,39 @@ type Hub struct {
 	idleTimeout  time.Duration
 	lastActivity time.Time
 
-	debugger *debugger.Debugger
+	dbg debugger.Debugger
+
+	// Debugger channels owned by the hub
+	breakpointHit        chan debugger.BreakpointEvent
+	initialBreakpointHit chan debugger.InitialBreakpointHitEvent
+	debugCommand         chan debugger.DebugCommand
+	endDebugSession      chan bool
 
 	mu sync.RWMutex
 }
 
-func NewHub(sessionID string, idleTimeout time.Duration, dbg *debugger.Debugger) *Hub {
+func NewHub(sessionID string, idleTimeout time.Duration) *Hub {
+	breakpointHit := make(chan debugger.BreakpointEvent, 1)
+	initialBreakpointHit := make(chan debugger.InitialBreakpointHitEvent, 1)
+	debugCommand := make(chan debugger.DebugCommand, 1)
+	endDebugSession := make(chan bool, 1)
+
+	dbg := debugger.NewDebugger(breakpointHit, initialBreakpointHit, debugCommand, endDebugSession)
+
 	return &Hub{
-		sessionID:    sessionID,
-		connections:  make(map[*Connection]struct{}),
-		register:     make(chan *Connection),
-		unregister:   make(chan *Connection),
-		events:       make(chan Message, eventBufferSize),
-		commands:     make(chan Message, commandBufferSize),
-		idleTimeout:  idleTimeout,
-		lastActivity: time.Now(),
-		debugger:     dbg,
+		sessionID:            sessionID,
+		connections:          make(map[*Connection]struct{}),
+		register:             make(chan *Connection),
+		unregister:           make(chan *Connection),
+		events:               make(chan Message, eventBufferSize),
+		commands:             make(chan Message, commandBufferSize),
+		idleTimeout:          idleTimeout,
+		lastActivity:         time.Now(),
+		dbg:                  dbg,
+		breakpointHit:        breakpointHit,
+		initialBreakpointHit: initialBreakpointHit,
+		debugCommand:         debugCommand,
+		endDebugSession:      endDebugSession,
 	}
 }
 
@@ -112,7 +129,7 @@ func (h *Hub) Run() {
 			log.Printf("[Hub] Hub %s command: %s", h.sessionID, cmd.Type)
 			h.handleCommand(cmd)
 
-		case <-h.debugger.EndDebugSession:
+		case <-h.endDebugSession:
 			log.Printf("[Hub] Debugger signaled end of session %s, shutting down hub", h.sessionID)
 			h.shutdown()
 		}
@@ -146,7 +163,7 @@ func (h *Hub) shutdown() {
 func (h *Hub) listenForDebuggerEvents() {
 	for {
 		select {
-		case bpEvent := <-h.debugger.BreakpointHit:
+		case bpEvent := <-h.breakpointHit:
 			log.Printf("[Hub] [Debugger Event] Breakpoint hit at %s:%d in %s", bpEvent.Filename, bpEvent.Line, bpEvent.Function)
 
 			// Create and send breakpoint hit event to all clients
@@ -192,7 +209,7 @@ func (h *Hub) listenForDebuggerEvents() {
 
 			h.Broadcast(stateMessage)
 
-		case initialBpEvent := <-h.debugger.InitialBreakpointHit:
+		case initialBpEvent := <-h.initialBreakpointHit:
 			log.Printf("[Hub] [Debugger Event] Initial breakpoint hit (PID: %d, session: %s)", initialBpEvent.PID, h.sessionID)
 
 			// Create and send initial breakpoint event to all clients
@@ -236,7 +253,7 @@ func (h *Hub) listenForDebuggerEvents() {
 
 			h.Broadcast(stateMessage)
 
-		case <-h.debugger.EndDebugSession:
+		case <-h.endDebugSession:
 			log.Println("[Hub] Debugger event listener ending, sending state update to ready")
 			h.sendStateUpdate(StateReady)
 			return
@@ -259,7 +276,7 @@ func (h *Hub) handleCommand(cmd Message) {
 		go h.listenForDebuggerEvents()
 
 		// Start the debug session
-		go h.debugger.StartWithDebug(startDebugCmd.TargetPath)
+		go h.dbg.StartWithDebug(startDebugCmd.TargetPath)
 
 	case CmdContinue:
 		var continueCmd ContinueCmd
@@ -360,7 +377,7 @@ func (h *Hub) sendStateUpdate(state State) {
 // Helper method to send commands to debugger
 func (h *Hub) sendCommandToDebugger(cmd debugger.DebugCommand, cmdName string) {
 	select {
-	case h.debugger.DebugCommand <- cmd:
+	case h.debugCommand <- cmd:
 		log.Printf("[Hub] [Command] %s command sent to debugger (session: %s)", cmdName, h.sessionID)
 	default:
 		log.Printf("[Hub] [Error] Failed to send %s command to debugger - channel full", cmdName)
