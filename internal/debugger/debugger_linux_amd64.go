@@ -88,7 +88,7 @@ func (d *linuxAMD64Debugger) StartWithDebug(path string) {
 	// Validate and sanitise the user-supplied path before passing it to exec.
 	validatedPath, err := validateTargetPath(path)
 	if err != nil {
-		log.Printf("[linuxAMD64Debugger] Rejected target path %q: %v", path, err)
+		log.Printf("[Debugger] Rejected target path %q: %v", path, err)
 		panic(err)
 	}
 

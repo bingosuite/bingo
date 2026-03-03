@@ -41,7 +41,9 @@
         "go.testTimeout": "30s"
       },
       "extensions": [
-        "golang.go"
+        "golang.go",
+        "aaron-bond.better-comments",
+        "usernamehw.errorlens"
       ]
     }
   }
