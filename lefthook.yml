@@ -2,43 +2,29 @@
 # Documentation: https://lefthook.dev/configuration/
 
 pre-commit:
-  parallel: true
+  parallel: false
   commands:
-    format:
+    imports:
       glob: "*.go"
-      run: gofmt -w {staged_files} && git add {staged_files}
+      run: goimports -w {staged_files} && git add {staged_files}
 
     vet:
       glob: "*.go"
       run: go vet ./...
 
-    imports:
-      glob: "*.go"
-      run: |
-        if command -v goimports &> /dev/null; then
-          goimports -w {staged_files} && git add {staged_files}
-        fi
-
     lint:
       glob: "*.go"
-      run: |
-        if command -v golangci-lint &> /dev/null; then
-          golangci-lint run --new-from-rev=HEAD ./...
-        fi
+      run: golangci-lint run --new-from-rev=HEAD ./...
 
 pre-push:
   commands:
     vet:
-      run: go vet ./cmd/bingo
+      run: go vet ./...
 
     build:
-      run: just build
+      run: go build -o ./build/bingo/bingo ./cmd/bingo
 
 commit-msg:
   commands:
     check-message:
-      run: |
-        if [ ! -f ./build/githook/commitlint ]; then
-          go build -o ./build/githook/commitlint ./cmd/githook
-        fi
-        ./build/githook/commitlint {1}
+      run: go run ./cmd/githook {1}
