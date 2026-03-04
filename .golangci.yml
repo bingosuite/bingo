@@ -1,0 +1,13 @@
+version: "2"
+
+linters:
+  enable:
+    - gocyclo
+    - gocognit
+
+  settings:
+    gocyclo:
+      min-complexity: 15
+
+    gocognit:
+      min-complexity: 20
