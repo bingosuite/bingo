@@ -21,6 +21,6 @@ type DebugInfo interface {
 	// LineToPC returns the memory address, function or an error from the filename and line number
 	LineToPC(file string, line int) (pc uint64, fn *gosym.Func, err error)
 
-	// LookupFunc returns the Func struct who's name corresponds to the value of fn
+	// LookupFunc returns the Func struct whose name corresponds to the value of fn
 	LookupFunc(fn string) *gosym.Func
 }
