@@ -4,10 +4,102 @@ package debugger
 #cgo LDFLAGS: -framework CoreFoundation
 #include <mach/mach.h>
 #include <sys/types.h>
+#include <mach/mach_vm.h>
+#include <mach/arm/thread_state.h>
+#include <string.h>
+
+// Standard Mach exception message structures
+typedef struct {
+    mach_msg_header_t Head;
+    mach_msg_body_t msgh_body;
+    mach_msg_ool_ports_descriptor_t ool_ports;
+    NDR_record_t nondescript;
+    exception_type_t exception;
+    mach_msg_type_number_t code_count;
+    integer_t codes[2];
+    mach_port_t thread_port;
+    mach_port_t task_port;
+} exc_msg_t;
+
+typedef struct {
+    mach_msg_header_t Head;
+    NDR_record_t nondescript;
+    kern_return_t RetCode;
+} exc_msg_reply_t;
 
 // Wrapper to get mach_task_self() value
 static mach_port_t get_mach_task_self() {
     return mach_task_self();
+}
+
+// Wrapper for function-like macro not directly callable from cgo.
+static mach_msg_bits_t get_reply_bits(mach_msg_bits_t bits) {
+	return MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(bits), 0);
+}
+
+// Wrapper to avoid cgo integer conversion pitfalls for exception behavior flags.
+static kern_return_t set_debug_exception_ports(task_t task, mach_port_t exc_port) {
+	return task_set_exception_ports(
+		task,
+		EXC_MASK_BREAKPOINT | EXC_MASK_BAD_INSTRUCTION,
+		exc_port,
+		EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
+		THREAD_STATE_NONE
+	);
+}
+
+static kern_return_t clear_debug_exception_ports(task_t task) {
+	return task_set_exception_ports(
+		task,
+		EXC_MASK_BREAKPOINT | EXC_MASK_BAD_INSTRUCTION,
+		MACH_PORT_NULL,
+		0,
+		THREAD_STATE_NONE
+	);
+}
+
+// Fetch first task thread and clean up thread list allocation from task_threads.
+static kern_return_t get_first_thread(task_t task, thread_act_t *out_thread) {
+	thread_act_array_t thread_list;
+	mach_msg_type_number_t thread_count;
+	kern_return_t kr = task_threads(task, &thread_list, &thread_count);
+	if (kr != KERN_SUCCESS) return kr;
+	if (thread_count == 0) {
+		vm_deallocate(mach_task_self(), (vm_address_t)thread_list, 0);
+		return KERN_FAILURE;
+	}
+
+	*out_thread = thread_list[0];
+	vm_deallocate(
+		mach_task_self(),
+		(vm_address_t)thread_list,
+		(vm_size_t)(thread_count * sizeof(thread_act_t))
+	);
+	return KERN_SUCCESS;
+}
+
+kern_return_t get_arm64_thread_state(thread_act_t thr, arm_thread_state64_t *state, mach_msg_type_number_t *count) {
+    *count = ARM_THREAD_STATE64_COUNT;
+    return thread_get_state(thr, ARM_THREAD_STATE64, (thread_state_t)state, count);
+}
+
+kern_return_t set_arm64_thread_state(thread_act_t thr, arm_thread_state64_t *state, mach_msg_type_number_t count) {
+    return thread_set_state(thr, ARM_THREAD_STATE64, (thread_state_t)state, count);
+}
+
+kern_return_t read_word(task_t task, mach_vm_address_t addr, uint32_t *out) {
+    vm_offset_t data;
+    mach_msg_type_number_t sz;
+    kern_return_t kr = mach_vm_read(task, addr, sizeof(uint32_t), &data, &sz);
+    if (kr != KERN_SUCCESS) return kr;
+    if (sz < sizeof(uint32_t)) { mach_vm_deallocate(mach_task_self(), data, sz); return KERN_FAILURE; }
+    memcpy(out, (void*)data, sizeof(uint32_t));
+    mach_vm_deallocate(mach_task_self(), data, sz);
+    return KERN_SUCCESS;
+}
+
+kern_return_t write_word(task_t task, mach_vm_address_t addr, uint32_t val) {
+    return mach_vm_write(task, addr, (vm_offset_t)&val, sizeof(uint32_t));
 }
 */
 import "C"
@@ -20,27 +112,15 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
-	"time"
 	"unsafe"
 
 	"github.com/bingosuite/bingo/internal/debuginfo"
-
-	"golang.org/x/sys/unix"
+	// for C.mach_* constants
 )
 
 var (
 	// ARM64 breakpoint instruction (BRK #0) - 4 bytes
 	bpCode = []byte{0x00, 0x00, 0x20, 0xd4}
-)
-
-// Darwin ptrace request types (for process control only)
-const (
-	PT_CONTINUE = 7  // Continue the child
-	PT_STEP     = 9  // Single step the child
-	PT_DETACH   = 11 // Stop tracing a process
-	PT_GETREGS  = 15 // Get all registers
-	PT_SETREGS  = 16 // Set all registers
 )
 
 // VM protection flags (used with mach_vm_protect)
@@ -72,6 +152,10 @@ type darwinARM64Debugger struct {
 	BreakpointHit        chan BreakpointEvent
 	InitialBreakpointHit chan InitialBreakpointHitEvent
 	DebugCommand         chan DebugCommand
+
+	task       C.mach_port_t
+	mainThread C.thread_act_t
+	excPort    C.mach_port_t
 }
 
 func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan InitialBreakpointHitEvent, debugCommand chan DebugCommand, endDebugSession chan bool) Debugger {
@@ -85,7 +169,7 @@ func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan I
 }
 
 func (d *darwinARM64Debugger) computeSlide(pid int) error {
-	regs, err := ptraceGetRegs(pid)
+	regs, err := d.getRegs()
 	if err != nil {
 		return err
 	}
@@ -137,249 +221,254 @@ func validateTargetPath(path string) (string, error) {
 	return abs, nil
 }
 
-// ptrace wraps the ptrace system call for Darwin
-func ptrace(request int, pid int, addr uintptr, data uintptr) error {
-	_, _, errno := syscall.Syscall6(syscall.SYS_PTRACE, uintptr(request), uintptr(pid), addr, data, 0, 0)
-	if errno != 0 {
-		return errno
+func (d *darwinARM64Debugger) getRegs() (*ARM64ThreadState, error) {
+	var st ARM64ThreadState
+	count := C.mach_msg_type_number_t(C.ARM_THREAD_STATE64_COUNT)
+	kr := C.get_arm64_thread_state(d.mainThread, (*C.arm_thread_state64_t)(unsafe.Pointer(&st)), &count)
+	if kr != C.KERN_SUCCESS {
+		return nil, fmt.Errorf("thread_get_state failed: %d", kr)
+	}
+	return &st, nil
+}
+
+func (d *darwinARM64Debugger) setRegs(st *ARM64ThreadState) error {
+	count := C.mach_msg_type_number_t(C.ARM_THREAD_STATE64_COUNT)
+	kr := C.set_arm64_thread_state(d.mainThread, (*C.arm_thread_state64_t)(unsafe.Pointer(st)), count)
+	if kr != C.KERN_SUCCESS {
+		return fmt.Errorf("thread_set_state failed: %d", kr)
 	}
 	return nil
 }
 
-// ptraceGetRegs retrieves ARM64 register state from the target process
-func ptraceGetRegs(pid int) (*ARM64ThreadState, error) {
-	var regs ARM64ThreadState
-	err := ptrace(PT_GETREGS, pid, uintptr(unsafe.Pointer(&regs)), 0)
-	if err != nil {
-		return nil, err
+func (d *darwinARM64Debugger) readWord(addr uint64) ([]byte, error) {
+	var word C.uint32_t
+	kr := C.read_word(d.task, C.mach_vm_address_t(addr), &word)
+	if kr != C.KERN_SUCCESS {
+		return nil, fmt.Errorf("read_word failed: %d", kr)
 	}
-	return &regs, nil
+	v := uint32(word)
+	return []byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)}, nil
 }
 
-// ptraceSetRegs sets ARM64 register state in the target process
-func ptraceSetRegs(pid int, regs *ARM64ThreadState) error {
-	return ptrace(PT_SETREGS, pid, uintptr(unsafe.Pointer(regs)), 0)
-}
-
-// ptracePeekData reads 4 bytes from the target process
-func ptracePeekData(pid int, addr uintptr) ([]byte, error) {
-	data, _, errno := syscall.Syscall6(
-		syscall.SYS_PTRACE,
-		uintptr(unix.PT_READ_D),
-		uintptr(pid),
-		addr,
-		0, 0, 0,
-	)
-
-	if errno != 0 {
-		return nil, errno
-	}
-
-	word := uint32(data)
-
-	return []byte{
-		byte(word),
-		byte(word >> 8),
-		byte(word >> 16),
-		byte(word >> 24),
-	}, nil
-}
-
-// ptracePokeData writes 4 bytes to the target process
-func ptracePokeData(pid int, addr uintptr, data []byte) error {
+func (d *darwinARM64Debugger) writeWord(addr uint64, data []byte) error {
 	if len(data) < 4 {
-		padded := make([]byte, 4)
-		copy(padded, data)
-		data = padded
+		tmp := make([]byte, 4)
+		copy(tmp, data)
+		data = tmp
 	}
-
-	word :=
-		uintptr(data[0]) |
-			uintptr(data[1])<<8 |
-			uintptr(data[2])<<16 |
-			uintptr(data[3])<<24
-
-	_, _, errno := syscall.Syscall6(
-		syscall.SYS_PTRACE,
-		uintptr(unix.PT_WRITE_D),
-		uintptr(pid),
-		addr,
-		word,
-		0, 0,
-	)
-
-	if errno != 0 {
-		return errno
+	v := uint32(data[0]) | uint32(data[1])<<8 | uint32(data[2])<<16 | uint32(data[3])<<24
+	kr := C.write_word(d.task, C.mach_vm_address_t(addr), C.uint32_t(v))
+	if kr != C.KERN_SUCCESS {
+		return fmt.Errorf("write_word failed: %d", kr)
 	}
-
 	return nil
 }
 
-// ptraceCont continues execution of the target process
-func ptraceCont(pid int, signal int) error {
-	return ptrace(PT_CONTINUE, pid, 1, uintptr(signal))
+// exceptionLoop runs in its own OS thread and handles all Mach exceptions
+func (d *darwinARM64Debugger) exceptionLoop() {
+	runtime.LockOSThread() // Mach msg requires fixed thread
+	defer runtime.UnlockOSThread()
+
+	for {
+		select {
+		case <-d.EndDebugSession:
+			log.Println("[Debugger] Exception loop ending")
+			return
+		default:
+		}
+
+		var excMsg C.exc_msg_t
+		var reply C.exc_msg_reply_t
+
+		// Receive exception message (blocks until breakpoint hit)
+		kr := C.mach_msg(
+			(*C.mach_msg_header_t)(unsafe.Pointer(&excMsg)),
+			C.MACH_RCV_MSG,
+			0,
+			C.mach_msg_size_t(unsafe.Sizeof(excMsg)),
+			d.excPort,
+			C.MACH_MSG_TIMEOUT_NONE,
+			C.MACH_PORT_NULL,
+		)
+		if kr != C.MACH_MSG_SUCCESS {
+			log.Printf("[Debugger] mach_msg receive failed: %d", kr)
+			continue
+		}
+
+		// Check if it's a breakpoint exception
+		if excMsg.exception == C.EXC_BREAKPOINT || excMsg.exception == C.EXC_BAD_INSTRUCTION {
+			thread := C.thread_act_t(excMsg.thread_port)
+			if d.mainThread == 0 {
+				d.mainThread = thread // Cache first thread seen
+				log.Printf("[Debugger] Cached main thread: %d", thread)
+			}
+
+			// Dispatch to your existing handlers
+			if d.DebugInfo == nil {
+				d.initialBreakpointHit()
+			} else {
+				d.breakpointHit(int(d.DebugInfo.GetTarget().PID))
+			}
+
+			// IMPORTANT: After your handler returns (Continue/step called),
+			// send reply to resume the thread
+			reply.Head.msgh_bits = C.get_reply_bits(excMsg.Head.msgh_bits)
+			reply.Head.msgh_remote_port = excMsg.Head.msgh_remote_port
+			reply.Head.msgh_size = C.mach_msg_size_t(unsafe.Sizeof(reply))
+			reply.Head.msgh_local_port = excMsg.Head.msgh_local_port
+			reply.RetCode = C.KERN_SUCCESS
+
+			replyKr := C.mach_msg(
+				(*C.mach_msg_header_t)(unsafe.Pointer(&reply)),
+				C.MACH_SEND_MSG,
+				C.mach_msg_size_t(unsafe.Sizeof(reply)),
+				0,
+				C.MACH_PORT_NULL,
+				C.MACH_MSG_TIMEOUT_NONE,
+				C.MACH_PORT_NULL,
+			)
+			if replyKr != C.MACH_MSG_SUCCESS {
+				log.Printf("[Debugger] Failed to send exception reply: %d", replyKr)
+			}
+		} else {
+			// Unknown exception - just resume
+			reply.Head.msgh_bits = C.get_reply_bits(excMsg.Head.msgh_bits)
+			reply.Head.msgh_remote_port = excMsg.Head.msgh_remote_port
+			reply.Head.msgh_size = C.mach_msg_size_t(unsafe.Sizeof(reply))
+			reply.RetCode = C.KERN_SUCCESS
+			C.mach_msg((*C.mach_msg_header_t)(unsafe.Pointer(&reply)), C.MACH_SEND_MSG, C.mach_msg_size_t(unsafe.Sizeof(reply)), 0, C.MACH_PORT_NULL, C.MACH_MSG_TIMEOUT_NONE, C.MACH_PORT_NULL)
+		}
+	}
 }
 
-// ptraceSingleStep executes a single instruction
-func ptraceSingleStep(pid int) error {
-	return ptrace(PT_STEP, pid, 1, 0)
-}
-
-// ptraceDetach detaches from the target process
-func ptraceDetach(pid int) error {
-	return ptrace(PT_DETACH, pid, 0, 0)
-}
-
-// StartWithDebug launches the target binary at the given path under debugger control
 func (d *darwinARM64Debugger) StartWithDebug(path string) {
-	// Lock this goroutine to the current OS thread.
-	// Darwin ptrace requires that all ptrace calls for a given traced process originate from the same OS thread that performed the initial attach.
-	// Without this, the Go scheduler may migrate the goroutine to a different OS thread, causing ptrace calls to fail.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	// Validate and sanitise the user-supplied path before passing it to exec.
 	validatedPath, err := validateTargetPath(path)
 	if err != nil {
 		log.Printf("[Debugger] Rejected target path %q: %v", path, err)
 		panic(err)
 	}
 
-	// Set up target for execution
-	// NOTE: We don't use Ptrace: true here because we'll use Mach VM for debugging instead
-	// Using both ptrace and Mach causes conflicts on macOS
 	cmd := exec.Command(validatedPath)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-
-	cmd.SysProcAttr = &unix.SysProcAttr{
-		Ptrace: true,
-	}
-
 	if err := cmd.Start(); err != nil {
 		panic(err)
 	}
 
+	// Get task port
+	var task C.mach_port_t
+	kr := C.task_for_pid(C.get_mach_task_self(), C.int(cmd.Process.Pid), &task)
+	if kr != C.KERN_SUCCESS {
+		panic(fmt.Errorf("task_for_pid failed: %d", kr))
+	}
+	d.task = task
+
+	// Set up exception port (your existing code - perfect)
+	var excPort C.mach_port_t
+	kr = C.mach_port_allocate(C.get_mach_task_self(), C.MACH_PORT_RIGHT_RECEIVE, &excPort)
+	if kr != C.KERN_SUCCESS {
+		panic(fmt.Errorf("mach_port_allocate failed: %d", kr))
+	}
+	kr = C.mach_port_insert_right(C.get_mach_task_self(), excPort, excPort, C.MACH_MSG_TYPE_MAKE_SEND)
+	if kr != C.KERN_SUCCESS {
+		panic(fmt.Errorf("mach_port_insert_right failed: %d", kr))
+	}
+	kr = C.set_debug_exception_ports(d.task, excPort)
+	if kr != C.KERN_SUCCESS {
+		panic(fmt.Errorf("task_set_exception_ports failed: %d", kr))
+	}
+	d.excPort = excPort
+
+	// Get initial threads
+	var firstThread C.thread_act_t
+	kr = C.get_first_thread(d.task, &firstThread)
+	if kr == C.KERN_SUCCESS {
+		d.mainThread = firstThread
+		log.Printf("[Debugger] Found main thread: %v", d.mainThread)
+	}
+
 	dbInf, err := debuginfo.NewDebugInfo(validatedPath, cmd.Process.Pid)
 	if err != nil {
-		log.Printf("[Debugger] Failed to create debug info: %v", err)
 		panic(err)
 	}
-	log.Printf("[Debugger] Started process with PID: %d and PGID: %d\n", dbInf.GetTarget().PID, dbInf.GetTarget().PGID)
-
+	d.DebugInfo = dbInf
 	d.computeSlide(dbInf.GetTarget().PID)
 
-	d.DebugInfo = dbInf
+	log.Println("[Debugger] Starting exception loop...")
 
-	// Wait for the process to stop after PT_ATTACH
-	var waitStatus unix.WaitStatus
-	if _, err := unix.Wait4(d.DebugInfo.GetTarget().PID, &waitStatus, 0, nil); err != nil {
-		log.Printf("[Debugger] Failed to wait after ptrace attach: %v", err)
-		panic(err)
-	}
-	log.Printf("[Debugger] Process stopped, ready for debugging")
+	// *** THIS IS THE KEY CHANGE: Start exception loop and let it handle everything ***
+	go d.exceptionLoop()
 
-	// Set initial breakpoints while the process is stopped at the initial SIGTRAP
-	d.initialBreakpointHit()
-
-	// Check if we were stopped during initial breakpoint
-	select {
-	case <-d.EndDebugSession:
-		log.Println("[Debugger] Debug session ended during initial breakpoint, cleaning up")
-		return
-	default:
-		// Continue to debug loop
-	}
-
-	log.Println("[Debugger] STARTING DEBUG LOOP")
-
-	d.mainDebugLoop()
-
-	log.Println("[Debugger] Debug loop ended")
+	// Don't call initialBreakpointHit here - exceptionLoop will call it on first breakpoint
+	log.Println("[Debugger] Debugger ready - waiting for breakpoints")
 }
 
-// Continue resumes execution of the process with the given PID after a breakpoint
+// resumeThread sends exception reply to resume (formerly ptraceCont)
+func (d *darwinARM64Debugger) resumeThread() error {
+	// The exceptionLoop handles the reply automatically after Continue/SingleStep
+	// This is now a no-op since resume happens in exceptionLoop
+	return nil
+}
+
 func (d *darwinARM64Debugger) Continue(pid int) {
-	// Read registers
-	regs, err := ptraceGetRegs(pid)
+	regs, err := d.getRegs()
 	if err != nil {
-		log.Printf("[Debugger] Failed to get registers: %v", err)
 		panic(err)
 	}
+
 	bpAddr := regs.Pc - 4
 	_, line, _ := d.DebugInfo.PCToLine(bpAddr)
 
+	// 1. Rewind PC to instruction
 	regs.Pc = bpAddr
-	if err := ptraceSetRegs(pid, regs); err != nil {
-		log.Printf("[Debugger] Failed to set registers: %v", err)
+	if err := d.setRegs(regs); err != nil {
 		panic(err)
 	}
 
+	// 2. Restore original instruction
 	if err := d.ClearBreakpoint(pid, line); err != nil {
-		log.Printf("[Debugger] Failed to clear breakpoint: %v", err)
 		panic(err)
 	}
-	regs.Pc = bpAddr
 
-	// Set the registers back with the rewound PC
-	if err := ptraceSetRegs(pid, regs); err != nil {
-		log.Printf("[Debugger] Failed to restore registers: %v", err)
-		log.Printf("[Debugger] Ending debug session due to error")
-		return
+	// 3. Single step over it (sets SS bit in CPSR)
+	if err := d.singleStepThread(); err != nil {
+		panic(err)
 	}
 
-	// Step over the instruction we previously removed to put the breakpoint
-	if err := ptraceSingleStep(pid); err != nil {
-		log.Printf("[Debugger] Failed to single-step: %v", err)
-		log.Printf("[Debugger] Ending debug session due to error")
-		return
-	}
-
-	var waitStatus unix.WaitStatus
-	// Wait until the program lets us know we stepped over
-	if _, err := unix.Wait4(pid, &waitStatus, 0, nil); err != nil {
-		log.Printf("[Debugger] Failed to wait for the single-step: %v", err)
-		log.Printf("[Debugger] Ending debug session due to error")
-		return
-	}
-
-	// Put the breakpoint back
-	if err := d.SetBreakpoint(pid, line); err != nil {
-		log.Printf("[Debugger] Failed to set breakpoint: %v", err)
-		log.Printf("[Debugger] Continuing without breakpoint")
-	}
-
-	// Resume execution
-	if err := ptraceCont(pid, 0); err != nil {
-		log.Printf("[Debugger] Failed to resume target execution: %v", err)
-		log.Printf("[Debugger] Ending debug session due to error")
-	}
+	// 4. exceptionLoop will catch the single-step breakpoint, reinsert breakpoint, and resume
 }
 
-// SingleStep executes a single instruction in the process with the given PID
+// singleStepThread sets up single-step mode then resumes (your ptraceSingleStep replacement)
+func (d *darwinARM64Debugger) singleStepThread() error {
+	regs, err := d.getRegs()
+	if err != nil {
+		return err
+	}
+
+	// Enable single-step by setting SS bit in CPSR (bit 21)
+	regs.Cpsr |= 1 << 21
+	return d.setRegs(regs)
+}
+
 func (d *darwinARM64Debugger) SingleStep(pid int) {
-	if err := ptraceSingleStep(pid); err != nil {
-		log.Printf("[Debugger] Failed to single-step: %v", err)
-		log.Printf("[Debugger] Ending debug session due to error")
-	}
+	d.singleStepThread() // Sets SS bit, exception loop handles next stop
 }
 
-// StopDebug detaches from the target and ends the debug session
 func (d *darwinARM64Debugger) StopDebug() {
-	// Detach from the target process, letting it continue running
-	if d.DebugInfo.GetTarget().PID > 0 {
-		log.Printf("[Debugger] Detaching from target process (PID: %d)", d.DebugInfo.GetTarget().PID)
-		if err := ptraceDetach(d.DebugInfo.GetTarget().PID); err != nil {
-			log.Printf("[Debugger] Failed to detach from target process: %v (might have already exited)", err)
-			// Don't panic - the process might have already exited, which is fine
-		}
+	if d.task != 0 {
+		// Clear exception ports
+		C.clear_debug_exception_ports(d.task)
+		// Deallocate task port
+		C.mach_port_deallocate(C.get_mach_task_self(), d.task)
+		d.task = 0
 	}
-	// Signal the debug loop to exit
 	select {
 	case d.EndDebugSession <- true:
 	default:
-		// Channel might be full, meaning debug session end already triggered
 	}
 }
 
@@ -394,7 +483,7 @@ func (d *darwinARM64Debugger) SetBreakpoint(pid int, line int) error {
 
 	log.Printf("[Debugger] Setting breakpoint at line %d PC=%#x", line, pc)
 
-	orig, err := ptracePeekData(pid, uintptr(pc))
+	orig, err := d.readWord(uint64(pc))
 	if err != nil {
 		return fmt.Errorf("failed to read instruction: %w", err)
 	}
@@ -402,7 +491,7 @@ func (d *darwinARM64Debugger) SetBreakpoint(pid int, line int) error {
 	d.Breakpoints[pc] = orig
 
 	brk := []byte{0x00, 0x00, 0x20, 0xd4} // ARM64 BRK
-	if err := ptracePokeData(pid, uintptr(pc), brk); err != nil {
+	if err := d.writeWord(uint64(pc), brk); err != nil {
 		return err
 	}
 
@@ -420,68 +509,12 @@ func (d *darwinARM64Debugger) ClearBreakpoint(pid int, line int) error {
 
 	original := d.Breakpoints[pc]
 
-	err = ptracePokeData(pid, uintptr(pc), original)
+	err = d.writeWord(uint64(pc), original)
 	if err != nil {
 		return fmt.Errorf("failed to restore instruction: %v", err)
 	}
 
 	return nil
-}
-
-// mainDebugLoop continuously monitors the target process for debug events
-func (d *darwinARM64Debugger) mainDebugLoop() {
-	for {
-		// Check if we should stop debugging
-		select {
-		case <-d.EndDebugSession:
-			log.Println("[Debugger] Debug session ending, exiting debug loop")
-			return
-		default:
-			// Continue with wait
-		}
-
-		// Wait for the target process to be interrupted or end
-		// On Darwin, we use the direct PID and WNOHANG for non-blocking wait
-		var waitStatus unix.WaitStatus
-		wpid, err := unix.Wait4(d.DebugInfo.GetTarget().PID, &waitStatus, unix.WNOHANG, nil)
-		if err != nil {
-			log.Printf("[Debugger] Failed to wait for the target: %v", err)
-			// Don't panic, just exit gracefully
-			return
-		}
-
-		// If no process state changed, sleep briefly to avoid busy waiting
-		if wpid == 0 {
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-
-		if waitStatus.Exited() {
-			if wpid == d.DebugInfo.GetTarget().PID { // If target exited, terminate
-				log.Printf("[Debugger] Target %v execution completed", d.DebugInfo.GetTarget().Path)
-				// Signal the end of debug session to hub
-				select {
-				case d.EndDebugSession <- true:
-				default:
-					// Channel might be full, meaning debug session end already triggered
-				}
-				return
-			} else {
-				log.Printf("[Debugger] Thread exited with PID: %v", wpid)
-			}
-		} else {
-			// Only stop on breakpoints caused by our debugger
-			if waitStatus.StopSignal() == unix.SIGTRAP {
-				d.breakpointHit(wpid)
-			} else {
-				if err := ptraceCont(wpid, 0); err != nil {
-					log.Printf("[Debugger] Failed to resume target execution: %v for PID: %d", err, wpid)
-					// Don't panic, might have been detached
-					return
-				}
-			}
-		}
-	}
 }
 
 // initialBreakpointHit handles the initial SIGTRAP and allows setting breakpoints
@@ -515,12 +548,8 @@ func (d *darwinARM64Debugger) initialBreakpointHit() {
 				}
 			case "continue":
 				log.Println("[Debugger] Continuing from initial breakpoint")
-				if err := ptraceCont(d.DebugInfo.GetTarget().PID, 0); err != nil {
-					log.Printf("[Debugger] Failed to resume target execution: %v", err)
-					log.Printf("[Debugger] Ending debug session due to error")
-					return
-				}
-				return // Exit initial breakpoint handling
+				d.Continue(d.DebugInfo.GetTarget().PID) // Uses Mach registers/single-step
+				return
 			case "step":
 				log.Println("[Debugger] Cannot single-step from initial breakpoint")
 			case "quit":
@@ -539,7 +568,7 @@ func (d *darwinARM64Debugger) initialBreakpointHit() {
 // breakpointHit handles a breakpoint event and waits for debugger commands
 func (d *darwinARM64Debugger) breakpointHit(pid int) {
 	// Get register information to determine location
-	regs, err := ptraceGetRegs(pid)
+	regs, err := d.getRegs()
 	if err != nil {
 		log.Printf("[Debugger] Failed to get registers: %v", err)
 		panic(err)
