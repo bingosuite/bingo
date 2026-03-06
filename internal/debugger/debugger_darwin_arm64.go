@@ -2,108 +2,9 @@ package debugger
 
 /*
 #cgo LDFLAGS: -framework CoreFoundation
-#include <mach/mach.h>
-#include <sys/types.h>
-#include <mach/mach_vm.h>
-#include <mach/arm/thread_state.h>
-#include <string.h>
-
-// Standard Mach exception message structures
-typedef struct {
-    mach_msg_header_t Head;
-    mach_msg_body_t msgh_body;
-    mach_msg_ool_ports_descriptor_t ool_ports;
-    NDR_record_t nondescript;
-    exception_type_t exception;
-    mach_msg_type_number_t code_count;
-    integer_t codes[2];
-    mach_port_t thread_port;
-    mach_port_t task_port;
-} exc_msg_t;
-
-typedef struct {
-    mach_msg_header_t Head;
-    NDR_record_t nondescript;
-    kern_return_t RetCode;
-} exc_msg_reply_t;
-
-// Wrapper to get mach_task_self() value
-static mach_port_t get_mach_task_self() {
-    return mach_task_self();
-}
-
-// Wrapper for function-like macro not directly callable from cgo.
-static mach_msg_bits_t get_reply_bits(mach_msg_bits_t bits) {
-	return MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(bits), 0);
-}
-
-// Wrapper to avoid cgo integer conversion pitfalls for exception behavior flags.
-static kern_return_t set_debug_exception_ports(task_t task, mach_port_t exc_port) {
-	return task_set_exception_ports(
-		task,
-		EXC_MASK_BREAKPOINT | EXC_MASK_BAD_INSTRUCTION,
-		exc_port,
-		EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
-		THREAD_STATE_NONE
-	);
-}
-
-static kern_return_t clear_debug_exception_ports(task_t task) {
-	return task_set_exception_ports(
-		task,
-		EXC_MASK_BREAKPOINT | EXC_MASK_BAD_INSTRUCTION,
-		MACH_PORT_NULL,
-		0,
-		THREAD_STATE_NONE
-	);
-}
-
-// Fetch first task thread and clean up thread list allocation from task_threads.
-static kern_return_t get_first_thread(task_t task, thread_act_t *out_thread) {
-	thread_act_array_t thread_list;
-	mach_msg_type_number_t thread_count;
-	kern_return_t kr = task_threads(task, &thread_list, &thread_count);
-	if (kr != KERN_SUCCESS) return kr;
-	if (thread_count == 0) {
-		vm_deallocate(mach_task_self(), (vm_address_t)thread_list, 0);
-		return KERN_FAILURE;
-	}
-
-	*out_thread = thread_list[0];
-	vm_deallocate(
-		mach_task_self(),
-		(vm_address_t)thread_list,
-		(vm_size_t)(thread_count * sizeof(thread_act_t))
-	);
-	return KERN_SUCCESS;
-}
-
-kern_return_t get_arm64_thread_state(thread_act_t thr, arm_thread_state64_t *state, mach_msg_type_number_t *count) {
-    *count = ARM_THREAD_STATE64_COUNT;
-    return thread_get_state(thr, ARM_THREAD_STATE64, (thread_state_t)state, count);
-}
-
-kern_return_t set_arm64_thread_state(thread_act_t thr, arm_thread_state64_t *state, mach_msg_type_number_t count) {
-    return thread_set_state(thr, ARM_THREAD_STATE64, (thread_state_t)state, count);
-}
-
-kern_return_t read_word(task_t task, mach_vm_address_t addr, uint32_t *out) {
-    vm_offset_t data;
-    mach_msg_type_number_t sz;
-    kern_return_t kr = mach_vm_read(task, addr, sizeof(uint32_t), &data, &sz);
-    if (kr != KERN_SUCCESS) return kr;
-    if (sz < sizeof(uint32_t)) { mach_vm_deallocate(mach_task_self(), data, sz); return KERN_FAILURE; }
-    memcpy(out, (void*)data, sizeof(uint32_t));
-    mach_vm_deallocate(mach_task_self(), data, sz);
-    return KERN_SUCCESS;
-}
-
-kern_return_t write_word(task_t task, mach_vm_address_t addr, uint32_t val) {
-    return mach_vm_write(task, addr, (vm_offset_t)&val, sizeof(uint32_t));
-}
+#include "darwin_helper.h"
 */
 import "C"
-
 import (
 	"fmt"
 	"log"
@@ -116,19 +17,6 @@ import (
 
 	"github.com/bingosuite/bingo/internal/debuginfo"
 	// for C.mach_* constants
-)
-
-var (
-	// ARM64 breakpoint instruction (BRK #0) - 4 bytes
-	bpCode = []byte{0x00, 0x00, 0x20, 0xd4}
-)
-
-// VM protection flags (used with mach_vm_protect)
-const (
-	VM_PROT_NONE    = 0x00
-	VM_PROT_READ    = 0x01
-	VM_PROT_WRITE   = 0x02
-	VM_PROT_EXECUTE = 0x04
 )
 
 // ARM64ThreadState represents ARM64 thread state for Darwin
@@ -168,7 +56,7 @@ func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan I
 	}
 }
 
-func (d *darwinARM64Debugger) computeSlide(pid int) error {
+func (d *darwinARM64Debugger) computeSlide() error {
 	regs, err := d.getRegs()
 	if err != nil {
 		return err
@@ -389,6 +277,13 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 	if kr == C.KERN_SUCCESS {
 		d.mainThread = firstThread
 		log.Printf("[Debugger] Found main thread: %v", d.mainThread)
+
+		// *** ADD THIS: SUSPEND THE THREAD ***
+		kr = C.thread_suspend(firstThread)
+		if kr != C.KERN_SUCCESS {
+			panic(fmt.Errorf("thread_suspend failed: %d", kr))
+		}
+		log.Printf("[Debugger] *** MAIN THREAD SUSPENDED *** (SIGTRAP equivalent)")
 	}
 
 	dbInf, err := debuginfo.NewDebugInfo(validatedPath, cmd.Process.Pid)
@@ -396,22 +291,20 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 		panic(err)
 	}
 	d.DebugInfo = dbInf
-	d.computeSlide(dbInf.GetTarget().PID)
+	d.computeSlide() // Compute ASLR slide based on initial PC and file PC
 
 	log.Println("[Debugger] Starting exception loop...")
-
-	// *** THIS IS THE KEY CHANGE: Start exception loop and let it handle everything ***
+	// 1. Start exception loop (background)
 	go d.exceptionLoop()
 
-	// Don't call initialBreakpointHit here - exceptionLoop will call it on first breakpoint
-	log.Println("[Debugger] Debugger ready - waiting for breakpoints")
-}
+	// 2. SIMULATE SIGTRAP: Thread suspended = "stopped at entry point"
+	log.Printf("[Debugger] Process suspended at entry point (SIGTRAP equivalent)")
 
-// resumeThread sends exception reply to resume (formerly ptraceCont)
-func (d *darwinARM64Debugger) resumeThread() error {
-	// The exceptionLoop handles the reply automatically after Continue/SingleStep
-	// This is now a no-op since resume happens in exceptionLoop
-	return nil
+	// 3. IMMEDIATELY trigger your existing initialBreakpointHit() handler
+	//    Thread is suspended so getRegs() works, user can set breakpoints
+	d.initialBreakpointHit() // ← This BLOCKS until user sends "continue"
+
+	log.Println("[Debugger] Initial setup complete")
 }
 
 func (d *darwinARM64Debugger) Continue(pid int) {
@@ -547,8 +440,13 @@ func (d *darwinARM64Debugger) initialBreakpointHit() {
 					}
 				}
 			case "continue":
-				log.Println("[Debugger] Continuing from initial breakpoint")
-				d.Continue(d.DebugInfo.GetTarget().PID) // Uses Mach registers/single-step
+				log.Println("[Debugger] Resuming from initial SIGTRAP equivalent")
+				// Resume the suspended thread (like ptraceCont after initial SIGTRAP)
+				kr := C.thread_resume(d.mainThread)
+				if kr != C.KERN_SUCCESS {
+					log.Printf("[Debugger] thread_resume failed: %d", kr)
+				}
+				d.Continue(d.DebugInfo.GetTarget().PID) // Step over breakpoints normally
 				return
 			case "step":
 				log.Println("[Debugger] Cannot single-step from initial breakpoint")
