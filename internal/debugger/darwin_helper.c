@@ -5,6 +5,14 @@
 #include <mach-o/dyld_images.h>
 #include <mach/task_info.h>
 
+#include <sys/ptrace.h>
+
+#include <stdio.h>
+
+int ptrace_attach_exc(int pid) {
+    return ptrace(PT_ATTACHEXC, pid, 0, 0);
+}
+
 kern_return_t find_image_slide(task_t task, mach_vm_address_t *slide) {
     mach_vm_address_t addr = MACH_VM_MIN_ADDRESS;
     mach_vm_size_t size = 0;
@@ -181,24 +189,19 @@ kern_return_t write_word(task_t task, mach_vm_address_t addr, uint32_t val) {
 
     kern_return_t kr;
 
-    // Raise max protection
-    kr = mach_vm_protect(task, page, size, TRUE,
-                         VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS)
-        return kr;
-
-    // Enable write
     kr = mach_vm_protect(task, page, size, FALSE,
-                         VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS)
+                         VM_PROT_READ | VM_PROT_WRITE);
+    if (kr != KERN_SUCCESS) {
+        printf("mach_vm_protect(RW) failed: %d\n", kr);
         return kr;
+    }
 
-    // Write breakpoint
     kr = mach_vm_write(task, addr, (vm_offset_t)&val, sizeof(uint32_t));
-    if (kr != KERN_SUCCESS)
+    if (kr != KERN_SUCCESS) {
+        printf("mach_vm_write failed: %d\n", kr);
         return kr;
+    }
 
-    // Restore RX
     kr = mach_vm_protect(task, page, size, FALSE,
                          VM_PROT_READ | VM_PROT_EXECUTE);
 
