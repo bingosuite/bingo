@@ -22,7 +22,7 @@ pre-push:
       run: go vet ./...
 
     build:
-      run: go build -o ./build/bingo/bingo ./cmd/bingo
+      run: mkdir -p ./build/bingo && go build -o ./build/bingo/bingo ./cmd/bingo
 
 commit-msg:
   commands:
