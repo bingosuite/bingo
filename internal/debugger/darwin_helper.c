@@ -2,6 +2,109 @@
 
 #include <string.h>
 
+#include <mach-o/dyld_images.h>
+#include <mach/task_info.h>
+
+kern_return_t find_image_slide(task_t task, mach_vm_address_t *slide) {
+    mach_vm_address_t addr = MACH_VM_MIN_ADDRESS;
+    mach_vm_size_t size = 0;
+
+    while (1) {
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        natural_t depth = 0;
+
+        kern_return_t kr = mach_vm_region_recurse(
+            task,
+            &addr,
+            &size,
+            &depth,
+            (vm_region_recurse_info_t)&info,
+            &count
+        );
+
+        if (kr != KERN_SUCCESS)
+            return kr;
+
+        if (info.protection & VM_PROT_EXECUTE) {
+            uint32_t magic = 0;
+            kr = mach_vm_read_overwrite(
+                task,
+                addr,
+                sizeof(uint32_t),
+                (mach_vm_address_t)&magic,
+                &size
+            );
+
+            if (kr == KERN_SUCCESS && magic == 0xfeedfacf) {
+                *slide = addr - 0x100000000;
+                return KERN_SUCCESS;
+            }
+        }
+
+        addr += size;
+    }
+}
+
+kern_return_t get_dyld_info(task_t task, struct dyld_all_image_infos *out_infos) {
+    task_dyld_info_data_t dyld_info;
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+
+    kern_return_t kr = task_info(task, TASK_DYLD_INFO,
+                                 (task_info_t)&dyld_info, &count);
+    if (kr != KERN_SUCCESS) {
+        return kr;
+    }
+
+    mach_vm_size_t sz = sizeof(struct dyld_all_image_infos);
+
+    vm_offset_t data;
+    mach_msg_type_number_t out_sz;
+
+    kr = mach_vm_read(task,
+                      dyld_info.all_image_info_addr,
+                      sz,
+                      &data,
+                      &out_sz);
+
+    if (kr != KERN_SUCCESS)
+        return kr;
+
+    memcpy(out_infos, (void *)data, sz);
+    mach_vm_deallocate(mach_task_self(), data, out_sz);
+
+    return KERN_SUCCESS;
+}
+
+kern_return_t get_main_image_address(task_t task, mach_vm_address_t *addr) {
+    struct dyld_all_image_infos infos;
+
+    kern_return_t kr = get_dyld_info(task, &infos);
+    if (kr != KERN_SUCCESS)
+        return kr;
+
+    struct dyld_image_info image;
+
+    vm_offset_t data;
+    mach_msg_type_number_t sz;
+
+    kr = mach_vm_read(task,
+                      (mach_vm_address_t)infos.infoArray,
+                      sizeof(struct dyld_image_info),
+                      &data,
+                      &sz);
+
+    if (kr != KERN_SUCCESS)
+        return kr;
+
+    memcpy(&image, (void *)data, sizeof(image));
+    mach_vm_deallocate(mach_task_self(), data, sz);
+
+    *addr = (mach_vm_address_t)image.imageLoadAddress;
+
+    return KERN_SUCCESS;
+}
+
 mach_port_t get_mach_task_self(void) {
     return mach_task_self();
 }
@@ -61,41 +164,44 @@ kern_return_t set_arm64_thread_state(thread_act_t thr, arm_thread_state64_t *sta
 }
 
 kern_return_t read_word(task_t task, mach_vm_address_t addr, uint32_t *out) {
-    vm_offset_t data;
-    mach_msg_type_number_t sz;
+    mach_vm_size_t outsize = 0;
 
-    kern_return_t kr = mach_vm_protect(task, addr & ~0x3FFF, 0x4000, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS) {
-        return kr;
-    }
-
-    kr = mach_vm_read(task, addr, sizeof(uint32_t), &data, &sz);
-    if (kr != KERN_SUCCESS) {
-        mach_vm_protect(task, addr & ~0x3FFF, 0x4000, 0, VM_PROT_READ | VM_PROT_EXECUTE);
-        return kr;
-    }
-
-    if (sz < sizeof(uint32_t)) {
-        mach_vm_deallocate(mach_task_self(), data, sz);
-        mach_vm_protect(task, addr & ~0x3FFF, 0x4000, 0, VM_PROT_READ | VM_PROT_EXECUTE);
-        return KERN_FAILURE;
-    }
-
-    memcpy(out, (void *)data, sizeof(uint32_t));
-    mach_vm_deallocate(mach_task_self(), data, sz);
-
-    mach_vm_protect(task, addr & ~0x3FFF, 0x4000, 0, VM_PROT_READ | VM_PROT_EXECUTE);
-    return KERN_SUCCESS;
+    return mach_vm_read_overwrite(
+        task,
+        addr,
+        sizeof(uint32_t),
+        (mach_vm_address_t)out,
+        &outsize
+    );
 }
 
 kern_return_t write_word(task_t task, mach_vm_address_t addr, uint32_t val) {
-    kern_return_t kr = mach_vm_protect(task, addr & ~0x3FFF, 0x4000, 0, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS) {
-        return kr;
-    }
+    mach_vm_address_t page = addr & ~0xFFF;
+    mach_vm_size_t size = 0x1000;
 
+    kern_return_t kr;
+
+    // Raise max protection
+    kr = mach_vm_protect(task, page, size, TRUE,
+                         VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS)
+        return kr;
+
+    // Enable write
+    kr = mach_vm_protect(task, page, size, FALSE,
+                         VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS)
+        return kr;
+
+    // Write breakpoint
     kr = mach_vm_write(task, addr, (vm_offset_t)&val, sizeof(uint32_t));
-    mach_vm_protect(task, addr & ~0x3FFF, 0x4000, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS)
+        return kr;
+
+    // Restore RX
+    kr = mach_vm_protect(task, page, size, FALSE,
+                         VM_PROT_READ | VM_PROT_EXECUTE);
+
     return kr;
 }
 
