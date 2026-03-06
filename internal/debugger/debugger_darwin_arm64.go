@@ -6,7 +6,6 @@ package debugger
 */
 import "C"
 import (
-	"debug/macho"
 	"fmt"
 	"log"
 	"os"
@@ -14,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"unsafe"
 
 	"github.com/bingosuite/bingo/internal/debuginfo"
@@ -55,24 +55,6 @@ func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan I
 		InitialBreakpointHit: initialBreakpointHit,
 		DebugCommand:         debugCommand,
 	}
-}
-
-func getMachOTextBase(path string) (uint64, error) {
-	f, err := macho.Open(path)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-
-	for _, load := range f.Loads {
-		if seg, ok := load.(*macho.Segment); ok {
-			if seg.Name == "__TEXT" {
-				return seg.Addr, nil
-			}
-		}
-	}
-
-	return 0, fmt.Errorf("__TEXT segment not found")
 }
 
 func (d *darwinARM64Debugger) computeSlide() error {
@@ -258,7 +240,16 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Ptrace: true,
+	}
 	if err := cmd.Start(); err != nil {
+		panic(err)
+	}
+
+	var ws syscall.WaitStatus
+	_, err = syscall.Wait4(cmd.Process.Pid, &ws, 0, nil)
+	if err != nil {
 		panic(err)
 	}
 

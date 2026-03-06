@@ -38,5 +38,6 @@ kern_return_t suspend_thread(thread_act_t thread);
 kern_return_t resume_thread(thread_act_t thread);
 kern_return_t get_main_image_address(task_t task, mach_vm_address_t *addr);
 kern_return_t find_image_slide(task_t task, mach_vm_address_t *slide);
+int ptrace_attach_exc(int pid);
 
 #endif
