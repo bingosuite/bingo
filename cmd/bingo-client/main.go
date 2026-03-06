@@ -17,6 +17,7 @@ import (
 	"golang.org/x/term"
 )
 
+// TODO: refactor
 func main() { //nolint:gocognit,gocyclo // this is a temporary default client that we will refactor completely later on
 	cfg, err := config.Load("config/config.yml")
 	if err != nil {

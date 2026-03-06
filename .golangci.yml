@@ -6,8 +6,11 @@ linters:
     - gocognit
 
   settings:
+    # Number of linearly independent paths through a function (if, else if, for, case, &&, ||)
+    # Measures of how many test cases are needed for full branch coverage
     gocyclo:
       min-complexity: 20
 
+    # Measure of how hard the code is to read. Adds more weight for nesting.
     gocognit:
       min-complexity: 30
