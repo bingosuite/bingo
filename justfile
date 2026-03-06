@@ -11,7 +11,7 @@ system-info:
 # Build the BinGo binary. Takes positional arguments for the target OS and architecture (Must be valid `go build` targets).
 build OS="linux" ARCH="amd64":
 	mkdir -p ./build/bingo
-	env GOOS={{OS}} GOARCH={{ARCH}} go build -o ./build/bingo/bingo_{{OS}}_{{ARCH}}{{ if OS == "windows" { ".exe" } else { "" } }} ./cmd/bingo
+	{{ if OS == "darwin" { "env CGO_ENABLED=1 GOOS=" + OS + " GOARCH=" + ARCH + " go build -o ./build/bingo/bingo_" + OS + "_" + ARCH + " ./cmd/bingo" } else { "env GOOS=" + OS + " GOARCH=" + ARCH + " go build -o ./build/bingo/bingo_" + OS + "_" + ARCH + (if OS == "windows" { ".exe" } else { "" }) + " ./cmd/bingo" } }}
 
 # Usage: just run 				->	runs ./build/bingo/bingo_linux_amd64 (Default)
 #		 just run windows 		->	runs ./build/bingo/bingo_windows_amd64.exe (Windows specified, default architecture)
@@ -70,3 +70,7 @@ coverage PKG="./...":
 # Run integration tests
 integration:
 	go run github.com/onsi/ginkgo/v2/ginkgo -r ./test/integration/.
+
+# Codesign the MacOS binary for debugging (required for task_for_pid and memory operations)
+sign:
+	codesign --entitlements entitlements.plist --force -s - build/bingo/bingo_darwin_arm64
