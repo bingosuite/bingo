@@ -6,6 +6,7 @@ package debugger
 */
 import "C"
 import (
+	"debug/macho"
 	"fmt"
 	"log"
 	"os"
@@ -56,22 +57,36 @@ func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan I
 	}
 }
 
+func getMachOTextBase(path string) (uint64, error) {
+	f, err := macho.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	for _, load := range f.Loads {
+		if seg, ok := load.(*macho.Segment); ok {
+			if seg.Name == "__TEXT" {
+				return seg.Addr, nil
+			}
+		}
+	}
+
+	return 0, fmt.Errorf("__TEXT segment not found")
+}
+
 func (d *darwinARM64Debugger) computeSlide() error {
-	regs, err := d.getRegs()
-	if err != nil {
-		return err
+	var slide C.mach_vm_address_t
+
+	kr := C.find_image_slide(d.task, &slide)
+	if kr != C.KERN_SUCCESS {
+		return fmt.Errorf("find_image_slide failed: %d", kr)
 	}
 
-	runtimePC := regs.Pc
-
-	filePC, _, err := d.DebugInfo.LineToPC(d.DebugInfo.GetTarget().Path, 1)
-	if err != nil {
-		return err
-	}
-
-	d.slide = runtimePC - uint64(filePC)
+	d.slide = uint64(slide)
 
 	log.Printf("[Debugger] ASLR slide = %#x", d.slide)
+
 	return nil
 }
 
@@ -291,7 +306,6 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 		panic(err)
 	}
 	d.DebugInfo = dbInf
-	d.computeSlide() // Compute ASLR slide based on initial PC and file PC
 
 	log.Println("[Debugger] Starting exception loop...")
 	// 1. Start exception loop (background)
@@ -366,44 +380,47 @@ func (d *darwinARM64Debugger) StopDebug() {
 }
 
 func (d *darwinARM64Debugger) SetBreakpoint(pid int, line int) error {
-	pc, _, err := d.DebugInfo.LineToPC(d.DebugInfo.GetTarget().Path, line)
+	filePC, _, err := d.DebugInfo.LineToPC(d.DebugInfo.GetTarget().Path, line)
 	if err != nil {
 		return err
 	}
 
-	pc = pc + d.slide
-	pc = pc &^ 0x3 // ARM64 instruction alignment
+	runtimePC := (filePC + d.slide) &^ 0x3
 
-	log.Printf("[Debugger] Setting breakpoint at line %d PC=%#x", line, pc)
+	log.Printf(
+		"[Debugger] breakpoint filePC=%#x slide=%#x runtimePC=%#x",
+		filePC,
+		d.slide,
+		runtimePC,
+	)
 
-	orig, err := d.readWord(uint64(pc))
+	orig, err := d.readWord(runtimePC)
 	if err != nil {
 		return fmt.Errorf("failed to read instruction: %w", err)
 	}
 
-	d.Breakpoints[pc] = orig
+	d.Breakpoints[runtimePC] = orig
 
-	brk := []byte{0x00, 0x00, 0x20, 0xd4} // ARM64 BRK
-	if err := d.writeWord(uint64(pc), brk); err != nil {
-		return err
+	brk := []byte{0x20, 0x00, 0x20, 0xd4} // BRK #1
+
+	if err := d.writeWord(runtimePC, brk); err != nil {
+		return fmt.Errorf("failed to write breakpoint: %w", err)
 	}
 
 	return nil
 }
 
 func (d *darwinARM64Debugger) ClearBreakpoint(pid int, line int) error {
-	pc, _, err := d.DebugInfo.LineToPC(d.DebugInfo.GetTarget().Path, line)
-	pc += d.slide
+	filePC, _, err := d.DebugInfo.LineToPC(d.DebugInfo.GetTarget().Path, line)
 	if err != nil {
 		return err
 	}
 
-	pc = pc &^ 0x3 // align to 4-byte boundary
+	runtimePC := (filePC + d.slide) &^ 0x3
 
-	original := d.Breakpoints[pc]
+	orig := d.Breakpoints[runtimePC]
 
-	err = d.writeWord(uint64(pc), original)
-	if err != nil {
+	if err := d.writeWord(runtimePC, orig); err != nil {
 		return fmt.Errorf("failed to restore instruction: %v", err)
 	}
 
@@ -412,6 +429,12 @@ func (d *darwinARM64Debugger) ClearBreakpoint(pid int, line int) error {
 
 // initialBreakpointHit handles the initial SIGTRAP and allows setting breakpoints
 func (d *darwinARM64Debugger) initialBreakpointHit() {
+
+	if d.slide == 0 {
+		if err := d.computeSlide(); err != nil {
+			log.Printf("slide computation failed: %v", err)
+		}
+	}
 	// Create initial breakpoint event
 	event := InitialBreakpointHitEvent{
 		PID: d.DebugInfo.GetTarget().PID,
