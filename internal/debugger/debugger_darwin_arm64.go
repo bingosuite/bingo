@@ -1,5 +1,17 @@
 package debugger
 
+/*
+#cgo LDFLAGS: -framework CoreFoundation
+#include <mach/mach.h>
+#include <sys/types.h>
+
+// Wrapper to get mach_task_self() value
+static mach_port_t get_mach_task_self() {
+    return mach_task_self();
+}
+*/
+import "C"
+
 import (
 	"fmt"
 	"log"
@@ -22,20 +34,21 @@ var (
 	bpCode = []byte{0x00, 0x00, 0x20, 0xd4}
 )
 
-// Darwin ptrace request types
+// Darwin ptrace request types (for process control only)
 const (
-	PT_TRACE_ME  = 0  // Child declares it's being traced
-	PT_READ_I    = 1  // Read word in child's I space
-	PT_READ_D    = 2  // Read word in child's D space
-	PT_WRITE_I   = 4  // Write word in child's I space
-	PT_WRITE_D   = 5  // Write word in child's D space
-	PT_CONTINUE  = 7  // Continue the child
-	PT_STEP      = 9  // Single step the child
-	PT_DETACH    = 11 // Stop tracing a process
-	PT_ATTACHEXC = 14 // Attach to running process with signal exception
-	PT_THUPDATE  = 13 // Update thread list
-	PT_GETREGS   = 15 // Get all registers
-	PT_SETREGS   = 16 // Set all registers
+	PT_CONTINUE = 7  // Continue the child
+	PT_STEP     = 9  // Single step the child
+	PT_DETACH   = 11 // Stop tracing a process
+	PT_GETREGS  = 15 // Get all registers
+	PT_SETREGS  = 16 // Set all registers
+)
+
+// VM protection flags (used with mach_vm_protect)
+const (
+	VM_PROT_NONE    = 0x00
+	VM_PROT_READ    = 0x01
+	VM_PROT_WRITE   = 0x02
+	VM_PROT_EXECUTE = 0x04
 )
 
 // ARM64ThreadState represents ARM64 thread state for Darwin
@@ -53,6 +66,7 @@ type darwinARM64Debugger struct {
 	DebugInfo       debuginfo.DebugInfo
 	Breakpoints     map[uint64][]byte
 	EndDebugSession chan bool
+	slide           uint64
 
 	// Communication with hub
 	BreakpointHit        chan BreakpointEvent
@@ -68,6 +82,25 @@ func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan I
 		InitialBreakpointHit: initialBreakpointHit,
 		DebugCommand:         debugCommand,
 	}
+}
+
+func (d *darwinARM64Debugger) computeSlide(pid int) error {
+	regs, err := ptraceGetRegs(pid)
+	if err != nil {
+		return err
+	}
+
+	runtimePC := regs.Pc
+
+	filePC, _, err := d.DebugInfo.LineToPC(d.DebugInfo.GetTarget().Path, 1)
+	if err != nil {
+		return err
+	}
+
+	d.slide = runtimePC - uint64(filePC)
+
+	log.Printf("[Debugger] ASLR slide = %#x", d.slide)
+	return nil
 }
 
 // validateTargetPath resolves path to an absolute path, ensures it stays
@@ -128,47 +161,55 @@ func ptraceSetRegs(pid int, regs *ARM64ThreadState) error {
 	return ptrace(PT_SETREGS, pid, uintptr(unsafe.Pointer(regs)), 0)
 }
 
-// ptracePeekData reads a word from the target process memory
-// For ARM64, we read 4 bytes at a time
+// ptracePeekData reads 4 bytes from the target process
 func ptracePeekData(pid int, addr uintptr) ([]byte, error) {
-	// Align to 4-byte boundary for ARM64
-	alignedAddr := addr & ^uintptr(3)
+	data, _, errno := syscall.Syscall6(
+		syscall.SYS_PTRACE,
+		uintptr(unix.PT_READ_D),
+		uintptr(pid),
+		addr,
+		0, 0, 0,
+	)
 
-	var data int32
-	err := ptrace(PT_READ_D, pid, alignedAddr, uintptr(unsafe.Pointer(&data)))
-	if err != nil {
-		return nil, fmt.Errorf("ptrace PT_READ_D failed at 0x%x: %v", addr, err)
+	if errno != 0 {
+		return nil, errno
 	}
 
-	// Convert int32 to byte slice
-	result := make([]byte, 4)
-	result[0] = byte(data)
-	result[1] = byte(data >> 8)
-	result[2] = byte(data >> 16)
-	result[3] = byte(data >> 24)
+	word := uint32(data)
 
-	return result, nil
+	return []byte{
+		byte(word),
+		byte(word >> 8),
+		byte(word >> 16),
+		byte(word >> 24),
+	}, nil
 }
 
-// ptracePokeData writes data to the target process memory
+// ptracePokeData writes 4 bytes to the target process
 func ptracePokeData(pid int, addr uintptr, data []byte) error {
-	// Align to 4-byte boundary for ARM64
-	alignedAddr := addr & ^uintptr(3)
-
-	// Ensure data is exactly 4 bytes for ARM64
 	if len(data) < 4 {
-		// Pad with zeros if needed
 		padded := make([]byte, 4)
 		copy(padded, data)
 		data = padded
 	}
 
-	// Convert byte slice to int32
-	word := int32(data[0]) | int32(data[1])<<8 | int32(data[2])<<16 | int32(data[3])<<24
+	word :=
+		uintptr(data[0]) |
+			uintptr(data[1])<<8 |
+			uintptr(data[2])<<16 |
+			uintptr(data[3])<<24
 
-	err := ptrace(PT_WRITE_D, pid, alignedAddr, uintptr(word))
-	if err != nil {
-		return fmt.Errorf("ptrace PT_WRITE_D failed at 0x%x: %v", addr, err)
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_PTRACE,
+		uintptr(unix.PT_WRITE_D),
+		uintptr(pid),
+		addr,
+		word,
+		0, 0,
+	)
+
+	if errno != 0 {
+		return errno
 	}
 
 	return nil
@@ -205,14 +246,18 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 	}
 
 	// Set up target for execution
+	// NOTE: We don't use Ptrace: true here because we'll use Mach VM for debugging instead
+	// Using both ptrace and Mach causes conflicts on macOS
 	cmd := exec.Command(validatedPath)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = &unix.SysProcAttr{Ptrace: true}
+
+	cmd.SysProcAttr = &unix.SysProcAttr{
+		Ptrace: true,
+	}
 
 	if err := cmd.Start(); err != nil {
-		log.Printf("[Debugger] Failed to start target: %v", err)
 		panic(err)
 	}
 
@@ -223,13 +268,17 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 	}
 	log.Printf("[Debugger] Started process with PID: %d and PGID: %d\n", dbInf.GetTarget().PID, dbInf.GetTarget().PGID)
 
+	d.computeSlide(dbInf.GetTarget().PID)
+
 	d.DebugInfo = dbInf
 
-	// We want to catch the initial SIGTRAP sent by process creation. When this is caught, we know that the target just started and we can ask the user where they want to set their breakpoints
+	// Wait for the process to stop after PT_ATTACH
 	var waitStatus unix.WaitStatus
-	if _, status := unix.Wait4(d.DebugInfo.GetTarget().PID, &waitStatus, 0, nil); status != nil {
-		log.Printf("[Debugger] Received SIGTRAP from process creation: %v", status)
+	if _, err := unix.Wait4(d.DebugInfo.GetTarget().PID, &waitStatus, 0, nil); err != nil {
+		log.Printf("[Debugger] Failed to wait after ptrace attach: %v", err)
+		panic(err)
 	}
+	log.Printf("[Debugger] Process stopped, ready for debugging")
 
 	// Set initial breakpoints while the process is stopped at the initial SIGTRAP
 	d.initialBreakpointHit()
@@ -258,11 +307,15 @@ func (d *darwinARM64Debugger) Continue(pid int) {
 		log.Printf("[Debugger] Failed to get registers: %v", err)
 		panic(err)
 	}
-	// ARM64 breakpoint is 4 bytes, so we rewind by 4
-	_, line, _ := d.DebugInfo.PCToLine(regs.Pc - 4)
-
-	// Remove the breakpoint
 	bpAddr := regs.Pc - 4
+	_, line, _ := d.DebugInfo.PCToLine(bpAddr)
+
+	regs.Pc = bpAddr
+	if err := ptraceSetRegs(pid, regs); err != nil {
+		log.Printf("[Debugger] Failed to set registers: %v", err)
+		panic(err)
+	}
+
 	if err := d.ClearBreakpoint(pid, line); err != nil {
 		log.Printf("[Debugger] Failed to clear breakpoint: %v", err)
 		panic(err)
@@ -272,32 +325,35 @@ func (d *darwinARM64Debugger) Continue(pid int) {
 	// Set the registers back with the rewound PC
 	if err := ptraceSetRegs(pid, regs); err != nil {
 		log.Printf("[Debugger] Failed to restore registers: %v", err)
-		panic(err)
+		log.Printf("[Debugger] Ending debug session due to error")
+		return
 	}
 
 	// Step over the instruction we previously removed to put the breakpoint
 	if err := ptraceSingleStep(pid); err != nil {
 		log.Printf("[Debugger] Failed to single-step: %v", err)
-		panic(err)
+		log.Printf("[Debugger] Ending debug session due to error")
+		return
 	}
 
 	var waitStatus unix.WaitStatus
 	// Wait until the program lets us know we stepped over
 	if _, err := unix.Wait4(pid, &waitStatus, 0, nil); err != nil {
 		log.Printf("[Debugger] Failed to wait for the single-step: %v", err)
-		panic(err)
+		log.Printf("[Debugger] Ending debug session due to error")
+		return
 	}
 
 	// Put the breakpoint back
 	if err := d.SetBreakpoint(pid, line); err != nil {
 		log.Printf("[Debugger] Failed to set breakpoint: %v", err)
-		panic(err)
+		log.Printf("[Debugger] Continuing without breakpoint")
 	}
 
 	// Resume execution
 	if err := ptraceCont(pid, 0); err != nil {
 		log.Printf("[Debugger] Failed to resume target execution: %v", err)
-		panic(err)
+		log.Printf("[Debugger] Ending debug session due to error")
 	}
 }
 
@@ -305,7 +361,7 @@ func (d *darwinARM64Debugger) Continue(pid int) {
 func (d *darwinARM64Debugger) SingleStep(pid int) {
 	if err := ptraceSingleStep(pid); err != nil {
 		log.Printf("[Debugger] Failed to single-step: %v", err)
-		panic(err)
+		log.Printf("[Debugger] Ending debug session due to error")
 	}
 }
 
@@ -316,7 +372,7 @@ func (d *darwinARM64Debugger) StopDebug() {
 		log.Printf("[Debugger] Detaching from target process (PID: %d)", d.DebugInfo.GetTarget().PID)
 		if err := ptraceDetach(d.DebugInfo.GetTarget().PID); err != nil {
 			log.Printf("[Debugger] Failed to detach from target process: %v (might have already exited)", err)
-			panic(err)
+			// Don't panic - the process might have already exited, which is fine
 		}
 	}
 	// Signal the debug loop to exit
@@ -327,39 +383,48 @@ func (d *darwinARM64Debugger) StopDebug() {
 	}
 }
 
-// SetBreakpoint inserts a breakpoint at the given source line in the target
 func (d *darwinARM64Debugger) SetBreakpoint(pid int, line int) error {
 	pc, _, err := d.DebugInfo.LineToPC(d.DebugInfo.GetTarget().Path, line)
 	if err != nil {
-		return fmt.Errorf("failed to get PC of line %v: %v", line, err)
+		return err
 	}
 
-	log.Printf("[Debugger] Setting breakpoint at line %d, PC: 0x%x, PID: %d", line, pc, pid)
+	pc = pc + d.slide
+	pc = pc &^ 0x3 // ARM64 instruction alignment
 
-	original, err := ptracePeekData(pid, uintptr(pc))
+	log.Printf("[Debugger] Setting breakpoint at line %d PC=%#x", line, pc)
+
+	orig, err := ptracePeekData(pid, uintptr(pc))
 	if err != nil {
-		return fmt.Errorf("failed to read original machine code into memory: %v for PID: %d", err, pid)
+		return fmt.Errorf("failed to read instruction: %w", err)
 	}
-	log.Printf("[Debugger] Read original instruction: %x", original)
 
-	if err := ptracePokeData(pid, uintptr(pc), bpCode); err != nil {
-		return fmt.Errorf("failed to write breakpoint into memory: %v", err)
+	d.Breakpoints[pc] = orig
+
+	brk := []byte{0x00, 0x00, 0x20, 0xd4} // ARM64 BRK
+	if err := ptracePokeData(pid, uintptr(pc), brk); err != nil {
+		return err
 	}
-	log.Printf("[Debugger] Wrote breakpoint instruction at 0x%x", pc)
 
-	d.Breakpoints[pc] = original
 	return nil
 }
 
-// ClearBreakpoint removes the breakpoint at the given source line
 func (d *darwinARM64Debugger) ClearBreakpoint(pid int, line int) error {
 	pc, _, err := d.DebugInfo.LineToPC(d.DebugInfo.GetTarget().Path, line)
+	pc += d.slide
 	if err != nil {
-		return fmt.Errorf("failed to get PC of line %v: %v", line, err)
+		return err
 	}
-	if err := ptracePokeData(pid, uintptr(pc), d.Breakpoints[pc]); err != nil {
-		return fmt.Errorf("failed to write breakpoint into memory: %v", err)
+
+	pc = pc &^ 0x3 // align to 4-byte boundary
+
+	original := d.Breakpoints[pc]
+
+	err = ptracePokeData(pid, uintptr(pc), original)
+	if err != nil {
+		return fmt.Errorf("failed to restore instruction: %v", err)
 	}
+
 	return nil
 }
 
@@ -440,11 +505,11 @@ func (d *darwinARM64Debugger) initialBreakpointHit() {
 			case "setBreakpoint":
 				if data, ok := cmd.Data.(map[string]any); ok {
 					if line, ok := data["line"].(int); ok {
+
 						if err := d.SetBreakpoint(d.DebugInfo.GetTarget().PID, int(line)); err != nil {
 							log.Printf("[Debugger] Failed to set breakpoint at line %d: %v", int(line), err)
-							panic(err)
 						} else {
-							log.Printf("[Debugger] Breakpoint set at line %d while at breakpoint", int(line))
+							log.Printf("[Debugger] Breakpoint set at line %d while at initial breakpoint", int(line))
 						}
 					}
 				}
@@ -452,7 +517,8 @@ func (d *darwinARM64Debugger) initialBreakpointHit() {
 				log.Println("[Debugger] Continuing from initial breakpoint")
 				if err := ptraceCont(d.DebugInfo.GetTarget().PID, 0); err != nil {
 					log.Printf("[Debugger] Failed to resume target execution: %v", err)
-					panic(err)
+					log.Printf("[Debugger] Ending debug session due to error")
+					return
 				}
 				return // Exit initial breakpoint handling
 			case "step":
