@@ -9,8 +9,25 @@
 
 #include <stdio.h>
 
+#include <mach/mach.h>
+
+#include <mach/exc.h>
+
+
 int ptrace_attach_exc(int pid) {
     return ptrace(PT_ATTACHEXC, pid, 0, 0);
+}
+
+kern_return_t resume_task(task_t task) {
+    return task_resume(task);
+}
+
+kern_return_t resume_task_all(task_t task) {
+    kern_return_t kr;
+    do {
+        kr = task_resume(task);
+    } while (kr == KERN_SUCCESS);
+    return KERN_SUCCESS;
 }
 
 kern_return_t find_image_slide(task_t task, mach_vm_address_t *slide) {
@@ -215,3 +232,37 @@ kern_return_t suspend_thread(thread_act_t thread) {
 kern_return_t resume_thread(thread_act_t thread) {
     return thread_resume(thread);
 }
+
+kern_return_t set_thread_exception_ports(task_t task, mach_port_t port) {
+    thread_act_array_t threads;
+    mach_msg_type_number_t count;
+
+    kern_return_t kr = task_threads(task, &threads, &count);
+    if (kr != KERN_SUCCESS) return kr;
+
+    for (mach_msg_type_number_t i = 0; i < count; i++) {
+        thread_set_exception_ports(
+            threads[i],
+            EXC_MASK_BREAKPOINT | EXC_MASK_BAD_INSTRUCTION,
+            port,
+            EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
+            ARM_THREAD_STATE64
+        );
+    }
+
+    vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_act_t));
+    return KERN_SUCCESS;
+}
+
+thread_act_t exc_msg_thread(exc_msg_t *msg) {
+    return msg->thread.name;
+}
+
+mach_msg_bits_t make_reply_bits(mach_msg_bits_t bits) {
+    return MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(bits), 0);
+}
+
+mach_msg_id_t make_reply_id(mach_msg_id_t id) {
+    return id + 100;
+}
+
