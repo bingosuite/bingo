@@ -55,6 +55,8 @@ kern_return_t set_thread_exception_ports(task_t task, mach_port_t port);
 thread_act_t exc_msg_thread(exc_msg_t *msg);
 mach_msg_bits_t make_reply_bits(mach_msg_bits_t bits);
 mach_msg_id_t make_reply_id(mach_msg_id_t id);
+kern_return_t get_debug_state(thread_act_t thread, arm_debug_state64_t *state);
+kern_return_t set_debug_state(thread_act_t thread, arm_debug_state64_t *state);
 
 
 #endif

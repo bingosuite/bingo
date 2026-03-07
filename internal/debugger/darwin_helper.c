@@ -13,6 +13,12 @@
 
 #include <mach/exc.h>
 
+#include <mach/mach.h>
+#include <mach/thread_act.h>
+#include <mach/arm/thread_status.h>
+
+
+
 
 int ptrace_attach_exc(int pid) {
     return ptrace(PT_ATTACHEXC, pid, 0, 0);
@@ -264,5 +270,14 @@ mach_msg_bits_t make_reply_bits(mach_msg_bits_t bits) {
 
 mach_msg_id_t make_reply_id(mach_msg_id_t id) {
     return id + 100;
+}
+
+kern_return_t get_debug_state(thread_act_t thread, arm_debug_state64_t *state) {
+    mach_msg_type_number_t count = ARM_DEBUG_STATE64_COUNT;
+    return thread_get_state(thread, ARM_DEBUG_STATE64, (thread_state_t)state, &count);
+}
+
+kern_return_t set_debug_state(thread_act_t thread, arm_debug_state64_t *state) {
+    return thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)state, ARM_DEBUG_STATE64_COUNT);
 }
 
