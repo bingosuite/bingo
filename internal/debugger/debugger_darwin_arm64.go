@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"unsafe"
 
 	"github.com/bingosuite/bingo/internal/debuginfo"
@@ -43,6 +44,10 @@ type darwinARM64Debugger struct {
 	task       C.mach_port_t
 	mainThread C.thread_act_t
 	excPort    C.mach_port_t
+
+	// Temporary breakpoint state for implementing "continue" command
+	tempBreakpoint uint64
+	tempOriginal   []byte
 }
 
 func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan InitialBreakpointHitEvent, debugCommand chan DebugCommand, endDebugSession chan bool) Debugger {
@@ -282,6 +287,26 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 		panic(err)
 	}
 
+	pid := cmd.Process.Pid
+	log.Printf("[Debugger] Started target PID %d", pid)
+
+	// Watch for process exit
+	go func() {
+		var status syscall.WaitStatus
+		_, err := syscall.Wait4(pid, &status, 0, nil)
+		if err != nil {
+			log.Printf("[Debugger] wait4 error: %v", err)
+		}
+
+		log.Printf("[Debugger] Target process exited: %v", status)
+
+		// signal debugger shutdown
+		select {
+		case d.EndDebugSession <- true:
+		default:
+		}
+	}()
+
 	// Get task port
 	var task C.mach_port_t
 	kr := C.task_for_pid(C.get_mach_task_self(), C.int(cmd.Process.Pid), &task)
@@ -358,35 +383,51 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 }
 
 func (d *darwinARM64Debugger) Continue(pid int) {
+	log.Printf("[Continue] Starting Continue for PID %d", pid)
+
 	regs, err := d.getRegs()
 	if err != nil {
 		panic(err)
 	}
 
-	bpAddr := regs.Pc
+	pc := regs.Pc
+	log.Printf("[Continue] PC = %#x", pc)
 
-	log.Printf("Continue lookup addr %#x", bpAddr)
-
-	orig, ok := d.Breakpoints[bpAddr]
+	orig, ok := d.Breakpoints[pc]
 	if !ok {
-		panic(fmt.Sprintf("breakpoint not found at %#x", bpAddr))
+		log.Printf("[Continue] No breakpoint at %#x, resuming normally", pc)
+		C.thread_resume(d.mainThread)
+		return
 	}
 
-	// restore instruction
-	if err := d.writeWord(bpAddr, orig); err != nil {
+	// 1️⃣ Restore original instruction
+	if err := d.writeWord(pc, orig); err != nil {
+		panic(err)
+	}
+	log.Printf("[Continue] Restored original instruction at %#x", pc)
+
+	// 2️⃣ Install temporary breakpoint at next instruction
+	next := pc + 4
+	log.Printf("[Continue] Installing temporary step breakpoint at %#x", next)
+
+	tmpOrig, err := d.readWord(next)
+	if err != nil {
 		panic(err)
 	}
 
-	// rewind PC so the instruction executes
-	regs.Pc = bpAddr
+	brk := []byte{0x20, 0x00, 0x20, 0xd4}
 
-	// enable single-step
-	regs.Cpsr |= 1 << 21
-
-	if err := d.setRegs(regs); err != nil {
+	if err := d.writeWord(next, brk); err != nil {
 		panic(err)
 	}
 
+	// store temporary breakpoint so we can restore it later
+	d.tempBreakpoint = next
+	d.tempOriginal = tmpOrig
+
+	log.Printf("[Continue] Temporary breakpoint installed")
+
+	// 3️⃣ Resume thread
 	C.thread_resume(d.mainThread)
 }
 
@@ -538,18 +579,29 @@ func (d *darwinARM64Debugger) breakpointHit(pid int) {
 		panic(err)
 	}
 
-	// Check if this was a single-step trap
-	if (regs.Cpsr & (1 << 21)) != 0 {
-		// Disable single step
-		regs.Cpsr &^= 1 << 21
-		d.setRegs(regs)
+	if d.tempBreakpoint != 0 && regs.Pc == d.tempBreakpoint {
+		log.Printf("[Debugger] Temporary step breakpoint hit")
 
-		// Reinsert breakpoints
-		for addr := range d.Breakpoints {
-			runtime := addr + d.slide
-			brk := []byte{0x20, 0x00, 0x20, 0xd4}
-			d.writeWord(runtime, brk)
+		// restore original instruction
+		if err := d.writeWord(d.tempBreakpoint, d.tempOriginal); err != nil {
+			panic(err)
 		}
+
+		// reinstall the user's breakpoint
+		brk := []byte{0x20, 0x00, 0x20, 0xd4}
+
+		for addr := range d.Breakpoints {
+			if err := d.writeWord(addr, brk); err != nil {
+				panic(err)
+			}
+		}
+
+		d.tempBreakpoint = 0
+
+		log.Printf("[Debugger] Step complete, resuming execution")
+
+		// automatically continue execution
+		C.thread_resume(d.mainThread)
 
 		return
 	}
