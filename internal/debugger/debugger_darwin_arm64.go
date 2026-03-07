@@ -13,11 +13,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"unsafe"
 
 	"github.com/bingosuite/bingo/internal/debuginfo"
-	// for C.mach_* constants
 )
 
 // ARM64ThreadState represents ARM64 thread state for Darwin
@@ -154,6 +152,7 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 	runtime.LockOSThread() // Mach msg requires fixed thread
 	defer runtime.UnlockOSThread()
 
+	log.Println("[Exception Loop] In top of exception loop")
 	for {
 		select {
 		case <-d.EndDebugSession:
@@ -162,15 +161,17 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 		default:
 		}
 
-		var excMsg C.exc_msg_t
+		var excBuf [4096]byte
 		var reply C.exc_msg_reply_t
+
+		log.Println("[Exception Loop] about to receive exception message...")
 
 		// Receive exception message (blocks until breakpoint hit)
 		kr := C.mach_msg(
-			(*C.mach_msg_header_t)(unsafe.Pointer(&excMsg)),
+			(*C.mach_msg_header_t)(unsafe.Pointer(&excBuf[0])),
 			C.MACH_RCV_MSG,
 			0,
-			C.mach_msg_size_t(unsafe.Sizeof(excMsg)),
+			C.mach_msg_size_t(len(excBuf)),
 			d.excPort,
 			C.MACH_MSG_TIMEOUT_NONE,
 			C.MACH_PORT_NULL,
@@ -179,10 +180,21 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 			log.Printf("[Debugger] mach_msg receive failed: %d", kr)
 			continue
 		}
+		log.Println("[Exception Loop] Received exception message")
+
+		excMsg := (*C.exc_msg_t)(unsafe.Pointer(&excBuf[0]))
+
+		// log.Printf(
+		// 	"[Exception Loop] exception=%d code=%d subcode=%d",
+		// 	excMsg.exception,
+		// 	excMsg.codes[0],
+		// 	excMsg.codes[1],
+		// )
 
 		// Check if it's a breakpoint exception
 		if excMsg.exception == C.EXC_BREAKPOINT || excMsg.exception == C.EXC_BAD_INSTRUCTION {
-			thread := C.thread_act_t(excMsg.thread_port)
+			log.Println("[Exception Loop] We got a breakpoint exception!")
+			thread := C.exc_msg_thread(excMsg)
 			if d.mainThread == 0 {
 				d.mainThread = thread // Cache first thread seen
 				log.Printf("[Debugger] Cached main thread: %d", thread)
@@ -190,17 +202,23 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 
 			// Dispatch to your existing handlers
 			if d.DebugInfo == nil {
+				log.Println("[Exception Loop] debuginfo not initialized, treating as initial breakpoint")
 				d.initialBreakpointHit()
 			} else {
+				log.Println("[Exception Loop] debuginfo initialized, treating as regular breakpoint")
 				d.breakpointHit(int(d.DebugInfo.GetTarget().PID))
 			}
 
 			// IMPORTANT: After your handler returns (Continue/step called),
 			// send reply to resume the thread
-			reply.Head.msgh_bits = C.get_reply_bits(excMsg.Head.msgh_bits)
+			reply.Head.msgh_bits = C.make_reply_bits(excMsg.Head.msgh_bits)
+			reply.Head.msgh_size = C.mach_msg_size_t(C.sizeof_exc_msg_reply_t)
+
 			reply.Head.msgh_remote_port = excMsg.Head.msgh_remote_port
-			reply.Head.msgh_size = C.mach_msg_size_t(unsafe.Sizeof(reply))
-			reply.Head.msgh_local_port = excMsg.Head.msgh_local_port
+			reply.Head.msgh_local_port = C.MACH_PORT_NULL
+
+			reply.Head.msgh_id = C.make_reply_id(excMsg.Head.msgh_id)
+
 			reply.RetCode = C.KERN_SUCCESS
 
 			replyKr := C.mach_msg(
@@ -217,9 +235,15 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 			}
 		} else {
 			// Unknown exception - just resume
-			reply.Head.msgh_bits = C.get_reply_bits(excMsg.Head.msgh_bits)
+			reply.Head.msgh_bits = C.make_reply_bits(excMsg.Head.msgh_bits)
+
+			reply.Head.msgh_size = C.mach_msg_size_t(C.sizeof_exc_msg_reply_t)
+
 			reply.Head.msgh_remote_port = excMsg.Head.msgh_remote_port
-			reply.Head.msgh_size = C.mach_msg_size_t(unsafe.Sizeof(reply))
+			reply.Head.msgh_local_port = C.MACH_PORT_NULL
+
+			reply.Head.msgh_id = excMsg.Head.msgh_id + 100
+
 			reply.RetCode = C.KERN_SUCCESS
 			C.mach_msg((*C.mach_msg_header_t)(unsafe.Pointer(&reply)), C.MACH_SEND_MSG, C.mach_msg_size_t(unsafe.Sizeof(reply)), 0, C.MACH_PORT_NULL, C.MACH_MSG_TIMEOUT_NONE, C.MACH_PORT_NULL)
 		}
@@ -240,16 +264,8 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Ptrace: true,
-	}
+	cmd.SysProcAttr = nil
 	if err := cmd.Start(); err != nil {
-		panic(err)
-	}
-
-	var ws syscall.WaitStatus
-	_, err = syscall.Wait4(cmd.Process.Pid, &ws, 0, nil)
-	if err != nil {
 		panic(err)
 	}
 
@@ -264,18 +280,33 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 	// Set up exception port (your existing code - perfect)
 	var excPort C.mach_port_t
 	kr = C.mach_port_allocate(C.get_mach_task_self(), C.MACH_PORT_RIGHT_RECEIVE, &excPort)
+	log.Println("mach_port_allocate:", kr)
 	if kr != C.KERN_SUCCESS {
 		panic(fmt.Errorf("mach_port_allocate failed: %d", kr))
 	}
-	kr = C.mach_port_insert_right(C.get_mach_task_self(), excPort, excPort, C.MACH_MSG_TYPE_MAKE_SEND)
+	d.excPort = excPort
+	log.Printf("[Debugger] exception port = %d", d.excPort)
+
+	kr = C.mach_port_insert_right(
+		C.get_mach_task_self(),
+		excPort,
+		excPort,
+		C.MACH_MSG_TYPE_MAKE_SEND,
+	)
+	log.Println("mach_port_insert_right:", kr)
 	if kr != C.KERN_SUCCESS {
 		panic(fmt.Errorf("mach_port_insert_right failed: %d", kr))
 	}
+
 	kr = C.set_debug_exception_ports(d.task, excPort)
 	if kr != C.KERN_SUCCESS {
 		panic(fmt.Errorf("task_set_exception_ports failed: %d", kr))
 	}
-	d.excPort = excPort
+
+	kr = C.set_thread_exception_ports(d.task, excPort)
+	if kr != C.KERN_SUCCESS {
+		panic(fmt.Errorf("thread_set_exception_ports failed: %d", kr))
+	}
 
 	// Get initial threads
 	var firstThread C.thread_act_t
@@ -297,19 +328,20 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 		panic(err)
 	}
 	d.DebugInfo = dbInf
+	d.initialBreakpointHit()
 
+	// Check if we were stopped during initial breakpoint
+	select {
+	case <-d.EndDebugSession:
+		log.Println("[Debugger] Debug session ended during initial breakpoint, cleaning up")
+		return
+	default:
+		// Continue to debug loop
+	}
 	log.Println("[Debugger] Starting exception loop...")
-	// 1. Start exception loop (background)
-	go d.exceptionLoop()
+	d.exceptionLoop()
 
-	// 2. SIMULATE SIGTRAP: Thread suspended = "stopped at entry point"
-	log.Printf("[Debugger] Process suspended at entry point (SIGTRAP equivalent)")
-
-	// 3. IMMEDIATELY trigger your existing initialBreakpointHit() handler
-	//    Thread is suspended so getRegs() works, user can set breakpoints
-	d.initialBreakpointHit() // ← This BLOCKS until user sends "continue"
-
-	log.Println("[Debugger] Initial setup complete")
+	log.Println("[Debugger] Done")
 }
 
 func (d *darwinARM64Debugger) Continue(pid int) {
@@ -319,25 +351,24 @@ func (d *darwinARM64Debugger) Continue(pid int) {
 	}
 
 	bpAddr := regs.Pc - 4
-	_, line, _ := d.DebugInfo.PCToLine(bpAddr)
+	lookupPC := bpAddr - d.slide
 
-	// 1. Rewind PC to instruction
+	_, line, _ := d.DebugInfo.PCToLine(lookupPC)
+
+	// 1. rewind PC
 	regs.Pc = bpAddr
-	if err := d.setRegs(regs); err != nil {
-		panic(err)
-	}
 
-	// 2. Restore original instruction
+	// 2. restore original instruction
 	if err := d.ClearBreakpoint(pid, line); err != nil {
 		panic(err)
 	}
 
-	// 3. Single step over it (sets SS bit in CPSR)
-	if err := d.singleStepThread(); err != nil {
+	// 3. enable single step
+	regs.Cpsr |= 1 << 21
+
+	if err := d.setRegs(regs); err != nil {
 		panic(err)
 	}
-
-	// 4. exceptionLoop will catch the single-step breakpoint, reinsert breakpoint, and resume
 }
 
 // singleStepThread sets up single-step mode then resumes (your ptraceSingleStep replacement)
@@ -454,13 +485,13 @@ func (d *darwinARM64Debugger) initialBreakpointHit() {
 					}
 				}
 			case "continue":
-				log.Println("[Debugger] Resuming from initial SIGTRAP equivalent")
-				// Resume the suspended thread (like ptraceCont after initial SIGTRAP)
-				kr := C.thread_resume(d.mainThread)
-				if kr != C.KERN_SUCCESS {
-					log.Printf("[Debugger] thread_resume failed: %d", kr)
+				log.Println("[Debugger] Continuing from initial SIGTRAP equivalent")
+
+				for i := 0; i < 10; i++ {
+					C.task_resume(d.task)
+					C.thread_resume(d.mainThread)
 				}
-				d.Continue(d.DebugInfo.GetTarget().PID) // Step over breakpoints normally
+
 				return
 			case "step":
 				log.Println("[Debugger] Cannot single-step from initial breakpoint")
@@ -487,48 +518,62 @@ func (d *darwinARM64Debugger) breakpointHit(pid int) {
 	}
 
 	// Get location information (rewind PC by 4 bytes for ARM64)
-	filename, line, fn := d.DebugInfo.PCToLine(regs.Pc - 4)
+	pc := regs.Pc - 4
+	pc -= d.slide
+	filename, line, fn := d.DebugInfo.PCToLine(pc)
 
-	// Create breakpoint event
+	function := "<unknown>"
+	if fn != nil {
+		function = fn.Name
+	}
+
 	event := BreakpointEvent{
 		PID:      pid,
 		Filename: filename,
 		Line:     line,
-		Function: fn.Name,
+		Function: function,
 	}
+	log.Printf("runtime PC: %#x", regs.Pc)
+	log.Printf("slide: %#x", d.slide)
+	log.Printf("lookup PC: %#x", (regs.Pc-4)-d.slide)
 
 	// Send breakpoint hit event to hub
-	log.Printf("[Debugger] Breakpoint hit at %s:%d in %s, waiting for command", filename, line, fn.Name)
+	log.Printf("[Debugger] Breakpoint hit at %s:%d in %s, waiting for command", filename, line, function)
 	d.BreakpointHit <- event
 
-	// Wait for command from hub
-	select {
-	case cmd := <-d.DebugCommand:
-		log.Printf("[Debugger] Received command: %s", cmd.Type)
-		switch cmd.Type {
-		case "continue":
-			d.Continue(pid)
-		case "step":
-			d.SingleStep(pid)
-		case "setBreakpoint":
-			if data, ok := cmd.Data.(map[string]any); ok {
-				if line, ok := data["line"].(int); ok {
-					if err := d.SetBreakpoint(pid, int(line)); err != nil {
-						log.Printf("[Debugger] Failed to set breakpoint at line %d: %v", int(line), err)
-					} else {
-						log.Printf("[Debugger] Breakpoint set at line %d while at breakpoint", int(line))
+	// Wait for commands from hub (loop until terminal command)
+	for {
+		select {
+		case cmd := <-d.DebugCommand:
+			log.Printf("[Debugger] Received command: %s", cmd.Type)
+			switch cmd.Type {
+			case "continue":
+				d.Continue(pid)
+				return // Terminal command - resume exception loop
+			case "step":
+				d.SingleStep(pid)
+				return // Terminal command - resume exception loop
+			case "setBreakpoint":
+				if data, ok := cmd.Data.(map[string]any); ok {
+					if line, ok := data["line"].(int); ok {
+						if err := d.SetBreakpoint(pid, int(line)); err != nil {
+							log.Printf("[Debugger] Failed to set breakpoint at line %d: %v", int(line), err)
+						} else {
+							log.Printf("[Debugger] Breakpoint set at line %d while at breakpoint", int(line))
+						}
 					}
 				}
+				// Non-terminal command - loop again to wait for next command
+			case "quit":
+				d.StopDebug()
+				return // Terminal command
+			default:
+				log.Printf("[Debugger] Unknown command: %s", cmd.Type)
+				// Loop again to wait for next command
 			}
-		case "quit":
-			d.StopDebug()
+		case <-d.EndDebugSession:
+			log.Println("[Debugger] Debug session ending, stopping breakpoint handler")
 			return
-		default:
-			log.Printf("[Debugger] Unknown command: %s", cmd.Type)
-			d.Continue(pid) // Default to continue
 		}
-	case <-d.EndDebugSession:
-		log.Println("[Debugger] Debug session ending, stopping breakpoint handler")
-		return
 	}
 }
