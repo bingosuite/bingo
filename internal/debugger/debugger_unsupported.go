@@ -1,4 +1,4 @@
-//go:build !(linux && amd64)
+//go:build !((linux && amd64) || (darwin && arm64))
 
 package debugger
 
