@@ -4,19 +4,24 @@
 #include <mach/arm/thread_state.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <mach/exception_types.h>
+#include <mach/message.h>
 #include <stdint.h>
 #include <sys/types.h>
 
 typedef struct {
     mach_msg_header_t Head;
     mach_msg_body_t msgh_body;
-    mach_msg_ool_ports_descriptor_t ool_ports;
-    NDR_record_t nondescript;
+
+    mach_msg_port_descriptor_t thread;
+    mach_msg_port_descriptor_t task;
+
+    NDR_record_t NDR;
+
     exception_type_t exception;
-    mach_msg_type_number_t code_count;
-    integer_t codes[2];
-    mach_port_t thread_port;
-    mach_port_t task_port;
+    mach_msg_type_number_t codeCnt;
+    mach_exception_data_type_t code[2];
+
 } exc_msg_t;
 
 typedef struct {
@@ -24,6 +29,11 @@ typedef struct {
     NDR_record_t nondescript;
     kern_return_t RetCode;
 } exc_msg_reply_t;
+
+enum {
+    sizeof_exc_msg_reply_t = sizeof(exc_msg_reply_t)
+};
+
 
 mach_port_t get_mach_task_self(void);
 mach_msg_bits_t get_reply_bits(mach_msg_bits_t bits);
@@ -39,5 +49,12 @@ kern_return_t resume_thread(thread_act_t thread);
 kern_return_t get_main_image_address(task_t task, mach_vm_address_t *addr);
 kern_return_t find_image_slide(task_t task, mach_vm_address_t *slide);
 int ptrace_attach_exc(int pid);
+kern_return_t resume_task(task_t task);
+kern_return_t resume_task_all(task_t task);
+kern_return_t set_thread_exception_ports(task_t task, mach_port_t port);
+thread_act_t exc_msg_thread(exc_msg_t *msg);
+mach_msg_bits_t make_reply_bits(mach_msg_bits_t bits);
+mach_msg_id_t make_reply_id(mach_msg_id_t id);
+
 
 #endif
