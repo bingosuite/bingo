@@ -212,7 +212,7 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 			// IMPORTANT: After your handler returns (Continue/step called),
 			// send reply to resume the thread
 			reply.Head.msgh_bits = C.make_reply_bits(excMsg.Head.msgh_bits)
-			reply.Head.msgh_size = C.mach_msg_size_t(C.sizeof_exc_msg_reply_t)
+			reply.Head.msgh_size = C.mach_msg_size_t(unsafe.Sizeof(reply))
 
 			reply.Head.msgh_remote_port = excMsg.Head.msgh_remote_port
 			reply.Head.msgh_local_port = C.MACH_PORT_NULL
@@ -230,22 +230,35 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 				C.MACH_MSG_TIMEOUT_NONE,
 				C.MACH_PORT_NULL,
 			)
+
 			if replyKr != C.MACH_MSG_SUCCESS {
 				log.Printf("[Debugger] Failed to send exception reply: %d", replyKr)
+			} else {
+				// Resume the stopped thread
+				C.thread_resume(d.mainThread)
 			}
 		} else {
-			// Unknown exception - just resume
-			reply.Head.msgh_bits = C.make_reply_bits(excMsg.Head.msgh_bits)
+			// Unknown exception - pass to next handler
 
-			reply.Head.msgh_size = C.mach_msg_size_t(C.sizeof_exc_msg_reply_t)
+			reply.Head.msgh_bits = C.make_reply_bits(excMsg.Head.msgh_bits)
+			reply.Head.msgh_size = C.mach_msg_size_t(unsafe.Sizeof(reply))
 
 			reply.Head.msgh_remote_port = excMsg.Head.msgh_remote_port
 			reply.Head.msgh_local_port = C.MACH_PORT_NULL
 
 			reply.Head.msgh_id = excMsg.Head.msgh_id + 100
 
-			reply.RetCode = C.KERN_SUCCESS
-			C.mach_msg((*C.mach_msg_header_t)(unsafe.Pointer(&reply)), C.MACH_SEND_MSG, C.mach_msg_size_t(unsafe.Sizeof(reply)), 0, C.MACH_PORT_NULL, C.MACH_MSG_TIMEOUT_NONE, C.MACH_PORT_NULL)
+			reply.RetCode = 5 // KERN_FAILURE
+
+			C.mach_msg(
+				(*C.mach_msg_header_t)(unsafe.Pointer(&reply)),
+				C.MACH_SEND_MSG,
+				C.mach_msg_size_t(unsafe.Sizeof(reply)),
+				0,
+				C.MACH_PORT_NULL,
+				C.MACH_MSG_TIMEOUT_NONE,
+				C.MACH_PORT_NULL,
+			)
 		}
 	}
 }
@@ -350,25 +363,31 @@ func (d *darwinARM64Debugger) Continue(pid int) {
 		panic(err)
 	}
 
-	bpAddr := regs.Pc - 4
-	lookupPC := bpAddr - d.slide
+	bpAddr := regs.Pc
 
-	_, line, _ := d.DebugInfo.PCToLine(lookupPC)
+	log.Printf("Continue lookup addr %#x", bpAddr)
 
-	// 1. rewind PC
-	regs.Pc = bpAddr
+	orig, ok := d.Breakpoints[bpAddr]
+	if !ok {
+		panic(fmt.Sprintf("breakpoint not found at %#x", bpAddr))
+	}
 
-	// 2. restore original instruction
-	if err := d.ClearBreakpoint(pid, line); err != nil {
+	// restore instruction
+	if err := d.writeWord(bpAddr, orig); err != nil {
 		panic(err)
 	}
 
-	// 3. enable single step
+	// rewind PC so the instruction executes
+	regs.Pc = bpAddr
+
+	// enable single-step
 	regs.Cpsr |= 1 << 21
 
 	if err := d.setRegs(regs); err != nil {
 		panic(err)
 	}
+
+	C.thread_resume(d.mainThread)
 }
 
 // singleStepThread sets up single-step mode then resumes (your ptraceSingleStep replacement)
@@ -407,7 +426,9 @@ func (d *darwinARM64Debugger) SetBreakpoint(pid int, line int) error {
 		return err
 	}
 
-	runtimePC := (filePC + d.slide) &^ 0x3
+	// convert to runtime address
+	runtimePC := (filePC + d.slide)
+	log.Printf("Breakpoint stored at %#x", runtimePC)
 
 	log.Printf(
 		"[Debugger] breakpoint filePC=%#x slide=%#x runtimePC=%#x",
@@ -416,18 +437,23 @@ func (d *darwinARM64Debugger) SetBreakpoint(pid int, line int) error {
 		runtimePC,
 	)
 
+	// read original instruction
 	orig, err := d.readWord(runtimePC)
 	if err != nil {
 		return fmt.Errorf("failed to read instruction: %w", err)
 	}
 
+	// save original instruction
 	d.Breakpoints[runtimePC] = orig
 
-	brk := []byte{0x20, 0x00, 0x20, 0xd4} // BRK #1
+	// insert BRK
+	brk := []byte{0x20, 0x00, 0x20, 0xd4}
 
 	if err := d.writeWord(runtimePC, brk); err != nil {
 		return fmt.Errorf("failed to write breakpoint: %w", err)
 	}
+
+	log.Printf("[Debugger] Breakpoint inserted at %#x", runtimePC)
 
 	return nil
 }
@@ -438,7 +464,7 @@ func (d *darwinARM64Debugger) ClearBreakpoint(pid int, line int) error {
 		return err
 	}
 
-	runtimePC := (filePC + d.slide) &^ 0x3
+	runtimePC := (filePC + d.slide)
 
 	orig := d.Breakpoints[runtimePC]
 
@@ -486,12 +512,7 @@ func (d *darwinARM64Debugger) initialBreakpointHit() {
 				}
 			case "continue":
 				log.Println("[Debugger] Continuing from initial SIGTRAP equivalent")
-
-				for i := 0; i < 10; i++ {
-					C.task_resume(d.task)
-					C.thread_resume(d.mainThread)
-				}
-
+				C.thread_resume(d.mainThread)
 				return
 			case "step":
 				log.Println("[Debugger] Cannot single-step from initial breakpoint")
@@ -517,9 +538,24 @@ func (d *darwinARM64Debugger) breakpointHit(pid int) {
 		panic(err)
 	}
 
+	// Check if this was a single-step trap
+	if (regs.Cpsr & (1 << 21)) != 0 {
+		// Disable single step
+		regs.Cpsr &^= 1 << 21
+		d.setRegs(regs)
+
+		// Reinsert breakpoints
+		for addr := range d.Breakpoints {
+			runtime := addr + d.slide
+			brk := []byte{0x20, 0x00, 0x20, 0xd4}
+			d.writeWord(runtime, brk)
+		}
+
+		return
+	}
+
 	// Get location information (rewind PC by 4 bytes for ARM64)
-	pc := regs.Pc - 4
-	pc -= d.slide
+	pc := regs.Pc - d.slide
 	filename, line, fn := d.DebugInfo.PCToLine(pc)
 
 	function := "<unknown>"
