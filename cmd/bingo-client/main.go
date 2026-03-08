@@ -21,10 +21,7 @@ import (
 func main() { //nolint:gocognit,gocyclo // this is a temporary default client that we will refactor completely later on
 	cfg, err := config.Load("config/config.yml")
 	if err != nil {
-		log.Printf("Failed to load config: %v", err)
-	}
-
-	if cfg == nil {
+		log.Printf("Failed to load config: %v, using defaults", err)
 		cfg = config.Default()
 	}
 
