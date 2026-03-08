@@ -266,10 +266,6 @@ func (c *Client) SetBreakpoint(filename string, line int) error {
 	return c.SendCommand(string(ws.CmdSetBreakpoint), payload)
 }
 
-func marshalJSON(v any) ([]byte, error) {
-	return json.Marshal(v)
-}
-
 func (c *Client) setState(state ws.State) {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
