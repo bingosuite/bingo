@@ -43,15 +43,14 @@ Low-level functions should wrap and return errors. The top-level caller (e.g. th
 
 ```go
 // Bad — logs and panics at every layer
-if err := d.SetBreakpoint(pid, line); err != nil {
+if err := d.setBreakpoint(pid, line); err != nil {
     log.Printf("failed: %v", err)
     panic(err)
 }
 
-// Good — low-level function just returns; caller logs once
-if err := d.StartWithDebug(path); err != nil {
-    log.Printf("[Hub] Debug session for %q failed: %v", path, err)
-    // signal shutdown, clean up, etc.
+// Good — low-level function just wraps and returns; caller logs once
+if err := d.setBreakpoint(pid, line); err != nil {
+    return fmt.Errorf("setting initial breakpoint at line %d: %w", line, err)
 }
 ```
 
@@ -90,38 +89,61 @@ var ErrProcessExited = errors.New("target process has exited")
 if errors.Is(err, debugger.ErrProcessExited) { ... }
 ```
 
-## 7. Cross-goroutine error propagation: `chan error`
+## 7. Cross-goroutine error propagation: typed event channels
 
-When a goroutine needs to signal its outcome back to an owner (e.g. the debugger back to the hub), use a `chan error` where `nil` means a clean exit and a non-nil value carries the failure. This is consistent with how `context`, `errgroup`, and the standard library communicate goroutine results.
+When an error occurs inside a goroutine, the idiomatic Go rule still applies — no panics, no global state. But the goroutine cannot `return` an error to its caller, so the error must travel on a channel.
 
-In this codebase, `endDebugSession chan error` serves this role:
+In Bingo, **all debugger outcomes — normal events, clean exits, and failures — are delivered through the same `chan DebuggerEvent`**. This is preferable to a separate `chan error` because:
+
+- There is a single channel to `select` on; no need to coordinate multiple channels.
+- The hub's event loop handles every case uniformly with a type switch.
+- `SessionEndedEvent` carries either a clean exit (`Err: nil`) or a failure (`Err: someErr`).
+
+### How it works
+
+`StartWithDebug` has **no return value**. It always sends a `SessionEndedEvent` before returning, so the hub always learns the outcome through the event channel regardless of whether the session ended cleanly or with an error.
 
 ```go
-// Debugger: clean exit (target process finished normally)
-select {
-case d.EndDebugSession <- nil:
-default:
+// debugger_linux_amd64.go
+
+// notifyEnd is called on every exit path — errors and clean exits alike.
+notifyEnd := func(err error) { d.sendEvent(SessionEndedEvent{Err: err}) }
+
+// On failure:
+if err := cmd.Start(); err != nil {
+    notifyEnd(fmt.Errorf("starting target: %w", err))
+    return
 }
 
-// Debugger: failure (e.g. ptrace error in the debug loop)
-// The hub goroutine that launched StartWithDebug sends the returned error:
-go func() {
-    if err := h.dbg.StartWithDebug(path); err != nil {
-        select {
-        case h.endDebugSession <- err:
-        default:
-        }
-    }
-}()
+// On clean exit:
+notifyEnd(nil)
+```
 
-// Hub: receive and act on the result
-case err := <-h.endDebugSession:
-    if err != nil {
-        log.Printf("[Hub] Debug session error: %v", err)
-        h.broadcastError(err)
+```go
+// hub.go
+
+// StartWithDebug is launched in a goroutine. No error return to check.
+go h.dbg.StartWithDebug(startDebugCmd.TargetPath)
+
+// The hub's Run loop receives all outcomes uniformly:
+case event := <-h.debuggerEvents:
+    if done := h.handleDebuggerEvent(event); done {
+        return
+    }
+
+// handleDebuggerEvent uses a type switch:
+case debugger.SessionEndedEvent:
+    if e.Err != nil {
+        log.Printf("[Hub] Debug session %s ended with error: %v", h.sessionID, e.Err)
+        h.broadcastError(e.Err)
     }
     h.shutdown()
+    return true
 ```
+
+### What goes in the interface vs. what stays internal
+
+Only methods the hub actually calls belong on the `Debugger` interface. Internal helpers (`continueExec`, `singleStep`, `setBreakpoint`, etc.) stay as unexported methods on the concrete type, returning `error` normally through the synchronous call chain. Those errors eventually reach `mainDebugLoop` → `StartWithDebug` → `notifyEnd`, which puts them on the channel.
 
 For cases where multiple goroutines need to be coordinated, [`golang.org/x/sync/errgroup`](https://pkg.go.dev/golang.org/x/sync/errgroup) is the idiomatic tool — it collects the first non-nil error from a group and cancels the others via a `context.Context`.
 
@@ -163,5 +185,6 @@ Do not send raw internal error chains or Go type information to the client. The 
 | Error the caller must branch on | Define a sentinel `var Err... = errors.New(...)` |
 | Programmer bug (should never happen) | `panic` is acceptable |
 | Logging | Log once at the call site that handles the error, not at every layer |
-| Goroutine → owner error propagation | `chan error`: send `nil` for clean exit, non-nil for failure |
+| Goroutine → owner error propagation | Send a `SessionEndedEvent{Err: err}` on `chan DebuggerEvent`; no `return error` from the goroutine function |
+| Methods not called by the hub | Keep unexported on the concrete type; return errors through the call chain normally |
 | Server → WebSocket client error | Broadcast a typed `ErrorEvent`; keep internal details server-side |

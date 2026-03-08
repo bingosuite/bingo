@@ -35,36 +35,30 @@ type Hub struct {
 	dbg debugger.Debugger
 
 	// Debugger channels owned by the hub
-	breakpointHit        chan debugger.BreakpointEvent
-	initialBreakpointHit chan debugger.InitialBreakpointHitEvent
-	debugCommand         chan debugger.DebugCommand
-	endDebugSession      chan error
+	debuggerEvents chan debugger.DebuggerEvent
+	debugCommand   chan debugger.DebugCommand
 
 	mu sync.RWMutex
 }
 
 func NewHub(sessionID string, idleTimeout time.Duration) *Hub {
-	breakpointHit := make(chan debugger.BreakpointEvent, 1)
-	initialBreakpointHit := make(chan debugger.InitialBreakpointHitEvent, 1)
+	debuggerEvents := make(chan debugger.DebuggerEvent, 8)
 	debugCommand := make(chan debugger.DebugCommand, 1)
-	endDebugSession := make(chan error, 1)
 
-	dbg := debugger.NewDebugger(breakpointHit, initialBreakpointHit, debugCommand, endDebugSession)
+	dbg := debugger.NewDebugger(debuggerEvents, debugCommand)
 
 	return &Hub{
-		sessionID:            sessionID,
-		connections:          make(map[*Connection]struct{}),
-		register:             make(chan *Connection),
-		unregister:           make(chan *Connection),
-		events:               make(chan Message, eventBufferSize),
-		commands:             make(chan Message, commandBufferSize),
-		idleTimeout:          idleTimeout,
-		lastActivity:         time.Now(),
-		dbg:                  dbg,
-		breakpointHit:        breakpointHit,
-		initialBreakpointHit: initialBreakpointHit,
-		debugCommand:         debugCommand,
-		endDebugSession:      endDebugSession,
+		sessionID:      sessionID,
+		connections:    make(map[*Connection]struct{}),
+		register:       make(chan *Connection),
+		unregister:     make(chan *Connection),
+		events:         make(chan Message, eventBufferSize),
+		commands:       make(chan Message, commandBufferSize),
+		idleTimeout:    idleTimeout,
+		lastActivity:   time.Now(),
+		dbg:            dbg,
+		debuggerEvents: debuggerEvents,
+		debugCommand:   debugCommand,
 	}
 }
 
@@ -129,14 +123,10 @@ func (h *Hub) Run() {
 			log.Printf("[Hub] Hub %s command: %s", h.sessionID, cmd.Type)
 			h.handleCommand(cmd)
 
-		case err := <-h.endDebugSession:
-			if err != nil {
-				log.Printf("[Hub] Debug session %s ended with error: %v", h.sessionID, err)
-				h.broadcastError(err)
-			} else {
-				log.Printf("[Hub] Debugger signaled end of session %s, shutting down hub", h.sessionID)
+		case event := <-h.debuggerEvents:
+			if done := h.handleDebuggerEvent(event); done {
+				return
 			}
-			h.shutdown()
 		}
 	}
 }
@@ -164,109 +154,60 @@ func (h *Hub) shutdown() {
 	}
 }
 
-// Listen for events from the debugger (breakpoint hits)
-func (h *Hub) listenForDebuggerEvents() {
-	for {
-		select {
-		case bpEvent := <-h.breakpointHit:
-			log.Printf("[Hub] [Debugger Event] Breakpoint hit at %s:%d in %s", bpEvent.Filename, bpEvent.Line, bpEvent.Function)
+// handleDebuggerEvent processes a single event from the debugger. It returns
+// true when the hub should shut down (i.e. the session has ended).
+func (h *Hub) handleDebuggerEvent(event debugger.DebuggerEvent) bool {
+	switch e := event.(type) {
+	case debugger.BreakpointEvent:
+		log.Printf("[Hub] [Debugger Event] Breakpoint hit at %s:%d in %s", e.Filename, e.Line, e.Function)
 
-			// Create and send breakpoint hit event to all clients
-			event := BreakpointHitEvent{
-				Type:      EventBreakpointHit,
-				SessionID: h.sessionID,
-				PID:       bpEvent.PID,
-				Filename:  bpEvent.Filename,
-				Line:      bpEvent.Line,
-				Function:  bpEvent.Function,
-			}
-
-			eventData, err := json.Marshal(event)
-			if err != nil {
-				log.Printf("[Hub] Failed to marshal breakpoint event: %v", err)
-				continue
-			}
-
-			message := Message{
-				Type: string(EventBreakpointHit),
-				Data: eventData,
-			}
-
-			h.Broadcast(message)
-
-			// Also send state update to indicate we're at a breakpoint
-			stateEvent := StateUpdateEvent{
-				Type:      EventStateUpdate,
-				SessionID: h.sessionID,
-				NewState:  StateBreakpoint,
-			}
-
-			stateData, err := json.Marshal(stateEvent)
-			if err != nil {
-				log.Printf("[Hub] Failed to marshal state update event: %v", err)
-				continue
-			}
-
-			stateMessage := Message{
-				Type: string(EventStateUpdate),
-				Data: stateData,
-			}
-
-			h.Broadcast(stateMessage)
-
-		case initialBpEvent := <-h.initialBreakpointHit:
-			log.Printf("[Hub] [Debugger Event] Initial breakpoint hit (PID: %d, session: %s)", initialBpEvent.PID, h.sessionID)
-
-			// Create and send initial breakpoint event to all clients
-			event := InitialBreakpointHitEvent{
-				Type:      EventInitialBreakpoint,
-				SessionID: h.sessionID,
-				PID:       initialBpEvent.PID,
-			}
-
-			eventData, err := json.Marshal(event)
-			if err != nil {
-				log.Printf("[Hub] Failed to marshal initial breakpoint event: %v", err)
-				continue
-			}
-
-			message := Message{
-				Type: string(EventInitialBreakpoint),
-				Data: eventData,
-			}
-
-			h.Broadcast(message)
-
-			// Also send state update to indicate we're at a breakpoint
-			log.Printf("[Hub] [State Change] Transitioning to breakpoint state (session: %s)", h.sessionID)
-			stateEvent := StateUpdateEvent{
-				Type:      EventStateUpdate,
-				SessionID: h.sessionID,
-				NewState:  StateBreakpoint,
-			}
-
-			stateData, err := json.Marshal(stateEvent)
-			if err != nil {
-				log.Printf("[Hub] Failed to marshal state update event: %v", err)
-				continue
-			}
-
-			stateMessage := Message{
-				Type: string(EventStateUpdate),
-				Data: stateData,
-			}
-
-			h.Broadcast(stateMessage)
-
-		case err := <-h.endDebugSession:
-			if err != nil {
-				log.Printf("[Hub] Debugger error in session %s: %v", h.sessionID, err)
-				h.broadcastError(err)
-			}
-			log.Println("[Hub] Debugger event listener ending, sending state update to ready")
-			h.sendStateUpdate(StateReady)
-			return
+		eventData, err := json.Marshal(BreakpointHitEvent{
+			Type:      EventBreakpointHit,
+			SessionID: h.sessionID,
+			PID:       e.PID,
+			Filename:  e.Filename,
+			Line:      e.Line,
+			Function:  e.Function,
+		})
+		if err != nil {
+			log.Printf("[Hub] Failed to marshal breakpoint event: %v", err)
+			return false
 		}
+		h.Broadcast(Message{Type: string(EventBreakpointHit), Data: eventData})
+		h.sendStateUpdate(StateBreakpoint)
+		return false
+
+	case debugger.InitialBreakpointHitEvent:
+		log.Printf("[Hub] [Debugger Event] Initial breakpoint hit (PID: %d, session: %s)", e.PID, h.sessionID)
+
+		eventData, err := json.Marshal(InitialBreakpointHitEvent{
+			Type:      EventInitialBreakpoint,
+			SessionID: h.sessionID,
+			PID:       e.PID,
+		})
+		if err != nil {
+			log.Printf("[Hub] Failed to marshal initial breakpoint event: %v", err)
+			return false
+		}
+		h.Broadcast(Message{Type: string(EventInitialBreakpoint), Data: eventData})
+		log.Printf("[Hub] [State Change] Transitioning to breakpoint state (session: %s)", h.sessionID)
+		h.sendStateUpdate(StateBreakpoint)
+		return false
+
+	case debugger.SessionEndedEvent:
+		if e.Err != nil {
+			log.Printf("[Hub] Debug session %s ended with error: %v", h.sessionID, e.Err)
+			h.broadcastError(e.Err)
+		} else {
+			log.Printf("[Hub] Debugger completed session %s", h.sessionID)
+		}
+		h.sendStateUpdate(StateReady)
+		h.shutdown()
+		return true
+
+	default:
+		log.Printf("[Hub] Unknown debugger event type: %T", event)
+		return false
 	}
 }
 
@@ -280,24 +221,9 @@ func (h *Hub) handleCommand(cmd Message) {
 			return
 		}
 		log.Printf("[Hub] [Command] StartDebug received: %s (session: %s)", startDebugCmd.TargetPath, h.sessionID)
-
-		// Prevent stale messages from prior debug runs from leaking into this new session.
-		// TODO: fix the drain channels
-		//h.clearDebuggerChannels(h.debugCommand, h.breakpointHit, h.initialBreakpointHit, h.endDebugSession)
-
-		// Start listening for events from this new debugger
-		go h.listenForDebuggerEvents()
-
-		// Start the debug session
-		go func() {
-			if err := h.dbg.StartWithDebug(startDebugCmd.TargetPath); err != nil {
-				log.Printf("[Hub] [Error] Debug session for %q failed: %v", startDebugCmd.TargetPath, err)
-				select {
-				case h.endDebugSession <- err:
-				default:
-				}
-			}
-		}()
+		// StartWithDebug delivers all outcomes via the debuggerEvents channel as a
+		// SessionEndedEvent, so the hub's Run loop handles success and failure uniformly.
+		go h.dbg.StartWithDebug(startDebugCmd.TargetPath)
 
 	case CmdContinue:
 		var continueCmd ContinueCmd
