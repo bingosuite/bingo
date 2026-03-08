@@ -59,7 +59,7 @@ const (
 	CmdStartDebug    CommandType = "startDebug"
 	CmdSetBreakpoint CommandType = "setBreakpoint"
 	CmdContinue      CommandType = "continue"
-	CmdStepOver      CommandType = "stepOver"
+	CmdStepOver      CommandType = "step"
 	CmdExit          CommandType = "exit"
 )
 

@@ -48,6 +48,11 @@ type darwinARM64Debugger struct {
 	// Temporary breakpoint state for implementing "continue" command
 	tempBreakpoint uint64
 	tempOriginal   []byte
+	tempIsStepOver bool // true if temp breakpoint is from stepOver (stop), false if from continue (auto-resume)
+
+	// Single-step state: track if we removed a breakpoint for stepping
+	singleStepRemovedBP uint64
+	isSingleStepping    bool // Track if we're currently single-stepping
 }
 
 func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan InitialBreakpointHitEvent, debugCommand chan DebugCommand, endDebugSession chan bool) Debugger {
@@ -203,6 +208,23 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 			if d.mainThread == 0 {
 				d.mainThread = thread // Cache first thread seen
 				log.Printf("[Debugger] Cached main thread: %d", thread)
+			}
+
+			// Check if we just completed a single-step
+			if d.isSingleStepping {
+				log.Println("[Exception Loop] Single-step completed, clearing state")
+				C.disable_single_step(d.mainThread) // Ensure SS bit is cleared
+				d.isSingleStepping = false
+
+				// Re-install any breakpoint we temporarily removed for single-stepping
+				if d.singleStepRemovedBP != 0 {
+					log.Printf("[Exception Loop] Re-installing breakpoint at %#x", d.singleStepRemovedBP)
+					brk := []byte{0x20, 0x00, 0x20, 0xd4}
+					if err := d.writeWord(d.singleStepRemovedBP, brk); err != nil {
+						log.Printf("[Exception Loop] Failed to re-install breakpoint: %v", err)
+					}
+					d.singleStepRemovedBP = 0
+				}
 			}
 
 			// Dispatch to your existing handlers
@@ -424,6 +446,7 @@ func (d *darwinARM64Debugger) Continue(pid int) {
 	// store temporary breakpoint so we can restore it later
 	d.tempBreakpoint = next
 	d.tempOriginal = tmpOrig
+	d.tempIsStepOver = false // Continue temp breakpoint - auto-resume
 
 	log.Printf("[Continue] Temporary breakpoint installed")
 
@@ -431,20 +454,98 @@ func (d *darwinARM64Debugger) Continue(pid int) {
 	C.thread_resume(d.mainThread)
 }
 
-// singleStepThread sets up single-step mode then resumes (your ptraceSingleStep replacement)
-func (d *darwinARM64Debugger) singleStepThread() error {
+func (d *darwinARM64Debugger) SingleStep(pid int) {
+	log.Printf("[SingleStep] Starting single step for PID %d", pid)
+
+	// Get current PC to check if we're at a breakpoint
 	regs, err := d.getRegs()
 	if err != nil {
-		return err
+		panic(err)
 	}
 
-	// Enable single-step by setting SS bit in CPSR (bit 21)
-	regs.Cpsr |= 1 << 21
-	return d.setRegs(regs)
+	pc := regs.Pc
+	log.Printf("[SingleStep] Current PC = %#x", pc)
+
+	// If we're at a breakpoint, temporarily restore the original instruction
+	d.singleStepRemovedBP = 0 // Reset
+	if orig, ok := d.Breakpoints[pc]; ok {
+		log.Printf("[SingleStep] At breakpoint, temporarily restoring original instruction")
+		if err := d.writeWord(pc, orig); err != nil {
+			panic(err)
+		}
+		d.singleStepRemovedBP = pc // Remember we need to re-install this
+	}
+
+	// Enable single-step mode using hardware debug registers
+	kr := C.enable_single_step(d.mainThread)
+	if kr != C.KERN_SUCCESS {
+		panic(fmt.Errorf("enable_single_step failed: %d", kr))
+	}
+
+	// Mark that we're single-stepping (CPU clears SS bit when exception fires)
+	d.isSingleStepping = true
+
+	log.Printf("[SingleStep] Hardware single-step enabled, resuming thread")
+
+	// Resume the thread - it will execute one instruction and trap
+	C.thread_resume(d.mainThread)
 }
 
-func (d *darwinARM64Debugger) SingleStep(pid int) {
-	d.singleStepThread() // Sets SS bit, exception loop handles next stop
+func (d *darwinARM64Debugger) StepOver(pid int) {
+	log.Printf("[StepOver] Starting step over for PID %d", pid)
+
+	// Get current location
+	regs, err := d.getRegs()
+	if err != nil {
+		panic(err)
+	}
+
+	pc := regs.Pc - d.slide
+	filename, line, _ := d.DebugInfo.PCToLine(pc)
+
+	log.Printf("[StepOver] Current location: %s:%d", filename, line)
+
+	// Find the next source line
+	nextLine := line + 1
+	nextPC, _, err := d.DebugInfo.LineToPC(filename, nextLine)
+	if err != nil {
+		log.Printf("[StepOver] Failed to find next line %d: %v, using single-step instead", nextLine, err)
+		d.SingleStep(pid)
+		return
+	}
+
+	nextRuntimePC := nextPC + d.slide
+	log.Printf("[StepOver] Next line %d is at PC %#x", nextLine, nextRuntimePC)
+
+	// If we're at a breakpoint, restore the original instruction
+	currentRuntimePC := regs.Pc
+	if orig, ok := d.Breakpoints[currentRuntimePC]; ok {
+		log.Printf("[StepOver] Restoring original instruction at %#x", currentRuntimePC)
+		if err := d.writeWord(currentRuntimePC, orig); err != nil {
+			panic(err)
+		}
+	}
+
+	// Set temporary breakpoint at next line
+	tmpOrig, err := d.readWord(nextRuntimePC)
+	if err != nil {
+		panic(err)
+	}
+
+	brk := []byte{0x20, 0x00, 0x20, 0xd4}
+	if err := d.writeWord(nextRuntimePC, brk); err != nil {
+		panic(err)
+	}
+
+	// Store temporary breakpoint info
+	d.tempBreakpoint = nextRuntimePC
+	d.tempOriginal = tmpOrig
+	d.tempIsStepOver = true // StepOver temp breakpoint - stop at destination
+
+	log.Printf("[StepOver] Temporary breakpoint installed at next line, resuming")
+
+	// Resume execution
+	C.thread_resume(d.mainThread)
 }
 
 func (d *darwinARM64Debugger) StopDebug() {
@@ -580,14 +681,14 @@ func (d *darwinARM64Debugger) breakpointHit(pid int) {
 	}
 
 	if d.tempBreakpoint != 0 && regs.Pc == d.tempBreakpoint {
-		log.Printf("[Debugger] Temporary step breakpoint hit")
+		log.Printf("[Debugger] Temporary breakpoint hit")
 
 		// restore original instruction
 		if err := d.writeWord(d.tempBreakpoint, d.tempOriginal); err != nil {
 			panic(err)
 		}
 
-		// reinstall the user's breakpoint
+		// reinstall the user's breakpoints
 		brk := []byte{0x20, 0x00, 0x20, 0xd4}
 
 		for addr := range d.Breakpoints {
@@ -596,14 +697,19 @@ func (d *darwinARM64Debugger) breakpointHit(pid int) {
 			}
 		}
 
+		isStepOver := d.tempIsStepOver
 		d.tempBreakpoint = 0
+		d.tempIsStepOver = false
 
-		log.Printf("[Debugger] Step complete, resuming execution")
-
-		// automatically continue execution
-		C.thread_resume(d.mainThread)
-
-		return
+		if isStepOver {
+			log.Printf("[Debugger] StepOver complete, stopping at destination")
+			// Fall through to normal breakpoint handling (notify user)
+		} else {
+			log.Printf("[Debugger] Continue step-over breakpoint complete, resuming execution")
+			// automatically continue execution
+			C.thread_resume(d.mainThread)
+			return
+		}
 	}
 
 	// Get location information (rewind PC by 4 bytes for ARM64)
@@ -639,7 +745,7 @@ func (d *darwinARM64Debugger) breakpointHit(pid int) {
 				d.Continue(pid)
 				return // Terminal command - resume exception loop
 			case "step":
-				d.SingleStep(pid)
+				d.StepOver(pid)
 				return // Terminal command - resume exception loop
 			case "setBreakpoint":
 				if data, ok := cmd.Data.(map[string]any); ok {
