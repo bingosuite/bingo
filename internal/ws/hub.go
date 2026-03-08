@@ -38,7 +38,7 @@ type Hub struct {
 	breakpointHit        chan debugger.BreakpointEvent
 	initialBreakpointHit chan debugger.InitialBreakpointHitEvent
 	debugCommand         chan debugger.DebugCommand
-	endDebugSession      chan bool
+	endDebugSession      chan error
 
 	mu sync.RWMutex
 }
@@ -47,7 +47,7 @@ func NewHub(sessionID string, idleTimeout time.Duration) *Hub {
 	breakpointHit := make(chan debugger.BreakpointEvent, 1)
 	initialBreakpointHit := make(chan debugger.InitialBreakpointHitEvent, 1)
 	debugCommand := make(chan debugger.DebugCommand, 1)
-	endDebugSession := make(chan bool, 1)
+	endDebugSession := make(chan error, 1)
 
 	dbg := debugger.NewDebugger(breakpointHit, initialBreakpointHit, debugCommand, endDebugSession)
 
@@ -129,8 +129,13 @@ func (h *Hub) Run() {
 			log.Printf("[Hub] Hub %s command: %s", h.sessionID, cmd.Type)
 			h.handleCommand(cmd)
 
-		case <-h.endDebugSession:
-			log.Printf("[Hub] Debugger signaled end of session %s, shutting down hub", h.sessionID)
+		case err := <-h.endDebugSession:
+			if err != nil {
+				log.Printf("[Hub] Debug session %s ended with error: %v", h.sessionID, err)
+				h.broadcastError(err)
+			} else {
+				log.Printf("[Hub] Debugger signaled end of session %s, shutting down hub", h.sessionID)
+			}
 			h.shutdown()
 		}
 	}
@@ -253,7 +258,11 @@ func (h *Hub) listenForDebuggerEvents() {
 
 			h.Broadcast(stateMessage)
 
-		case <-h.endDebugSession:
+		case err := <-h.endDebugSession:
+			if err != nil {
+				log.Printf("[Hub] Debugger error in session %s: %v", h.sessionID, err)
+				h.broadcastError(err)
+			}
 			log.Println("[Hub] Debugger event listener ending, sending state update to ready")
 			h.sendStateUpdate(StateReady)
 			return
@@ -280,7 +289,15 @@ func (h *Hub) handleCommand(cmd Message) {
 		go h.listenForDebuggerEvents()
 
 		// Start the debug session
-		go h.dbg.StartWithDebug(startDebugCmd.TargetPath)
+		go func() {
+			if err := h.dbg.StartWithDebug(startDebugCmd.TargetPath); err != nil {
+				log.Printf("[Hub] [Error] Debug session for %q failed: %v", startDebugCmd.TargetPath, err)
+				select {
+				case h.endDebugSession <- err:
+				default:
+				}
+			}
+		}()
 
 	case CmdContinue:
 		var continueCmd ContinueCmd
@@ -403,4 +420,19 @@ func (h *Hub) sendCommandToDebugger(cmd debugger.DebugCommand, cmdName string) {
 	default:
 		log.Printf("[Hub] [Error] Failed to send %s command to debugger - channel full", cmdName)
 	}
+}
+
+// broadcastError sends an error event to all connected clients.
+func (h *Hub) broadcastError(err error) {
+	event := ErrorEvent{
+		Type:      EventError,
+		SessionID: h.sessionID,
+		Message:   err.Error(),
+	}
+	data, marshalErr := json.Marshal(event)
+	if marshalErr != nil {
+		log.Printf("[Hub] Failed to marshal error event: %v", marshalErr)
+		return
+	}
+	h.Broadcast(Message{Type: string(EventError), Data: data})
 }
