@@ -85,7 +85,17 @@ func (h *Hub) Run() {
 			h.handleCommand(cmd)
 		case event := <-h.debuggerEvents:
 			if done := h.handleDebuggerEvent(event); done {
-				return
+				// Flush any final messages queued during shutdown (e.g. the
+				// stateUpdate and error broadcast from SessionEndedEvent) so
+				// clients receive them before the hub exits.
+				for {
+					select {
+					case msg := <-h.events:
+						h.handleEvent(msg)
+					default:
+						return
+					}
+				}
 			}
 		}
 	}
