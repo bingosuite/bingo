@@ -69,65 +69,85 @@ func (h *Hub) Run() {
 	for {
 		select {
 		case <-ticker.C:
-			// Check idle timeout
-			if h.idleTimeout > 0 && len(h.connections) == 0 {
-				if time.Since(h.lastActivity) > h.idleTimeout {
-					log.Printf("[Hub] Session %s idle for %v, shutting down", h.sessionID, h.idleTimeout)
-					h.shutdown()
-					return
-				}
+			if h.checkIdleTimeout() {
+				return
 			}
-
 		case client := <-h.register:
-			h.mu.Lock()
-			h.connections[client] = struct{}{}
-			h.lastActivity = time.Now()
-			h.mu.Unlock()
-			log.Printf("[Hub] Client %s connected to hub %s (%d total)", client.id, h.sessionID, len(h.connections))
-
+			h.handleRegister(client)
 		case client := <-h.unregister:
-			h.mu.Lock()
-			if _, ok := h.connections[client]; ok {
-				delete(h.connections, client)
-				client.CloseSend()
-				log.Printf("[Hub] Client %s disconnected from hub %s (%d remaining)", client.id, h.sessionID, len(h.connections))
-
-				// When last client leaves, shutdown hub
-				if len(h.connections) == 0 {
-					h.mu.Unlock()
-					log.Printf("[Hub] Session %s has no clients, shutting down hub", h.sessionID)
-					h.shutdown()
-					return
-				}
+			if h.handleUnregister(client) {
+				return
 			}
-			h.mu.Unlock()
-
 		case event := <-h.events:
-			h.lastActivity = time.Now()
-			h.mu.RLock()
-			var slowConnections []*Connection
-			for connection := range h.connections {
-				select {
-				case connection.send <- event:
-				default: // when a send operation blocks (connection consuming too slowly or reader goroutine died), discard the connection
-					slowConnections = append(slowConnections, connection)
-				}
-			}
-			h.mu.RUnlock()
-			for _, connection := range slowConnections {
-				log.Printf("[Hub] Connection %s is slow; unregistering from hub %s", connection.id, h.sessionID)
-				h.Unregister(connection)
-			}
-
+			h.handleEvent(event)
 		case cmd := <-h.commands:
 			log.Printf("[Hub] Hub %s command: %s", h.sessionID, cmd.Type)
 			h.handleCommand(cmd)
-
 		case event := <-h.debuggerEvents:
 			if done := h.handleDebuggerEvent(event); done {
 				return
 			}
 		}
+	}
+}
+
+// checkIdleTimeout shuts down the hub when it has been idle too long and
+// returns true to signal that Run should exit.
+func (h *Hub) checkIdleTimeout() bool {
+	if h.idleTimeout > 0 && len(h.connections) == 0 {
+		if time.Since(h.lastActivity) > h.idleTimeout {
+			log.Printf("[Hub] Session %s idle for %v, shutting down", h.sessionID, h.idleTimeout)
+			h.shutdown()
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Hub) handleRegister(client *Connection) {
+	h.mu.Lock()
+	h.connections[client] = struct{}{}
+	h.lastActivity = time.Now()
+	h.mu.Unlock()
+	log.Printf("[Hub] Client %s connected to hub %s (%d total)", client.id, h.sessionID, len(h.connections))
+}
+
+// handleUnregister removes the client and returns true when Run should exit
+// (i.e. the last client has left).
+func (h *Hub) handleUnregister(client *Connection) bool {
+	h.mu.Lock()
+	if _, ok := h.connections[client]; ok {
+		delete(h.connections, client)
+		client.CloseSend()
+		log.Printf("[Hub] Client %s disconnected from hub %s (%d remaining)", client.id, h.sessionID, len(h.connections))
+
+		// When last client leaves, shutdown hub
+		if len(h.connections) == 0 {
+			h.mu.Unlock()
+			log.Printf("[Hub] Session %s has no clients, shutting down hub", h.sessionID)
+			h.shutdown()
+			return true
+		}
+	}
+	h.mu.Unlock()
+	return false
+}
+
+func (h *Hub) handleEvent(event Message) {
+	h.lastActivity = time.Now()
+	h.mu.RLock()
+	var slowConnections []*Connection
+	for connection := range h.connections {
+		select {
+		case connection.send <- event:
+		default: // send blocked: connection is too slow or its reader has died
+			slowConnections = append(slowConnections, connection)
+		}
+	}
+	h.mu.RUnlock()
+	for _, connection := range slowConnections {
+		log.Printf("[Hub] Connection %s is slow; unregistering from hub %s", connection.id, h.sessionID)
+		h.Unregister(connection)
 	}
 }
 
