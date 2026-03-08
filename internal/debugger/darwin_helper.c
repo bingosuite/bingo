@@ -281,3 +281,53 @@ kern_return_t set_debug_state(thread_act_t thread, arm_debug_state64_t *state) {
     return thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)state, ARM_DEBUG_STATE64_COUNT);
 }
 
+// Enable single-step mode (set SS bit in MDSCR_EL1)
+kern_return_t enable_single_step(thread_act_t thread) {
+    arm_debug_state64_t debug_state;
+    mach_msg_type_number_t count = ARM_DEBUG_STATE64_COUNT;
+    
+    kern_return_t kr = thread_get_state(thread, ARM_DEBUG_STATE64, 
+                                       (thread_state_t)&debug_state, &count);
+    if (kr != KERN_SUCCESS) {
+        return kr;
+    }
+    
+    // Set bit 0 (SS - Single Step) in MDSCR_EL1
+    debug_state.__mdscr_el1 |= 1;
+    
+    return thread_set_state(thread, ARM_DEBUG_STATE64, 
+                           (thread_state_t)&debug_state, ARM_DEBUG_STATE64_COUNT);
+}
+
+// Disable single-step mode (clear SS bit in MDSCR_EL1)
+kern_return_t disable_single_step(thread_act_t thread) {
+    arm_debug_state64_t debug_state;
+    mach_msg_type_number_t count = ARM_DEBUG_STATE64_COUNT;
+    
+    kern_return_t kr = thread_get_state(thread, ARM_DEBUG_STATE64, 
+                                       (thread_state_t)&debug_state, &count);
+    if (kr != KERN_SUCCESS) {
+        return kr;
+    }
+    
+    // Clear bit 0 (SS - Single Step) in MDSCR_EL1
+    debug_state.__mdscr_el1 &= ~1;
+    
+    return thread_set_state(thread, ARM_DEBUG_STATE64, 
+                           (thread_state_t)&debug_state, ARM_DEBUG_STATE64_COUNT);
+}
+
+// Check if single-step is currently enabled
+int is_single_step_enabled(thread_act_t thread) {
+    arm_debug_state64_t debug_state;
+    mach_msg_type_number_t count = ARM_DEBUG_STATE64_COUNT;
+    
+    kern_return_t kr = thread_get_state(thread, ARM_DEBUG_STATE64, 
+                                       (thread_state_t)&debug_state, &count);
+    if (kr != KERN_SUCCESS) {
+        return 0;
+    }
+    
+    return (debug_state.__mdscr_el1 & 1) != 0;
+}
+
