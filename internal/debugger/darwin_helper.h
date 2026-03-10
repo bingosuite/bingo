@@ -1,3 +1,5 @@
+//go:build darwin && arm64
+
 #ifndef DARWIN_HELPER_H
 #define DARWIN_HELPER_H
 
