@@ -272,6 +272,9 @@ func (h *Hub) handleCommand(cmd Message) {
 		}
 		log.Printf("[Hub] [Command] StartDebug received: %s (session: %s)", startDebugCmd.TargetPath, h.sessionID)
 
+		// Prevent stale messages from prior debug runs from leaking into this new session.
+		h.clearDebuggerChannels()
+
 		// Start listening for events from this new debugger
 		go h.listenForDebuggerEvents()
 
@@ -348,6 +351,59 @@ func (h *Hub) handleCommand(cmd Message) {
 
 	default:
 		log.Printf("[Hub] [Error] Unknown command type: %s", cmd.Type)
+	}
+}
+
+func (h *Hub) clearDebuggerChannels() {
+	drainedDebugCmd := 0
+	for {
+		select {
+		case <-h.debugCommand:
+			drainedDebugCmd++
+		default:
+			goto drainBreakpointHit
+		}
+	}
+
+drainBreakpointHit:
+	drainedBreakpointHit := 0
+	for {
+		select {
+		case <-h.breakpointHit:
+			drainedBreakpointHit++
+		default:
+			goto drainInitialBreakpointHit
+		}
+	}
+
+drainInitialBreakpointHit:
+	drainedInitialBreakpointHit := 0
+	for {
+		select {
+		case <-h.initialBreakpointHit:
+			drainedInitialBreakpointHit++
+		default:
+			goto drainEndDebugSession
+		}
+	}
+
+drainEndDebugSession:
+	drainedEndDebugSession := 0
+	for {
+		select {
+		case <-h.endDebugSession:
+			drainedEndDebugSession++
+		default:
+			log.Printf(
+				"[Hub] [Command] Cleared stale debugger channel messages before start (session: %s, debugCommand=%d, breakpointHit=%d, initialBreakpoint=%d, endDebugSession=%d)",
+				h.sessionID,
+				drainedDebugCmd,
+				drainedBreakpointHit,
+				drainedInitialBreakpointHit,
+				drainedEndDebugSession,
+			)
+			return
+		}
 	}
 }
 

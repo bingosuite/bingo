@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/bingosuite/bingo/config"
+	"github.com/bingosuite/bingo/internal/debugger"
 	"github.com/gorilla/websocket"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -130,6 +131,22 @@ var _ = Describe("Hub", func() {
 
 			time.Sleep(50 * time.Millisecond)
 			// Command sent successfully if we reach here
+		})
+	})
+
+	Describe("clearDebuggerChannels", func() {
+		It("should drain stale debugger messages", func() {
+			hub.debugCommand <- debugger.DebugCommand{Type: "continue"}
+			hub.breakpointHit <- debugger.BreakpointEvent{PID: 1234}
+			hub.initialBreakpointHit <- debugger.InitialBreakpointHitEvent{PID: 1234}
+			hub.endDebugSession <- true
+
+			hub.clearDebuggerChannels()
+
+			Expect(len(hub.debugCommand)).To(Equal(0))
+			Expect(len(hub.breakpointHit)).To(Equal(0))
+			Expect(len(hub.initialBreakpointHit)).To(Equal(0))
+			Expect(len(hub.endDebugSession)).To(Equal(0))
 		})
 	})
 
