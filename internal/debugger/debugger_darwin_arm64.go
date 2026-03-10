@@ -608,8 +608,10 @@ func (d *darwinARM64Debugger) initialBreakpointHit() {
 			case "setBreakpoint":
 				if data, ok := cmd.Data.(map[string]any); ok {
 					if line, ok := data["line"].(int); ok {
-						if err := d.SetBreakpoint(d.DebugInfo.GetTarget().PID, line); err != nil {
-							log.Printf("%s failed to set breakpoint at line %d: %v", logPrefixDebugger, line, err)
+						if err := d.SetBreakpoint(d.DebugInfo.GetTarget().PID, int(line)); err != nil {
+							log.Printf("%s failed to set breakpoint at line %d: %v", logPrefixDebugger, int(line), err)
+						} else {
+							log.Printf("%s breakpoint set at line %d", logPrefixDebugger, int(line))
 						}
 					}
 				}
