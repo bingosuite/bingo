@@ -1,3 +1,5 @@
+//go:build darwin && arm64
+
 #include "darwin_helper.h"
 
 #include <mach/arm/thread_status.h>
