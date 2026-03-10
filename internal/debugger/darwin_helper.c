@@ -6,13 +6,14 @@
 #include <mach/mach_vm.h>
 #include <mach/thread_act.h>
 #include <mach/task_info.h>
+#include <mach-o/loader.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ptrace.h>
 
 kern_return_t find_image_slide(task_t task, mach_vm_address_t *slide) {
     mach_vm_address_t addr = MACH_VM_MIN_ADDRESS;
-    mach_vm_size_t size = 0;
+    mach_vm_size_t region_size = 0;
 
     while (1) {
         vm_region_submap_info_data_64_t info;
@@ -22,7 +23,7 @@ kern_return_t find_image_slide(task_t task, mach_vm_address_t *slide) {
         kern_return_t kr = mach_vm_region_recurse(
             task,
             &addr,
-            &size,
+            &region_size,
             &depth,
             (vm_region_recurse_info_t)&info,
             &count
@@ -32,28 +33,81 @@ kern_return_t find_image_slide(task_t task, mach_vm_address_t *slide) {
             return kr;
 
         if (info.protection & VM_PROT_EXECUTE) {
-            uint32_t magic = 0;
+            struct mach_header_64 mh;
+            mach_vm_size_t read_size = 0;
             kr = mach_vm_read_overwrite(
                 task,
                 addr,
-                sizeof(uint32_t),
-                (mach_vm_address_t)&magic,
-                &size
+                sizeof(mh),
+                (mach_vm_address_t)&mh,
+                &read_size
             );
 
-            if (kr == KERN_SUCCESS && magic == 0xfeedfacf) {
-                *slide = addr - 0x100000000;
-                return KERN_SUCCESS;
+            if (kr == KERN_SUCCESS && read_size >= sizeof(mh) && mh.magic == MH_MAGIC_64 && mh.filetype == MH_EXECUTE) {
+                // Compute unslid vmaddr from first LC_SEGMENT_64 with fileoff==0.
+                // This corresponds to where Mach-O expects the image to be loaded.
+                uint8_t lc_buf[4096];
+                mach_vm_size_t lc_size = sizeof(lc_buf);
+                mach_vm_address_t lc_addr = addr + sizeof(struct mach_header_64);
+
+                kr = mach_vm_read_overwrite(
+                    task,
+                    lc_addr,
+                    lc_size,
+                    (mach_vm_address_t)lc_buf,
+                    &lc_size
+                );
+
+                if (kr == KERN_SUCCESS) {
+                    uint32_t ncmds = mh.ncmds;
+                    uint32_t sizeofcmds = mh.sizeofcmds;
+                    if (sizeofcmds > lc_size) {
+                        sizeofcmds = (uint32_t)lc_size;
+                    }
+
+                    uint32_t off = 0;
+                    for (uint32_t i = 0; i < ncmds && off + sizeof(struct load_command) <= sizeofcmds; i++) {
+                        struct load_command *lc = (struct load_command *)(lc_buf + off);
+                        if (lc->cmdsize == 0 || off + lc->cmdsize > sizeofcmds) {
+                            break;
+                        }
+
+                        if (lc->cmd == LC_SEGMENT_64 && lc->cmdsize >= sizeof(struct segment_command_64)) {
+                            struct segment_command_64 *seg = (struct segment_command_64 *)lc;
+                            // Use __TEXT as the unslid image base. Using only fileoff==0 can
+                            // incorrectly match __PAGEZERO (vmaddr=0), which produces a huge,
+                            // invalid slide and wrong runtime breakpoint addresses.
+                            if (strncmp(seg->segname, "__TEXT", 16) == 0) {
+                                *slide = addr - seg->vmaddr;
+                                return KERN_SUCCESS;
+                            }
+                        }
+
+                        off += lc->cmdsize;
+                    }
+                }
             }
         }
 
-        addr += size;
+        addr += region_size;
     }
 }
 
 // Port and task management
 mach_port_t get_mach_task_self(void) {
     return mach_task_self();
+}
+
+kern_return_t cleanup_exception_port(mach_port_t port) {
+    kern_return_t kr;
+
+    // Remove send right
+    kr = mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, -1);
+    if (kr != KERN_SUCCESS) return kr;
+
+    // Remove receive right
+    kr = mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE, -1);
+    return kr;
 }
 
 // Exception port configuration
@@ -146,6 +200,18 @@ kern_return_t write_word(task_t task, mach_vm_address_t addr, uint32_t val) {
     kr = mach_vm_protect(task, page, size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
 
     return kr;
+}
+
+kern_return_t probe_address_readable(task_t task, mach_vm_address_t addr) {
+    uint32_t tmp = 0;
+    mach_vm_size_t outsize = 0;
+    return mach_vm_read_overwrite(
+        task,
+        addr,
+        sizeof(uint32_t),
+        (mach_vm_address_t)&tmp,
+        &outsize
+    );
 }
 
 // Message handling
