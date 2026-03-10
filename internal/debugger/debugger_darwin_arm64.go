@@ -55,6 +55,23 @@ type darwinARM64Debugger struct {
 	isSingleStepping    bool // Track if we're currently single-stepping
 }
 
+func (d *darwinARM64Debugger) resetSessionState() {
+	d.DebugInfo = nil
+	d.slide = 0
+	d.Breakpoints = make(map[uint64][]byte)
+
+	d.task = 0
+	d.mainThread = 0
+	d.excPort = 0
+
+	d.tempBreakpoint = 0
+	d.tempOriginal = nil
+	d.tempIsStepOver = false
+
+	d.singleStepRemovedBP = 0
+	d.isSingleStepping = false
+}
+
 func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan InitialBreakpointHitEvent, debugCommand chan DebugCommand, endDebugSession chan bool) Debugger {
 	return &darwinARM64Debugger{
 		Breakpoints:          make(map[uint64][]byte),
@@ -66,6 +83,10 @@ func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan I
 }
 
 func (d *darwinARM64Debugger) computeSlide() error {
+	if d.task == 0 {
+		return fmt.Errorf("cannot compute slide: debugger task not initialized")
+	}
+
 	var slide C.mach_vm_address_t
 
 	kr := C.find_image_slide(d.task, &slide)
@@ -122,15 +143,6 @@ func (d *darwinARM64Debugger) getRegs() (*ARM64ThreadState, error) {
 		return nil, fmt.Errorf("thread_get_state failed: %d", kr)
 	}
 	return &st, nil
-}
-
-func (d *darwinARM64Debugger) setRegs(st *ARM64ThreadState) error {
-	count := C.mach_msg_type_number_t(C.ARM_THREAD_STATE64_COUNT)
-	kr := C.set_arm64_thread_state(d.mainThread, (*C.arm_thread_state64_t)(unsafe.Pointer(st)), count)
-	if kr != C.KERN_SUCCESS {
-		return fmt.Errorf("thread_set_state failed: %d", kr)
-	}
-	return nil
 }
 
 func (d *darwinARM64Debugger) readWord(addr uint64) ([]byte, error) {
@@ -293,6 +305,16 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 func (d *darwinARM64Debugger) StartWithDebug(path string) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+
+	// Consecutive runs in the same hub reuse the debugger instance, so clear
+	// all process-specific state before starting a new target.
+	d.resetSessionState()
+
+	// Drain any stale shutdown signal from a previous run.
+	select {
+	case <-d.EndDebugSession:
+	default:
+	}
 
 	validatedPath, err := validateTargetPath(path)
 	if err != nil {
@@ -549,6 +571,18 @@ func (d *darwinARM64Debugger) StepOver(pid int) {
 }
 
 func (d *darwinARM64Debugger) StopDebug() {
+	if d.DebugInfo != nil {
+		syscall.Kill(d.DebugInfo.GetTarget().PID, syscall.SIGKILL)
+	}
+
+	if d.excPort != 0 {
+		kr := C.cleanup_exception_port(d.excPort)
+		if kr != C.KERN_SUCCESS {
+			log.Printf("cleanup_exception_port failed: %d", kr)
+		}
+		d.excPort = 0
+	}
+
 	if d.task != 0 {
 		// Clear exception ports
 		C.clear_debug_exception_ports(d.task)
@@ -560,9 +594,25 @@ func (d *darwinARM64Debugger) StopDebug() {
 	case d.EndDebugSession <- true:
 	default:
 	}
+
+	// Ensure the next StartWithDebug begins from a clean slate even if the
+	// same debugger instance is reused by the hub.
+	d.resetSessionState()
 }
 
 func (d *darwinARM64Debugger) SetBreakpoint(pid int, line int) error {
+	if d.DebugInfo == nil {
+		return fmt.Errorf("cannot set breakpoint: debug info not initialized")
+	}
+	if d.task == 0 {
+		return fmt.Errorf("cannot set breakpoint: debugger task is not initialized")
+	}
+	if d.slide == 0 {
+		if err := d.computeSlide(); err != nil {
+			return fmt.Errorf("cannot set breakpoint: failed to compute slide: %w", err)
+		}
+	}
+
 	filePC, _, err := d.DebugInfo.LineToPC(d.DebugInfo.GetTarget().Path, line)
 	if err != nil {
 		return err
@@ -579,6 +629,16 @@ func (d *darwinARM64Debugger) SetBreakpoint(pid int, line int) error {
 		runtimePC,
 	)
 
+	if kr := C.probe_address_readable(d.task, C.mach_vm_address_t(runtimePC)); kr != C.KERN_SUCCESS {
+		return fmt.Errorf(
+			"computed runtime breakpoint address is not readable (kr=%d): filePC=%#x slide=%#x runtimePC=%#x",
+			kr,
+			filePC,
+			d.slide,
+			runtimePC,
+		)
+	}
+
 	// read original instruction
 	orig, err := d.readWord(runtimePC)
 	if err != nil {
@@ -592,7 +652,13 @@ func (d *darwinARM64Debugger) SetBreakpoint(pid int, line int) error {
 	brk := []byte{0x20, 0x00, 0x20, 0xd4}
 
 	if err := d.writeWord(runtimePC, brk); err != nil {
-		return fmt.Errorf("failed to write breakpoint: %w", err)
+		return fmt.Errorf(
+			"failed to write breakpoint: %w (filePC=%#x slide=%#x runtimePC=%#x)",
+			err,
+			filePC,
+			d.slide,
+			runtimePC,
+		)
 	}
 
 	log.Printf("[Debugger] Breakpoint inserted at %#x", runtimePC)
@@ -619,11 +685,8 @@ func (d *darwinARM64Debugger) ClearBreakpoint(pid int, line int) error {
 
 // initialBreakpointHit handles the initial SIGTRAP and allows setting breakpoints
 func (d *darwinARM64Debugger) initialBreakpointHit() {
-
-	if d.slide == 0 {
-		if err := d.computeSlide(); err != nil {
-			log.Printf("slide computation failed: %v", err)
-		}
+	if err := d.computeSlide(); err != nil {
+		log.Printf("slide computation failed: %v", err)
 	}
 	// Create initial breakpoint event
 	event := InitialBreakpointHitEvent{
