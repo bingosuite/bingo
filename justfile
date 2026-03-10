@@ -74,3 +74,6 @@ integration:
 # Codesign the MacOS binary for debugging (required for task_for_pid and memory operations)
 sign:
 	codesign --entitlements entitlements.plist --force -s - build/bingo/bingo_darwin_arm64
+
+unsign:
+	codesign --remove-signature build/bingo/bingo_darwin_arm64
