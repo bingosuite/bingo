@@ -37,6 +37,7 @@ enum {
 
 // Port and task management
 mach_port_t get_mach_task_self(void);
+kern_return_t cleanup_exception_port(mach_port_t port);
 
 // Exception port configuration
 kern_return_t set_debug_exception_ports(task_t task, mach_port_t exc_port);
@@ -55,6 +56,7 @@ kern_return_t set_arm64_thread_state(thread_act_t thr, arm_thread_state64_t *sta
 // Memory read/write operations
 kern_return_t read_word(task_t task, mach_vm_address_t addr, uint32_t *out);
 kern_return_t write_word(task_t task, mach_vm_address_t addr, uint32_t val);
+kern_return_t probe_address_readable(task_t task, mach_vm_address_t addr);
 
 // Memory management and slide detection
 kern_return_t find_image_slide(task_t task, mach_vm_address_t *slide);
