@@ -207,9 +207,9 @@ func (c *Client) SingleStep() error {
 		Type:      ws.CmdSingleStep,
 		SessionID: c.SessionID(),
 	}
-	payload, err := marshalJSON(cmd)
+	payload, err := json.Marshal(cmd)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshalling singleStep command: %w", err)
 	}
 	return c.SendCommand(string(ws.CmdSingleStep), payload)
 }

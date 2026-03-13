@@ -349,7 +349,7 @@ func (d *linuxAMD64Debugger) initialBreakpointHit() error {
 				if err := unix.PtraceCont(d.DebugInfo.GetTarget().PID, 0); err != nil {
 					return fmt.Errorf("resuming target after initial stop: %w", err)
 				}
-				return // Exit initial breakpoint handling
+				return nil // Exit initial breakpoint handling
 			case "stepOver":
 				log.Println("[Debugger] Cannot stepover from initial breakpoint")
 			case "singleStep":
