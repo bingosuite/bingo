@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/ptrace.h>
 
+// Finds the main executable image in a task and computes its ASLR slide.
 kern_return_t find_image_slide(task_t task, mach_vm_address_t *slide) {
     mach_vm_address_t addr = MACH_VM_MIN_ADDRESS;
     mach_vm_size_t region_size = 0;
@@ -95,11 +96,12 @@ kern_return_t find_image_slide(task_t task, mach_vm_address_t *slide) {
     }
 }
 
-// Port and task management
+// Returns the current process's Mach task port.
 mach_port_t get_mach_task_self(void) {
     return mach_task_self();
 }
 
+// Releases send and receive rights for an exception port.
 kern_return_t cleanup_exception_port(mach_port_t port) {
     kern_return_t kr;
 
@@ -112,7 +114,7 @@ kern_return_t cleanup_exception_port(mach_port_t port) {
     return kr;
 }
 
-// Exception port configuration
+// Installs breakpoint and bad-instruction exception handlers for a task.
 kern_return_t set_debug_exception_ports(task_t task, mach_port_t exc_port) {
     return task_set_exception_ports(
         task,
@@ -123,6 +125,7 @@ kern_return_t set_debug_exception_ports(task_t task, mach_port_t exc_port) {
     );
 }
 
+// Clears breakpoint and bad-instruction exception handlers for a task.
 kern_return_t clear_debug_exception_ports(task_t task) {
     return task_set_exception_ports(
         task,
@@ -133,7 +136,7 @@ kern_return_t clear_debug_exception_ports(task_t task) {
     );
 }
 
-// Thread management
+// Returns the first thread in a task.
 kern_return_t get_first_thread(task_t task, thread_act_t *out_thread) {
     thread_act_array_t thread_list;
     mach_msg_type_number_t thread_count;
@@ -155,19 +158,20 @@ kern_return_t get_first_thread(task_t task, thread_act_t *out_thread) {
     return KERN_SUCCESS;
 }
 
-// Thread state operations
+// Reads ARM64 general-purpose register state for a thread.
 kern_return_t get_arm64_thread_state(thread_act_t thr, arm_thread_state64_t *state,
                                      mach_msg_type_number_t *count) {
     *count = ARM_THREAD_STATE64_COUNT;
     return thread_get_state(thr, ARM_THREAD_STATE64, (thread_state_t)state, count);
 }
 
+// Writes ARM64 general-purpose register state for a thread.
 kern_return_t set_arm64_thread_state(thread_act_t thr, arm_thread_state64_t *state,
                                      mach_msg_type_number_t count) {
     return thread_set_state(thr, ARM_THREAD_STATE64, (thread_state_t)state, count);
 }
 
-// Memory read/write operations
+// Reads a 32-bit word from the target task memory.
 kern_return_t read_word(task_t task, mach_vm_address_t addr, uint32_t *out) {
     mach_vm_size_t outsize = 0;
 
@@ -180,6 +184,7 @@ kern_return_t read_word(task_t task, mach_vm_address_t addr, uint32_t *out) {
     );
 }
 
+// Writes a 32-bit word to target task memory, adjusting page protections as needed.
 kern_return_t write_word(task_t task, mach_vm_address_t addr, uint32_t val) {
     mach_vm_address_t page = addr & ~0xFFF;
     mach_vm_size_t size = 0x1000;
@@ -204,6 +209,7 @@ kern_return_t write_word(task_t task, mach_vm_address_t addr, uint32_t val) {
     return kr;
 }
 
+// Checks whether a target address is readable by attempting a 32-bit read.
 kern_return_t probe_address_readable(task_t task, mach_vm_address_t addr) {
     uint32_t tmp = 0;
     mach_vm_size_t outsize = 0;
@@ -216,7 +222,7 @@ kern_return_t probe_address_readable(task_t task, mach_vm_address_t addr) {
     );
 }
 
-// Message handling
+// Applies exception port settings to all threads in a task.
 kern_return_t set_thread_exception_ports(task_t task, mach_port_t port) {
     thread_act_array_t threads;
     mach_msg_type_number_t count;
@@ -239,14 +245,17 @@ kern_return_t set_thread_exception_ports(task_t task, mach_port_t port) {
 }
 
 // Exception message utilities
+// Extracts the thread port from an exception message.
 thread_act_t exc_msg_thread(exc_msg_t *msg) {
     return msg->thread.name;
 }
 
+// Builds reply message bits using the original message's remote bits.
 mach_msg_bits_t make_reply_bits(mach_msg_bits_t bits) {
     return MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(bits), 0);
 }
 
+// Builds the corresponding Mach exception reply message ID.
 mach_msg_id_t make_reply_id(mach_msg_id_t id) {
     return id + 100;
 }
