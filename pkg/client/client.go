@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/bingosuite/bingo/internal/ws"
@@ -116,12 +117,8 @@ func (c *Client) handleMessage(msg ws.Message) {
 			log.Printf("Error parsing sessionStarted: %v", err)
 			return
 		}
-		if started.SessionID != "" {
-			c.setSessionID(started.SessionID)
-			log.Printf("Session ID set: %s", started.SessionID)
-			return
-		}
-		log.Println("Debug session started")
+		c.setSessionID(started.SessionID)
+		log.Printf("[Session] Connected (session: %s)", started.SessionID)
 
 	case ws.EventStateUpdate:
 		var update ws.StateUpdateEvent
@@ -157,20 +154,23 @@ func (c *Client) handleMessage(msg ws.Message) {
 		log.Printf("[State Change] %s -> breakpoint", oldState)
 		log.Printf("Initial breakpoint hit (pid=%d)", initial.PID)
 
+	case ws.EventError:
+		var errEvent ws.ErrorEvent
+		if err := unmarshalData(msg.Data, &errEvent); err != nil {
+			log.Printf("Error parsing error event: %v", err)
+			return
+		}
+		log.Printf("[Error] %s", errEvent.Message)
+
 	default:
 		log.Printf("Unknown message type: %s", msg.Type)
 	}
 }
 
 func unmarshalData(data []byte, v any) error {
-	// Handle empty data
 	if len(data) == 0 {
 		return nil
 	}
-	return unmarshalJSON(data, v)
-}
-
-func unmarshalJSON(data []byte, v any) error {
 	return json.Unmarshal(data, v)
 }
 
@@ -195,9 +195,9 @@ func (c *Client) Continue() error {
 		Type:      ws.CmdContinue,
 		SessionID: c.SessionID(),
 	}
-	payload, err := marshalJSON(cmd)
+	payload, err := json.Marshal(cmd)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshalling continue command: %w", err)
 	}
 	return c.SendCommand(string(ws.CmdContinue), payload)
 }
@@ -207,9 +207,9 @@ func (c *Client) SingleStep() error {
 		Type:      ws.CmdSingleStep,
 		SessionID: c.SessionID(),
 	}
-	payload, err := marshalJSON(cmd)
+	payload, err := json.Marshal(cmd)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshalling singleStep command: %w", err)
 	}
 	return c.SendCommand(string(ws.CmdSingleStep), payload)
 }
@@ -219,9 +219,9 @@ func (c *Client) StepOver() error {
 		Type:      ws.CmdStepOver,
 		SessionID: c.SessionID(),
 	}
-	payload, err := marshalJSON(cmd)
+	payload, err := json.Marshal(cmd)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshalling stepOver command: %w", err)
 	}
 	return c.SendCommand(string(ws.CmdStepOver), payload)
 }
@@ -232,9 +232,9 @@ func (c *Client) StartDebug(targetPath string) error {
 		SessionID:  c.SessionID(),
 		TargetPath: targetPath,
 	}
-	payload, err := marshalJSON(cmd)
+	payload, err := json.Marshal(cmd)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshalling startDebug command: %w", err)
 	}
 	return c.SendCommand(string(ws.CmdStartDebug), payload)
 }
@@ -244,9 +244,9 @@ func (c *Client) Stop() error {
 		Type:      ws.CmdExit,
 		SessionID: c.SessionID(),
 	}
-	payload, err := marshalJSON(cmd)
+	payload, err := json.Marshal(cmd)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshalling exit command: %w", err)
 	}
 	// State will be updated to 'ready' when server confirms debug session has stopped
 	return c.SendCommand(string(ws.CmdExit), payload)
@@ -259,15 +259,11 @@ func (c *Client) SetBreakpoint(filename string, line int) error {
 		Filename:  filename,
 		Line:      line,
 	}
-	payload, err := marshalJSON(cmd)
+	payload, err := json.Marshal(cmd)
 	if err != nil {
-		return err
+		return fmt.Errorf("marshalling setBreakpoint command: %w", err)
 	}
 	return c.SendCommand(string(ws.CmdSetBreakpoint), payload)
-}
-
-func marshalJSON(v any) ([]byte, error) {
-	return json.Marshal(v)
 }
 
 func (c *Client) setState(state ws.State) {
@@ -330,5 +326,8 @@ func isConnectionClosedError(err error) bool {
 	if err == nil {
 		return false
 	}
-	return websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway)
+	errMsg := err.Error()
+	return websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
+		strings.Contains(errMsg, "use of closed network connection") ||
+		strings.Contains(errMsg, "broken pipe")
 }
