@@ -619,7 +619,9 @@ func (d *darwinARM64Debugger) initialBreakpointHit() {
 				log.Printf("%s continuing execution", logPrefixDebugger)
 				C.thread_resume(d.mainThread)
 				return
-			case "step":
+			case "stepover":
+				log.Printf("%s cannot stepover from initial breakpoint", logPrefixDebugger)
+			case "singlestep":
 				log.Printf("%s cannot single-step from initial breakpoint", logPrefixDebugger)
 			case "quit":
 				d.StopDebug()
@@ -692,8 +694,11 @@ func (d *darwinARM64Debugger) breakpointHit(pid int) {
 			case "continue":
 				d.Continue(pid)
 				return
-			case "step":
+			case "stepover":
 				d.StepOver(pid)
+				return
+			case "singlestep":
+				d.SingleStep(pid)
 				return
 			case "setBreakpoint":
 				if data, ok := cmd.Data.(map[string]any); ok {
