@@ -355,9 +355,9 @@ func (d *linuxAMD64Debugger) initialBreakpointHit() {
 					panic(err)
 				}
 				return // Exit initial breakpoint handling
-			case "stepover":
+			case "stepOver":
 				log.Println("[Debugger] Cannot stepover from initial breakpoint")
-			case "singlestep":
+			case "singleStep":
 				log.Println("[Debugger] Cannot single-step from initial breakpoint")
 			case "quit":
 				d.StopDebug()
@@ -402,9 +402,9 @@ func (d *linuxAMD64Debugger) breakpointHit(pid int) {
 		switch cmd.Type {
 		case "continue":
 			d.Continue(pid)
-		case "stepover":
+		case "stepOver":
 			d.StepOver(pid)
-		case "singlestep":
+		case "singleStep":
 			d.SingleStep(pid)
 		case "setBreakpoint":
 			if data, ok := cmd.Data.(map[string]any); ok {

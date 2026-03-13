@@ -77,6 +77,12 @@ mach_msg_bits_t make_reply_bits(mach_msg_bits_t bits);
 // Builds the corresponding Mach exception reply message ID.
 mach_msg_id_t make_reply_id(mach_msg_id_t id);
 
+// Destroys a received Mach message and releases any descriptor rights it carries.
+void destroy_mach_message(mach_msg_header_t *msg);
+
+// Releases a send right for a thread port when it is no longer needed.
+kern_return_t release_thread_port(thread_act_t thread);
+
 // Enables hardware single-step mode for a thread.
 kern_return_t enable_single_step(thread_act_t thread);
 // Disables hardware single-step mode for a thread.
