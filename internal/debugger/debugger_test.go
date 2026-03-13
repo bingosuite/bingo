@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bingosuite/bingo/internal/debuginfo"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -161,16 +162,34 @@ var _ = Describe("Debugger", func() {
 	Describe("Continue", func() {
 		PIt("TODO: should rewind RIP after breakpoint trap and clear/reapply breakpoint around single-step")
 		PIt("TODO: should call ptrace continue after stepping over restored instruction")
-		PIt("TODO: should panic when register operations or ptrace operations fail")
+
+		It("should panic when register operations or ptrace operations fail", func() {
+			d := NewDebugger()
+			Expect(func() {
+				d.Continue(-1)
+			}).To(Panic())
+		})
 	})
 
 	Describe("SingleStep", func() {
 		PIt("TODO: should execute one ptrace single-step for the provided PID")
-		PIt("TODO: should panic when ptrace single-step fails")
+
+		It("should panic when ptrace single-step fails", func() {
+			d := NewDebugger()
+			Expect(func() {
+				d.SingleStep(-1)
+			}).To(Panic())
+		})
 	})
 
 	Describe("StopDebug", func() {
-		PIt("TODO: should detach from target when PID is available")
+		It("should panic when detach fails for a non-traced PID", func() {
+			d := NewDebugger()
+			d.DebugInfo.Target.PID = 9999999
+			Expect(func() {
+				d.StopDebug()
+			}).To(Panic())
+		})
 
 		It("should signal EndDebugSession without blocking when channel already contains a signal", func() {
 			d := NewDebugger()
@@ -197,13 +216,45 @@ var _ = Describe("Debugger", func() {
 
 	Describe("SetBreakpoint", func() {
 		PIt("TODO: should resolve source line to PC, read original bytes, write breakpoint byte, and store original instruction")
-		PIt("TODO: should return error when source line cannot be mapped to a program counter")
+
+		It("should return error when source line cannot be mapped to a program counter", func() {
+			exePath, err := os.Executable()
+			Expect(err).NotTo(HaveOccurred())
+
+			di, err := debuginfo.NewDebugInfo(exePath, os.Getpid())
+			Expect(err).NotTo(HaveOccurred())
+
+			d := NewDebugger()
+			d.DebugInfo = *di
+			d.DebugInfo.Target.Path = "/nonexistent/path.go"
+
+			err = d.SetBreakpoint(os.Getpid(), 1)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to get PC of line"))
+		})
+
 		PIt("TODO: should return error when ptrace peek or poke fails")
 	})
 
 	Describe("ClearBreakpoint", func() {
 		PIt("TODO: should resolve source line to PC and restore original machine code at breakpoint address")
-		PIt("TODO: should return error when source line cannot be mapped to a program counter")
+
+		It("should return error when source line cannot be mapped to a program counter", func() {
+			exePath, err := os.Executable()
+			Expect(err).NotTo(HaveOccurred())
+
+			di, err := debuginfo.NewDebugInfo(exePath, os.Getpid())
+			Expect(err).NotTo(HaveOccurred())
+
+			d := NewDebugger()
+			d.DebugInfo = *di
+			d.DebugInfo.Target.Path = "/nonexistent/path.go"
+
+			err = d.ClearBreakpoint(os.Getpid(), 1)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to get PC of line"))
+		})
+
 		PIt("TODO: should return error when restoring original code fails")
 	})
 
