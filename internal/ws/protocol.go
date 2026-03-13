@@ -59,7 +59,8 @@ const (
 	CmdStartDebug    CommandType = "startDebug"
 	CmdSetBreakpoint CommandType = "setBreakpoint"
 	CmdContinue      CommandType = "continue"
-	CmdStepOver      CommandType = "step"
+	CmdStepOver      CommandType = "stepOver"
+	CmdSingleStep    CommandType = "singleStep"
 	CmdExit          CommandType = "exit"
 )
 
@@ -75,6 +76,11 @@ type ContinueCmd struct {
 }
 
 type StepOverCmd struct {
+	Type      CommandType `json:"type"`
+	SessionID string      `json:"sessionId"`
+}
+
+type SingleStepCmd struct {
 	Type      CommandType `json:"type"`
 	SessionID string      `json:"sessionId"`
 }
