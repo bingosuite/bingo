@@ -271,6 +271,7 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 			if replyKr != C.MACH_MSG_SUCCESS {
 				log.Printf("%s failed to send exception reply: %d", logPrefixExceptionLoop, replyKr)
 			}
+			C.destroy_mach_message((*C.mach_msg_header_t)(unsafe.Pointer(&excBuf[0])))
 			C.thread_resume(d.mainThread)
 		} else {
 			// Unknown exception - pass to next handler
@@ -291,6 +292,7 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 				C.MACH_MSG_TIMEOUT_NONE,
 				C.MACH_PORT_NULL,
 			)
+			C.destroy_mach_message((*C.mach_msg_header_t)(unsafe.Pointer(&excBuf[0])))
 		}
 	}
 }
@@ -533,6 +535,13 @@ func (d *darwinARM64Debugger) StopDebug() {
 		syscall.Kill(d.DebugInfo.GetTarget().PID, syscall.SIGKILL)
 	}
 
+	if d.mainThread != 0 {
+		if kr := C.release_thread_port(d.mainThread); kr != C.KERN_SUCCESS {
+			log.Printf("%s release_thread_port failed: %d", logPrefixDebugger, kr)
+		}
+		d.mainThread = 0
+	}
+
 	if d.excPort != 0 {
 		kr := C.cleanup_exception_port(d.excPort)
 		if kr != C.KERN_SUCCESS {
@@ -647,9 +656,9 @@ func (d *darwinARM64Debugger) initialBreakpointHit() {
 				log.Printf("%s continuing execution", logPrefixDebugger)
 				C.thread_resume(d.mainThread)
 				return
-			case "stepover":
+			case "stepOver":
 				log.Printf("%s cannot stepover from initial breakpoint", logPrefixDebugger)
-			case "singlestep":
+			case "singleStep":
 				log.Printf("%s cannot single-step from initial breakpoint", logPrefixDebugger)
 			case "quit":
 				d.StopDebug()
@@ -723,10 +732,10 @@ func (d *darwinARM64Debugger) breakpointHit(pid int) {
 			case "continue":
 				d.Continue(pid)
 				return
-			case "stepover":
+			case "stepOver":
 				d.StepOver(pid)
 				return
-			case "singlestep":
+			case "singleStep":
 				d.SingleStep(pid)
 				return
 			case "setBreakpoint":

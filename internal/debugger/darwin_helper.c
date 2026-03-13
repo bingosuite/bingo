@@ -150,6 +150,13 @@ kern_return_t get_first_thread(task_t task, thread_act_t *out_thread) {
     }
 
     *out_thread = thread_list[0];
+
+    // task_threads returns send rights for each thread. Keep only the selected
+    // first thread right and release the rest to avoid leaking rights.
+    for (mach_msg_type_number_t i = 1; i < thread_count; i++) {
+        mach_port_deallocate(mach_task_self(), thread_list[i]);
+    }
+
     vm_deallocate(
         mach_task_self(),
         (vm_address_t)thread_list,
@@ -230,18 +237,26 @@ kern_return_t set_thread_exception_ports(task_t task, mach_port_t port) {
     kern_return_t kr = task_threads(task, &threads, &count);
     if (kr != KERN_SUCCESS) return kr;
 
+    kern_return_t first_error = KERN_SUCCESS;
+
     for (mach_msg_type_number_t i = 0; i < count; i++) {
-        thread_set_exception_ports(
+        kern_return_t set_kr = thread_set_exception_ports(
             threads[i],
             EXC_MASK_BREAKPOINT | EXC_MASK_BAD_INSTRUCTION,
             port,
             EXCEPTION_DEFAULT | MACH_EXCEPTION_CODES,
             ARM_THREAD_STATE64
         );
+
+        if (set_kr != KERN_SUCCESS && first_error == KERN_SUCCESS) {
+            first_error = set_kr;
+        }
+
+        mach_port_deallocate(mach_task_self(), threads[i]);
     }
 
     vm_deallocate(mach_task_self(), (vm_address_t)threads, count * sizeof(thread_act_t));
-    return KERN_SUCCESS;
+    return first_error;
 }
 
 // Exception message utilities
@@ -258,6 +273,16 @@ mach_msg_bits_t make_reply_bits(mach_msg_bits_t bits) {
 // Builds the corresponding Mach exception reply message ID.
 mach_msg_id_t make_reply_id(mach_msg_id_t id) {
     return id + 100;
+}
+
+// Destroys a received Mach message and releases any descriptor rights it carries.
+void destroy_mach_message(mach_msg_header_t *msg) {
+    mach_msg_destroy(msg);
+}
+
+// Releases a send right for a thread port when it is no longer needed.
+kern_return_t release_thread_port(thread_act_t thread) {
+    return mach_port_deallocate(mach_task_self(), thread);
 }
 
 // Single-step mode control
