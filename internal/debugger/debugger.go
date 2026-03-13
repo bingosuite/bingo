@@ -15,7 +15,7 @@ type InitialBreakpointHitEvent struct {
 
 // DebugCommand represents commands that can be sent to the debugger
 type DebugCommand struct {
-	Type string `json:"type"` // "continue", "step", "quit", "setBreakpoint"
+	Type string `json:"type"` // "continue", "stepover", "singlestep", "quit", "setBreakpoint"
 	Data any    `json:"data,omitempty"`
 }
 

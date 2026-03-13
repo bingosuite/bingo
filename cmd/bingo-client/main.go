@@ -45,7 +45,7 @@ func main() { //nolint:gocognit,gocyclo // this is a temporary default client th
 		log.Fatalf("Failed to start client: %v", err)
 	}
 
-	log.Println("Connected. Commands: start <path>, stop, c=continue, s=step, b=<file> <line>, state, q=quit")
+	log.Println("Connected. Commands: start <path>, stop, c=continue, s=step-over, ss=single-step, b=<file> <line>, state, q=quit")
 
 	inputReader := bufio.NewReader(os.Stdin)
 	useRawInput := term.IsTerminal(int(os.Stdin.Fd()))
@@ -115,6 +115,9 @@ func main() { //nolint:gocognit,gocyclo // this is a temporary default client th
 			time.Sleep(100 * time.Millisecond)
 		case "s", "step", "stepover":
 			cmdErr = c.StepOver()
+			time.Sleep(100 * time.Millisecond)
+		case "ss", "singlestep":
+			cmdErr = c.SingleStep()
 			time.Sleep(100 * time.Millisecond)
 		case "state":
 			fmt.Printf("state=%s session=%s\n", c.State(), c.SessionID())

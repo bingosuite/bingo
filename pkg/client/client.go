@@ -202,6 +202,18 @@ func (c *Client) Continue() error {
 	return c.SendCommand(string(ws.CmdContinue), payload)
 }
 
+func (c *Client) SingleStep() error {
+	cmd := ws.SingleStepCmd{
+		Type:      ws.CmdSingleStep,
+		SessionID: c.SessionID(),
+	}
+	payload, err := marshalJSON(cmd)
+	if err != nil {
+		return err
+	}
+	return c.SendCommand(string(ws.CmdSingleStep), payload)
+}
+
 func (c *Client) StepOver() error {
 	cmd := ws.StepOverCmd{
 		Type:      ws.CmdStepOver,

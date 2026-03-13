@@ -299,6 +299,23 @@ func (h *Hub) handleCommand(cmd Message) {
 		}
 		h.sendCommandToDebugger(debugCmd, "Continue")
 
+	case CmdSingleStep:
+		var singleStepCmd SingleStepCmd
+		if err := json.Unmarshal(cmd.Data, &singleStepCmd); err != nil {
+			log.Printf("[Hub] Failed to unmarshal singleStep command: %v", err)
+			return
+		}
+		log.Printf("[Hub] [Command] SingleStep received (session: %s)", h.sessionID)
+
+		// Send executing state update
+		h.sendStateUpdate(StateExecuting)
+
+		// Send command to debugger
+		debugCmd := debugger.DebugCommand{
+			Type: "singleStep",
+		}
+		h.sendCommandToDebugger(debugCmd, "SingleStep")
+
 	case CmdStepOver:
 		var stepOverCmd StepOverCmd
 		if err := json.Unmarshal(cmd.Data, &stepOverCmd); err != nil {
@@ -312,7 +329,7 @@ func (h *Hub) handleCommand(cmd Message) {
 
 		// Send command to debugger
 		debugCmd := debugger.DebugCommand{
-			Type: "step",
+			Type: "stepOver",
 		}
 		h.sendCommandToDebugger(debugCmd, "StepOver")
 
