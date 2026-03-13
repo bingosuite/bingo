@@ -64,6 +64,8 @@ type darwinARM64Debugger struct {
 	isSingleStepping    bool // Track if we're currently single-stepping
 }
 
+// resetSessionState clears all per-session debugger state so a debugger
+// instance can be safely reused for a new target process.
 func (d *darwinARM64Debugger) resetSessionState() {
 	d.DebugInfo = nil
 	d.slide = 0
@@ -81,6 +83,8 @@ func (d *darwinARM64Debugger) resetSessionState() {
 	d.isSingleStepping = false
 }
 
+// NewDebugger creates a Darwin ARM64 debugger implementation wired to the
+// hub communication channels.
 func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan InitialBreakpointHitEvent, debugCommand chan DebugCommand, endDebugSession chan bool) Debugger {
 	return &darwinARM64Debugger{
 		Breakpoints:          make(map[uint64][]byte),
@@ -91,6 +95,8 @@ func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan I
 	}
 }
 
+// computeSlide resolves and stores the target image ASLR slide used to
+// translate file addresses to runtime addresses.
 func (d *darwinARM64Debugger) computeSlide() error {
 	if d.task == 0 {
 		return fmt.Errorf("cannot compute slide: debugger task not initialized")
@@ -108,9 +114,9 @@ func (d *darwinARM64Debugger) computeSlide() error {
 	return nil
 }
 
-// validateTargetPath resolves path to an absolute path, ensures it stays
-// within the current working directory, and confirms it is a regular
-// executable file. This prevents command injection from user-supplied input.
+// validateTargetPath returns a safe absolute executable path by normalizing the
+// user input, restricting it to the current workspace, and validating file
+// type and execute permissions.
 func validateTargetPath(path string) (string, error) {
 	// Resolve to absolute path to eliminate any relative traversal tricks
 	abs, err := filepath.Abs(filepath.Clean(path))
@@ -142,6 +148,7 @@ func validateTargetPath(path string) (string, error) {
 	return abs, nil
 }
 
+// getRegs reads the current ARM64 register state from the tracked main thread.
 func (d *darwinARM64Debugger) getRegs() (*ARM64ThreadState, error) {
 	var st ARM64ThreadState
 	count := C.mach_msg_type_number_t(C.ARM_THREAD_STATE64_COUNT)
@@ -152,6 +159,7 @@ func (d *darwinARM64Debugger) getRegs() (*ARM64ThreadState, error) {
 	return &st, nil
 }
 
+// readWord reads one 32-bit instruction word from target process memory.
 func (d *darwinARM64Debugger) readWord(addr uint64) ([]byte, error) {
 	var word C.uint32_t
 	kr := C.read_word(d.task, C.mach_vm_address_t(addr), &word)
@@ -162,6 +170,7 @@ func (d *darwinARM64Debugger) readWord(addr uint64) ([]byte, error) {
 	return []byte{byte(v), byte(v >> 8), byte(v >> 16), byte(v >> 24)}, nil
 }
 
+// writeWord writes one 32-bit instruction word into target process memory.
 func (d *darwinARM64Debugger) writeWord(addr uint64, data []byte) error {
 	if len(data) < 4 {
 		tmp := make([]byte, 4)
@@ -176,7 +185,9 @@ func (d *darwinARM64Debugger) writeWord(addr uint64, data []byte) error {
 	return nil
 }
 
-// exceptionLoop runs in its own OS thread and handles all Mach exceptions
+// exceptionLoop waits for Mach exception messages and converts breakpoint
+// exceptions into debugger events while keeping thread-exception reply flow
+// valid for the kernel.
 func (d *darwinARM64Debugger) exceptionLoop() {
 	runtime.LockOSThread() // Mach msg requires fixed thread
 	defer runtime.UnlockOSThread()
@@ -284,6 +295,9 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 	}
 }
 
+// StartWithDebug launches the target binary under debugger control, initializes
+// task/exception ports, emits the initial stop event, and enters the exception
+// handling loop.
 func (d *darwinARM64Debugger) StartWithDebug(path string) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -391,6 +405,8 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 	d.exceptionLoop()
 }
 
+// Continue restores the current breakpointed instruction, places a temporary
+// trap at the following instruction, and resumes execution.
 func (d *darwinARM64Debugger) Continue(pid int) {
 	log.Printf("%s continuing execution for PID %d", logPrefixDebugger, pid)
 
@@ -431,6 +447,8 @@ func (d *darwinARM64Debugger) Continue(pid int) {
 	C.thread_resume(d.mainThread)
 }
 
+// SingleStep executes exactly one instruction by enabling CPU single-step and
+// temporarily removing any breakpoint at the current program counter.
 func (d *darwinARM64Debugger) SingleStep(pid int) {
 	log.Printf("%s single-stepping for PID %d", logPrefixDebugger, pid)
 
@@ -458,6 +476,8 @@ func (d *darwinARM64Debugger) SingleStep(pid int) {
 	C.thread_resume(d.mainThread)
 }
 
+// StepOver advances to the next source line by setting a temporary breakpoint
+// on the next line address, falling back to single-step when needed.
 func (d *darwinARM64Debugger) StepOver(pid int) {
 	log.Printf("%s step over for PID %d", logPrefixDebugger, pid)
 
@@ -505,6 +525,8 @@ func (d *darwinARM64Debugger) StepOver(pid int) {
 	C.thread_resume(d.mainThread)
 }
 
+// StopDebug terminates the debugged process (if running), releases Mach ports,
+// and notifies listeners that the debug session has ended.
 func (d *darwinARM64Debugger) StopDebug() {
 	log.Printf("%s stopping debug session", logPrefixDebugger)
 	if d.DebugInfo != nil {
@@ -531,6 +553,8 @@ func (d *darwinARM64Debugger) StopDebug() {
 	}
 }
 
+// SetBreakpoint installs an ARM64 software breakpoint at the requested source
+// line after resolving it to a runtime address with ASLR slide.
 func (d *darwinARM64Debugger) SetBreakpoint(pid int, line int) error {
 	if d.DebugInfo == nil {
 		return fmt.Errorf("cannot set breakpoint: debug info not initialized")
@@ -570,6 +594,8 @@ func (d *darwinARM64Debugger) SetBreakpoint(pid int, line int) error {
 	return nil
 }
 
+// ClearBreakpoint restores the original instruction at the requested source
+// line.
 func (d *darwinARM64Debugger) ClearBreakpoint(pid int, line int) error {
 	filePC, _, err := d.DebugInfo.LineToPC(d.DebugInfo.GetTarget().Path, line)
 	if err != nil {
@@ -586,6 +612,8 @@ func (d *darwinARM64Debugger) ClearBreakpoint(pid int, line int) error {
 	return nil
 }
 
+// initialBreakpointHit publishes the initial stop event and processes commands
+// allowed before normal execution resumes.
 func (d *darwinARM64Debugger) initialBreakpointHit() {
 	if err := d.computeSlide(); err != nil {
 		log.Printf("%s slide computation failed: %v", logPrefixDebugger, err)
@@ -636,7 +664,8 @@ func (d *darwinARM64Debugger) initialBreakpointHit() {
 	}
 }
 
-// breakpointHit handles a breakpoint event and waits for debugger commands
+// breakpointHit resolves the current PC to source location, publishes a
+// breakpoint event, and processes runtime debugger commands.
 func (d *darwinARM64Debugger) breakpointHit(pid int) {
 	log.Printf("%s breakpoint hit for PID %d", logPrefixDebugger, pid)
 	// Get register information to determine location
