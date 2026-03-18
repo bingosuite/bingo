@@ -6,6 +6,7 @@ package debugger
 */
 import "C"
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -191,7 +192,7 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 
 	for {
 		select {
-		case <-d.EndDebugSession:
+		case <-d.Stop:
 			return
 		default:
 		}
@@ -333,7 +334,7 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 
 		// signal debugger shutdown
 		select {
-		case d.EndDebugSession <- true:
+		case d.Stop <- true:
 		default:
 		}
 	}()
@@ -394,7 +395,7 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 	d.initialBreakpointHit()
 
 	select {
-	case <-d.EndDebugSession:
+	case <-d.Stop:
 		log.Printf("%s debug session ended during initial breakpoint", logPrefixDebugger)
 		return
 	default:
@@ -554,7 +555,7 @@ func (d *darwinARM64Debugger) StopDebug() {
 	}
 
 	select {
-	case d.EndDebugSession <- true:
+	case d.Stop <- true:
 	default:
 	}
 }
@@ -629,13 +630,23 @@ func (d *darwinARM64Debugger) initialBreakpointHit() {
 		PID: d.DebugInfo.GetTarget().PID,
 	}
 
+	eventData, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("%s failed to marshal initial breakpoint event: %v", logPrefixDebugger, err)
+	}
+
+	message := DebugEvent{
+		Type: DbgEventInitialBreakpointHit,
+		Data: eventData,
+	}
+
 	log.Printf("%s ready for commands", logPrefixDebugger)
-	d.InitialBreakpointHit <- event
+	d.DebugEvents <- message
 
 	// Wait for commands from hub
 	for {
 		select {
-		case cmd := <-d.DebugCommand:
+		case cmd := <-d.DebugCommands:
 			log.Printf("%s received command: %s", logPrefixDebugger, cmd.Type)
 
 			switch cmd.Type {
@@ -663,7 +674,7 @@ func (d *darwinARM64Debugger) initialBreakpointHit() {
 			default:
 				log.Printf("%s unknown command: %s", logPrefixDebugger, cmd.Type)
 			}
-		case <-d.EndDebugSession:
+		case <-d.Stop:
 			log.Printf("%s debug session ended during initial breakpoint", logPrefixDebugger)
 			return
 		}
@@ -710,20 +721,30 @@ func (d *darwinARM64Debugger) breakpointHit(pid int) {
 		function = fn.Name
 	}
 
-	event := BreakpointEvent{
+	event := BreakpointHitEvent{
 		PID:      pid,
 		Filename: filename,
 		Line:     line,
 		Function: function,
 	}
 
+	eventData, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("%s failed to marshal breakpoint event: %v", logPrefixDebugger, err)
+	}
+
+	message := DebugEvent{
+		Type: DbgEventBreakpointHit,
+		Data: eventData,
+	}
+
 	log.Printf("%s breakpoint at %s:%d in %s", logPrefixDebugger, filename, line, function)
-	d.BreakpointHit <- event
+	d.DebugEvents <- message
 
 	// Wait for commands from hub
 	for {
 		select {
-		case cmd := <-d.DebugCommand:
+		case cmd := <-d.DebugCommands:
 			log.Printf("%s received command: %s", logPrefixDebugger, cmd.Type)
 			switch cmd.Type {
 			case "continue":
@@ -749,7 +770,7 @@ func (d *darwinARM64Debugger) breakpointHit(pid int) {
 			default:
 				log.Printf("%s unknown command: %s", logPrefixDebugger, cmd.Type)
 			}
-		case <-d.EndDebugSession:
+		case <-d.Stop:
 			log.Printf("%s debug session ended", logPrefixDebugger)
 			return
 		}
