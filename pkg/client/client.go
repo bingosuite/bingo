@@ -109,8 +109,8 @@ func (c *Client) writePump() {
 func (c *Client) handleMessage(msg ws.Message) {
 	log.Printf("Received message type: %s", msg.Type)
 
-	switch ws.EventType(msg.Type) {
-	case ws.EventSessionStarted:
+	switch ws.HubEventType(msg.Type) {
+	case ws.HubEventSessionStarted:
 		var started ws.SessionStartedEvent
 		if err := unmarshalData(msg.Data, &started); err != nil {
 			log.Printf("Error parsing sessionStarted: %v", err)
@@ -123,7 +123,7 @@ func (c *Client) handleMessage(msg ws.Message) {
 		}
 		log.Println("Debug session started")
 
-	case ws.EventStateUpdate:
+	case ws.HubEventStateUpdate:
 		var update ws.StateUpdateEvent
 		if err := unmarshalData(msg.Data, &update); err != nil {
 			log.Printf("Error parsing stateUpdate: %v", err)
@@ -135,7 +135,7 @@ func (c *Client) handleMessage(msg ws.Message) {
 			log.Printf("[State Change] %s -> %s", oldState, update.NewState)
 		}
 
-	case ws.EventBreakpointHit:
+	case ws.HubEventBreakpointHit:
 		var hit ws.BreakpointHitEvent
 		if err := unmarshalData(msg.Data, &hit); err != nil {
 			log.Printf("Error parsing breakpointHit: %v", err)
@@ -146,7 +146,7 @@ func (c *Client) handleMessage(msg ws.Message) {
 		log.Printf("[State Change] %s -> breakpoint", oldState)
 		log.Printf("Breakpoint hit at %s:%d in %s", hit.Filename, hit.Line, hit.Function)
 
-	case ws.EventInitialBreakpoint:
+	case ws.HubEventInitialBreakpoint:
 		var initial ws.InitialBreakpointHitEvent
 		if err := unmarshalData(msg.Data, &initial); err != nil {
 			log.Printf("Error parsing initialBreakpoint: %v", err)
@@ -192,43 +192,43 @@ func (c *Client) SendCommand(cmdType string, payload []byte) error {
 
 func (c *Client) Continue() error {
 	cmd := ws.ContinueCmd{
-		Type:      ws.CmdContinue,
+		Type:      ws.HubCmdContinue,
 		SessionID: c.SessionID(),
 	}
 	payload, err := marshalJSON(cmd)
 	if err != nil {
 		return err
 	}
-	return c.SendCommand(string(ws.CmdContinue), payload)
+	return c.SendCommand(string(ws.HubCmdContinue), payload)
 }
 
 func (c *Client) SingleStep() error {
 	cmd := ws.SingleStepCmd{
-		Type:      ws.CmdSingleStep,
+		Type:      ws.HubCmdSingleStep,
 		SessionID: c.SessionID(),
 	}
 	payload, err := marshalJSON(cmd)
 	if err != nil {
 		return err
 	}
-	return c.SendCommand(string(ws.CmdSingleStep), payload)
+	return c.SendCommand(string(ws.HubCmdSingleStep), payload)
 }
 
 func (c *Client) StepOver() error {
 	cmd := ws.StepOverCmd{
-		Type:      ws.CmdStepOver,
+		Type:      ws.HubCmdStepOver,
 		SessionID: c.SessionID(),
 	}
 	payload, err := marshalJSON(cmd)
 	if err != nil {
 		return err
 	}
-	return c.SendCommand(string(ws.CmdStepOver), payload)
+	return c.SendCommand(string(ws.HubCmdStepOver), payload)
 }
 
 func (c *Client) StartDebug(targetPath string) error {
 	cmd := ws.StartDebugCmd{
-		Type:       ws.CmdStartDebug,
+		Type:       ws.HubCmdStartDebug,
 		SessionID:  c.SessionID(),
 		TargetPath: targetPath,
 	}
@@ -236,12 +236,12 @@ func (c *Client) StartDebug(targetPath string) error {
 	if err != nil {
 		return err
 	}
-	return c.SendCommand(string(ws.CmdStartDebug), payload)
+	return c.SendCommand(string(ws.HubCmdStartDebug), payload)
 }
 
 func (c *Client) Stop() error {
 	cmd := ws.ExitCmd{
-		Type:      ws.CmdExit,
+		Type:      ws.HubCmdExit,
 		SessionID: c.SessionID(),
 	}
 	payload, err := marshalJSON(cmd)
@@ -249,12 +249,12 @@ func (c *Client) Stop() error {
 		return err
 	}
 	// State will be updated to 'ready' when server confirms debug session has stopped
-	return c.SendCommand(string(ws.CmdExit), payload)
+	return c.SendCommand(string(ws.HubCmdExit), payload)
 }
 
 func (c *Client) SetBreakpoint(filename string, line int) error {
 	cmd := ws.SetBreakpointCmd{
-		Type:      ws.CmdSetBreakpoint,
+		Type:      ws.HubCmdSetBreakpoint,
 		SessionID: c.SessionID(),
 		Filename:  filename,
 		Line:      line,
@@ -263,7 +263,7 @@ func (c *Client) SetBreakpoint(filename string, line int) error {
 	if err != nil {
 		return err
 	}
-	return c.SendCommand(string(ws.CmdSetBreakpoint), payload)
+	return c.SendCommand(string(ws.HubCmdSetBreakpoint), payload)
 }
 
 func marshalJSON(v any) ([]byte, error) {
