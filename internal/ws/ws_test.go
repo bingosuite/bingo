@@ -118,11 +118,11 @@ var _ = Describe("Hub", func() {
 	Describe("SendCommand", func() {
 		It("should send commands to hub", func() {
 			cmdData, _ := json.Marshal(ContinueCmd{
-				Type:      CmdContinue,
+				Type:      HubCmdContinue,
 				SessionID: "test-session",
 			})
 			command := Message{
-				Type: string(CmdContinue),
+				Type: string(HubCmdContinue),
 				Data: cmdData,
 			}
 
@@ -221,7 +221,7 @@ var _ = Describe("Hub", func() {
 			time.Sleep(100 * time.Millisecond)
 
 			hub.Broadcast(Message{
-				Type: string(EventStateUpdate),
+				Type: string(HubEventStateUpdate),
 				Data: json.RawMessage(`{"data":"test"}`),
 			})
 
@@ -300,7 +300,7 @@ var _ = Describe("Connection", func() {
 			defer func() { _ = clientConn.Close() }()
 
 			testMsg := Message{
-				Type: string(CmdContinue),
+				Type: string(HubCmdContinue),
 				Data: json.RawMessage(`{"sessionId":"test-session","type":"continue"}`),
 			}
 
@@ -371,7 +371,7 @@ var _ = Describe("Connection", func() {
 			connection := NewConnection(clientConn, nil, "connection-1")
 			go connection.WritePump()
 
-			connection.send <- Message{Type: string(EventStateUpdate), Data: json.RawMessage(`{"ok":true}`)}
+			connection.send <- Message{Type: string(HubEventStateUpdate), Data: json.RawMessage(`{"ok":true}`)}
 			close(connection.send)
 			Eventually(func() bool {
 				select {
@@ -404,7 +404,7 @@ var _ = Describe("Connection", func() {
 			connection := NewConnection(clientConn, nil, "connection-1")
 			go connection.WritePump()
 
-			connection.send <- Message{Type: string(EventStateUpdate), Data: json.RawMessage(`{"ok":true}`)}
+			connection.send <- Message{Type: string(HubEventStateUpdate), Data: json.RawMessage(`{"ok":true}`)}
 
 			Eventually(func() bool {
 				select {
@@ -522,7 +522,7 @@ var _ = Describe("Connection", func() {
 
 			for i := 0; i < eventBufferSize+10; i++ {
 				hub.Broadcast(Message{
-					Type: string(EventStateUpdate),
+					Type: string(HubEventStateUpdate),
 					Data: json.RawMessage(`{"index":` + string(bytes.Join([][]byte{}, []byte{})) + `}`),
 				})
 			}
@@ -726,7 +726,7 @@ var _ = Describe("Server", func() {
 			var msg Message
 			_ = conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 			Expect(conn.ReadJSON(&msg)).To(Succeed())
-			Expect(msg.Type).To(Equal(string(EventSessionStarted)))
+			Expect(msg.Type).To(Equal(string(HubEventSessionStarted)))
 
 			var started SessionStartedEvent
 			Expect(json.Unmarshal(msg.Data, &started)).To(Succeed())
@@ -848,11 +848,11 @@ var _ = Describe("Protocol", func() {
 		It("should handle Message struct", func() {
 			data, _ := json.Marshal(map[string]string{"key": "value"})
 			msg := Message{
-				Type: string(EventStateUpdate),
+				Type: string(HubEventStateUpdate),
 				Data: data,
 			}
 
-			Expect(msg.Type).To(Equal(string(EventStateUpdate)))
+			Expect(msg.Type).To(Equal(string(HubEventStateUpdate)))
 			Expect(msg.Data).NotTo(BeNil())
 
 			jsonData, err := json.Marshal(msg)
@@ -869,11 +869,11 @@ var _ = Describe("Protocol", func() {
 	Describe("ContinueCmd", func() {
 		It("should handle ContinueCmd struct", func() {
 			cmd := ContinueCmd{
-				Type:      CmdContinue,
+				Type:      HubCmdContinue,
 				SessionID: "session-1",
 			}
 
-			Expect(cmd.Type).To(Equal(CmdContinue))
+			Expect(cmd.Type).To(Equal(HubCmdContinue))
 			Expect(cmd.SessionID).To(Equal("session-1"))
 
 			data, err := json.Marshal(cmd)
