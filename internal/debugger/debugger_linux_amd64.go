@@ -1,6 +1,7 @@
 package debugger
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -24,23 +25,20 @@ const (
 )
 
 type linuxAMD64Debugger struct {
-	DebugInfo       debuginfo.DebugInfo
-	Breakpoints     map[uint64][]byte
-	EndDebugSession chan bool
+	DebugInfo   debuginfo.DebugInfo
+	Breakpoints map[uint64][]byte
 
-	// Communication with hub
-	BreakpointHit        chan BreakpointEvent
-	InitialBreakpointHit chan InitialBreakpointHitEvent
-	DebugCommand         chan DebugCommand
+	Stop          chan bool
+	DebugEvents   chan DebugEvent
+	DebugCommands chan DebugCommand
 }
 
-func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan InitialBreakpointHitEvent, debugCommand chan DebugCommand, endDebugSession chan bool) Debugger {
+func NewDebugger(debugCommands chan DebugCommand, debugEvents chan DebugEvent, stop chan bool) Debugger {
 	return &linuxAMD64Debugger{
-		Breakpoints:          make(map[uint64][]byte),
-		EndDebugSession:      endDebugSession,
-		BreakpointHit:        breakpointHit,
-		InitialBreakpointHit: initialBreakpointHit,
-		DebugCommand:         debugCommand,
+		Breakpoints:   make(map[uint64][]byte),
+		DebugEvents:   debugEvents,
+		DebugCommands: debugCommands,
+		Stop:          stop,
 	}
 }
 
@@ -132,7 +130,7 @@ func (d *linuxAMD64Debugger) StartWithDebug(path string) {
 
 	// Check if we were stopped during initial breakpoint
 	select {
-	case <-d.EndDebugSession:
+	case <-d.Stop:
 		log.Println("[Debugger] Debug session ended during initial breakpoint, cleaning up")
 		return
 	default:
@@ -225,7 +223,7 @@ func (d *linuxAMD64Debugger) StopDebug() {
 	}
 	// Signal the debug loop to exit
 	select {
-	case d.EndDebugSession <- true:
+	case d.Stop <- true:
 	default:
 		// Channel might be full, meaning debug session end already triggered
 	}
@@ -266,7 +264,7 @@ func (d *linuxAMD64Debugger) mainDebugLoop() {
 	for {
 		// Check if we should stop debugging
 		select {
-		case <-d.EndDebugSession:
+		case <-d.Stop:
 			log.Println("[Debugger] Debug session ending, exiting debug loop")
 			return
 		default:
@@ -293,7 +291,7 @@ func (d *linuxAMD64Debugger) mainDebugLoop() {
 				log.Printf("[Debugger] Target %v execution completed", d.DebugInfo.GetTarget().Path)
 				// Signal the end of debug session to hub
 				select {
-				case d.EndDebugSession <- true:
+				case d.Stop <- true:
 				default:
 					// Channel might be full, meaning debug session end already triggered
 				}
@@ -326,18 +324,29 @@ func (d *linuxAMD64Debugger) initialBreakpointHit() {
 		PID: d.DebugInfo.GetTarget().PID,
 	}
 
+	eventData, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("[Debugger] Failed to marshal breakpoint event: %v", err)
+		panic(err)
+	}
+
+	message := DebugEvent{
+		Type: DbgEventInitialBreakpointHit,
+		Data: eventData,
+	}
+
 	// Send initial breakpoint hit event to hub
 	log.Println("[Debugger] Initial breakpoint hit, debugger ready for commands")
-	d.InitialBreakpointHit <- event
+	d.DebugEvents <- message
 
 	// Wait for commands from hub (typically to set breakpoints)
 	for {
 		select {
-		case cmd := <-d.DebugCommand:
+		case cmd := <-d.DebugCommands:
 			log.Printf("[Debugger] Received command: %s", cmd.Type)
 
 			switch cmd.Type {
-			case "setBreakpoint":
+			case DbgCommandSetBreakpoint:
 				if data, ok := cmd.Data.(map[string]any); ok {
 					if line, ok := data["line"].(int); ok {
 						if err := d.SetBreakpoint(d.DebugInfo.GetTarget().PID, int(line)); err != nil {
@@ -348,24 +357,24 @@ func (d *linuxAMD64Debugger) initialBreakpointHit() {
 						}
 					}
 				}
-			case "continue":
+			case DbgCommandContinue:
 				log.Println("[Debugger] Continuing from initial breakpoint")
 				if err := unix.PtraceCont(d.DebugInfo.GetTarget().PID, 0); err != nil {
 					log.Printf("[Debugger] Failed to resume target execution: %v", err)
 					panic(err)
 				}
 				return // Exit initial breakpoint handling
-			case "stepOver":
+			case DbgCommandStepOver:
 				log.Println("[Debugger] Cannot stepover from initial breakpoint")
-			case "singleStep":
+			case DbgCommandSingleStep:
 				log.Println("[Debugger] Cannot single-step from initial breakpoint")
-			case "quit":
+			case DbgCommandQuit:
 				d.StopDebug()
 				return
 			default:
 				log.Printf("[Debugger] Unknown command during initial breakpoint: %s", cmd.Type)
 			}
-		case <-d.EndDebugSession:
+		case <-d.Stop:
 			log.Println("[Debugger] Debug session ending during initial breakpoint")
 			return
 		}
@@ -384,29 +393,41 @@ func (d *linuxAMD64Debugger) breakpointHit(pid int) {
 	filename, line, fn := d.DebugInfo.PCToLine(regs.Rip - 1)
 
 	// Create breakpoint event
-	event := BreakpointEvent{
+	event := BreakpointHitEvent{
 		PID:      pid,
 		Filename: filename,
 		Line:     line,
 		Function: fn.Name,
 	}
 
+	eventData, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("[Debugger] Failed to marshal breakpoint event: %v", err)
+		panic(err)
+	}
+
+	message := DebugEvent{
+		Type: DbgEventInitialBreakpointHit,
+		Data: eventData,
+	}
+
 	// Send breakpoint hit event to hub
 	log.Printf("[Debugger] Breakpoint hit at %s:%d in %s, waiting for command", filename, line, fn.Name)
-	d.BreakpointHit <- event
+	d.DebugEvents <- message
 
 	// Wait for command from hub
+	// TODO: handle filename
 	select {
-	case cmd := <-d.DebugCommand:
+	case cmd := <-d.DebugCommands:
 		log.Printf("[Debugger] Received command: %s", cmd.Type)
 		switch cmd.Type {
-		case "continue":
+		case DbgCommandContinue:
 			d.Continue(pid)
-		case "stepOver":
+		case DbgCommandStepOver:
 			d.StepOver(pid)
-		case "singleStep":
+		case DbgCommandSingleStep:
 			d.SingleStep(pid)
-		case "setBreakpoint":
+		case DbgCommandSetBreakpoint:
 			if data, ok := cmd.Data.(map[string]any); ok {
 				if line, ok := data["line"].(int); ok {
 					if err := d.SetBreakpoint(pid, int(line)); err != nil {
@@ -416,14 +437,14 @@ func (d *linuxAMD64Debugger) breakpointHit(pid int) {
 					}
 				}
 			}
-		case "quit":
+		case DbgCommandQuit:
 			d.StopDebug()
 			return
 		default:
 			log.Printf("[Debugger] Unknown command: %s", cmd.Type)
-			d.Continue(pid) // Default to continue
+			//d.Continue(pid) // Default to continue
 		}
-	case <-d.EndDebugSession:
+	case <-d.Stop:
 		log.Println("[Debugger] Debug session ending, stopping breakpoint handler")
 		return
 	}

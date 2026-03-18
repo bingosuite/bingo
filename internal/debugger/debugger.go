@@ -1,24 +1,5 @@
 package debugger
 
-// BreakpointEvent represents a breakpoint hit event
-type BreakpointEvent struct {
-	PID      int    `json:"pid"`
-	Filename string `json:"filename"`
-	Line     int    `json:"line"`
-	Function string `json:"function"`
-}
-
-// InitialBreakpointHitEvent represents the initial breakpoint hit when debugging starts
-type InitialBreakpointHitEvent struct {
-	PID int `json:"pid"`
-}
-
-// DebugCommand represents commands that can be sent to the debugger
-type DebugCommand struct {
-	Type string `json:"type"` // "continue", "stepover", "singlestep", "quit", "setBreakpoint"
-	Data any    `json:"data,omitempty"`
-}
-
 type Debugger interface {
 	// StartWithDebug launches the target binary at the given path under debugger control
 	StartWithDebug(path string)

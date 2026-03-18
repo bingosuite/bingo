@@ -6,12 +6,7 @@ import "fmt"
 
 type unsupportedDebugger struct{}
 
-func NewDebugger(
-	breakpointHit chan BreakpointEvent,
-	initialBreakpointHit chan InitialBreakpointHitEvent,
-	debugCommand chan DebugCommand,
-	endDebugSession chan bool,
-) Debugger {
+func NewDebugger(debugCommands chan DebugCommand, debugEvents chan DebugEvent, stop chan bool) Debugger {
 	return &unsupportedDebugger{}
 }
 

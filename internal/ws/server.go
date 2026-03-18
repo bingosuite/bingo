@@ -106,7 +106,7 @@ func (s *Server) getOrCreateSession(w http.ResponseWriter, r *http.Request) {
 
 	hub.Register(client)
 	ack := SessionStartedEvent{
-		Type:      EventSessionStarted,
+		Type:      HubEventSessionStarted,
 		SessionID: sessionID,
 		PID:       0,
 	}
@@ -116,7 +116,7 @@ func (s *Server) getOrCreateSession(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	client.send <- Message{
-		Type: string(EventSessionStarted),
+		Type: string(HubEventSessionStarted),
 		Data: data,
 	}
 }

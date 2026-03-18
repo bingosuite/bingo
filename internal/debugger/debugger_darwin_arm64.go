@@ -40,15 +40,13 @@ type ARM64ThreadState struct {
 }
 
 type darwinARM64Debugger struct {
-	DebugInfo       debuginfo.DebugInfo
-	Breakpoints     map[uint64][]byte
-	EndDebugSession chan bool
-	slide           uint64
+	DebugInfo   debuginfo.DebugInfo
+	Breakpoints map[uint64][]byte
+	slide       uint64
 
-	// Communication with hub
-	BreakpointHit        chan BreakpointEvent
-	InitialBreakpointHit chan InitialBreakpointHitEvent
-	DebugCommand         chan DebugCommand
+	Stop          chan bool
+	DebugEvents   chan DebugEvent
+	DebugCommands chan DebugCommand
 
 	task       C.mach_port_t
 	mainThread C.thread_act_t
@@ -85,13 +83,12 @@ func (d *darwinARM64Debugger) resetSessionState() {
 
 // NewDebugger creates a Darwin ARM64 debugger implementation wired to the
 // hub communication channels.
-func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan InitialBreakpointHitEvent, debugCommand chan DebugCommand, endDebugSession chan bool) Debugger {
+func NewDebugger(debugCommands chan DebugCommand, debugEvents chan DebugEvent, stop chan bool) Debugger {
 	return &darwinARM64Debugger{
-		Breakpoints:          make(map[uint64][]byte),
-		EndDebugSession:      endDebugSession,
-		BreakpointHit:        breakpointHit,
-		InitialBreakpointHit: initialBreakpointHit,
-		DebugCommand:         debugCommand,
+		Breakpoints:   make(map[uint64][]byte),
+		DebugEvents:   debugEvents,
+		DebugCommands: debugCommands,
+		Stop:          stop,
 	}
 }
 
