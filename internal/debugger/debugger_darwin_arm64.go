@@ -20,8 +20,7 @@ import (
 )
 
 const (
-	logPrefixDebugger      = "[Debugger]"
-	logPrefixExceptionLoop = "[ExceptionLoop]"
+	logPrefixDebugger = "[DBG]"
 
 	KERN_FAILURE_CODE = 5
 )
@@ -202,7 +201,7 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 		var excBuf [4096]byte
 		var reply C.exc_msg_reply_t
 
-		log.Printf("%s waiting for exception message", logPrefixExceptionLoop)
+		log.Printf("%s waiting for exception message", logPrefixDebugger)
 
 		// Receive exception message (blocks until breakpoint hit)
 		kr := C.mach_msg(
@@ -215,16 +214,16 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 			C.MACH_PORT_NULL,
 		)
 		if kr != C.MACH_MSG_SUCCESS {
-			log.Printf("%s mach_msg receive failed: %d", logPrefixExceptionLoop, kr)
+			log.Printf("%s mach_msg receive failed: %d", logPrefixDebugger, kr)
 			continue
 		}
-		log.Printf("%s received exception message", logPrefixExceptionLoop)
+		log.Printf("%s received exception message", logPrefixDebugger)
 
 		excMsg := (*C.exc_msg_t)(unsafe.Pointer(&excBuf[0]))
 
 		// Check if it's a breakpoint exception
 		if excMsg.exception == C.EXC_BREAKPOINT || excMsg.exception == C.EXC_BAD_INSTRUCTION {
-			log.Printf("%s breakpoint exception received", logPrefixExceptionLoop)
+			log.Printf("%s breakpoint exception received", logPrefixDebugger)
 			thread := C.exc_msg_thread(excMsg)
 			if d.mainThread == 0 {
 				d.mainThread = thread
@@ -238,14 +237,14 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 				// Re-install any breakpoint we temporarily removed for single-stepping
 				if d.singleStepRemovedBP != 0 {
 					if err := d.writeWord(d.singleStepRemovedBP, arm64BreakpointBytes); err != nil {
-						log.Printf("%s failed to re-install breakpoint: %v", logPrefixExceptionLoop, err)
+						log.Printf("%s failed to re-install breakpoint: %v", logPrefixDebugger, err)
 					}
 					d.singleStepRemovedBP = 0
 				}
 			}
 
 			if d.DebugInfo == nil {
-				log.Printf("%s handling initial breakpoint", logPrefixExceptionLoop)
+				log.Printf("%s handling initial breakpoint", logPrefixDebugger)
 				d.initialBreakpointHit()
 			} else {
 				d.breakpointHit(d.DebugInfo.GetTarget().PID)
@@ -269,7 +268,7 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 			)
 
 			if replyKr != C.MACH_MSG_SUCCESS {
-				log.Printf("%s failed to send exception reply: %d", logPrefixExceptionLoop, replyKr)
+				log.Printf("%s failed to send exception reply: %d", logPrefixDebugger, replyKr)
 			}
 			C.destroy_mach_message((*C.mach_msg_header_t)(unsafe.Pointer(&excBuf[0])))
 			C.thread_resume(d.mainThread)
