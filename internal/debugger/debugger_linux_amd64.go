@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bingosuite/bingo/internal/debuginfo"
@@ -24,24 +25,39 @@ const (
 )
 
 type linuxAMD64Debugger struct {
-	DebugInfo       debuginfo.DebugInfo
-	Breakpoints     map[uint64][]byte
-	EndDebugSession chan bool
+	DebugInfo   debuginfo.DebugInfo
+	Breakpoints map[uint64][]byte
+
+	// stop is closed by StopDebug to signal all internal loops to exit.
+	stop     chan struct{}
+	stopOnce sync.Once
 
 	// Communication with hub
-	BreakpointHit        chan BreakpointEvent
-	InitialBreakpointHit chan InitialBreakpointHitEvent
-	DebugCommand         chan DebugCommand
+	DebuggerEvents chan DebuggerEvent
+	DebugCommand   chan DebugCommand
 }
 
-func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan InitialBreakpointHitEvent, debugCommand chan DebugCommand, endDebugSession chan bool) Debugger {
+func NewDebugger(debuggerEvents chan DebuggerEvent, debugCommand chan DebugCommand) Debugger {
 	return &linuxAMD64Debugger{
-		Breakpoints:          make(map[uint64][]byte),
-		EndDebugSession:      endDebugSession,
-		BreakpointHit:        breakpointHit,
-		InitialBreakpointHit: initialBreakpointHit,
-		DebugCommand:         debugCommand,
+		Breakpoints:    make(map[uint64][]byte),
+		stop:           make(chan struct{}),
+		DebuggerEvents: debuggerEvents,
+		DebugCommand:   debugCommand,
 	}
+}
+
+// sendEvent sends an event to the hub, aborting silently if the session is stopping.
+func (d *linuxAMD64Debugger) sendEvent(event DebuggerEvent) {
+	select {
+	case d.DebuggerEvents <- event:
+	case <-d.stop:
+	}
+}
+
+// sendSessionEnded must always deliver the terminal session event so the hub
+// can run its shutdown cleanup logic.
+func (d *linuxAMD64Debugger) sendSessionEnded(err error) {
+	d.DebuggerEvents <- SessionEndedEvent{Err: err}
 }
 
 // validateTargetPath resolves path to an absolute path, ensures it stays
@@ -85,11 +101,16 @@ func (d *linuxAMD64Debugger) StartWithDebug(path string) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
+	// notifyEnd always sends a SessionEndedEvent before returning, so the hub
+	// learns of both clean exits and failures through the same channel.
+	notifyEnd := func(err error) { d.sendSessionEnded(err) }
+
 	// Validate and sanitise the user-supplied path before passing it to exec.
 	validatedPath, err := validateTargetPath(path)
 	if err != nil {
 		log.Printf("[Debugger] Rejected target path %q: %v", path, err)
-		panic(err)
+		notifyEnd(err)
+		return
 	}
 
 	// Set up target for execution
@@ -101,20 +122,23 @@ func (d *linuxAMD64Debugger) StartWithDebug(path string) {
 
 	if err := cmd.Start(); err != nil {
 		log.Printf("[Debugger] Failed to start target: %v", err)
-		panic(err)
+		notifyEnd(fmt.Errorf("starting target: %w", err))
+		return
 	}
 
 	dbInf, err := debuginfo.NewDebugInfo(validatedPath, cmd.Process.Pid)
 	if err != nil {
 		log.Printf("[Debugger] Failed to create debug info: %v", err)
-		panic(err)
+		notifyEnd(fmt.Errorf("creating debug info: %w", err))
+		return
 	}
 	log.Printf("[Debugger] Started process with PID: %d and PGID: %d\n", dbInf.GetTarget().PID, dbInf.GetTarget().PGID)
 
 	// Enable tracking threads spawned from target and killing target once Bingo exits
 	if err := unix.PtraceSetOptions(dbInf.GetTarget().PID, unix.PTRACE_O_TRACECLONE|ptraceOExitKill); err != nil {
 		log.Printf("[Debugger] Failed to set TRACECLONE and EXITKILL options on target: %v", err)
-		panic(err)
+		notifyEnd(fmt.Errorf("setting ptrace options: %w", err))
+		return
 	}
 
 	d.DebugInfo = dbInf
@@ -128,12 +152,16 @@ func (d *linuxAMD64Debugger) StartWithDebug(path string) {
 	}
 
 	// Set initial breakpoints while the process is stopped at the initial SIGTRAP
-	d.initialBreakpointHit()
+	if err := d.initialBreakpointHit(); err != nil {
+		notifyEnd(fmt.Errorf("initial breakpoint: %w", err))
+		return
+	}
 
 	// Check if we were stopped during initial breakpoint
 	select {
-	case <-d.EndDebugSession:
+	case <-d.stop:
 		log.Println("[Debugger] Debug session ended during initial breakpoint, cleaning up")
+		notifyEnd(nil)
 		return
 	default:
 		// Continue to debug loop
@@ -141,134 +169,124 @@ func (d *linuxAMD64Debugger) StartWithDebug(path string) {
 
 	log.Println("[Debugger] STARTING DEBUG LOOP")
 
-	d.mainDebugLoop()
+	if err := d.mainDebugLoop(); err != nil {
+		notifyEnd(fmt.Errorf("debug loop: %w", err))
+		return
+	}
 
 	log.Println("[Debugger] Debug loop ended")
-
+	notifyEnd(nil)
 }
 
-func (d *linuxAMD64Debugger) Continue(pid int) {
+func (d *linuxAMD64Debugger) continueExec(pid int) error {
 	// Read registers
 	var regs unix.PtraceRegs
 	if err := unix.PtraceGetRegs(pid, &regs); err != nil {
-		log.Printf("[Debugger] Failed to get registers: %v", err)
-		panic(err)
+		return fmt.Errorf("getting registers for pid %d: %w", pid, err)
 	}
 	_, line, _ := d.DebugInfo.PCToLine(regs.Rip - 1) // Breakpoint advances PC by 1 on x86, so we need to rewind
-	//fmt.Printf("[Debugger] Stopped at %s at %d in %s\n", fn.Name, line, filename)
 
 	// Remove the breakpoint
 	bpAddr := regs.Rip - 1
-	if err := d.ClearBreakpoint(pid, line); err != nil {
-		log.Printf("[Debugger] Failed to clear breakpoint: %v", err)
-		panic(err)
+	if err := d.clearBreakpoint(pid, line); err != nil {
+		return fmt.Errorf("clearing breakpoint at line %d: %w", line, err)
 	}
 	regs.Rip = bpAddr
 
 	// Rewind Rip by 1
 	if err := unix.PtraceSetRegs(pid, &regs); err != nil {
-		log.Printf("[Debugger] Failed to restore registers: %v", err)
-		panic(err)
+		return fmt.Errorf("restoring registers for pid %d: %w", pid, err)
 	}
 
 	// Step over the instruction we previously removed to put the breakpoint
 	// TODO: decide if we want to call debugger.SingleStep() for this or just the system
 	if err := unix.PtraceSingleStep(pid); err != nil {
-		log.Printf("[Debugger] Failed to single-step: %v", err)
-		panic(err)
+		return fmt.Errorf("single-stepping pid %d: %w", pid, err)
 	}
 
 	// TODO: only trigger for step over signal
 	var waitStatus unix.WaitStatus
 	// Wait until the program lets us know we stepped over (handle cases where we get another signal which Wait4 would consume)
 	if _, err := unix.Wait4(pid, &waitStatus, 0, nil); err != nil {
-		log.Printf("[Debugger] Failed to wait for the single-step: %v", err)
-		panic(err)
+		return fmt.Errorf("waiting for single-step on pid %d: %w", pid, err)
 	}
 
 	// Put the breakpoint back
-	if err := d.SetBreakpoint(pid, line); err != nil {
-		log.Printf("[Debugger] Failed to set breakpoint: %v", err)
-		panic(err)
+	if err := d.setBreakpoint(pid, line); err != nil {
+		return fmt.Errorf("re-setting breakpoint at line %d: %w", line, err)
 	}
 
 	// Resume execution
 	// TODO: decide if we want to call debugger.Continue() for this or just the system call
 	if err := unix.PtraceCont(pid, 0); err != nil {
-		log.Printf("[Debugger] Failed to resume target execution: %v", err)
-		panic(err)
+		return fmt.Errorf("resuming pid %d: %w", pid, err)
 	}
-
+	return nil
 }
 
-func (d *linuxAMD64Debugger) SingleStep(pid int) {
-
+func (d *linuxAMD64Debugger) singleStep(pid int) error {
 	if err := unix.PtraceSingleStep(pid); err != nil {
-		log.Printf("[Debugger] Failed to single-step: %v", err)
-		panic(err)
+		return fmt.Errorf("single-stepping pid %d: %w", pid, err)
 	}
-
+	return nil
 }
 
-func (d *linuxAMD64Debugger) StepOver(pid int) {
+func (d *linuxAMD64Debugger) stepOver(pid int) error {
 	// TODO
+	return nil
 }
 
-func (d *linuxAMD64Debugger) StopDebug() {
-	// Detach from the target process, letting it continue running
+func (d *linuxAMD64Debugger) stopDebug() {
 	if d.DebugInfo.GetTarget().PID > 0 {
 		log.Printf("[Debugger] Detaching from target process (PID: %d)", d.DebugInfo.GetTarget().PID)
 		if err := unix.PtraceDetach(d.DebugInfo.GetTarget().PID); err != nil {
+			// Process may have already exited; log but don't treat as fatal
 			log.Printf("[Debugger] Failed to detach from target process: %v (might have already exited)", err)
-			panic(err)
 		}
 	}
-	// Signal the debug loop to exit
-	select {
-	case d.EndDebugSession <- true:
-	default:
-		// Channel might be full, meaning debug session end already triggered
-	}
+	// Close the stop channel to signal all internal loops to exit.
+	// sync.Once ensures this is safe to call multiple times.
+	d.stopOnce.Do(func() { close(d.stop) })
 }
 
-func (d *linuxAMD64Debugger) SetBreakpoint(pid int, line int) error {
+func (d *linuxAMD64Debugger) setBreakpoint(pid int, line int) error {
 
 	pc, _, err := d.DebugInfo.LineToPC(d.DebugInfo.GetTarget().Path, line)
 	if err != nil {
-		return fmt.Errorf("failed to get PC of line %v: %v", line, err)
+		return fmt.Errorf("resolving PC for line %d: %w", line, err)
 	}
 
 	original := make([]byte, len(bpCode))
 	if _, err := unix.PtracePeekData(pid, uintptr(pc), original); err != nil {
-		return fmt.Errorf("failed to read original machine code into memory: %v for PID: %d", err, pid)
+		return fmt.Errorf("reading original instruction at line %d (pid %d): %w", line, pid, err)
 	}
 	if _, err := unix.PtracePokeData(pid, uintptr(pc), bpCode); err != nil {
-		return fmt.Errorf("failed to write breakpoint into memory: %v", err)
+		return fmt.Errorf("writing breakpoint at line %d: %w", line, err)
 	}
 	d.Breakpoints[pc] = original
 	return nil
 }
 
-func (d *linuxAMD64Debugger) ClearBreakpoint(pid int, line int) error {
+func (d *linuxAMD64Debugger) clearBreakpoint(pid int, line int) error {
 
 	pc, _, err := d.DebugInfo.LineToPC(d.DebugInfo.GetTarget().Path, line)
 	if err != nil {
-		return fmt.Errorf("failed to get PC of line %v: %v", line, err)
+		return fmt.Errorf("resolving PC for line %d: %w", line, err)
 	}
 	if _, err := unix.PtracePokeData(pid, uintptr(pc), d.Breakpoints[pc]); err != nil {
-		return fmt.Errorf("failed to write breakpoint into memory: %v", err)
+		return fmt.Errorf("restoring original instruction at line %d: %w", line, err)
 	}
 	return nil
 }
 
 // TODO: pass the correct pid to the debugger methods, keep an eye on this
-func (d *linuxAMD64Debugger) mainDebugLoop() {
+func (d *linuxAMD64Debugger) mainDebugLoop() error {
 	for {
 		// Check if we should stop debugging
 		select {
-		case <-d.EndDebugSession:
+		case <-d.stop:
 			log.Println("[Debugger] Debug session ending, exiting debug loop")
-			return
+			return nil
 		default:
 			// Continue with wait
 		}
@@ -277,9 +295,7 @@ func (d *linuxAMD64Debugger) mainDebugLoop() {
 		var waitStatus unix.WaitStatus
 		wpid, err := unix.Wait4(-1*d.DebugInfo.GetTarget().PGID, &waitStatus, unix.WNOHANG, nil)
 		if err != nil {
-			log.Printf("[Debugger] Failed to wait for the target or any of its threads: %v", err)
-			// Don't panic, just exit gracefully
-			return
+			return fmt.Errorf("waiting for target or its threads: %w", err)
 		}
 
 		// TODO: change 10ms polling approach to goroutine
@@ -289,30 +305,21 @@ func (d *linuxAMD64Debugger) mainDebugLoop() {
 		}
 
 		if waitStatus.Exited() {
-			if wpid == d.DebugInfo.GetTarget().PID { // If target exited, terminate
+			if wpid == d.DebugInfo.GetTarget().PID { // If target exited, return and let StartWithDebug send SessionEndedEvent
 				log.Printf("[Debugger] Target %v execution completed", d.DebugInfo.GetTarget().Path)
-				// Signal the end of debug session to hub
-				select {
-				case d.EndDebugSession <- true:
-				default:
-					// Channel might be full, meaning debug session end already triggered
-				}
-				return
+				return nil
 			} else {
 				log.Printf("[Debugger] Thread exited with PID: %v", wpid)
 			}
 		} else {
 			// Only stop on breakpoints caused by our debugger, ignore any other event like spawning of new threads
 			if waitStatus.StopSignal() == unix.SIGTRAP && waitStatus.TrapCause() != unix.PTRACE_EVENT_CLONE {
-				//TODO: improve error handling and messages
-
-				d.breakpointHit(wpid)
-
+				if err := d.breakpointHit(wpid); err != nil {
+					return fmt.Errorf("handling breakpoint for pid %d: %w", wpid, err)
+				}
 			} else {
 				if err := unix.PtraceCont(wpid, 0); err != nil {
-					log.Printf("[Debugger] Failed to resume target execution: %v for PID: %d", err, wpid)
-					// Don't panic, might have been detached
-					return
+					return fmt.Errorf("resuming pid %d: %w", wpid, err)
 				}
 			}
 		}
@@ -320,15 +327,12 @@ func (d *linuxAMD64Debugger) mainDebugLoop() {
 }
 
 // TODO: maybe refactor later
-func (d *linuxAMD64Debugger) initialBreakpointHit() {
-	// Create initial breakpoint event
+func (d *linuxAMD64Debugger) initialBreakpointHit() error {
 	event := InitialBreakpointHitEvent{
 		PID: d.DebugInfo.GetTarget().PID,
 	}
-
-	// Send initial breakpoint hit event to hub
 	log.Println("[Debugger] Initial breakpoint hit, debugger ready for commands")
-	d.InitialBreakpointHit <- event
+	d.sendEvent(event)
 
 	// Wait for commands from hub (typically to set breakpoints)
 	for {
@@ -340,50 +344,42 @@ func (d *linuxAMD64Debugger) initialBreakpointHit() {
 			case "setBreakpoint":
 				if data, ok := cmd.Data.(map[string]any); ok {
 					if line, ok := data["line"].(int); ok {
-						if err := d.SetBreakpoint(d.DebugInfo.GetTarget().PID, int(line)); err != nil {
-							log.Printf("[Debugger] Failed to set breakpoint at line %d: %v", int(line), err)
-							panic(err)
-						} else {
-							log.Printf("[Debugger] Breakpoint set at line %d while at breakpoint", int(line))
+						if err := d.setBreakpoint(d.DebugInfo.GetTarget().PID, line); err != nil {
+							return fmt.Errorf("setting initial breakpoint at line %d: %w", line, err)
 						}
+						log.Printf("[Debugger] Breakpoint set at line %d while at breakpoint", line)
 					}
 				}
 			case "continue":
 				log.Println("[Debugger] Continuing from initial breakpoint")
 				if err := unix.PtraceCont(d.DebugInfo.GetTarget().PID, 0); err != nil {
-					log.Printf("[Debugger] Failed to resume target execution: %v", err)
-					panic(err)
+					return fmt.Errorf("resuming target after initial stop: %w", err)
 				}
-				return // Exit initial breakpoint handling
+				return nil // Exit initial breakpoint handling
 			case "stepOver":
 				log.Println("[Debugger] Cannot stepover from initial breakpoint")
 			case "singleStep":
 				log.Println("[Debugger] Cannot single-step from initial breakpoint")
 			case "quit":
-				d.StopDebug()
-				return
+				d.stopDebug()
+				return nil
 			default:
 				log.Printf("[Debugger] Unknown command during initial breakpoint: %s", cmd.Type)
 			}
-		case <-d.EndDebugSession:
+		case <-d.stop:
 			log.Println("[Debugger] Debug session ending during initial breakpoint")
-			return
+			return nil
 		}
 	}
 }
 
-func (d *linuxAMD64Debugger) breakpointHit(pid int) {
-	// Get register information to determine location
+func (d *linuxAMD64Debugger) breakpointHit(pid int) error {
 	var regs unix.PtraceRegs
 	if err := unix.PtraceGetRegs(pid, &regs); err != nil {
-		log.Printf("[Debugger] Failed to get registers: %v", err)
-		panic(err)
+		return fmt.Errorf("getting registers for pid %d: %w", pid, err)
 	}
 
-	// Get location information
 	filename, line, fn := d.DebugInfo.PCToLine(regs.Rip - 1)
-
-	// Create breakpoint event
 	event := BreakpointEvent{
 		PID:      pid,
 		Filename: filename,
@@ -391,9 +387,8 @@ func (d *linuxAMD64Debugger) breakpointHit(pid int) {
 		Function: fn.Name,
 	}
 
-	// Send breakpoint hit event to hub
 	log.Printf("[Debugger] Breakpoint hit at %s:%d in %s, waiting for command", filename, line, fn.Name)
-	d.BreakpointHit <- event
+	d.sendEvent(event)
 
 	// Wait for command from hub
 	select {
@@ -401,30 +396,39 @@ func (d *linuxAMD64Debugger) breakpointHit(pid int) {
 		log.Printf("[Debugger] Received command: %s", cmd.Type)
 		switch cmd.Type {
 		case "continue":
-			d.Continue(pid)
+			if err := d.continueExec(pid); err != nil {
+				return fmt.Errorf("continuing from breakpoint: %w", err)
+			}
 		case "stepOver":
-			d.StepOver(pid)
+			if err := d.stepOver(pid); err != nil {
+				return fmt.Errorf("stepping over at breakpoint: %w", err)
+			}
 		case "singleStep":
-			d.SingleStep(pid)
+			if err := d.singleStep(pid); err != nil {
+				return fmt.Errorf("single stepping at breakpoint: %w", err)
+			}
 		case "setBreakpoint":
 			if data, ok := cmd.Data.(map[string]any); ok {
 				if line, ok := data["line"].(int); ok {
-					if err := d.SetBreakpoint(pid, int(line)); err != nil {
-						log.Printf("[Debugger] Failed to set breakpoint at line %d: %v", int(line), err)
+					if err := d.setBreakpoint(pid, line); err != nil {
+						log.Printf("[Debugger] Failed to set breakpoint at line %d: %v", line, err)
 					} else {
-						log.Printf("[Debugger] Breakpoint set at line %d while at breakpoint", int(line))
+						log.Printf("[Debugger] Breakpoint set at line %d while at breakpoint", line)
 					}
 				}
 			}
 		case "quit":
-			d.StopDebug()
-			return
+			d.stopDebug()
+			return nil
 		default:
 			log.Printf("[Debugger] Unknown command: %s", cmd.Type)
-			d.Continue(pid) // Default to continue
+			if err := d.continueExec(pid); err != nil {
+				return fmt.Errorf("continuing from breakpoint (default): %w", err)
+			}
 		}
-	case <-d.EndDebugSession:
+	case <-d.stop:
 		log.Println("[Debugger] Debug session ending, stopping breakpoint handler")
-		return
+		return nil
 	}
+	return nil
 }

@@ -35,36 +35,30 @@ type Hub struct {
 	dbg debugger.Debugger
 
 	// Debugger channels owned by the hub
-	breakpointHit        chan debugger.BreakpointEvent
-	initialBreakpointHit chan debugger.InitialBreakpointHitEvent
-	debugCommand         chan debugger.DebugCommand
-	endDebugSession      chan bool
+	debuggerEvents chan debugger.DebuggerEvent
+	debugCommand   chan debugger.DebugCommand
 
 	mu sync.RWMutex
 }
 
 func NewHub(sessionID string, idleTimeout time.Duration) *Hub {
-	breakpointHit := make(chan debugger.BreakpointEvent, 1)
-	initialBreakpointHit := make(chan debugger.InitialBreakpointHitEvent, 1)
+	debuggerEvents := make(chan debugger.DebuggerEvent, 8)
 	debugCommand := make(chan debugger.DebugCommand, 1)
-	endDebugSession := make(chan bool, 1)
 
-	dbg := debugger.NewDebugger(breakpointHit, initialBreakpointHit, debugCommand, endDebugSession)
+	dbg := debugger.NewDebugger(debuggerEvents, debugCommand)
 
 	return &Hub{
-		sessionID:            sessionID,
-		connections:          make(map[*Connection]struct{}),
-		register:             make(chan *Connection),
-		unregister:           make(chan *Connection),
-		events:               make(chan Message, eventBufferSize),
-		commands:             make(chan Message, commandBufferSize),
-		idleTimeout:          idleTimeout,
-		lastActivity:         time.Now(),
-		dbg:                  dbg,
-		breakpointHit:        breakpointHit,
-		initialBreakpointHit: initialBreakpointHit,
-		debugCommand:         debugCommand,
-		endDebugSession:      endDebugSession,
+		sessionID:      sessionID,
+		connections:    make(map[*Connection]struct{}),
+		register:       make(chan *Connection),
+		unregister:     make(chan *Connection),
+		events:         make(chan Message, eventBufferSize),
+		commands:       make(chan Message, commandBufferSize),
+		idleTimeout:    idleTimeout,
+		lastActivity:   time.Now(),
+		dbg:            dbg,
+		debuggerEvents: debuggerEvents,
+		debugCommand:   debugCommand,
 	}
 }
 
@@ -75,64 +69,94 @@ func (h *Hub) Run() {
 	for {
 		select {
 		case <-ticker.C:
-			// Check idle timeout
-			if h.idleTimeout > 0 && len(h.connections) == 0 {
-				if time.Since(h.lastActivity) > h.idleTimeout {
-					log.Printf("[Hub] Session %s idle for %v, shutting down", h.sessionID, h.idleTimeout)
-					h.shutdown()
-					return
-				}
+			if h.checkIdleTimeout() {
+				return
 			}
-
 		case client := <-h.register:
-			h.mu.Lock()
-			h.connections[client] = struct{}{}
-			h.lastActivity = time.Now()
-			h.mu.Unlock()
-			log.Printf("[Hub] Client %s connected to hub %s (%d total)", client.id, h.sessionID, len(h.connections))
-
+			h.handleRegister(client)
 		case client := <-h.unregister:
-			h.mu.Lock()
-			if _, ok := h.connections[client]; ok {
-				delete(h.connections, client)
-				client.CloseSend()
-				log.Printf("[Hub] Client %s disconnected from hub %s (%d remaining)", client.id, h.sessionID, len(h.connections))
-
-				// When last client leaves, shutdown hub
-				if len(h.connections) == 0 {
-					h.mu.Unlock()
-					log.Printf("[Hub] Session %s has no clients, shutting down hub", h.sessionID)
-					h.shutdown()
-					return
-				}
+			if h.handleUnregister(client) {
+				return
 			}
-			h.mu.Unlock()
-
 		case event := <-h.events:
-			h.lastActivity = time.Now()
-			h.mu.RLock()
-			var slowConnections []*Connection
-			for connection := range h.connections {
-				select {
-				case connection.send <- event:
-				default: // when a send operation blocks (connection consuming too slowly or reader goroutine died), discard the connection
-					slowConnections = append(slowConnections, connection)
-				}
-			}
-			h.mu.RUnlock()
-			for _, connection := range slowConnections {
-				log.Printf("[Hub] Connection %s is slow; unregistering from hub %s", connection.id, h.sessionID)
-				h.Unregister(connection)
-			}
-
+			h.handleEvent(event)
 		case cmd := <-h.commands:
 			log.Printf("[Hub] Hub %s command: %s", h.sessionID, cmd.Type)
 			h.handleCommand(cmd)
-
-		case <-h.endDebugSession:
-			log.Printf("[Hub] Debugger signaled end of session %s, shutting down hub", h.sessionID)
-			h.shutdown()
+		case event := <-h.debuggerEvents:
+			if done := h.handleDebuggerEvent(event); done {
+				// Flush any final messages queued during shutdown (e.g. the
+				// stateUpdate and error broadcast from SessionEndedEvent) so
+				// clients receive them before the hub exits.
+				for {
+					select {
+					case msg := <-h.events:
+						h.handleEvent(msg)
+					default:
+						return
+					}
+				}
+			}
 		}
+	}
+}
+
+// checkIdleTimeout shuts down the hub when it has been idle too long and
+// returns true to signal that Run should exit.
+func (h *Hub) checkIdleTimeout() bool {
+	if h.idleTimeout > 0 && len(h.connections) == 0 {
+		if time.Since(h.lastActivity) > h.idleTimeout {
+			log.Printf("[Hub] Session %s idle for %v, shutting down", h.sessionID, h.idleTimeout)
+			h.shutdown()
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Hub) handleRegister(client *Connection) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.connections[client] = struct{}{}
+	h.lastActivity = time.Now()
+	log.Printf("[Hub] Client %s connected to hub %s (%d total)", client.id, h.sessionID, len(h.connections))
+}
+
+// handleUnregister removes the client and returns true when Run should exit
+// (i.e. the last client has left).
+func (h *Hub) handleUnregister(client *Connection) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.connections[client]; ok {
+		delete(h.connections, client)
+		client.CloseSend()
+		log.Printf("[Hub] Client %s disconnected from hub %s (%d remaining)", client.id, h.sessionID, len(h.connections))
+
+		// When last client leaves, shutdown hub
+		if len(h.connections) == 0 {
+			log.Printf("[Hub] Session %s has no clients, shutting down hub", h.sessionID)
+			h.shutdown()
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Hub) handleEvent(event Message) {
+	h.lastActivity = time.Now()
+	h.mu.RLock()
+	var slowConnections []*Connection
+	for connection := range h.connections {
+		select {
+		case connection.send <- event:
+		default: // send blocked: connection is too slow or its reader has died
+			slowConnections = append(slowConnections, connection)
+		}
+	}
+	h.mu.RUnlock()
+	for _, connection := range slowConnections {
+		log.Printf("[Hub] Connection %s is slow; unregistering from hub %s", connection.id, h.sessionID)
+		h.Unregister(connection)
 	}
 }
 
@@ -159,105 +183,60 @@ func (h *Hub) shutdown() {
 	}
 }
 
-// Listen for events from the debugger (breakpoint hits)
-func (h *Hub) listenForDebuggerEvents() {
-	for {
-		select {
-		case bpEvent := <-h.breakpointHit:
-			log.Printf("[Hub] [Debugger Event] Breakpoint hit at %s:%d in %s", bpEvent.Filename, bpEvent.Line, bpEvent.Function)
+// handleDebuggerEvent processes a single event from the debugger. It returns
+// true when the hub should shut down (i.e. the session has ended).
+func (h *Hub) handleDebuggerEvent(event debugger.DebuggerEvent) bool {
+	switch e := event.(type) {
+	case debugger.BreakpointEvent:
+		log.Printf("[Hub] [Debugger Event] Breakpoint hit at %s:%d in %s", e.Filename, e.Line, e.Function)
 
-			// Create and send breakpoint hit event to all clients
-			event := BreakpointHitEvent{
-				Type:      EventBreakpointHit,
-				SessionID: h.sessionID,
-				PID:       bpEvent.PID,
-				Filename:  bpEvent.Filename,
-				Line:      bpEvent.Line,
-				Function:  bpEvent.Function,
-			}
-
-			eventData, err := json.Marshal(event)
-			if err != nil {
-				log.Printf("[Hub] Failed to marshal breakpoint event: %v", err)
-				continue
-			}
-
-			message := Message{
-				Type: string(EventBreakpointHit),
-				Data: eventData,
-			}
-
-			h.Broadcast(message)
-
-			// Also send state update to indicate we're at a breakpoint
-			stateEvent := StateUpdateEvent{
-				Type:      EventStateUpdate,
-				SessionID: h.sessionID,
-				NewState:  StateBreakpoint,
-			}
-
-			stateData, err := json.Marshal(stateEvent)
-			if err != nil {
-				log.Printf("[Hub] Failed to marshal state update event: %v", err)
-				continue
-			}
-
-			stateMessage := Message{
-				Type: string(EventStateUpdate),
-				Data: stateData,
-			}
-
-			h.Broadcast(stateMessage)
-
-		case initialBpEvent := <-h.initialBreakpointHit:
-			log.Printf("[Hub] [Debugger Event] Initial breakpoint hit (PID: %d, session: %s)", initialBpEvent.PID, h.sessionID)
-
-			// Create and send initial breakpoint event to all clients
-			event := InitialBreakpointHitEvent{
-				Type:      EventInitialBreakpoint,
-				SessionID: h.sessionID,
-				PID:       initialBpEvent.PID,
-			}
-
-			eventData, err := json.Marshal(event)
-			if err != nil {
-				log.Printf("[Hub] Failed to marshal initial breakpoint event: %v", err)
-				continue
-			}
-
-			message := Message{
-				Type: string(EventInitialBreakpoint),
-				Data: eventData,
-			}
-
-			h.Broadcast(message)
-
-			// Also send state update to indicate we're at a breakpoint
-			log.Printf("[Hub] [State Change] Transitioning to breakpoint state (session: %s)", h.sessionID)
-			stateEvent := StateUpdateEvent{
-				Type:      EventStateUpdate,
-				SessionID: h.sessionID,
-				NewState:  StateBreakpoint,
-			}
-
-			stateData, err := json.Marshal(stateEvent)
-			if err != nil {
-				log.Printf("[Hub] Failed to marshal state update event: %v", err)
-				continue
-			}
-
-			stateMessage := Message{
-				Type: string(EventStateUpdate),
-				Data: stateData,
-			}
-
-			h.Broadcast(stateMessage)
-
-		case <-h.endDebugSession:
-			log.Println("[Hub] Debugger event listener ending, sending state update to ready")
-			h.sendStateUpdate(StateReady)
-			return
+		eventData, err := json.Marshal(BreakpointHitEvent{
+			Type:      EventBreakpointHit,
+			SessionID: h.sessionID,
+			PID:       e.PID,
+			Filename:  e.Filename,
+			Line:      e.Line,
+			Function:  e.Function,
+		})
+		if err != nil {
+			log.Printf("[Hub] Failed to marshal breakpoint event: %v", err)
+			return false
 		}
+		h.Broadcast(Message{Type: string(EventBreakpointHit), Data: eventData})
+		h.sendStateUpdate(StateBreakpoint)
+		return false
+
+	case debugger.InitialBreakpointHitEvent:
+		log.Printf("[Hub] [Debugger Event] Initial breakpoint hit (PID: %d, session: %s)", e.PID, h.sessionID)
+
+		eventData, err := json.Marshal(InitialBreakpointHitEvent{
+			Type:      EventInitialBreakpoint,
+			SessionID: h.sessionID,
+			PID:       e.PID,
+		})
+		if err != nil {
+			log.Printf("[Hub] Failed to marshal initial breakpoint event: %v", err)
+			return false
+		}
+		h.Broadcast(Message{Type: string(EventInitialBreakpoint), Data: eventData})
+		log.Printf("[Hub] [State Change] Transitioning to breakpoint state (session: %s)", h.sessionID)
+		h.sendStateUpdate(StateBreakpoint)
+		return false
+
+	case debugger.SessionEndedEvent:
+		if e.Err != nil {
+			log.Printf("[Hub] Debug session %s ended with error: %v", h.sessionID, e.Err)
+			h.broadcastError(e.Err)
+		} else {
+			log.Printf("[Hub] Debugger completed session %s", h.sessionID)
+		}
+		h.sendStateUpdate(StateReady)
+		h.shutdown()
+		return true
+
+	default:
+		log.Printf("[Hub] Unknown debugger event type: %T", event)
+		return false
 	}
 }
 
@@ -271,15 +250,8 @@ func (h *Hub) handleCommand(cmd Message) {
 			return
 		}
 		log.Printf("[Hub] [Command] StartDebug received: %s (session: %s)", startDebugCmd.TargetPath, h.sessionID)
-
-		// Prevent stale messages from prior debug runs from leaking into this new session.
-		// TODO: fix the drain channels
-		//h.clearDebuggerChannels(h.debugCommand, h.breakpointHit, h.initialBreakpointHit, h.endDebugSession)
-
-		// Start listening for events from this new debugger
-		go h.listenForDebuggerEvents()
-
-		// Start the debug session
+		// StartWithDebug delivers all outcomes via the debuggerEvents channel as a
+		// SessionEndedEvent, so the hub's Run loop handles success and failure uniformly.
 		go h.dbg.StartWithDebug(startDebugCmd.TargetPath)
 
 	case CmdContinue:
@@ -403,4 +375,20 @@ func (h *Hub) sendCommandToDebugger(cmd debugger.DebugCommand, cmdName string) {
 	default:
 		log.Printf("[Hub] [Error] Failed to send %s command to debugger - channel full", cmdName)
 	}
+}
+
+// broadcastError sends an error event to all connected clients. Log the full error server-side, but only send a generic message to clients to avoid leaking sensitive info.
+func (h *Hub) broadcastError(err error) {
+	log.Printf("session %s error: %v", h.sessionID, err)
+	event := ErrorEvent{
+		Type:      EventError,
+		SessionID: h.sessionID,
+		Message:   "an unexpected error occurred during debugging. Check server logs for details.",
+	}
+	data, marshalErr := json.Marshal(event)
+	if marshalErr != nil {
+		log.Printf("[Hub] Failed to marshal error event: %v", marshalErr)
+		return
+	}
+	h.Broadcast(Message{Type: string(EventError), Data: data})
 }

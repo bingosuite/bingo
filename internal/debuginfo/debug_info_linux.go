@@ -4,6 +4,7 @@ import (
 	"debug/elf"
 	"debug/gosym"
 	"fmt"
+	"log"
 
 	"golang.org/x/sys/unix"
 )
@@ -17,17 +18,17 @@ type linuxDebugInfo struct {
 func NewDebugInfo(path string, pid int) (DebugInfo, error) {
 	exe, err := elf.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open target ELF file: %v", err)
+		return nil, fmt.Errorf("opening target ELF file: %w", err)
 	}
 	defer func() {
 		if err := exe.Close(); err != nil {
-			fmt.Printf("failed to close target ELF file: %v\n", err)
+			log.Printf("[DebugInfo] closing ELF file: %v", err)
 		}
 	}()
 	// Read line table (mapping between memory addresses and source file + line number)
 	lineTableData, err := exe.Section(".gopclntab").Data()
 	if err != nil {
-		return nil, fmt.Errorf("failed to read Line Table data into memory: %v", err)
+		return nil, fmt.Errorf("reading .gopclntab section: %w", err)
 	}
 	// Address where the machine code for the target starts
 	addr := exe.Section(".text").Addr
@@ -36,7 +37,7 @@ func NewDebugInfo(path string, pid int) (DebugInfo, error) {
 	// Create symbol table object for looking up functions, variables and types
 	symTable, err := gosym.NewTable([]byte{}, lineTable)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create Symbol Table: %v", err)
+		return nil, fmt.Errorf("creating symbol table: %w", err)
 	}
 
 	// Need to get this to dynamically get the path to the main source Go file
@@ -46,7 +47,7 @@ func NewDebugInfo(path string, pid int) (DebugInfo, error) {
 	// Need this to wait on threads
 	pgid, err := unix.Getpgid(pid)
 	if err != nil {
-		return nil, fmt.Errorf("error getting PGID: %v", err)
+		return nil, fmt.Errorf("getting PGID for pid %d: %w", pid, err)
 	}
 
 	return &linuxDebugInfo{

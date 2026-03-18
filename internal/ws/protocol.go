@@ -23,6 +23,7 @@ const (
 	EventStateUpdate       EventType = "stateUpdate"
 	EventBreakpointHit     EventType = "breakpointHit"
 	EventInitialBreakpoint EventType = "initialBreakpoint"
+	EventError             EventType = "error"
 )
 
 type SessionStartedEvent struct {
@@ -50,6 +51,12 @@ type InitialBreakpointHitEvent struct {
 	Type      EventType `json:"type"`
 	SessionID string    `json:"sessionId"`
 	PID       int       `json:"pid"`
+}
+
+type ErrorEvent struct {
+	Type      EventType `json:"type"`
+	SessionID string    `json:"sessionId"`
+	Message   string    `json:"message"`
 }
 
 // Command messages (client -> server)

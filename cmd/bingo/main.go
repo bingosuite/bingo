@@ -21,8 +21,7 @@ func main() {
 
 	go func() {
 		if err := server.Serve(); err != nil {
-			log.Printf("WebSocket server error: %v", err)
-			panic(err)
+			log.Fatalf("WebSocket server error: %v", err)
 		}
 	}()
 

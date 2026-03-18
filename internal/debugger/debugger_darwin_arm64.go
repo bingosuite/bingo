@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 
@@ -40,15 +41,17 @@ type ARM64ThreadState struct {
 }
 
 type darwinARM64Debugger struct {
-	DebugInfo       debuginfo.DebugInfo
-	Breakpoints     map[uint64][]byte
-	EndDebugSession chan bool
-	slide           uint64
+	DebugInfo   debuginfo.DebugInfo
+	Breakpoints map[uint64][]byte
+	slide       uint64
+
+	// stop is closed by StopDebug to signal all internal loops to exit.
+	stop     chan struct{}
+	stopOnce sync.Once
 
 	// Communication with hub
-	BreakpointHit        chan BreakpointEvent
-	InitialBreakpointHit chan InitialBreakpointHitEvent
-	DebugCommand         chan DebugCommand
+	DebuggerEvents chan DebuggerEvent
+	DebugCommand   chan DebugCommand
 
 	task       C.mach_port_t
 	mainThread C.thread_act_t
@@ -85,14 +88,27 @@ func (d *darwinARM64Debugger) resetSessionState() {
 
 // NewDebugger creates a Darwin ARM64 debugger implementation wired to the
 // hub communication channels.
-func NewDebugger(breakpointHit chan BreakpointEvent, initialBreakpointHit chan InitialBreakpointHitEvent, debugCommand chan DebugCommand, endDebugSession chan bool) Debugger {
+func NewDebugger(debuggerEvents chan DebuggerEvent, debugCommand chan DebugCommand) Debugger {
 	return &darwinARM64Debugger{
-		Breakpoints:          make(map[uint64][]byte),
-		EndDebugSession:      endDebugSession,
-		BreakpointHit:        breakpointHit,
-		InitialBreakpointHit: initialBreakpointHit,
-		DebugCommand:         debugCommand,
+		Breakpoints:    make(map[uint64][]byte),
+		stop:           make(chan struct{}),
+		DebuggerEvents: debuggerEvents,
+		DebugCommand:   debugCommand,
 	}
+}
+
+// sendEvent sends an event to the hub, aborting silently if the session is stopping.
+func (d *darwinARM64Debugger) sendEvent(event DebuggerEvent) {
+	select {
+	case d.DebuggerEvents <- event:
+	case <-d.stop:
+	}
+}
+
+// sendSessionEnded must always deliver the terminal session event so the hub
+// can run its shutdown cleanup logic.
+func (d *darwinARM64Debugger) sendSessionEnded(err error) {
+	d.DebuggerEvents <- SessionEndedEvent{Err: err}
 }
 
 // computeSlide resolves and stores the target image ASLR slide used to
@@ -194,7 +210,7 @@ func (d *darwinARM64Debugger) exceptionLoop() {
 
 	for {
 		select {
-		case <-d.EndDebugSession:
+		case <-d.stop:
 			return
 		default:
 		}
@@ -304,12 +320,16 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
+	// notifyEnd always sends a SessionEndedEvent before returning.
+	notifyEnd := func(err error) { d.sendSessionEnded(err) }
+
 	d.resetSessionState()
 
 	validatedPath, err := validateTargetPath(path)
 	if err != nil {
 		log.Printf("%s rejected target path %q: %v", logPrefixDebugger, path, err)
-		panic(err)
+		notifyEnd(err)
+		return
 	}
 
 	cmd := exec.Command(validatedPath)
@@ -318,7 +338,8 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = nil
 	if err := cmd.Start(); err != nil {
-		panic(err)
+		notifyEnd(err)
+		return
 	}
 
 	pid := cmd.Process.Pid
@@ -334,18 +355,16 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 
 		log.Printf("%s target process exited: %v", logPrefixDebugger, status)
 
-		// signal debugger shutdown
-		select {
-		case d.EndDebugSession <- true:
-		default:
-		}
+		// Signal debugger shutdown.
+		d.stopOnce.Do(func() { close(d.stop) })
 	}()
 
 	// Get task port
 	var task C.mach_port_t
 	kr := C.task_for_pid(C.get_mach_task_self(), C.int(cmd.Process.Pid), &task)
 	if kr != C.KERN_SUCCESS {
-		panic(fmt.Errorf("task_for_pid failed: %d", kr))
+		notifyEnd(fmt.Errorf("task_for_pid failed: %d", kr))
+		return
 	}
 	d.task = task
 
@@ -353,7 +372,8 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 	var excPort C.mach_port_t
 	kr = C.mach_port_allocate(C.get_mach_task_self(), C.MACH_PORT_RIGHT_RECEIVE, &excPort)
 	if kr != C.KERN_SUCCESS {
-		panic(fmt.Errorf("mach_port_allocate failed: %d", kr))
+		notifyEnd(fmt.Errorf("mach_port_allocate failed: %d", kr))
+		return
 	}
 	d.excPort = excPort
 	log.Printf("%s exception port allocated: %d", logPrefixDebugger, d.excPort)
@@ -365,17 +385,20 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 		C.MACH_MSG_TYPE_MAKE_SEND,
 	)
 	if kr != C.KERN_SUCCESS {
-		panic(fmt.Errorf("mach_port_insert_right failed: %d", kr))
+		notifyEnd(fmt.Errorf("mach_port_insert_right failed: %d", kr))
+		return
 	}
 
 	kr = C.set_debug_exception_ports(d.task, excPort)
 	if kr != C.KERN_SUCCESS {
-		panic(fmt.Errorf("task_set_exception_ports failed: %d", kr))
+		notifyEnd(fmt.Errorf("task_set_exception_ports failed: %d", kr))
+		return
 	}
 
 	kr = C.set_thread_exception_ports(d.task, excPort)
 	if kr != C.KERN_SUCCESS {
-		panic(fmt.Errorf("thread_set_exception_ports failed: %d", kr))
+		notifyEnd(fmt.Errorf("thread_set_exception_ports failed: %d", kr))
+		return
 	}
 
 	// Get initial threads
@@ -385,26 +408,30 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 		d.mainThread = firstThread
 		kr = C.thread_suspend(firstThread)
 		if kr != C.KERN_SUCCESS {
-			panic(fmt.Errorf("thread_suspend failed: %d", kr))
+			notifyEnd(fmt.Errorf("thread_suspend failed: %d", kr))
+			return
 		}
 	}
 
 	dbInf, err := debuginfo.NewDebugInfo(validatedPath, cmd.Process.Pid)
 	if err != nil {
-		panic(err)
+		notifyEnd(err)
+		return
 	}
 	d.DebugInfo = dbInf
 	d.initialBreakpointHit()
 
 	select {
-	case <-d.EndDebugSession:
+	case <-d.stop:
 		log.Printf("%s debug session ended during initial breakpoint", logPrefixDebugger)
+		notifyEnd(nil)
 		return
 	default:
 		// Continue to debug loop
 	}
 
 	d.exceptionLoop()
+	notifyEnd(nil)
 }
 
 // Continue restores the current breakpointed instruction, places a temporary
@@ -556,10 +583,7 @@ func (d *darwinARM64Debugger) StopDebug() {
 		d.task = 0
 	}
 
-	select {
-	case d.EndDebugSession <- true:
-	default:
-	}
+	d.stopOnce.Do(func() { close(d.stop) })
 }
 
 // SetBreakpoint installs an ARM64 software breakpoint at the requested source
@@ -633,7 +657,7 @@ func (d *darwinARM64Debugger) initialBreakpointHit() {
 	}
 
 	log.Printf("%s ready for commands", logPrefixDebugger)
-	d.InitialBreakpointHit <- event
+	d.sendEvent(event)
 
 	// Wait for commands from hub
 	for {
@@ -666,7 +690,7 @@ func (d *darwinARM64Debugger) initialBreakpointHit() {
 			default:
 				log.Printf("%s unknown command: %s", logPrefixDebugger, cmd.Type)
 			}
-		case <-d.EndDebugSession:
+		case <-d.stop:
 			log.Printf("%s debug session ended during initial breakpoint", logPrefixDebugger)
 			return
 		}
@@ -721,7 +745,7 @@ func (d *darwinARM64Debugger) breakpointHit(pid int) {
 	}
 
 	log.Printf("%s breakpoint at %s:%d in %s", logPrefixDebugger, filename, line, function)
-	d.BreakpointHit <- event
+	d.sendEvent(event)
 
 	// Wait for commands from hub
 	for {
@@ -752,7 +776,7 @@ func (d *darwinARM64Debugger) breakpointHit(pid int) {
 			default:
 				log.Printf("%s unknown command: %s", logPrefixDebugger, cmd.Type)
 			}
-		case <-d.EndDebugSession:
+		case <-d.stop:
 			log.Printf("%s debug session ended", logPrefixDebugger)
 			return
 		}
