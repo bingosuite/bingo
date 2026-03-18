@@ -116,9 +116,9 @@ func (h *Hub) checkIdleTimeout() bool {
 
 func (h *Hub) handleRegister(client *Connection) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.connections[client] = struct{}{}
 	h.lastActivity = time.Now()
-	h.mu.Unlock()
 	log.Printf("[Hub] Client %s connected to hub %s (%d total)", client.id, h.sessionID, len(h.connections))
 }
 
@@ -126,6 +126,7 @@ func (h *Hub) handleRegister(client *Connection) {
 // (i.e. the last client has left).
 func (h *Hub) handleUnregister(client *Connection) bool {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	if _, ok := h.connections[client]; ok {
 		delete(h.connections, client)
 		client.CloseSend()
@@ -133,13 +134,11 @@ func (h *Hub) handleUnregister(client *Connection) bool {
 
 		// When last client leaves, shutdown hub
 		if len(h.connections) == 0 {
-			h.mu.Unlock()
 			log.Printf("[Hub] Session %s has no clients, shutting down hub", h.sessionID)
 			h.shutdown()
 			return true
 		}
 	}
-	h.mu.Unlock()
 	return false
 }
 
@@ -378,12 +377,13 @@ func (h *Hub) sendCommandToDebugger(cmd debugger.DebugCommand, cmdName string) {
 	}
 }
 
-// broadcastError sends an error event to all connected clients.
+// broadcastError sends an error event to all connected clients. Log the full error server-side, but only send a generic message to clients to avoid leaking sensitive info.
 func (h *Hub) broadcastError(err error) {
+	log.Printf("session %s error: %v", h.sessionID, err)
 	event := ErrorEvent{
 		Type:      EventError,
 		SessionID: h.sessionID,
-		Message:   err.Error(),
+		Message:   "an unexpected error occurred during debugging. Check server logs for details.",
 	}
 	data, marshalErr := json.Marshal(event)
 	if marshalErr != nil {

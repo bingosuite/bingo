@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/url"
-	"strings"
 	"sync"
 
 	"github.com/bingosuite/bingo/internal/ws"
@@ -321,13 +320,9 @@ func (c *Client) closeConn() {
 	})
 }
 
-// TODO: refactor
 func isConnectionClosedError(err error) bool {
 	if err == nil {
 		return false
 	}
-	errMsg := err.Error()
-	return websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) ||
-		strings.Contains(errMsg, "use of closed network connection") ||
-		strings.Contains(errMsg, "broken pipe")
+	return websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway)
 }

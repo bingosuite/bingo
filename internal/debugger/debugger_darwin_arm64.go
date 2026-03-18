@@ -105,6 +105,12 @@ func (d *darwinARM64Debugger) sendEvent(event DebuggerEvent) {
 	}
 }
 
+// sendSessionEnded must always deliver the terminal session event so the hub
+// can run its shutdown cleanup logic.
+func (d *darwinARM64Debugger) sendSessionEnded(err error) {
+	d.DebuggerEvents <- SessionEndedEvent{Err: err}
+}
+
 // computeSlide resolves and stores the target image ASLR slide used to
 // translate file addresses to runtime addresses.
 func (d *darwinARM64Debugger) computeSlide() error {
@@ -315,7 +321,7 @@ func (d *darwinARM64Debugger) StartWithDebug(path string) {
 	defer runtime.UnlockOSThread()
 
 	// notifyEnd always sends a SessionEndedEvent before returning.
-	notifyEnd := func(err error) { d.sendEvent(SessionEndedEvent{Err: err}) }
+	notifyEnd := func(err error) { d.sendSessionEnded(err) }
 
 	d.resetSessionState()
 

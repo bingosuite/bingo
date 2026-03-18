@@ -166,7 +166,7 @@ func (h *Hub) broadcastError(err error) {
     event := ErrorEvent{
         Type:      EventError,
         SessionID: h.sessionID,
-        Message:   err.Error(),
+        Message:   "an unexpected error occurred during debugging. Check server logs for details.", // Don't leak internal details to clients
     }
     data, _ := json.Marshal(event)
     h.Broadcast(Message{Type: string(EventError), Data: data})
@@ -177,14 +177,14 @@ Do not send raw internal error chains or Go type information to the client. The 
 
 ## Summary
 
-| Situation | Convention |
-|---|---|
-| Operational / system-call failure | Return `error` wrapped with `fmt.Errorf("context: %w", err)` |
-| Fatal startup failure in `main` | `log.Fatalf(...)` |
-| Expected condition (e.g. process already exited) | Log and continue; don't propagate |
-| Error the caller must branch on | Define a sentinel `var Err... = errors.New(...)` |
-| Programmer bug (should never happen) | `panic` is acceptable |
-| Logging | Log once at the call site that handles the error, not at every layer |
-| Goroutine → owner error propagation | Send a `SessionEndedEvent{Err: err}` on `chan DebuggerEvent`; no `return error` from the goroutine function |
-| Methods not called by the hub | Keep unexported on the concrete type; return errors through the call chain normally |
-| Server → WebSocket client error | Broadcast a typed `ErrorEvent`; keep internal details server-side |
+| Situation                                        | Convention                                                                                                  |
+| ------------------------------------------------ | ----------------------------------------------------------------------------------------------------------- |
+| Operational / system-call failure                | Return `error` wrapped with `fmt.Errorf("context: %w", err)`                                                |
+| Fatal startup failure in `main`                  | `log.Fatalf(...)`                                                                                           |
+| Expected condition (e.g. process already exited) | Log and continue; don't propagate                                                                           |
+| Error the caller must branch on                  | Define a sentinel `var Err... = errors.New(...)`                                                            |
+| Programmer bug (should never happen)             | `panic` is acceptable                                                                                       |
+| Logging                                          | Log once at the call site that handles the error, not at every layer                                        |
+| Goroutine → owner error propagation              | Send a `SessionEndedEvent{Err: err}` on `chan DebuggerEvent`; no `return error` from the goroutine function |
+| Methods not called by the hub                    | Keep unexported on the concrete type; return errors through the call chain normally                         |
+| Server → WebSocket client error                  | Broadcast a typed `ErrorEvent`; keep internal details server-side                                           |

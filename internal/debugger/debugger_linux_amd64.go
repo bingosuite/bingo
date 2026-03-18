@@ -54,6 +54,12 @@ func (d *linuxAMD64Debugger) sendEvent(event DebuggerEvent) {
 	}
 }
 
+// sendSessionEnded must always deliver the terminal session event so the hub
+// can run its shutdown cleanup logic.
+func (d *linuxAMD64Debugger) sendSessionEnded(err error) {
+	d.DebuggerEvents <- SessionEndedEvent{Err: err}
+}
+
 // validateTargetPath resolves path to an absolute path, ensures it stays
 // within the current working directory, and confirms it is a regular
 // executable file. This prevents command injection from user-supplied input.
@@ -97,7 +103,7 @@ func (d *linuxAMD64Debugger) StartWithDebug(path string) {
 
 	// notifyEnd always sends a SessionEndedEvent before returning, so the hub
 	// learns of both clean exits and failures through the same channel.
-	notifyEnd := func(err error) { d.sendEvent(SessionEndedEvent{Err: err}) }
+	notifyEnd := func(err error) { d.sendSessionEnded(err) }
 
 	// Validate and sanitise the user-supplied path before passing it to exec.
 	validatedPath, err := validateTargetPath(path)
