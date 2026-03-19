@@ -211,13 +211,19 @@ var _ = Describe("Server", func() {
 			Expect(json.Unmarshal(msg.Data, &started)).To(Succeed())
 			Expect(started.SessionID).NotTo(BeEmpty())
 
+			Eventually(func() int {
+				s.mu.RLock()
+				defer s.mu.RUnlock()
+				return len(s.hubs)
+			}, 2*time.Second, 50*time.Millisecond).Should(Equal(1))
+
 			_ = conn.Close()
 
 			Eventually(func() int {
 				s.mu.RLock()
 				defer s.mu.RUnlock()
 				return len(s.hubs)
-			}, 2*time.Second, 50*time.Millisecond).Should(BeNumerically(">=", 1))
+			}, 2*time.Second, 50*time.Millisecond).Should(Equal(0))
 
 			time.Sleep(50 * time.Millisecond)
 		})
