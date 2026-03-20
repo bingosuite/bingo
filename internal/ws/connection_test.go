@@ -9,7 +9,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bingosuite/bingo/internal/debugger"
 	"github.com/gorilla/websocket"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -23,7 +22,7 @@ var _ = Describe("Connection", func() {
 	)
 
 	BeforeEach(func() {
-		hub = NewHub("test-session", time.Minute, debugger.NewDebugger())
+		hub = NewHub("test-session", time.Minute)
 
 		server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			upgrader := websocket.Upgrader{}

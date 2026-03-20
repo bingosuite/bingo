@@ -1,6 +1,7 @@
 package debugger
 
 import (
+	"debug/gosym"
 	"os"
 	"path/filepath"
 	"testing"
@@ -11,6 +12,44 @@ import (
 	. "github.com/onsi/gomega"
 )
 
+type testDebugInfo struct {
+	target      debuginfo.Target
+	lineToPCErr error
+}
+
+func (t *testDebugInfo) GetTarget() debuginfo.Target {
+	return t.target
+}
+
+func (t *testDebugInfo) PCToLine(pc uint64) (string, int, *gosym.Func) {
+	return "", 0, nil
+}
+
+func (t *testDebugInfo) LineToPC(file string, line int) (uint64, *gosym.Func, error) {
+	if t.lineToPCErr != nil {
+		return 0, nil, t.lineToPCErr
+	}
+	return 0, nil, nil
+}
+
+func (t *testDebugInfo) LookupFunc(fn string) *gosym.Func {
+	return nil
+}
+
+func newTestDebugger() *linuxAMD64Debugger {
+	breakpointHit := make(chan BreakpointEvent, 1)
+	initialBreakpointHit := make(chan InitialBreakpointHitEvent, 1)
+	debugCommand := make(chan DebugCommand, 1)
+	endDebugSession := make(chan bool, 1)
+
+	dbg := NewDebugger(breakpointHit, initialBreakpointHit, debugCommand, endDebugSession)
+	typed, ok := dbg.(*linuxAMD64Debugger)
+	if !ok {
+		panic("expected linuxAMD64Debugger")
+	}
+	return typed
+}
+
 func TestDebugger(t *testing.T) {
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "Debugger Suite")
@@ -19,7 +58,7 @@ func TestDebugger(t *testing.T) {
 var _ = Describe("Debugger", func() {
 	Describe("NewDebugger", func() {
 		It("should initialize all channels with expected buffer sizes and default map state", func() {
-			d := NewDebugger()
+			d := newTestDebugger()
 
 			Expect(d.Breakpoints).NotTo(BeNil())
 			Expect(d.Breakpoints).To(BeEmpty())
@@ -31,11 +70,9 @@ var _ = Describe("Debugger", func() {
 		})
 
 		It("should start with empty breakpoint storage and zero-value debug info", func() {
-			d := NewDebugger()
+			d := newTestDebugger()
 
-			Expect(d.DebugInfo.Target.PID).To(Equal(0))
-			Expect(d.DebugInfo.Target.PGID).To(Equal(0))
-			Expect(d.DebugInfo.Target.Path).To(BeEmpty())
+			Expect(d.DebugInfo).To(BeNil())
 		})
 	})
 
@@ -120,7 +157,7 @@ var _ = Describe("Debugger", func() {
 
 	Describe("StartWithDebug", func() {
 		It("should validate user path before creating target process", func() {
-			d := NewDebugger()
+			d := newTestDebugger()
 			outsideDir, err := os.MkdirTemp("", "debugger-outside-start-*")
 			Expect(err).NotTo(HaveOccurred())
 			defer func() {
@@ -140,7 +177,7 @@ var _ = Describe("Debugger", func() {
 		PIt("TODO: should continue into main debug loop after initial setup completes")
 
 		It("should panic on target start or debug info initialization failures", func() {
-			d := NewDebugger()
+			d := newTestDebugger()
 			cwd, err := os.Getwd()
 			Expect(err).NotTo(HaveOccurred())
 
@@ -164,7 +201,7 @@ var _ = Describe("Debugger", func() {
 		PIt("TODO: should call ptrace continue after stepping over restored instruction")
 
 		It("should panic when register operations or ptrace operations fail", func() {
-			d := NewDebugger()
+			d := newTestDebugger()
 			Expect(func() {
 				d.Continue(-1)
 			}).To(Panic())
@@ -175,7 +212,7 @@ var _ = Describe("Debugger", func() {
 		PIt("TODO: should execute one ptrace single-step for the provided PID")
 
 		It("should panic when ptrace single-step fails", func() {
-			d := NewDebugger()
+			d := newTestDebugger()
 			Expect(func() {
 				d.SingleStep(-1)
 			}).To(Panic())
@@ -184,15 +221,16 @@ var _ = Describe("Debugger", func() {
 
 	Describe("StopDebug", func() {
 		It("should panic when detach fails for a non-traced PID", func() {
-			d := NewDebugger()
-			d.DebugInfo.Target.PID = 9999999
+			d := newTestDebugger()
+			d.DebugInfo = &testDebugInfo{target: debuginfo.Target{PID: 9999999}}
 			Expect(func() {
 				d.StopDebug()
 			}).To(Panic())
 		})
 
 		It("should signal EndDebugSession without blocking when channel already contains a signal", func() {
-			d := NewDebugger()
+			d := newTestDebugger()
+			d.DebugInfo = &testDebugInfo{target: debuginfo.Target{PID: 0}}
 			d.EndDebugSession <- true
 
 			done := make(chan struct{})
@@ -205,8 +243,8 @@ var _ = Describe("Debugger", func() {
 		})
 
 		It("should skip detach and still signal end when target PID is not set", func() {
-			d := NewDebugger()
-			d.DebugInfo.Target.PID = 0
+			d := newTestDebugger()
+			d.DebugInfo = &testDebugInfo{target: debuginfo.Target{PID: 0}}
 
 			d.StopDebug()
 
@@ -218,17 +256,13 @@ var _ = Describe("Debugger", func() {
 		PIt("TODO: should resolve source line to PC, read original bytes, write breakpoint byte, and store original instruction")
 
 		It("should return error when source line cannot be mapped to a program counter", func() {
-			exePath, err := os.Executable()
-			Expect(err).NotTo(HaveOccurred())
+			d := newTestDebugger()
+			d.DebugInfo = &testDebugInfo{
+				target:      debuginfo.Target{Path: "/nonexistent/path.go", PID: os.Getpid()},
+				lineToPCErr: os.ErrNotExist,
+			}
 
-			di, err := debuginfo.NewDebugInfo(exePath, os.Getpid())
-			Expect(err).NotTo(HaveOccurred())
-
-			d := NewDebugger()
-			d.DebugInfo = *di
-			d.DebugInfo.Target.Path = "/nonexistent/path.go"
-
-			err = d.SetBreakpoint(os.Getpid(), 1)
+			err := d.SetBreakpoint(os.Getpid(), 1)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("failed to get PC of line"))
 		})
@@ -240,17 +274,13 @@ var _ = Describe("Debugger", func() {
 		PIt("TODO: should resolve source line to PC and restore original machine code at breakpoint address")
 
 		It("should return error when source line cannot be mapped to a program counter", func() {
-			exePath, err := os.Executable()
-			Expect(err).NotTo(HaveOccurred())
+			d := newTestDebugger()
+			d.DebugInfo = &testDebugInfo{
+				target:      debuginfo.Target{Path: "/nonexistent/path.go", PID: os.Getpid()},
+				lineToPCErr: os.ErrNotExist,
+			}
 
-			di, err := debuginfo.NewDebugInfo(exePath, os.Getpid())
-			Expect(err).NotTo(HaveOccurred())
-
-			d := NewDebugger()
-			d.DebugInfo = *di
-			d.DebugInfo.Target.Path = "/nonexistent/path.go"
-
-			err = d.ClearBreakpoint(os.Getpid(), 1)
+			err := d.ClearBreakpoint(os.Getpid(), 1)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("failed to get PC of line"))
 		})
@@ -260,7 +290,7 @@ var _ = Describe("Debugger", func() {
 
 	Describe("mainDebugLoop", func() {
 		It("should exit immediately when EndDebugSession is signaled", func() {
-			d := NewDebugger()
+			d := newTestDebugger()
 			d.EndDebugSession <- true
 
 			done := make(chan struct{})
@@ -277,8 +307,8 @@ var _ = Describe("Debugger", func() {
 		PIt("TODO: should route SIGTRAP breakpoint stops to breakpointHit and continue non-breakpoint stops")
 
 		It("should return gracefully on wait failures", func() {
-			d := NewDebugger()
-			d.DebugInfo.Target.PGID = -12345
+			d := newTestDebugger()
+			d.DebugInfo = &testDebugInfo{target: debuginfo.Target{PGID: -12345}}
 
 			done := make(chan struct{})
 			go func() {
@@ -292,8 +322,8 @@ var _ = Describe("Debugger", func() {
 
 	Describe("initialBreakpointHit", func() {
 		It("should emit initial breakpoint event with target PID and await incoming debug commands", func() {
-			d := NewDebugger()
-			d.DebugInfo.Target.PID = 99
+			d := newTestDebugger()
+			d.DebugInfo = &testDebugInfo{target: debuginfo.Target{PID: 99}}
 
 			done := make(chan struct{})
 			go func() {
@@ -308,8 +338,8 @@ var _ = Describe("Debugger", func() {
 		})
 
 		It("should ignore malformed setBreakpoint payloads during initial stop and keep waiting", func() {
-			d := NewDebugger()
-			d.DebugInfo.Target.PID = 7
+			d := newTestDebugger()
+			d.DebugInfo = &testDebugInfo{target: debuginfo.Target{PID: 7}}
 
 			done := make(chan struct{})
 			go func() {
@@ -329,8 +359,8 @@ var _ = Describe("Debugger", func() {
 		PIt("TODO: should continue traced process on continue command and exit initial loop")
 
 		It("should stop debug session on quit command", func() {
-			d := NewDebugger()
-			d.DebugInfo.Target.PID = 0
+			d := newTestDebugger()
+			d.DebugInfo = &testDebugInfo{target: debuginfo.Target{PID: 0}}
 
 			done := make(chan struct{})
 			go func() {
@@ -346,8 +376,8 @@ var _ = Describe("Debugger", func() {
 		})
 
 		It("should exit when EndDebugSession signal arrives", func() {
-			d := NewDebugger()
-			d.DebugInfo.Target.PID = 101
+			d := newTestDebugger()
+			d.DebugInfo = &testDebugInfo{target: debuginfo.Target{PID: 101}}
 
 			done := make(chan struct{})
 			go func() {
@@ -362,8 +392,8 @@ var _ = Describe("Debugger", func() {
 		})
 
 		It("should ignore unknown commands and continue waiting for a valid command or end signal", func() {
-			d := NewDebugger()
-			d.DebugInfo.Target.PID = 202
+			d := newTestDebugger()
+			d.DebugInfo = &testDebugInfo{target: debuginfo.Target{PID: 202}}
 
 			done := make(chan struct{})
 			go func() {

@@ -25,14 +25,15 @@ var _ = Describe("DebugInfo", func() {
 			Expect(err).NotTo(HaveOccurred())
 
 			Expect(di).NotTo(BeNil())
-			Expect(di.SymTable).NotTo(BeNil())
-			Expect(di.LineTable).NotTo(BeNil())
-			Expect(di.Target.PID).To(Equal(pid))
+			Expect(di.LookupFunc("main.main")).NotTo(BeNil())
+
+			target := di.GetTarget()
+			Expect(target.PID).To(Equal(pid))
 
 			expectedPGID, err := unix.Getpgid(pid)
 			Expect(err).NotTo(HaveOccurred())
-			Expect(di.Target.PGID).To(Equal(expectedPGID))
-			Expect(di.Target.Path).NotTo(BeEmpty())
+			Expect(target.PGID).To(Equal(expectedPGID))
+			Expect(target.Path).NotTo(BeEmpty())
 		})
 
 		It("should return an error when executable path does not exist", func() {

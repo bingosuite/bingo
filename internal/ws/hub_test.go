@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bingosuite/bingo/internal/debugger"
 	"github.com/gorilla/websocket"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -29,7 +28,7 @@ var _ = Describe("Hub", func() {
 	)
 
 	BeforeEach(func() {
-		hub = NewHub("test-session", time.Minute, debugger.NewDebugger())
+		hub = NewHub("test-session", time.Minute)
 		shutdownCalled = &atomic.Bool{}
 		hub.onShutdown = func(sessionID string) {
 			shutdownCalled.Store(true)
@@ -57,7 +56,7 @@ var _ = Describe("Hub", func() {
 			sessionID := "test-session"
 			idleTimeout := 5 * time.Minute
 
-			testHub := NewHub(sessionID, idleTimeout, debugger.NewDebugger())
+			testHub := NewHub(sessionID, idleTimeout)
 
 			Expect(testHub.sessionID).To(Equal(sessionID))
 			Expect(testHub.idleTimeout).To(Equal(idleTimeout))
@@ -133,7 +132,7 @@ var _ = Describe("Hub", func() {
 	Describe("IdleTimeout", func() {
 		It("should detect idle timeout and shutdown", func() {
 			idleTimeout := 100 * time.Millisecond
-			hub := NewHub("test-session", idleTimeout, debugger.NewDebugger())
+			hub := NewHub("test-session", idleTimeout)
 
 			shutdownCalled := atomic.Bool{}
 			hub.onShutdown = func(sessionID string) {
