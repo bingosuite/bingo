@@ -17,16 +17,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Check imports formatting
+        run: |
+          go install golang.org/x/tools/cmd/goimports@latest
+          unformatted=$(goimports -l .)
+          if [ -n "$unformatted" ]; then
+            echo "The following files need goimports formatting:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
       - name: Lint
         uses: golangci/golangci-lint-action@v9.2.0
 
       - name: Magic Number Check
         uses: tommy-muehle/go-mnd@v2.5.1
-
-      - name: Set up Go
-        uses: actions/setup-go@v4
-        with:
-          go-version: "1.25.5"
 
       - name: Build
         run: go build -v ./...
