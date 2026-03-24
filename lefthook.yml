@@ -1,29 +1,6 @@
 # Lefthook configuration for Go project
 # Documentation: https://lefthook.dev/configuration/
 
-pre-commit:
-  parallel: false
-  commands:
-    imports:
-      glob: "*.go"
-      run: goimports -w {staged_files} && git add {staged_files}
-
-    vet:
-      glob: "*.go"
-      run: go vet ./...
-
-    lint:
-      glob: "*.go"
-      run: golangci-lint run --new-from-rev=HEAD ./...
-
-pre-push:
-  commands:
-    vet:
-      run: go vet ./...
-
-    build:
-      run: mkdir -p ./build/bingo && go build -o ./build/bingo/bingo ./cmd/bingo
-
 commit-msg:
   commands:
     check-message:
