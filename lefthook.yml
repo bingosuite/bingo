@@ -1,6 +1,13 @@
 # Lefthook configuration for Go project
 # Documentation: https://lefthook.dev/configuration/
 
+pre-commit:
+  parallel: false
+  commands:
+    imports:
+      glob: "*.go"
+      run: goimports -w {staged_files} && git add {staged_files}
+
 commit-msg:
   commands:
     check-message:
