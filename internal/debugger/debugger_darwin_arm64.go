@@ -530,7 +530,9 @@ func (d *darwinARM64Debugger) StepOver(pid int) {
 // and notifies listeners that the debug session has ended.
 func (d *darwinARM64Debugger) StopDebug() {
 	log.Printf("%s stopping debug session", logPrefixDebugger)
-	if d.DebugInfo != nil {
+	if d.DebugInfo != nil && d.DebugInfo.GetTarget().PID > 0 {
+		// Only kill if PID is valid (positive value)
+		// This prevents crashes when tests use mock/invalid PIDs like -1
 		syscall.Kill(d.DebugInfo.GetTarget().PID, syscall.SIGKILL)
 	}
 
