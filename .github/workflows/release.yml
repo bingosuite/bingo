@@ -48,6 +48,6 @@ jobs:
           tar -C dist -czf "release/${ASSET_BASE}.tar.gz" "${ASSET_BASE}"
 
       - name: Upload release asset
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe
         with:
           files: release/*
