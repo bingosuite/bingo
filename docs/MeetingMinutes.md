@@ -15,3 +15,11 @@
 ## Meeting 3: February 23rd, 2025
 
 - Third meeting with Robert Lagnière. We presented the prototype on a basic go program and discussed issues we faced related to os thread swaping and goroutines. We discussed performance influences from our architecture decisions, and everything seems to make sense and work well so far. For the next meeting, we will enhance the client experience and program tests, as well as make the debugger work on a more complex program.
+
+## Meeting 4: March 9th, 2025
+
+- Fourth meeting with Robert Laganière. We talked about multi-platform support and how we should make the platform specific code as thin as possible, and abstract the debugger properly. Our current approach does not do this, and we have agreed to begin working on a refactor and take a pause on feature development. Overall we are still on track, and refactoring the foundation now is essential to keep the project maintainable and scalable in the future.
+
+## Meeting 5: March 23rd, 2025
+
+- Fifth meeting with Robert Laganière. We're still in refactoring mode and feature dev is still paused. We decided to unify the hub and debugger in the backend to avoid using an internal protocol, which was a bad architectural decision. This new approach is much more efficient and easier to maintain, but we still have to implement it fully and refactor the existing channels. We also engineered the state machine for the client-server interaction and concluded the state should be entirely server driven, since we can have multiple clients connected to the same session. We also spent time writing unit tests to improve our coverage. Next steps: implement the refactor fully and close the first chapter of the project, which is the basic debugger implementation.
