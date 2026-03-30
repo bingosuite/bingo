@@ -11,7 +11,7 @@ system-info:
 # Build the BinGo binary. Takes positional arguments for the target OS and architecture (Must be valid `go build` targets).
 build OS="linux" ARCH="amd64":
 	mkdir -p ./build/bingo
-	{{ if OS == "darwin" { "env CGO_ENABLED=1 GOOS=" + OS + " GOARCH=" + ARCH + " go build -o ./build/bingo/bingo_" + OS + "_" + ARCH + " ./cmd/bingo" } else { "env GOOS=" + OS + " GOARCH=" + ARCH + " go build -o ./build/bingo/bingo_" + OS + "_" + ARCH + (if OS == "windows" { ".exe" } else { "" }) + " ./cmd/bingo" } }}
+	{{ if OS == "darwin" { "env CGO_ENABLED=1 GOOS=" + OS + " GOARCH=" + ARCH + " go build -tags bingonative -o ./build/bingo/bingo_" + OS + "_" + ARCH + " ./cmd/bingo && codesign --sign - --entitlements entitlements.plist --force ./build/bingo/bingo_" + OS + "_" + ARCH } else { "env GOOS=" + OS + " GOARCH=" + ARCH + " go build -o ./build/bingo/bingo_" + OS + "_" + ARCH + (if OS == "windows" { ".exe" } else { "" }) + " ./cmd/bingo" } }}
 
 # Usage: just run 				->	runs ./build/bingo/bingo_linux_amd64 (Default)
 #		 just run windows 		->	runs ./build/bingo/bingo_windows_amd64.exe (Windows specified, default architecture)
@@ -23,40 +23,32 @@ run OS="linux" ARCH="amd64":
 # Builds then runs the bingo binary for the target OS and architecture (Must be valid `go build` targets).
 go OS="linux" ARCH="amd64": build-target (build OS ARCH) (run OS ARCH)
 
-# Build BinGo for all supported platforms (just example for now, we do not support all of these)
+# Build BinGo for all supported platforms
 build-all:
     just build linux   amd64
-    just build linux   arm64
-    just build darwin  amd64
-    just build darwin  arm64
-    just build windows amd64
-    just build windows arm64
-
-# Usage: just cli                    (both default)
-#        just cli localhost:8080     (custom server)
-#        just cli - abc123           (default server, custom session)
-#        just cli localhost:8080 abc123 (both custom)
-# Use "-" for default value
-# Run test cli with optional server and session
-cli server="" session="":
-	#!/usr/bin/env bash
-	set -euo pipefail
-	ARGS=""
-	if [ -n "{{server}}" ] && [ "{{server}}" != "-" ]; then ARGS="$ARGS --server {{server}}"; fi
-	if [ -n "{{session}}" ] && [ "{{session}}" != "-" ]; then ARGS="$ARGS --session {{session}}"; fi
-	go run ./cmd/bingo-client/main.go $ARGS
 
 # Build the Target with maximum debugging information
-build-target: 
+build-target:
 	mkdir -p ./build/target
 	go build --gcflags="all=-N -l" -o ./build/target/target ./cmd/target
 
 # Run the target by itself
-run-target: 
+run-target:
 	./build/target/target
 
 # Build and run the target by itself
-go-target: build-target run-target 
+go-target: build-target run-target
+
+# Run the bingo debug server (native platform, auto-detected).
+# Builds with cgo + bingonative tag, codesigns with debugger entitlement on macOS.
+server *ARGS:
+	go build -tags bingonative -o ./build/bingo/bingo_server ./cmd/bingo
+	{{ if os() == "macos" { "codesign --sign - --entitlements entitlements.plist --force ./build/bingo/bingo_server" } else { "" } }}
+	./build/bingo/bingo_server {{ARGS}}
+
+# Build and run the interactive CLI client
+cli *ARGS:
+	go run ./cmd/cli {{ARGS}}
 
 # Run unit tests on the PKG (defaults to ./...)
 test PKG="./...":
@@ -70,10 +62,3 @@ coverage PKG="./...":
 # Run integration tests
 integration:
 	go run github.com/onsi/ginkgo/v2/ginkgo -r ./test/integration/.
-
-# Codesign the MacOS binary for debugging (required for task_for_pid and memory operations)
-sign:
-	codesign --entitlements entitlements.plist --force -s - build/bingo/bingo_darwin_arm64
-
-unsign:
-	codesign --remove-signature build/bingo/bingo_darwin_arm64
