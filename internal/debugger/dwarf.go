@@ -110,7 +110,11 @@ func (r *dwarfReader) PCForFileLine(file string, line int) (uint64, error) {
 // file whose line number is strictly greater than afterLine. Used by StepOver
 // to find where to place a temporary breakpoint.
 // Returns (0, false) if no such entry exists (e.g. last line of file).
-func (r *dwarfReader) NextLinePC(file string, afterLine int) (uint64, bool) {
+// NextLinePC returns the lowest runtime address of the first is-stmt entry in
+// file whose line number is strictly greater than afterLine. Also returns the
+// line number itself, so callers can chain calls without re-querying DWARF.
+// Returns (0, 0, false) if no such entry exists (e.g. last line of file).
+func (r *dwarfReader) NextLinePC(file string, afterLine int) (uint64, int, bool) {
 	bestLine := -1
 	bestAddr := uint64(^uint64(0))
 
@@ -146,9 +150,9 @@ func (r *dwarfReader) NextLinePC(file string, afterLine int) (uint64, bool) {
 		}
 	}
 	if bestLine < 0 {
-		return 0, false
+		return 0, 0, false
 	}
-	return uint64(int64(bestAddr) + r.slide), true
+	return uint64(int64(bestAddr) + r.slide), bestLine, true
 }
 
 // fileMatches reports whether candidate matches target using suffix comparison.
