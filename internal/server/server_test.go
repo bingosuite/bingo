@@ -204,7 +204,7 @@ var _ = Describe("Server", func() {
 			conn, _, err := websocket.DefaultDialer.Dial(toWS(ts, "/ws?create"), nil)
 			Expect(err).NotTo(HaveOccurred())
 
-			Expect(srv.sessions.count()).To(Equal(1))
+			Eventually(srv.sessions.count, "2s", "50ms").Should(Equal(1))
 
 			conn.Close()
 
@@ -236,7 +236,7 @@ var _ = Describe("Server", func() {
 			Expect(err).NotTo(HaveOccurred())
 			defer conn.Close()
 
-			Expect(srv.sessions.count()).To(Equal(1))
+			Eventually(srv.sessions.count, "2s", "50ms").Should(Equal(1))
 
 			// Cancelling the server context → hub.Run returns → session removed.
 			srv.cancel()
