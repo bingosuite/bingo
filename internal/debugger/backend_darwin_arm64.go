@@ -18,6 +18,7 @@ package debugger
 import "C"
 
 import (
+	"debug/macho"
 	"fmt"
 	"os"
 	"os/exec"
@@ -122,10 +123,13 @@ func (b *darwinBackend) ContinueProcess() error {
 	return nil
 }
 
-func (b *darwinBackend) SingleStep(tid int) error {
+func (b *darwinBackend) SingleStep(_ int) error {
 	b.stepping = true
-	if err := ptrace(ptDarwinStep, uintptr(tid), 1, 0); err != nil {
-		return fmt.Errorf("PT_STEP tid %d: %w", tid, err)
+	// Darwin ptrace PT_STEP operates on the whole process (by PID), not
+	// per-thread. The tid argument (a Mach thread port on ARM64) is not
+	// a valid ptrace process identifier, so we always use b.pid here.
+	if err := ptrace(ptDarwinStep, uintptr(b.pid), 1, 0); err != nil {
+		return fmt.Errorf("PT_STEP: %w", err)
 	}
 	return nil
 }
@@ -259,26 +263,87 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 		if !ws.Stopped() {
 			continue
 		}
+		// tid from Wait4 is the process PID, not a Mach thread port.
+		// Use Threads() to get the actual thread port before calling GetRegisters.
+		threads, terr := b.Threads()
+		if terr != nil || len(threads) == 0 {
+			return StopEvent{}, fmt.Errorf("Wait: get threads: %w", terr)
+		}
+		thread := threads[0]
+
 		if ws.StopSignal() == syscall.SIGTRAP {
-			regs, err := b.GetRegisters(tid)
+			regs, err := b.GetRegisters(thread)
 			if err != nil {
 				return StopEvent{}, err
 			}
 			if b.stepping {
 				b.stepping = false
-				return StopEvent{Reason: StopSingleStep, TID: tid, PC: regs.PC}, nil
+				return StopEvent{Reason: StopSingleStep, TID: thread, PC: regs.PC}, nil
 			}
-			return StopEvent{Reason: StopBreakpoint, TID: tid, PC: archRewindPC(regs.PC)}, nil
+			return StopEvent{Reason: StopBreakpoint, TID: thread, PC: archRewindPC(regs.PC)}, nil
 		}
-		regs, err := b.GetRegisters(tid)
+		// Non-TRAP signal delivered during a single-step (e.g. Go's SIGURG
+		// goroutine-preemption signal). Re-deliver it with PT_STEP so the
+		// step completes without the engine seeing a spurious StopSignal and
+		// calling ContinueProcess(), which would abort the step.
+		if b.stepping {
+			sig := uintptr(ws.StopSignal())
+			if perr := ptrace(ptDarwinStep, uintptr(b.pid), 1, sig); perr == nil {
+				continue
+			}
+		}
+		regs, err := b.GetRegisters(thread)
 		if err != nil {
 			return StopEvent{}, err
 		}
-		return StopEvent{Reason: StopSignal, TID: tid, PC: regs.PC, Signal: int(ws.StopSignal())}, nil
+		return StopEvent{Reason: StopSignal, TID: thread, PC: regs.PC, Signal: int(ws.StopSignal())}, nil
 	}
 }
 
 func (b *darwinBackend) setPID(pid int) { b.pid = pid }
+
+// TextSlide returns the ASLR slide for the main executable: the difference
+// between where the binary was actually loaded and its preferred __TEXT vmaddr.
+// Returns 0 on any error (slide is treated as absent).
+//
+// We scan the task's VM map for the first executable region whose header has
+// the 64-bit Mach-O magic. This works even at the very first ptrace stop
+// (before dyld has run), because the kernel maps the binary before handing
+// control to dyld — unlike TASK_DYLD_INFO whose image array is unpopulated
+// at that point.
+func (b *darwinBackend) TextSlide(binaryPath string) int64 {
+	task, err := b.task()
+	if err != nil {
+		return 0
+	}
+
+	var loadAddr C.mach_vm_address_t
+	if kr := C.bingo_find_macho_load_addr(task, &loadAddr); kr != C.KERN_SUCCESS {
+		return 0
+	}
+
+	preferredVmaddr, err := machoTextVmaddr(binaryPath)
+	if err != nil {
+		return 0
+	}
+
+	return int64(loadAddr) - int64(preferredVmaddr)
+}
+
+// machoTextVmaddr returns the preferred load address of the __TEXT segment
+// from the Mach-O binary file (the non-ASLR base address).
+func machoTextVmaddr(binaryPath string) (uint64, error) {
+	f, err := macho.Open(binaryPath)
+	if err != nil {
+		return 0, fmt.Errorf("macho.Open %s: %w", binaryPath, err)
+	}
+	defer f.Close()
+	seg := f.Segment("__TEXT")
+	if seg == nil {
+		return 0, fmt.Errorf("no __TEXT segment in %s", binaryPath)
+	}
+	return seg.Addr, nil
+}
 
 var _ Backend = (*darwinBackend)(nil)
 
