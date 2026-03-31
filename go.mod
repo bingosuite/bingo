@@ -5,6 +5,7 @@ go 1.25.5
 tool github.com/evilmartians/lefthook
 
 require (
+	github.com/chzyer/readline v1.5.1
 	github.com/gorilla/websocket v1.5.3
 	github.com/onsi/ginkgo/v2 v2.27.5
 	github.com/onsi/gomega v1.39.0
