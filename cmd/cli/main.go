@@ -8,15 +8,16 @@
 package main
 
 import (
-	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
 
 	"github.com/bingosuite/bingo/pkg/client"
 	"github.com/bingosuite/bingo/pkg/protocol"
+	"github.com/chzyer/readline"
 )
 
 func main() {
@@ -46,15 +47,32 @@ func main() {
 	// Start a goroutine that prints incoming events.
 	go eventPrinter(c.Events())
 
+	// Configure readline with history support
+	rl, err := readline.NewEx(&readline.Config{
+		Prompt:          "bingo> ",
+		HistoryFile:     os.ExpandEnv("$HOME/.bingo_history"),
+		InterruptPrompt: "^C",
+		EOFPrompt:       "exit",
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error initializing readline: %v\n", err)
+		os.Exit(1)
+	}
+	defer rl.Close()
+
 	// Interactive command loop.
-	scanner := bufio.NewScanner(os.Stdin)
 	printHelp()
 	for {
-		fmt.Print("bingo> ")
-		if !scanner.Scan() {
+		line, err := rl.Readline()
+		if err != nil {
+			if err == readline.ErrInterrupt || err == io.EOF {
+				fmt.Println("bye")
+				return
+			}
 			break
 		}
-		line := strings.TrimSpace(scanner.Text())
+
+		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
