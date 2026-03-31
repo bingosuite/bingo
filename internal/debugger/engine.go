@@ -84,6 +84,14 @@ type engine struct {
 	steppingOverBP *breakpointEntry
 	bpResume       bpResumeAction
 	bpRetAddr      uint64 // return address; only used for bpResumeStepOut
+
+	// stepOverFile and stepOverLine record the source line that the most
+	// recent <stepover-next> breakpoint was aimed at. sourceStepOver reads
+	// these instead of re-querying DWARF via locationForPC, which can be
+	// unreliable when PC lands exactly at a DWARF line-entry boundary.
+	// Consumed (zeroed) on each sourceStepOver call and on user-BP hits.
+	stepOverFile string
+	stepOverLine int
 }
 
 type engineCmd struct {
@@ -409,6 +417,8 @@ func (e *engine) handleStop(stop StopEvent) {
 			return
 		}
 		e.lastBP = bp
+		e.stepOverFile = ""
+		e.stepOverLine = 0
 		e.emitBreakpointHit(bp, stop)
 
 	case StopSingleStep:
@@ -431,15 +441,19 @@ func (e *engine) handleStop(stop StopEvent) {
 				// land on a DWARF entry with line == 0, causing NextLinePC to pick the
 				// wrong address.
 				if e.dw != nil && sob.file != "" && sob.line > 0 {
-					if nextPC, ok := e.dw.NextLinePC(sob.file, sob.line); ok {
+					if nextPC, nextLine, ok := e.dw.NextLinePC(sob.file, sob.line); ok {
 						entry, setErr := e.bps.set(e.backend, "<stepover-next>", 0, nextPC)
 						if setErr == nil || errors.Is(setErr, errBreakpointExists) {
+							e.stepOverFile = sob.file
+							e.stepOverLine = nextLine
 							if cerr := e.backend.ContinueProcess(); cerr == nil {
 								e.setState(stateRunning)
 								go e.waitLoop()
 								return
 							} else if entry != nil {
 								_ = e.bps.clear(e.backend, entry.id)
+								e.stepOverFile = ""
+								e.stepOverLine = 0
 							}
 						}
 					}
@@ -497,26 +511,43 @@ func (e *engine) stepOver() error {
 // if the next line cannot be determined from DWARF.
 func (e *engine) sourceStepOver() error {
 	if e.dw != nil {
-		threads, err := e.backend.Threads()
-		if err == nil && len(threads) > 0 {
-			regs, err := e.backend.GetRegisters(threads[0])
-			if err == nil {
-				loc := e.dw.locationForPC(regs.PC)
-				if loc.File != "" && loc.Line > 0 {
-					if nextPC, ok := e.dw.NextLinePC(loc.File, loc.Line); ok {
-						entry, setErr := e.bps.set(e.backend, "<stepover-next>", 0, nextPC)
-						if setErr == nil || errors.Is(setErr, errBreakpointExists) {
-							if cerr := e.backend.ContinueProcess(); cerr != nil {
-								if entry != nil {
-									_ = e.bps.clear(e.backend, entry.id)
-								}
-								return cerr
-							}
-							e.setState(stateRunning)
-							go e.waitLoop()
-							return nil
+		// Prefer the remembered destination from the previous step-over; it is
+		// more reliable than re-querying locationForPC at the current PC, which
+		// may land on a DWARF boundary and return the wrong line.
+		file := e.stepOverFile
+		line := e.stepOverLine
+		e.stepOverFile = ""
+		e.stepOverLine = 0
+
+		if file == "" || line == 0 {
+			// No remembered target — look up from current PC.
+			threads, err := e.backend.Threads()
+			if err == nil && len(threads) > 0 {
+				if regs, err := e.backend.GetRegisters(threads[0]); err == nil {
+					loc := e.dw.locationForPC(regs.PC)
+					file = loc.File
+					line = loc.Line
+				}
+			}
+		}
+
+		if file != "" && line > 0 {
+			if nextPC, nextLine, ok := e.dw.NextLinePC(file, line); ok {
+				entry, setErr := e.bps.set(e.backend, "<stepover-next>", 0, nextPC)
+				if setErr == nil || errors.Is(setErr, errBreakpointExists) {
+					e.stepOverFile = file
+					e.stepOverLine = nextLine
+					if cerr := e.backend.ContinueProcess(); cerr != nil {
+						if entry != nil {
+							_ = e.bps.clear(e.backend, entry.id)
 						}
+						e.stepOverFile = ""
+						e.stepOverLine = 0
+						return cerr
 					}
+					e.setState(stateRunning)
+					go e.waitLoop()
+					return nil
 				}
 			}
 		}
