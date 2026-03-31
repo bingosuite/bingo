@@ -324,7 +324,7 @@ func printHelp() {
   state                      show current session state
 
   launch <binary> [args...]  start a process under the debugger
-  attach <pid> [binary]      attach to a running process
+  attach <pid> [binary]      attach to a running process  (find pid: pgrep <name>)
   kill                       terminate the debuggee
 
   c / continue               resume execution
