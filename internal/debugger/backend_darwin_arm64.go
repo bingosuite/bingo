@@ -86,8 +86,11 @@ func attachToProcess(pid int) error {
 	if err := ptrace(ptDarwinAttach, uintptr(pid), 0, 0); err != nil {
 		return fmt.Errorf("PT_ATTACH pid %d: %w", pid, err)
 	}
+	// Wait4 with a specific PID only works for natural children on Darwin.
+	// PT_ATTACH'd processes are not natural children, so use -1 (any child)
+	// to collect the post-attach SIGSTOP notification.
 	var ws syscall.WaitStatus
-	if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
+	if _, err := syscall.Wait4(-1, &ws, 0, nil); err != nil {
 		return fmt.Errorf("wait after PT_ATTACH: %w", err)
 	}
 	return nil
@@ -101,12 +104,10 @@ func killProcess(pid int, cmd *exec.Cmd) error {
 		_ = cmd.Wait()
 		return nil
 	}
+	// Attached (not launched) process: detach only, do not kill.
+	// The debugger does not own this process; leaving it running is correct.
 	_ = ptrace(ptDarwinDetach, uintptr(pid), 1, 0)
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return nil
-	}
-	return p.Kill()
+	return nil
 }
 
 func isAlreadyExited(err error) bool {
@@ -250,9 +251,16 @@ func (b *darwinBackend) Threads() ([]int, error) {
 func (b *darwinBackend) Wait() (StopEvent, error) {
 	for {
 		var ws syscall.WaitStatus
-		tid, err := syscall.Wait4(b.pid, &ws, 0, nil)
+		// Use -1 (any child) instead of a specific PID: Wait4(specific_pid)
+		// only works for natural children on Darwin. PT_ATTACH'd processes
+		// aren't natural children, so specific-PID wait blocks forever.
+		tid, err := syscall.Wait4(-1, &ws, 0, nil)
 		if err != nil {
 			return StopEvent{}, fmt.Errorf("wait4: %w", err)
+		}
+		if tid != b.pid {
+			// Stop from an unexpected process — ignore and loop.
+			continue
 		}
 		if ws.Exited() {
 			return StopEvent{Reason: StopExited, TID: tid, ExitCode: ws.ExitStatus()}, nil

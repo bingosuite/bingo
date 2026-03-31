@@ -87,13 +87,10 @@ func killProcess(pid int, cmd *exec.Cmd) error {
 		_ = cmd.Wait()
 		return nil
 	}
-	// Attached process: detach first so the target can continue after us.
+	// Attached (not launched) process: detach only, do not kill.
+	// The debugger does not own this process; leaving it running is correct.
 	_ = syscall.PtraceDetach(pid)
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return nil // already gone
-	}
-	return p.Kill()
+	return nil
 }
 
 func isAlreadyExited(err error) bool {

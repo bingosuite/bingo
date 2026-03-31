@@ -713,16 +713,17 @@ func (e *engine) emitBreakpointHit(bp *breakpointEntry, stop StopEvent) {
 
 // emitStoppedAtCurrentPC reads the current PC and emits an EventStepped so
 // clients know where the process is stopped (used after Launch/Attach).
+// Always emits even if registers cannot be read — the hub must receive a
+// suspending event or it loses track of state and drops resume commands.
 func (e *engine) emitStoppedAtCurrentPC() {
+	stop := StopEvent{}
 	threads, err := e.backend.Threads()
-	if err != nil || len(threads) == 0 {
-		return
+	if err == nil && len(threads) > 0 {
+		if regs, err := e.backend.GetRegisters(threads[0]); err == nil {
+			stop.PC = regs.PC
+		}
 	}
-	regs, err := e.backend.GetRegisters(threads[0])
-	if err != nil {
-		return
-	}
-	e.emitStepped(StopEvent{PC: regs.PC})
+	e.emitStepped(stop)
 }
 
 func (e *engine) emitStepped(stop StopEvent) {
