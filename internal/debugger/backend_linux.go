@@ -256,6 +256,17 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			}
 		}
 
+		// SIGURG (Go goroutine preemption) must always be re-delivered
+		// transparently — swallowing it breaks goroutine scheduling.
+		if sig == syscall.SIGURG {
+			if b.stepping {
+				_ = syscall.PtraceSingleStep(tid)
+			} else {
+				_ = syscall.PtraceCont(tid, int(sig))
+			}
+			continue
+		}
+
 		// Non-SIGTRAP signal (SIGSEGV, SIGBUS, etc.) — deliver to engine.
 		regs, err := b.GetRegisters(tid)
 		if err != nil {

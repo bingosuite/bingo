@@ -36,10 +36,13 @@ type darwinBackend struct {
 }
 
 // Darwin ptrace request codes from <sys/ptrace.h>.
+// PT_ATTACH = 10: standard attach; initial SIGSTOP arrives as a ptrace stop
+// collectible via wait4. Do NOT use PT_ATTACHEXC (14), which routes signals
+// through Mach exceptions — incompatible with our wait4-based Wait() loop.
 const (
 	ptDarwinContinue = uintptr(7)
 	ptDarwinStep     = uintptr(9)
-	ptDarwinAttach   = uintptr(14) // PT_ATTACH — not 13 (that is PT_SIGEXC)
+	ptDarwinAttach   = uintptr(10)
 	ptDarwinDetach   = uintptr(11)
 )
 
@@ -86,11 +89,9 @@ func attachToProcess(pid int) error {
 	if err := ptrace(ptDarwinAttach, uintptr(pid), 0, 0); err != nil {
 		return fmt.Errorf("PT_ATTACH pid %d: %w", pid, err)
 	}
-	// Wait4 with a specific PID only works for natural children on Darwin.
-	// PT_ATTACH'd processes are not natural children, so use -1 (any child)
-	// to collect the post-attach SIGSTOP notification.
+	// PT_ATTACH (10) makes the target wait4-able by its specific PID on Darwin.
 	var ws syscall.WaitStatus
-	if _, err := syscall.Wait4(-1, &ws, 0, nil); err != nil {
+	if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
 		return fmt.Errorf("wait after PT_ATTACH: %w", err)
 	}
 	return nil
@@ -251,16 +252,9 @@ func (b *darwinBackend) Threads() ([]int, error) {
 func (b *darwinBackend) Wait() (StopEvent, error) {
 	for {
 		var ws syscall.WaitStatus
-		// Use -1 (any child) instead of a specific PID: Wait4(specific_pid)
-		// only works for natural children on Darwin. PT_ATTACH'd processes
-		// aren't natural children, so specific-PID wait blocks forever.
-		tid, err := syscall.Wait4(-1, &ws, 0, nil)
+		tid, err := syscall.Wait4(b.pid, &ws, 0, nil)
 		if err != nil {
 			return StopEvent{}, fmt.Errorf("wait4: %w", err)
-		}
-		if tid != b.pid {
-			// Stop from an unexpected process — ignore and loop.
-			continue
 		}
 		if ws.Exited() {
 			return StopEvent{Reason: StopExited, TID: tid, ExitCode: ws.ExitStatus()}, nil
@@ -279,7 +273,9 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 		}
 		thread := threads[0]
 
-		if ws.StopSignal() == syscall.SIGTRAP {
+		sig := ws.StopSignal()
+
+		if sig == syscall.SIGTRAP {
 			regs, err := b.GetRegisters(thread)
 			if err != nil {
 				return StopEvent{}, err
@@ -290,13 +286,23 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 			}
 			return StopEvent{Reason: StopBreakpoint, TID: thread, PC: archRewindPC(regs.PC)}, nil
 		}
-		// Non-TRAP signal delivered during a single-step (e.g. Go's SIGURG
-		// goroutine-preemption signal). Re-deliver it with PT_STEP so the
-		// step completes without the engine seeing a spurious StopSignal and
-		// calling ContinueProcess(), which would abort the step.
+
+		// SIGURG is Go's goroutine-preemption signal. It must always be
+		// re-delivered to the tracee — whether we are stepping or running.
+		// Swallowing it breaks goroutine scheduling and hangs the process.
+		if sig == syscall.SIGURG {
+			if b.stepping {
+				_ = ptrace(ptDarwinStep, uintptr(b.pid), 1, uintptr(sig))
+			} else {
+				_ = ptrace(ptDarwinContinue, uintptr(b.pid), 1, uintptr(sig))
+			}
+			continue
+		}
+
+		// Other non-TRAP signals during a single-step: re-deliver via PT_STEP
+		// so the step completes without aborting.
 		if b.stepping {
-			sig := uintptr(ws.StopSignal())
-			if perr := ptrace(ptDarwinStep, uintptr(b.pid), 1, sig); perr == nil {
+			if perr := ptrace(ptDarwinStep, uintptr(b.pid), 1, uintptr(sig)); perr == nil {
 				continue
 			}
 		}
@@ -304,7 +310,7 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 		if err != nil {
 			return StopEvent{}, err
 		}
-		return StopEvent{Reason: StopSignal, TID: thread, PC: regs.PC, Signal: int(ws.StopSignal())}, nil
+		return StopEvent{Reason: StopSignal, TID: thread, PC: regs.PC, Signal: int(sig)}, nil
 	}
 }
 
