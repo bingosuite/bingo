@@ -85,6 +85,53 @@ static inline kern_return_t bingo_write_memory(
         VM_PROT_READ | VM_PROT_EXECUTE);
 }
 
+// bingo_find_macho_load_addr scans the task's virtual address space from
+// address 0 upward and returns the address of the first executable region
+// whose first four bytes are the 64-bit Mach-O magic (0xFEEDFACF).
+//
+// This finds the main executable's actual __TEXT vmaddr even before dyld has
+// run (i.e. at the very first ptrace stop after exec), because the kernel maps
+// the binary into memory before transferring control to dyld.  The ASLR slide
+// is then:  slide = *load_addr_out - preferred_text_vmaddr_from_file.
+static inline kern_return_t bingo_find_macho_load_addr(
+    mach_port_t task, mach_vm_address_t *load_addr_out)
+{
+    mach_vm_address_t addr = 0;
+    mach_vm_size_t    size = 0;
+    mach_port_t       obj  = MACH_PORT_NULL;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count;
+
+    for (;;) {
+        count = VM_REGION_BASIC_INFO_COUNT_64;
+        if (obj != MACH_PORT_NULL) {
+            mach_port_deallocate(mach_task_self(), obj);
+            obj = MACH_PORT_NULL;
+        }
+        kern_return_t kr = mach_vm_region(task, &addr, &size,
+            VM_REGION_BASIC_INFO_64,
+            (vm_region_info_t)&info, &count, &obj);
+        if (kr != KERN_SUCCESS) break;
+
+        if (info.protection & VM_PROT_EXECUTE) {
+            uint32_t magic = 0;
+            mach_vm_size_t out_sz = 0;
+            kr = mach_vm_read_overwrite(task, addr, sizeof(magic),
+                                        (mach_vm_address_t)&magic, &out_sz);
+            if (kr == KERN_SUCCESS && magic == 0xFEEDFACFu) {
+                if (obj != MACH_PORT_NULL)
+                    mach_port_deallocate(mach_task_self(), obj);
+                *load_addr_out = addr;
+                return KERN_SUCCESS;
+            }
+        }
+        addr += size;
+    }
+    if (obj != MACH_PORT_NULL)
+        mach_port_deallocate(mach_task_self(), obj);
+    return KERN_FAILURE;
+}
+
 // bingo_thread_list enumerates all threads in task.
 // The caller must vm_deallocate the returned threads array.
 static inline kern_return_t bingo_thread_list(

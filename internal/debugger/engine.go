@@ -44,6 +44,17 @@ const (
 //
 // Kill() dispatches a synthetic StopExited result into stopCh, which causes
 // the loop to set stateExited, call drainCmds, close done, and return.
+// bpResumeAction describes what to do after we finish stepping over a software
+// breakpoint (restore original bytes → single-step → reinstall trap).
+type bpResumeAction uint8
+
+const (
+	bpResumeContinue    bpResumeAction = iota // call ContinueProcess and keep running
+	bpResumeStep                              // stay suspended and emit EventStepped (machine-instruction level)
+	bpResumeSourceStep                        // set temp BP at next source line then ContinueProcess
+	bpResumeStepOut                           // set return-addr BP then ContinueProcess
+)
+
 type engine struct {
 	backend Backend
 	proc    process
@@ -61,6 +72,18 @@ type engine struct {
 	seq   uint64
 	state engineState
 	mu    sync.Mutex
+
+	// Software-breakpoint step-over state.
+	//
+	// When the process stops at a user breakpoint, lastBP is set to that
+	// entry. On the next resume command (Continue/StepOver/StepInto/StepOut)
+	// we restore the original bytes, single-step past the instruction,
+	// reinstall the trap, and then perform bpResumeAction.
+	// steppingOverBP is non-nil while that single-step is in flight.
+	lastBP         *breakpointEntry
+	steppingOverBP *breakpointEntry
+	bpResume       bpResumeAction
+	bpRetAddr      uint64 // return address; only used for bpResumeStepOut
 }
 
 type engineCmd struct {
@@ -185,6 +208,9 @@ func (e *engine) Continue() error {
 		if err := e.requireSuspended(); err != nil {
 			return err
 		}
+		if e.lastBP != nil {
+			return e.resumeFromBreakpoint(bpResumeContinue, 0)
+		}
 		if err := e.backend.ContinueProcess(); err != nil {
 			return err
 		}
@@ -207,6 +233,9 @@ func (e *engine) StepInto() error {
 	return e.dispatch(func() error {
 		if err := e.requireSuspended(); err != nil {
 			return err
+		}
+		if e.lastBP != nil {
+			return e.resumeFromBreakpoint(bpResumeStep, 0)
 		}
 		threads, err := e.backend.Threads()
 		if err != nil || len(threads) == 0 {
@@ -367,14 +396,69 @@ func (e *engine) handleStop(stop StopEvent) {
 			go e.waitLoop()
 			return
 		}
-		if bp.file == "<stepout-return>" {
+		if bp.file == "<stepover-next>" {
 			_ = e.bps.clear(e.backend, bp.id)
+			e.lastBP = nil
 			e.emitStepped(stop)
 			return
 		}
+		if bp.file == "<stepout-return>" {
+			_ = e.bps.clear(e.backend, bp.id)
+			e.lastBP = nil
+			e.emitStepped(stop)
+			return
+		}
+		e.lastBP = bp
 		e.emitBreakpointHit(bp, stop)
 
 	case StopSingleStep:
+		if sob := e.steppingOverBP; sob != nil {
+			// Finished stepping over the breakpoint instruction — reinstall it.
+			e.steppingOverBP = nil
+			_ = e.bps.reinstall(e.backend, sob)
+			switch e.bpResume {
+			case bpResumeContinue:
+				_ = e.backend.ContinueProcess()
+				e.setState(stateRunning)
+				go e.waitLoop()
+			case bpResumeStep:
+				e.setState(stateSuspended)
+				e.emitStepped(stop)
+			case bpResumeSourceStep:
+				// BP step-over complete. Set a temp BP at the next source line and continue.
+				// Use sob.file/sob.line (the BP's known location) rather than a DWARF
+				// lookup from stop.PC: stop.PC is one instruction past the BP and may
+				// land on a DWARF entry with line == 0, causing NextLinePC to pick the
+				// wrong address.
+				if e.dw != nil && sob.file != "" && sob.line > 0 {
+					if nextPC, ok := e.dw.NextLinePC(sob.file, sob.line); ok {
+						entry, setErr := e.bps.set(e.backend, "<stepover-next>", 0, nextPC)
+						if setErr == nil || errors.Is(setErr, errBreakpointExists) {
+							if cerr := e.backend.ContinueProcess(); cerr == nil {
+								e.setState(stateRunning)
+								go e.waitLoop()
+								return
+							} else if entry != nil {
+								_ = e.bps.clear(e.backend, entry.id)
+							}
+						}
+					}
+				}
+				// Fallback: emit Stepped at current position.
+				e.setState(stateSuspended)
+				e.emitStepped(stop)
+			case bpResumeStepOut:
+				_, setErr := e.bps.set(e.backend, "<stepout-return>", 0, e.bpRetAddr)
+				if setErr != nil && !errors.Is(setErr, errBreakpointExists) {
+					e.emitError(protocol.CmdStepOut, fmt.Errorf("StepOut: set return breakpoint: %w", setErr))
+					return
+				}
+				_ = e.backend.ContinueProcess()
+				e.setState(stateRunning)
+				go e.waitLoop()
+			}
+			return
+		}
 		e.setState(stateSuspended)
 		e.emitStepped(stop)
 
@@ -402,6 +486,42 @@ func (e *engine) drainCmds() {
 // ── Stepping ──────────────────────────────────────────────────────────────────
 
 func (e *engine) stepOver() error {
+	if e.lastBP != nil {
+		return e.resumeFromBreakpoint(bpResumeSourceStep, 0)
+	}
+	return e.sourceStepOver()
+}
+
+// sourceStepOver sets a temporary breakpoint at the first instruction of the
+// next source line and resumes. Falls back to a machine-instruction single-step
+// if the next line cannot be determined from DWARF.
+func (e *engine) sourceStepOver() error {
+	if e.dw != nil {
+		threads, err := e.backend.Threads()
+		if err == nil && len(threads) > 0 {
+			regs, err := e.backend.GetRegisters(threads[0])
+			if err == nil {
+				loc := e.dw.locationForPC(regs.PC)
+				if loc.File != "" && loc.Line > 0 {
+					if nextPC, ok := e.dw.NextLinePC(loc.File, loc.Line); ok {
+						entry, setErr := e.bps.set(e.backend, "<stepover-next>", 0, nextPC)
+						if setErr == nil || errors.Is(setErr, errBreakpointExists) {
+							if cerr := e.backend.ContinueProcess(); cerr != nil {
+								if entry != nil {
+									_ = e.bps.clear(e.backend, entry.id)
+								}
+								return cerr
+							}
+							e.setState(stateRunning)
+							go e.waitLoop()
+							return nil
+						}
+					}
+				}
+			}
+		}
+	}
+	// Fallback: machine-instruction single-step.
 	threads, err := e.backend.Threads()
 	if err != nil || len(threads) == 0 {
 		return fmt.Errorf("StepOver: no threads")
@@ -431,12 +551,52 @@ func (e *engine) stepOut() error {
 	if retAddr == 0 {
 		return fmt.Errorf("StepOut: null return address — at outermost frame?")
 	}
+	if e.lastBP != nil {
+		return e.resumeFromBreakpoint(bpResumeStepOut, retAddr)
+	}
 	_, setErr := e.bps.set(e.backend, "<stepout-return>", 0, retAddr)
 	if setErr != nil && !errors.Is(setErr, errBreakpointExists) {
 		return fmt.Errorf("StepOut: set return breakpoint: %w", setErr)
 	}
 	if err := e.backend.ContinueProcess(); err != nil {
 		return fmt.Errorf("StepOut: continue: %w", err)
+	}
+	e.setState(stateRunning)
+	go e.waitLoop()
+	return nil
+}
+
+// resumeFromBreakpoint handles the step-over sequence for software breakpoints:
+// restore original bytes → single-step past the instruction → reinstall trap
+// (done in handleStop's StopSingleStep case) → then perform action.
+func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) error {
+	bp := e.lastBP
+	e.lastBP = nil
+	e.steppingOverBP = bp
+	e.bpResume = action
+	e.bpRetAddr = retAddr
+
+	// Temporarily remove from the table and restore original bytes so the
+	// single-step executes the real instruction, not the trap.
+	e.bps.removeFromTable(bp)
+	if err := e.backend.WriteMemory(bp.addr, bp.originalBytes); err != nil {
+		e.bps.addToTable(bp) // roll back
+		e.steppingOverBP = nil
+		return fmt.Errorf("resume BP: restore bytes: %w", err)
+	}
+
+	threads, err := e.backend.Threads()
+	if err != nil || len(threads) == 0 {
+		_ = e.backend.WriteMemory(bp.addr, archTrapInstruction())
+		e.bps.addToTable(bp)
+		e.steppingOverBP = nil
+		return fmt.Errorf("resume BP: no threads")
+	}
+	if err := e.backend.SingleStep(threads[0]); err != nil {
+		_ = e.backend.WriteMemory(bp.addr, archTrapInstruction())
+		e.bps.addToTable(bp)
+		e.steppingOverBP = nil
+		return fmt.Errorf("resume BP: single step: %w", err)
 	}
 	e.setState(stateRunning)
 	go e.waitLoop()
@@ -507,6 +667,11 @@ func (e *engine) loadDWARF(binaryPath string) {
 	if err != nil {
 		e.dw = nil
 		return
+	}
+	// On platforms that support ASLR (Darwin ARM64), ask the backend for the
+	// slide so DWARF addresses can be adjusted to match the actual load address.
+	if sg, ok := e.backend.(interface{ TextSlide(string) int64 }); ok {
+		dr.slide = sg.TextSlide(binaryPath)
 	}
 	e.dw = dr
 }

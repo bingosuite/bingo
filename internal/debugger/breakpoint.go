@@ -108,6 +108,31 @@ func (t *breakpointTable) all() []protocol.Breakpoint {
 	return out
 }
 
+// removeFromTable removes an entry from the index maps without touching tracee
+// memory. Used during the step-over sequence when we need the entry to survive.
+func (t *breakpointTable) removeFromTable(entry *breakpointEntry) {
+	delete(t.byID, entry.id)
+	delete(t.byAddr, entry.addr)
+}
+
+// addToTable inserts an entry back into the index maps without touching tracee
+// memory.
+func (t *breakpointTable) addToTable(entry *breakpointEntry) {
+	t.byID[entry.id] = entry
+	t.byAddr[entry.addr] = entry
+}
+
+// reinstall writes the trap instruction back and re-registers the entry.
+// Called after a step-over single-step has completed.
+func (t *breakpointTable) reinstall(b Backend, entry *breakpointEntry) error {
+	trap := archTrapInstruction()
+	if err := b.WriteMemory(entry.addr, trap); err != nil {
+		return fmt.Errorf("breakpoint reinstall at 0x%x: %w", entry.addr, err)
+	}
+	t.addToTable(entry)
+	return nil
+}
+
 // clearAll is a best-effort restore of all breakpoints, used during Kill.
 // Continues on individual errors so a single bad write doesn't block shutdown.
 func (t *breakpointTable) clearAll(b Backend) {
