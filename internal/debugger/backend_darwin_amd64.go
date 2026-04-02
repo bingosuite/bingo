@@ -264,8 +264,18 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 			return StopEvent{Reason: StopBreakpoint, TID: tid, PC: archRewindPC(regs.PC)}, nil
 		}
 
-		// SIGURG (Go goroutine preemption) must always be re-delivered.
+		// SIGURG (Go goroutine preemption): swallow during step, re-deliver when running.
 		if sig == syscall.SIGURG {
+			if b.stepping {
+				_ = ptrace(ptDarwinStep, uintptr(b.pid), 1, 0)
+			} else {
+				_ = ptrace(ptDarwinContinue, uintptr(b.pid), 1, uintptr(sig))
+			}
+			continue
+		}
+
+		// SIGWINCH (terminal resize): always re-deliver transparently.
+		if sig == syscall.SIGWINCH {
 			if b.stepping {
 				_ = ptrace(ptDarwinStep, uintptr(b.pid), 1, uintptr(sig))
 			} else {
@@ -274,10 +284,15 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 			continue
 		}
 
+		// Any other signal during a step: re-deliver via PT_STEP so the step
+		// completes. If PT_STEP fails, return StopSignal to the engine so it
+		// can reinstall any in-progress step-over BP and recover cleanly.
 		if b.stepping {
-			if perr := ptrace(ptDarwinStep, uintptr(b.pid), 1, uintptr(sig)); perr == nil {
+			if ptrace(ptDarwinStep, uintptr(b.pid), 1, uintptr(sig)) == nil {
 				continue
 			}
+			b.stepping = false
+			// fall through to return StopSignal below
 		}
 		regs, err := b.GetRegisters(tid)
 		if err != nil {

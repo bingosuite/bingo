@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
+	"runtime"
 	"sync"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
@@ -81,6 +83,7 @@ type engine struct {
 	// reinstall the trap, and then perform bpResumeAction.
 	// steppingOverBP is non-nil while that single-step is in flight.
 	lastBP         *breakpointEntry
+	lastBPTID      int // TID (Mach thread port on Darwin) of the thread that hit lastBP
 	steppingOverBP *breakpointEntry
 	bpResume       bpResumeAction
 	bpRetAddr      uint64 // return address; only used for bpResumeStepOut
@@ -337,6 +340,11 @@ func (e *engine) Goroutines() ([]protocol.Goroutine, error) {
 // ── Event loop ────────────────────────────────────────────────────────────────
 
 func (e *engine) loop() {
+	// All ptrace calls (Continue, SingleStep, ReadMemory, WriteMemory, …) are
+	// made from dispatch closures that execute on this goroutine. Pin it to one
+	// OS thread so the kernel always sees the same tracer thread — required on
+	// Linux (ptrace is thread-specific) and avoids scheduler surprises on macOS.
+	runtime.LockOSThread()
 	defer func() {
 		close(e.done)   // signal waitLoop goroutines to abandon pending sends
 		close(e.events) // signal hub that no more events are coming
@@ -370,6 +378,12 @@ func (e *engine) loop() {
 // It selects on e.done so that if the engine loop has already exited
 // (e.g. Kill was called), the goroutine exits cleanly without blocking.
 func (e *engine) waitLoop() {
+	// Lock to an OS thread for the duration of the wait4 call. On some
+	// platforms wait4 has per-thread semantics; locking also ensures the
+	// goroutine is not rescheduled onto a thread that has unrelated ptrace
+	// state while the syscall is in progress.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	evt, err := e.backend.Wait()
 	select {
 	case e.stopCh <- stopResult{evt: evt, err: err}:
@@ -397,13 +411,29 @@ func (e *engine) handleStop(stop StopEvent) {
 	case StopBreakpoint:
 		e.setState(stateSuspended)
 		bp := e.bps.atAddr(stop.PC)
+		slog.Debug("StopBreakpoint", "pc", fmt.Sprintf("0x%x", stop.PC),
+			"found", bp != nil,
+			"steppingOverBP", e.steppingOverBP != nil)
 		if bp == nil {
-			// Spurious trap — not one of ours. Resume silently.
+			// Spurious SIGTRAP — a BRK we did not install (e.g. Go runtime
+			// internal breakpoint or system library assertion).
+			// On ARM64, BRK traps with PC pointing AT the BRK instruction.
+			// Calling ContinueProcess with signal=0 leaves PC unchanged and the
+			// CPU re-executes the BRK immediately — infinite trap loop.
+			// Advance PC past the 4-byte BRK before resuming.
+			slog.Warn("spurious SIGTRAP — advancing PC past BRK and resuming",
+				"pc", fmt.Sprintf("0x%x", stop.PC))
+			if regs, err := e.backend.GetRegisters(stop.TID); err == nil {
+				regs.PC = stop.PC + uint64(len(archTrapInstruction()))
+				_ = e.backend.SetRegisters(stop.TID, regs)
+			}
 			_ = e.backend.ContinueProcess()
 			e.setState(stateRunning)
 			go e.waitLoop()
 			return
 		}
+		slog.Debug("StopBreakpoint matched", "file", bp.file, "line", bp.line,
+			"addr", fmt.Sprintf("0x%x", bp.addr))
 		if bp.file == "<stepover-next>" {
 			_ = e.bps.clear(e.backend, bp.id)
 			e.lastBP = nil
@@ -417,15 +447,28 @@ func (e *engine) handleStop(stop StopEvent) {
 			return
 		}
 		e.lastBP = bp
+		e.lastBPTID = stop.TID
 		e.stepOverFile = ""
 		e.stepOverLine = 0
 		e.emitBreakpointHit(bp, stop)
 
 	case StopSingleStep:
+		slog.Debug("StopSingleStep", "pc", fmt.Sprintf("0x%x", stop.PC),
+			"steppingOverBP", e.steppingOverBP != nil)
 		if sob := e.steppingOverBP; sob != nil {
 			// Finished stepping over the breakpoint instruction — reinstall it.
 			e.steppingOverBP = nil
-			_ = e.bps.reinstall(e.backend, sob)
+			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
+				// BP could not be reinstalled (WriteMemory failed). Do NOT resume —
+				// that would run the process indefinitely with no trap to stop it.
+				// Suspend and report the error so the client knows what happened.
+				slog.Error("breakpoint reinstall failed — suspending to prevent runaway process",
+					"addr", fmt.Sprintf("0x%x", sob.addr), "err", rerr)
+				e.setState(stateSuspended)
+				e.emitError(protocol.CmdNone, fmt.Errorf("reinstall breakpoint 0x%x: %w", sob.addr, rerr))
+				return
+			}
+			slog.Debug("breakpoint reinstalled", "addr", fmt.Sprintf("0x%x", sob.addr))
 			switch e.bpResume {
 			case bpResumeContinue:
 				_ = e.backend.ContinueProcess()
@@ -442,6 +485,9 @@ func (e *engine) handleStop(stop StopEvent) {
 				// wrong address.
 				if e.dw != nil && sob.file != "" && sob.line > 0 {
 					if nextPC, nextLine, ok := e.dw.NextLinePC(sob.file, sob.line); ok {
+						slog.Debug("sourceStepOver: setting <stepover-next>",
+							"from", fmt.Sprintf("%s:%d", sob.file, sob.line),
+							"nextPC", fmt.Sprintf("0x%x", nextPC), "nextLine", nextLine)
 						entry, setErr := e.bps.set(e.backend, "<stepover-next>", 0, nextPC)
 						if setErr == nil || errors.Is(setErr, errBreakpointExists) {
 							e.stepOverFile = sob.file
@@ -455,10 +501,17 @@ func (e *engine) handleStop(stop StopEvent) {
 								e.stepOverFile = ""
 								e.stepOverLine = 0
 							}
+						} else {
+							slog.Warn("sourceStepOver: set <stepover-next> failed",
+								"addr", fmt.Sprintf("0x%x", nextPC), "err", setErr)
 						}
+					} else {
+						slog.Warn("sourceStepOver: NextLinePC found no next line",
+							"file", sob.file, "line", sob.line)
 					}
 				}
 				// Fallback: emit Stepped at current position.
+				slog.Debug("sourceStepOver fallback: emitting Stepped")
 				e.setState(stateSuspended)
 				e.emitStepped(stop)
 			case bpResumeStepOut:
@@ -477,6 +530,16 @@ func (e *engine) handleStop(stop StopEvent) {
 		e.emitStepped(stop)
 
 	case StopSignal:
+		// If a step-over was in progress, its breakpoint has been removed from
+		// the table. Reinstall it before resuming so we don't lose the BP.
+		if sob := e.steppingOverBP; sob != nil {
+			e.steppingOverBP = nil
+			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
+				e.setState(stateSuspended)
+				e.emitError(protocol.CmdNone, fmt.Errorf("reinstall breakpoint 0x%x after signal: %w", sob.addr, rerr))
+				return
+			}
+		}
 		e.emitOutput("stderr", fmt.Sprintf("signal %d", stop.Signal))
 		_ = e.backend.ContinueProcess()
 		e.setState(stateRunning)
@@ -616,14 +679,22 @@ func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) err
 		return fmt.Errorf("resume BP: restore bytes: %w", err)
 	}
 
-	threads, err := e.backend.Threads()
-	if err != nil || len(threads) == 0 {
-		_ = e.backend.WriteMemory(bp.addr, archTrapInstruction())
-		e.bps.addToTable(bp)
-		e.steppingOverBP = nil
-		return fmt.Errorf("resume BP: no threads")
+	// Use the TID of the thread that hit the breakpoint. On Darwin, task_threads
+	// returns threads in creation order; blindly using threads[0] often picks an
+	// idle Go runtime M instead of the goroutine running user code.
+	tid := e.lastBPTID
+	if tid == 0 {
+		threads, err := e.backend.Threads()
+		if err != nil || len(threads) == 0 {
+			_ = e.backend.WriteMemory(bp.addr, archTrapInstruction())
+			e.bps.addToTable(bp)
+			e.steppingOverBP = nil
+			return fmt.Errorf("resume BP: no threads")
+		}
+		tid = threads[0]
 	}
-	if err := e.backend.SingleStep(threads[0]); err != nil {
+	e.lastBPTID = 0
+	if err := e.backend.SingleStep(tid); err != nil {
 		_ = e.backend.WriteMemory(bp.addr, archTrapInstruction())
 		e.bps.addToTable(bp)
 		e.steppingOverBP = nil
