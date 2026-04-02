@@ -70,19 +70,43 @@ static inline kern_return_t bingo_read_memory(
 // bingo_write_memory writes n bytes from src into the task's address space.
 // Temporarily marks the target page(s) writable with VM_PROT_COPY so we can
 // patch read-only text segments (e.g. to install breakpoints), then restores
-// execute permission afterward.
+// execute permission.
+//
+// Icache coherency on Apple Silicon (ARM64):
+// mach_vm_machine_attribute(MATTR_CACHE, MATTR_VAL_ICACHE_FLUSH) is a no-op
+// on Apple Silicon — the kernel returns KERN_NOT_SUPPORTED. The correct
+// approach is to wrap the write with task_suspend + task_resume: the resume
+// call drains the instruction pipeline for all threads in the task, ensuring
+// the CPU sees the new bytes. task_suspend/resume use an independent suspend
+// count from ptrace, so this is safe to call while the process is
+// ptrace-stopped (the ptrace stop is unaffected).
 static inline kern_return_t bingo_write_memory(
     mach_port_t task, mach_vm_address_t addr,
     const void *src, mach_vm_size_t n)
 {
+    // Suspend the task so all threads are quiesced while we patch memory.
+    // This also causes task_resume to flush the instruction pipeline.
+    task_suspend(task);
+
     kern_return_t kr = mach_vm_protect(task, addr, n, FALSE,
         VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) return kr;
+    if (kr != KERN_SUCCESS) {
+        task_resume(task);
+        return kr;
+    }
     kr = mach_vm_write(task, addr,
         (vm_offset_t)src, (mach_msg_type_number_t)n);
-    if (kr != KERN_SUCCESS) return kr;
-    return mach_vm_protect(task, addr, n, FALSE,
+    if (kr != KERN_SUCCESS) {
+        task_resume(task);
+        return kr;
+    }
+    kr = mach_vm_protect(task, addr, n, FALSE,
         VM_PROT_READ | VM_PROT_EXECUTE);
+
+    // Resume lifts the task suspension and flushes the instruction pipeline
+    // for all threads, ensuring the CPU fetches the new bytes on next execute.
+    task_resume(task);
+    return kr;
 }
 
 // bingo_find_macho_load_addr scans the task's virtual address space from
