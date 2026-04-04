@@ -38,6 +38,14 @@ Success criteria:
 - Blocking and waiting on channels/mutexes can be identified.
 - Concurrency-focused tests validate core tracking behavior.
 
+Notes:
+
+- Leverage runtime/trace.
+- Batch events to avoid overwhelming the connection.
+- Send high-level structured events, not raw trace data.
+- Use breakpoints as flush points (send all buffered events) and full state snapshot points.
+- Define the end model first and then structure the events the client receives.
+
 ## Phase 3: Client Implementation
 
 Goal: provide a usable client experience on top of the debugger engine.
