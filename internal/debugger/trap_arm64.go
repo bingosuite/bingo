@@ -3,7 +3,7 @@
 package debugger
 
 // trap_arm64.go defines the two architecture-specific constants that every
-// arm64 backend (Linux, Darwin) needs for breakpoint management.
+// arm64 backend (only Darwin currently) needs for breakpoint management.
 // Build tag is arm64 only — no OS restriction.
 
 // archTrapInstruction returns the 4-byte BRK #0 instruction.

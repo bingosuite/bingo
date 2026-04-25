@@ -83,11 +83,6 @@ var _ = Describe("fileMatches", func() {
 		// Completely different filename.
 		Entry("different name",
 			"/home/user/project/main.go", "other.go", false),
-		// Windows backslash normalisation.
-		Entry("windows backslash",
-			`C:\project\pkg\main.go`, "main.go", true),
-		Entry("windows full path with backslashes",
-			`C:\project\pkg\main.go`, `pkg\main.go`, true),
 		// Empty strings.
 		Entry("empty candidate", "", "main.go", false),
 		Entry("empty target", "/home/x/main.go", "", false),

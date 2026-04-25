@@ -1,4 +1,4 @@
-//go:build linux
+//go:build linux && amd64
 
 package debugger
 
@@ -139,12 +139,37 @@ func (b *linuxBackend) WriteMemory(addr uint64, src []byte) error {
 	return nil
 }
 
+// GetRegisters reads the integer register set for thread tid via PTRACE_GETREGS
+// and extracts the four fields the engine needs. The Go runtime stores the g
+// pointer at FS_BASE on amd64.
 func (b *linuxBackend) GetRegisters(tid int) (Registers, error) {
-	return archGetRegisters(tid)
+	var r syscall.PtraceRegs
+	if err := syscall.PtraceGetRegs(tid, &r); err != nil {
+		return Registers{}, fmt.Errorf("PTRACE_GETREGS tid %d: %w", tid, err)
+	}
+	return Registers{
+		PC:  r.Rip,
+		SP:  r.Rsp,
+		BP:  r.Rbp,
+		TLS: r.Fs_base,
+	}, nil
 }
 
+// SetRegisters writes back the four engine-owned fields, preserving every
+// other register by reading the full set first.
 func (b *linuxBackend) SetRegisters(tid int, reg Registers) error {
-	return archSetRegisters(tid, reg)
+	var r syscall.PtraceRegs
+	if err := syscall.PtraceGetRegs(tid, &r); err != nil {
+		return fmt.Errorf("PTRACE_GETREGS (pre-set) tid %d: %w", tid, err)
+	}
+	r.Rip = reg.PC
+	r.Rsp = reg.SP
+	r.Rbp = reg.BP
+	r.Fs_base = reg.TLS
+	if err := syscall.PtraceSetRegs(tid, &r); err != nil {
+		return fmt.Errorf("PTRACE_SETREGS tid %d: %w", tid, err)
+	}
+	return nil
 }
 
 func (b *linuxBackend) Threads() ([]int, error) {
