@@ -24,6 +24,15 @@ BinGo is a standalone visual concurrency debugger for Go that helps you:
 - Debug tricky concurrency issues that traditional tools miss
 - Extend with new frontends and integrations thanks to a modular, UI-agnostic core
 
+## Supported Platforms
+
+BinGo is currently built and tested on:
+
+- `darwin/arm64` (Apple Silicon) — build with `-tags bingonative`
+- `linux/amd64`
+
+Builds on other GOOS/GOARCH combinations will fail with `undefined: newBackend` and similar errors from the [internal/debugger](internal/debugger/) package.
+
 ## Documentation
 
 For detailed documentation, including client meeting minutes, existing solution comparision, project roadmap, installation instructions, usage guides, and API references, please read the [**Docs**](https://github.com/bingosuite/bingo/tree/main/docs).
