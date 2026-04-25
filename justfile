@@ -9,28 +9,26 @@ build OS="linux" ARCH="amd64":
 	mkdir -p ./build/bingo
 	{{ if OS == "darwin" { "env CGO_ENABLED=1 GOOS=" + OS + " GOARCH=" + ARCH + " go build -tags bingonative -o ./build/bingo/bingo_" + OS + "_" + ARCH + " ./cmd/bingo && codesign --sign - --entitlements entitlements.plist --force ./build/bingo/bingo_" + OS + "_" + ARCH } else { "env GOOS=" + OS + " GOARCH=" + ARCH + " go build -o ./build/bingo/bingo_" + OS + "_" + ARCH + " ./cmd/bingo" } }}
 
-# Usage: just run 				->	runs ./build/bingo/bingo_linux_amd64 (Default)
-#		 just run darwin arm64 	-> 	runs ./build/bingo/bingo_darwin_arm64 (MacOs specified, ARM64 specified)
+# Usage: just run 										->	runs ./build/bingo/bingo_linux_amd64 (Default)
+#		 just run darwin arm64 							-> 	runs ./build/bingo/bingo_darwin_arm64 (MacOs specified, ARM64 specified)
+#		 just run linux amd64 -addr 127.0.0.1:6061 -v 	->  runs ./build/bingo/bingo_linux_amd64 -addr 127.0.0.1:6061 -v
+
+# ARGS:  -addr string    listen address (default ":6060")
+#		 -v              verbose logging (debug level)
 # Run the BinGo binary. Takes positional arguments for the target OS and architecture (Must be existing binaries).
-run OS="linux" ARCH="amd64":
-	./build/bingo/bingo_{{OS}}_{{ARCH}}{{ if OS == "windows" { ".exe" } else { "" } }}
+run OS="linux" ARCH="amd64" *ARGS="":
+	./build/bingo/bingo_{{OS}}_{{ARCH}} {{ARGS}}
 
 # Builds then runs the bingo binary for the target OS and architecture (Must be valid `go build` targets).
-go OS="linux" ARCH="amd64": build-target (build OS ARCH) (run OS ARCH)
+server OS="linux" ARCH="amd64" *ARGS="": build-target (build OS ARCH) (run OS ARCH ARGS)
 
 # Build the Target with maximum debugging information
 build-target:
-	go clean
 	mkdir -p ./build/target
 	go build --gcflags="all=-N -l" -o ./build/target/target ./cmd/target
 
-# Run the bingo debug server (native platform, auto-detected).
-# Builds with cgo + bingonative tag, codesigns with debugger entitlement on macOS.
-server *ARGS:
-	go build -tags bingonative -o ./build/bingo/bingo_server ./cmd/bingo
-	{{ if os() == "macos" { "codesign --sign - --entitlements entitlements.plist --force ./build/bingo/bingo_server" } else { "" } }}
-	./build/bingo/bingo_server {{ARGS}}
-
+# ARGS: -addr string    server address (default "localhost:6060")
+#	  	-session string session ID to join (omit to create a new session)
 # Build and run the interactive CLI client
 cli *ARGS:
 	go run ./cmd/cli {{ARGS}}
