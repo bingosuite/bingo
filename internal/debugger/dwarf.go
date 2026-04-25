@@ -4,7 +4,6 @@ import (
 	"debug/dwarf"
 	"debug/elf"
 	"debug/macho"
-	"debug/pe"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -49,14 +48,6 @@ func loadDWARFData(binaryPath string) (*dwarf.Data, error) {
 		f, err := macho.Open(binaryPath)
 		if err != nil {
 			return nil, fmt.Errorf("macho.Open: %w", err)
-		}
-		defer f.Close()
-		return f.DWARF()
-
-	case "windows":
-		f, err := pe.Open(binaryPath)
-		if err != nil {
-			return nil, fmt.Errorf("pe.Open: %w", err)
 		}
 		defer f.Close()
 		return f.DWARF()
@@ -156,10 +147,7 @@ func (r *dwarfReader) NextLinePC(file string, afterLine int) (uint64, int, bool)
 }
 
 // fileMatches reports whether candidate matches target using suffix comparison.
-// Both Unix and Windows path separators are normalised to '/'.
 func fileMatches(candidate, target string) bool {
-	candidate = strings.ReplaceAll(candidate, "\\", "/")
-	target = strings.ReplaceAll(target, "\\", "/")
 	return candidate == target || strings.HasSuffix(candidate, "/"+target)
 }
 

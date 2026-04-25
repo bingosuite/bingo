@@ -3,7 +3,7 @@
 package debugger
 
 // trap_amd64.go defines the two architecture-specific constants that every
-// amd64 backend (Linux, Darwin, Windows) needs for breakpoint management.
+// amd64 backend (only Linux) needs for breakpoint management.
 // Build tag is amd64 only — no OS restriction.
 
 // archTrapInstruction returns the single-byte INT3 instruction (0xCC).
