@@ -63,7 +63,7 @@ func New(addr string, log *slog.Logger) *Server {
 // Start begins listening for connections. It blocks until the server is shut
 // down or a fatal listener error occurs.
 func (s *Server) Start() error {
-	ln, err := net.Listen("tcp", s.httpServer.Addr)
+	ln, err := net.Listen("tcp4", s.httpServer.Addr)
 	if err != nil {
 		return err
 	}
