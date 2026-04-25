@@ -23,3 +23,7 @@
 ## Meeting 5: March 23rd, 2025
 
 - Fifth meeting with Robert Laganière. We're still in refactoring mode and feature dev is still paused. We decided to unify the hub and debugger in the backend to avoid using an internal protocol, which was a bad architectural decision. This new approach is much more efficient and easier to maintain, but we still have to implement it fully and refactor the existing channels. We also engineered the state machine for the client-server interaction and concluded the state should be entirely server driven, since we can have multiple clients connected to the same session. We also spent time writing unit tests to improve our coverage. Next steps: implement the refactor fully and close the first chapter of the project, which is the basic debugger implementation.
+
+## Meeting 6: April 13th, 2025
+
+- Sixth meeting with Robert Laganière. We're nearing the end of the refactor and almost finished the basic debugger. We are deciding it's too much scope to support many versions, so we will focus on linux amd64 and darwin arm64. We have some architecural issues to deal with, such as multiples sources of truth in the code, race conditions and memory leaks. On track to finish phase 1 by end of April.
