@@ -1,38 +1,28 @@
-// export_test.go exposes internal symbols to the debugger_test package.
-// Only compiled during `go test`.
+// Exposes internal symbols to debugger_test. Compiled only during `go test`.
 package debugger
 
-// ExportedTrapInstruction exposes archTrapInstruction so tests can verify
-// the correct bytes are written to tracee memory.
 func ExportedTrapInstruction() []byte {
 	return archTrapInstruction()
 }
 
-// ExportedFileMatches exposes fileMatches for DWARF path-matching tests.
 func ExportedFileMatches(candidate, target string) bool {
 	return fileMatches(candidate, target)
 }
 
-// ExportedErrBreakpointExists exposes the errBreakpointExists sentinel.
 var ExportedErrBreakpointExists = errBreakpointExists
 
-// ExportedForceSuspended puts d into stateSuspended with proc.live=true so
-// that tests can exercise suspended-state engine behaviour (stepping,
-// inspection, breakpoint operations) without launching a real OS process.
-//
-// This is only safe in tests — it bypasses ptrace/Win32 entirely.
+// ExportedForceSuspended forces stateSuspended with proc.live=true so tests
+// can exercise suspended-state behaviour without launching a real process.
 func ExportedForceSuspended(d Debugger) {
 	e := d.(*engine)
 	e.dispatch(func() error {
 		e.proc.live = true
-		e.proc.pid = 0 // pid=0 causes process.kill to be a no-op (guards against it)
+		e.proc.pid = 0
 		e.setState(stateSuspended)
 		return nil
 	})
 }
 
-// ExportedForceRunning puts d into stateRunning. Used to verify that
-// suspended-only commands are rejected when the process is running.
 func ExportedForceRunning(d Debugger) {
 	e := d.(*engine)
 	e.dispatch(func() error {
@@ -43,10 +33,8 @@ func ExportedForceRunning(d Debugger) {
 	})
 }
 
-// ExportedSetBreakpointAt installs a breakpoint at the given address using
-// the engine's internal breakpoint table, bypassing DWARF lookup entirely.
-// The file is recorded as "<direct-addr>" so tests can identify it.
-// Returns the assigned breakpoint ID. Panics if the installation fails.
+// ExportedSetBreakpointAt installs a BP at addr bypassing DWARF lookup.
+// File is "<direct-addr>". Panics on failure.
 func ExportedSetBreakpointAt(d Debugger, addr uint64) int {
 	e := d.(*engine)
 	var id int
@@ -64,8 +52,6 @@ func ExportedSetBreakpointAt(d Debugger, addr uint64) int {
 	return id
 }
 
-// ExportedSetBreakpointAtErr is like ExportedSetBreakpointAt but returns
-// the error instead of panicking. Used to test duplicate-address detection.
 func ExportedSetBreakpointAtErr(d Debugger, addr uint64) error {
 	e := d.(*engine)
 	return e.dispatch(func() error {

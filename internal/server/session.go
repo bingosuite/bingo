@@ -21,14 +21,12 @@ type SessionInfo struct {
 	CreatedAt time.Time             `json:"createdAt"`
 }
 
-// session is the internal bookkeeping for one debug session.
 type session struct {
 	id        string
 	hub       *hub.Hub
 	createdAt time.Time
 }
 
-// info returns a snapshot of the session's public metadata.
 func (s *session) info() SessionInfo {
 	return SessionInfo{
 		ID:        s.id,
@@ -38,8 +36,7 @@ func (s *session) info() SessionInfo {
 	}
 }
 
-// sessionStore manages the set of active sessions. All methods are safe
-// to call from multiple goroutines.
+// sessionStore is the goroutine-safe set of active sessions.
 type sessionStore struct {
 	mu       sync.RWMutex
 	sessions map[string]*session
@@ -53,13 +50,12 @@ func newSessionStore(log *slog.Logger) *sessionStore {
 	}
 }
 
-// create allocates a new session: generates a UUID, creates a debugger factory
-// and a Hub, starts the hub's Run loop, and watches for shutdown. Returns the
-// session so the caller can add the first client.
+// create allocates a new session, starts its hub loop, and watches for
+// shutdown. The caller adds the first client.
 func (ss *sessionStore) create(ctx context.Context) *session {
 	id := uuid.New().String()
 
-	// Each launch/re-launch gets a fresh debugger instance.
+	// Each launch/re-launch gets a fresh debugger.
 	factory := func() debugger.Debugger {
 		return debugger.New()
 	}
@@ -77,10 +73,8 @@ func (ss *sessionStore) create(ctx context.Context) *session {
 	ss.sessions[id] = s
 	ss.mu.Unlock()
 
-	// Start the hub's event loop.
 	go func() {
 		h.Run(ctx)
-		// Hub finished (last client left or context cancelled) — remove session.
 		ss.remove(id)
 		log.Info("session removed")
 	}()
@@ -89,21 +83,18 @@ func (ss *sessionStore) create(ctx context.Context) *session {
 	return s
 }
 
-// get returns the session with the given ID, or nil if not found.
 func (ss *sessionStore) get(id string) *session {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()
 	return ss.sessions[id]
 }
 
-// remove deletes a session from the store.
 func (ss *sessionStore) remove(id string) {
 	ss.mu.Lock()
 	delete(ss.sessions, id)
 	ss.mu.Unlock()
 }
 
-// list returns a snapshot of all active sessions.
 func (ss *sessionStore) list() []SessionInfo {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()
@@ -114,7 +105,6 @@ func (ss *sessionStore) list() []SessionInfo {
 	return out
 }
 
-// count returns the number of active sessions.
 func (ss *sessionStore) count() int {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()

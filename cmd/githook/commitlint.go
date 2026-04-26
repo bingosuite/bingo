@@ -14,7 +14,6 @@ func main() {
 	}
 	msg := string(data)
 
-	// regex for the commit msgs
 	re := regexp.MustCompile(`^(feat|fix|docs|style|refactor|perf|test|chore|wip)(\([^)]+\))?: .+`)
 	if !re.MatchString(msg) {
 		fmt.Println("\033[1;31m─────────────────────────────────────────────────────────────\033[0m")

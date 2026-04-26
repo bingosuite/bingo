@@ -15,8 +15,6 @@ func TestProtocol(t *testing.T) {
 	RunSpecs(t, "Protocol Suite")
 }
 
-// ── fixtures ──────────────────────────────────────────────────────────────────
-
 var sampleLocation = protocol.Location{
 	File:     "main.go",
 	Line:     42,
@@ -46,7 +44,6 @@ var sampleVariables = []protocol.Variable{
 	{Name: "msg", Value: "0xc000014070", Type: "string"},
 }
 
-// mustRaw marshals v to json.RawMessage, panicking on error. Test helper only.
 func mustRaw(v any) json.RawMessage {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -54,8 +51,6 @@ func mustRaw(v any) json.RawMessage {
 	}
 	return b
 }
-
-// ── Event ─────────────────────────────────────────────────────────────────────
 
 var _ = Describe("Event", func() {
 
@@ -290,8 +285,6 @@ var _ = Describe("Event", func() {
 					Expect(protocol.DecodeEventPayload(e, &p)).To(Succeed())
 					Expect(p.Command).To(Equal(protocol.CmdNone))
 					Expect(p.Message).To(Equal("backend failure"))
-					// Verify the command field is omitted from the raw JSON
-					// when CmdNone (empty string) is used, thanks to omitempty.
 					var raw map[string]any
 					Expect(json.Unmarshal(e.Payload, &raw)).To(Succeed())
 					_, hasCmd := raw["command"]
@@ -324,8 +317,6 @@ var _ = Describe("Event", func() {
 			}).NotTo(Panic())
 		})
 		It("returns an error when payload is not valid JSON for the target type", func() {
-			// Craft a raw event with a payload that can't unmarshal into a
-			// struct (e.g. a JSON array where an object is expected).
 			event := protocol.Event{
 				Version: protocol.Version,
 				Kind:    protocol.EventBreakpointHit,
@@ -333,14 +324,11 @@ var _ = Describe("Event", func() {
 				Payload: json.RawMessage(`[1,2,3]`),
 			}
 			var p protocol.BreakpointHitPayload
-			// json.Unmarshal into a struct from an array returns an error.
 			err := protocol.DecodeEventPayload(event, &p)
 			Expect(err).To(HaveOccurred())
 		})
 	})
 })
-
-// ── Command ───────────────────────────────────────────────────────────────────
 
 var _ = Describe("Command", func() {
 
@@ -497,8 +485,6 @@ var _ = Describe("Command", func() {
 	})
 })
 
-// ── Kind constants ────────────────────────────────────────────────────────────
-
 var _ = Describe("Kind constants", func() {
 
 	It("all non-sentinel EventKind values are non-empty strings", func() {
@@ -546,8 +532,6 @@ var _ = Describe("Kind constants", func() {
 	})
 })
 
-// ── Sequence numbers ──────────────────────────────────────────────────────────
-
 var _ = Describe("Sequence numbers", func() {
 	It("are preserved exactly through marshal/unmarshal", func() {
 		for _, seq := range []uint64{0, 1, 255, 1<<32 - 1, 1<<63 - 1} {
@@ -562,8 +546,6 @@ var _ = Describe("Sequence numbers", func() {
 		}
 	})
 })
-
-// ── Version field ─────────────────────────────────────────────────────────────
 
 var _ = Describe("Version", func() {
 	It("is non-empty", func() {

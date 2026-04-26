@@ -20,14 +20,11 @@ func TestServer(t *testing.T) {
 	RunSpecs(t, "Server Suite")
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
 
-// toWS converts an httptest URL (http://host:port) to ws://host:port/path.
 func toWS(ts *httptest.Server, path string) string {
 	return "ws" + strings.TrimPrefix(ts.URL, "http") + path
 }
 
-// recvState reads a single SessionState event from the WebSocket (1 s timeout).
 func recvState(conn *websocket.Conn) (protocol.SessionStatePayload, error) {
 	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 	_, msg, err := conn.ReadMessage()
@@ -42,7 +39,6 @@ func recvState(conn *websocket.Conn) (protocol.SessionStatePayload, error) {
 	return p, protocol.DecodeEventPayload(evt, &p)
 }
 
-// ── specs ────────────────────────────────────────────────────────────────────
 
 var _ = Describe("Server", func() {
 
@@ -57,13 +53,11 @@ var _ = Describe("Server", func() {
 	})
 
 	AfterEach(func() {
-		srv.cancel() // cancel all session contexts → hubs exit
+		srv.cancel()
 		ts.Close()
-		// Let hubs drain so goroutines don't leak into the next test.
 		time.Sleep(50 * time.Millisecond)
 	})
 
-	// ── REST: /api/sessions ──────────────────────────────────────────────
 
 	Describe("GET /api/sessions", func() {
 		It("returns an empty JSON array when no sessions exist", func() {
@@ -91,7 +85,6 @@ var _ = Describe("Server", func() {
 			Expect(err).NotTo(HaveOccurred())
 			defer conn.Close()
 
-			// Drain welcome so the write pump doesn't block.
 			_, _ = recvState(conn)
 
 			resp, err := http.Get(ts.URL + "/api/sessions")
@@ -106,7 +99,6 @@ var _ = Describe("Server", func() {
 		})
 	})
 
-	// ── WebSocket: /ws ───────────────────────────────────────────────────
 
 	Describe("WebSocket endpoint", func() {
 
@@ -116,8 +108,6 @@ var _ = Describe("Server", func() {
 			defer resp.Body.Close()
 			Expect(resp.StatusCode).To(Equal(http.StatusBadRequest))
 		})
-
-		// ── create ───────────────────────────────────────────────────────
 
 		Context("?create", func() {
 			It("upgrades to WebSocket and sends an idle welcome state", func() {
@@ -140,7 +130,6 @@ var _ = Describe("Server", func() {
 
 				p, err := recvState(conn)
 				Expect(err).NotTo(HaveOccurred())
-				// UUID v4 format: 8-4-4-4-12 hex digits.
 				Expect(p.SessionID).To(MatchRegexp(
 					`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`))
 			})
@@ -161,17 +150,13 @@ var _ = Describe("Server", func() {
 			})
 		})
 
-		// ── join ─────────────────────────────────────────────────────────
-
 		Context("?session={id}", func() {
 			It("joins an existing session with correct client count", func() {
-				// Create.
 				conn1, _, err := websocket.DefaultDialer.Dial(toWS(ts, "/ws?create"), nil)
 				Expect(err).NotTo(HaveOccurred())
 				defer conn1.Close()
 				p1, _ := recvState(conn1)
 
-				// Join.
 				conn2, _, err := websocket.DefaultDialer.Dial(
 					toWS(ts, "/ws?session="+p1.SessionID), nil)
 				Expect(err).NotTo(HaveOccurred())
@@ -188,7 +173,6 @@ var _ = Describe("Server", func() {
 					toWS(ts, "/ws?session=does-not-exist"), nil)
 				Expect(err).NotTo(HaveOccurred())
 
-				// Server sends a close frame; the next read must fail.
 				_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 				_, _, err = conn.ReadMessage()
 				Expect(err).To(HaveOccurred())
@@ -197,7 +181,6 @@ var _ = Describe("Server", func() {
 		})
 	})
 
-	// ── Session lifecycle ────────────────────────────────────────────────
 
 	Describe("session lifecycle", func() {
 		It("removes the session when the sole client disconnects", func() {
@@ -222,11 +205,9 @@ var _ = Describe("Server", func() {
 				toWS(ts, "/ws?session="+p.SessionID), nil)
 			Expect(err).NotTo(HaveOccurred())
 
-			// Disconnect the second client.
 			conn2.Close()
 			time.Sleep(100 * time.Millisecond)
 
-			// Session must survive — first client is still connected.
 			Expect(srv.sessions.count()).To(Equal(1))
 			Expect(srv.sessions.get(p.SessionID)).NotTo(BeNil())
 		})
@@ -238,14 +219,12 @@ var _ = Describe("Server", func() {
 
 			Eventually(srv.sessions.count, "2s", "50ms").Should(Equal(1))
 
-			// Cancelling the server context → hub.Run returns → session removed.
 			srv.cancel()
 
 			Eventually(srv.sessions.count, "2s", "50ms").Should(Equal(0))
 		})
 	})
 
-	// ── Start / Shutdown ─────────────────────────────────────────────────
 
 	Describe("Start and Shutdown", func() {
 		It("starts on a random port and shuts down cleanly", func() {
@@ -254,7 +233,6 @@ var _ = Describe("Server", func() {
 			errCh := make(chan error, 1)
 			go func() { errCh <- s.Start() }()
 
-			// Give the listener time to bind.
 			time.Sleep(50 * time.Millisecond)
 
 			s.Shutdown(time.Second)

@@ -2,13 +2,11 @@
 
 package debugger
 
-// backend_darwin_arm64.go is the complete Darwin/arm64 (Apple Silicon) backend.
-// It is entirely self-contained: struct, constants, process lifecycle, register
-// access via Mach thread_get_state, memory access via mach_vm_read/write, and
-// all Backend interface methods live here.
+// Darwin/arm64 (Apple Silicon) Backend. Self-contained: process lifecycle via
+// ptrace, registers via Mach thread_get_state, memory via mach_vm_read/write.
 //
-// Requires: com.apple.security.cs.debugger entitlement, or SIP disabled.
-// Cannot be cross-compiled from Linux/Windows — cgo requires the macOS SDK.
+// Requires com.apple.security.cs.debugger entitlement (or SIP disabled).
+// Cannot be cross-compiled from non-macOS — cgo needs the macOS SDK.
 
 /*
 #cgo LDFLAGS: -framework CoreFoundation
@@ -34,13 +32,12 @@ func newBackend() Backend {
 type darwinBackend struct {
 	pid      int
 	stepping bool
-	stepTID  int // Mach thread port passed to SingleStep; reused when step trap fires
+	stepTID  int // Mach thread port saved by SingleStep, reused on the step trap
 }
 
-// Darwin ptrace request codes from <sys/ptrace.h>.
-// PT_ATTACH = 10: standard attach; initial SIGSTOP arrives as a ptrace stop
-// collectible via wait4. Do NOT use PT_ATTACHEXC (14), which routes signals
-// through Mach exceptions — incompatible with our wait4-based Wait() loop.
+// Darwin ptrace request codes from <sys/ptrace.h>. PT_ATTACH (10) makes the
+// stop wait4-able by PID. Do NOT use PT_ATTACHEXC (14) — Mach exceptions are
+// incompatible with our wait4-based Wait loop.
 const (
 	ptDarwinContinue = uintptr(7)
 	ptDarwinStep     = uintptr(9)
@@ -59,8 +56,6 @@ func ptrace(request, pid, addr, data uintptr) error {
 	}
 	return nil
 }
-
-// ── Process lifecycle ─────────────────────────────────────────────────────────
 
 func startTracedProcess(binaryPath string, args []string, env []string) (int, *exec.Cmd, error) {
 	cmd := exec.Command(binaryPath, args...)
@@ -91,7 +86,6 @@ func attachToProcess(pid int) error {
 	if err := ptrace(ptDarwinAttach, uintptr(pid), 0, 0); err != nil {
 		return fmt.Errorf("PT_ATTACH pid %d: %w", pid, err)
 	}
-	// PT_ATTACH (10) makes the target wait4-able by its specific PID on Darwin.
 	var ws syscall.WaitStatus
 	if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
 		return fmt.Errorf("wait after PT_ATTACH: %w", err)
@@ -107,8 +101,7 @@ func killProcess(pid int, cmd *exec.Cmd) error {
 		_ = cmd.Wait()
 		return nil
 	}
-	// Attached (not launched) process: detach only, do not kill.
-	// The debugger does not own this process; leaving it running is correct.
+	// Attached (not launched): detach, don't kill — we don't own the process.
 	_ = ptrace(ptDarwinDetach, uintptr(pid), 1, 0)
 	return nil
 }
@@ -116,8 +109,6 @@ func killProcess(pid int, cmd *exec.Cmd) error {
 func isAlreadyExited(err error) bool {
 	return err != nil && err.Error() == "os: process already finished"
 }
-
-// ── Backend implementation ────────────────────────────────────────────────────
 
 func (b *darwinBackend) ContinueProcess() error {
 	b.stepping = false
@@ -129,10 +120,9 @@ func (b *darwinBackend) ContinueProcess() error {
 
 func (b *darwinBackend) SingleStep(tid int) error {
 	b.stepping = true
-	b.stepTID = tid // save so Wait() can read the right thread's registers
-	// Darwin ptrace PT_STEP operates on the whole process (by PID), not
-	// per-thread. The tid argument (a Mach thread port on ARM64) is not
-	// a valid ptrace process identifier, so we always use b.pid here.
+	b.stepTID = tid
+	// Darwin PT_STEP is per-process (by PID), not per-thread. The tid argument
+	// is a Mach thread port, not a valid ptrace identifier — use b.pid.
 	if err := ptrace(ptDarwinStep, uintptr(b.pid), 1, 0); err != nil {
 		return fmt.Errorf("PT_STEP: %w", err)
 	}
@@ -146,8 +136,6 @@ func (b *darwinBackend) StopProcess() error {
 	}
 	return p.Signal(syscall.SIGSTOP)
 }
-
-// ── Register access via Mach thread_get_state ─────────────────────────────────
 
 func (b *darwinBackend) GetRegisters(tid int) (Registers, error) {
 	thread := C.mach_port_t(tid)
@@ -183,8 +171,6 @@ func (b *darwinBackend) SetRegisters(tid int, reg Registers) error {
 	}
 	return nil
 }
-
-// ── Memory access via Mach mach_vm_read/write ─────────────────────────────────
 
 func (b *darwinBackend) ReadMemory(addr uint64, dst []byte) error {
 	if len(dst) == 0 {
@@ -224,8 +210,6 @@ func (b *darwinBackend) WriteMemory(addr uint64, src []byte) error {
 	return nil
 }
 
-// ── Thread enumeration via task_threads ───────────────────────────────────────
-
 func (b *darwinBackend) Threads() ([]int, error) {
 	task, err := b.task()
 	if err != nil {
@@ -250,15 +234,13 @@ func (b *darwinBackend) Threads() ([]int, error) {
 	return tids, nil
 }
 
-// findBreakpointThread returns the Mach thread port and registers of the thread
-// whose PC points to a BRK #0 instruction — i.e. the thread that hit our
-// software breakpoint. task_threads returns threads in creation order, which
-// may place idle Go runtime threads (parked in pthread_cond_wait) before the
-// goroutine running user code. Always using threads[0] reads the wrong PC.
-//
-// Falls back to threads[0] if no thread is found at a BRK.
+// findBreakpointThread returns the Mach thread port and registers of the
+// thread whose PC points at a BRK #0 — i.e. the one that hit our software BP.
+// task_threads returns threads in creation order, so threads[0] is often an
+// idle Go runtime M parked in pthread_cond_wait, not the goroutine running
+// user code. Falls back to threads[0] if nothing is at a BRK.
 func (b *darwinBackend) findBreakpointThread(threads []int) (int, Registers) {
-	trap := archTrapInstruction() // {0x00, 0x00, 0x20, 0xD4} = BRK #0
+	trap := archTrapInstruction()
 	for _, t := range threads {
 		regs, err := b.GetRegisters(t)
 		if err != nil {
@@ -272,15 +254,12 @@ func (b *darwinBackend) findBreakpointThread(threads []int) (int, Registers) {
 			return t, regs
 		}
 	}
-	// Fallback: no thread found at a BRK — return threads[0].
 	if len(threads) > 0 {
 		regs, _ := b.GetRegisters(threads[0])
 		return threads[0], regs
 	}
 	return 0, Registers{}
 }
-
-// ── Wait ──────────────────────────────────────────────────────────────────────
 
 func (b *darwinBackend) Wait() (StopEvent, error) {
 	for {
@@ -298,8 +277,8 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 		if !ws.Stopped() {
 			continue
 		}
-		// tid from Wait4 is the process PID, not a Mach thread port.
-		// Use Threads() to get the actual thread port before calling GetRegisters.
+		// tid from Wait4 is the PID, not a Mach thread port. Use Threads()
+		// to get the actual thread ports before reading registers.
 		threads, terr := b.Threads()
 		if terr != nil || len(threads) == 0 {
 			return StopEvent{}, fmt.Errorf("Wait: get threads: %w", terr)
@@ -309,10 +288,8 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 
 		if sig == syscall.SIGTRAP {
 			if b.stepping {
-				// Use the thread port we saved in SingleStep — that is the thread
-				// running user code whose next instruction we asked to trap.
-				// task_threads returns threads in creation order, which may put idle
-				// runtime M's before the active goroutine thread.
+				// Use the thread we saved in SingleStep — that's the one
+				// whose next instruction we asked to trap.
 				thread := b.stepTID
 				if thread == 0 {
 					thread = threads[0]
@@ -325,17 +302,12 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 				slog.Debug("Wait: SIGTRAP → SingleStep", "pc", fmt.Sprintf("0x%x", regs.PC))
 				return StopEvent{Reason: StopSingleStep, TID: thread, PC: regs.PC}, nil
 			}
-			// Breakpoint: find the thread sitting at a BRK instruction.
-			// task_threads order is non-deterministic; always using threads[0]
-			// returns idle Go runtime threads parked in pthread_cond_wait, not
-			// the goroutine that hit our breakpoint.
 			thread, regs := b.findBreakpointThread(threads)
 			slog.Debug("Wait: SIGTRAP → Breakpoint", "pc", fmt.Sprintf("0x%x", regs.PC), "tid", thread)
 			return StopEvent{Reason: StopBreakpoint, TID: thread, PC: regs.PC}, nil
 		}
 
-		// SIGURG is Go's goroutine-preemption signal — swallow during step,
-		// re-deliver transparently when running.
+		// SIGURG is Go's goroutine-preemption signal. Re-deliver transparently.
 		if sig == syscall.SIGURG {
 			if b.stepping {
 				_ = ptrace(ptDarwinStep, uintptr(b.pid), 1, 0)
@@ -345,10 +317,7 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 			continue
 		}
 
-		// SIGWINCH (terminal resize) is handled internally by the Go runtime.
-		// Always re-deliver it transparently — if we are stepping, re-issue
-		// PT_STEP with the signal so the runtime handles it and the step
-		// continues; if we are running, PT_CONTINUE with the signal.
+		// SIGWINCH (terminal resize): handled by the Go runtime, re-deliver.
 		if sig == syscall.SIGWINCH {
 			if b.stepping {
 				_ = ptrace(ptDarwinStep, uintptr(b.pid), 1, uintptr(sig))
@@ -358,20 +327,18 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 			continue
 		}
 
-		// Any other signal during a step: re-deliver via PT_STEP so the step
-		// completes. If PT_STEP fails, return StopSignal to the engine so it
-		// can reinstall any in-progress step-over BP and recover cleanly.
-		// Do NOT fall back to PT_CONTINUE + continue: that keeps Wait() looping
-		// forever (SIGURG every ~10ms) and stopCh never gets a result.
+		// Other signals during step: re-deliver via PT_STEP so the step
+		// completes. If PT_STEP fails, fall through to StopSignal so the
+		// engine can recover any in-flight step-over BP. Don't fall back to
+		// PT_CONTINUE+continue: that loops on SIGURG every ~10ms forever.
 		if b.stepping {
 			if ptrace(ptDarwinStep, uintptr(b.pid), 1, uintptr(sig)) == nil {
 				continue
 			}
 			b.stepping = false
-			// fall through to return StopSignal below
 		}
-		// For non-SIGTRAP signals use threads[0] — the signal may have arrived
-		// on any thread and we have no better way to pick without Mach exceptions.
+		// For non-SIGTRAP signals use threads[0] — without Mach exceptions we
+		// have no way to know which thread received it.
 		sigThread := threads[0]
 		regs, err := b.GetRegisters(sigThread)
 		if err != nil {
@@ -383,15 +350,12 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 
 func (b *darwinBackend) setPID(pid int) { b.pid = pid }
 
-// TextSlide returns the ASLR slide for the main executable: the difference
-// between where the binary was actually loaded and its preferred __TEXT vmaddr.
-// Returns 0 on any error (slide is treated as absent).
+// TextSlide returns the ASLR slide for the main executable: actual load
+// address minus preferred __TEXT vmaddr. Returns 0 on any error.
 //
-// We scan the task's VM map for the first executable region whose header has
-// the 64-bit Mach-O magic. This works even at the very first ptrace stop
-// (before dyld has run), because the kernel maps the binary before handing
-// control to dyld — unlike TASK_DYLD_INFO whose image array is unpopulated
-// at that point.
+// Scans the task's VM map for the first executable region with the 64-bit
+// Mach-O magic. Works even at the very first ptrace stop (before dyld runs),
+// unlike TASK_DYLD_INFO whose image array is unpopulated at that point.
 func (b *darwinBackend) TextSlide(binaryPath string) int64 {
 	task, err := b.task()
 	if err != nil {
@@ -411,8 +375,6 @@ func (b *darwinBackend) TextSlide(binaryPath string) int64 {
 	return int64(loadAddr) - int64(preferredVmaddr)
 }
 
-// machoTextVmaddr returns the preferred load address of the __TEXT segment
-// from the Mach-O binary file (the non-ASLR base address).
 func machoTextVmaddr(binaryPath string) (uint64, error) {
 	f, err := macho.Open(binaryPath)
 	if err != nil {
@@ -428,10 +390,8 @@ func machoTextVmaddr(binaryPath string) (uint64, error) {
 
 var _ Backend = (*darwinBackend)(nil)
 
-// ── Mach helpers ──────────────────────────────────────────────────────────────
-
-// task returns the Mach task port for the tracee.
-// Requires com.apple.security.cs.debugger entitlement or SIP disabled.
+// task returns the Mach task port for the tracee. Requires the
+// com.apple.security.cs.debugger entitlement or disabled SIP.
 func (b *darwinBackend) task() (C.mach_port_t, error) {
 	var task C.mach_port_t
 	kr := C.bingo_task_for_pid(C.int(b.pid), &task)

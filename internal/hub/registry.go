@@ -2,9 +2,8 @@ package hub
 
 import "sync"
 
-// registry is a thread-safe set of connected clients.
-// broadcast is called from the hub's single event-loop goroutine; add and
-// remove may be called from any goroutine, so we guard with a mutex.
+// registry is a thread-safe set of clients. broadcast is called from the
+// hub's event-loop goroutine; add/remove may be called from any goroutine.
 type registry struct {
 	mu      sync.RWMutex
 	clients map[*Client]struct{}
@@ -32,9 +31,6 @@ func (r *registry) count() int {
 	return len(r.clients)
 }
 
-// broadcast delivers msg to every registered client.
-// The hub calls this from its single event-loop goroutine, but we hold an
-// RLock so concurrent add/remove calls are safe.
 func (r *registry) broadcast(msg []byte) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -43,9 +39,9 @@ func (r *registry) broadcast(msg []byte) {
 	}
 }
 
-// closeAll signals every registered client to disconnect by closing its send
-// channel, then empties the registry. Uses c.closeSend() to prevent panics
-// if deliver() already closed the channel due to buffer overflow.
+// closeAll closes every client's send channel and empties the registry.
+// Uses closeSend() (idempotent) to avoid panics when deliver() already
+// closed the channel due to buffer overflow.
 func (r *registry) closeAll() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -55,7 +51,6 @@ func (r *registry) closeAll() {
 	}
 }
 
-// snapshot returns a point-in-time copy of all registered clients.
 func (r *registry) snapshot() []*Client {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

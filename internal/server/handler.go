@@ -8,19 +8,15 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// upgrader configures the WebSocket handshake. CheckOrigin is permissive
-// because bingo has no auth layer yet — tighten this when auth is added.
+// upgrader: CheckOrigin is permissive because bingo has no auth — tighten
+// when auth is added.
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
 	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
-// handleListSessions returns a JSON array of all active sessions.
-//
-//	GET /api/sessions
-//
-// Response: [{"id":"...","state":"idle","clients":1,"createdAt":"..."},...]
+// handleListSessions: GET /api/sessions
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -33,18 +29,13 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleWS upgrades the HTTP connection to a WebSocket and either creates a
-// new session or joins an existing one based on the query parameters:
+// handleWS upgrades to WebSocket and either creates or joins a session.
 //
-//	GET /ws?create         — create a new session and join it
-//	GET /ws?session={id}   — join an existing session by UUID
-//
-// On success the WebSocket receives an initial SessionState event. On failure
-// the connection is closed with a WebSocket close frame carrying the reason.
+//	GET /ws?create        — create + join
+//	GET /ws?session={id}  — join existing
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 
-	// Determine whether to create or join.
 	_, wantCreate := query["create"]
 	sessionID := query.Get("session")
 
@@ -53,11 +44,9 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Upgrade to WebSocket before any session logic so we can send close
-	// frames with descriptive reasons on error.
+	// Upgrade before session logic so we can send descriptive close frames on error.
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		// Upgrade already wrote the HTTP error.
 		s.log.Warn("websocket upgrade failed", "err", err)
 		return
 	}
@@ -71,7 +60,6 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// wsCreate creates a new session and adds the WebSocket as its first client.
 func (s *Server) wsCreate(conn *websocket.Conn, log *slog.Logger) {
 	sess := s.sessions.create(s.ctx)
 	log = log.With("session", sess.id, "action", "create")
@@ -79,8 +67,6 @@ func (s *Server) wsCreate(conn *websocket.Conn, log *slog.Logger) {
 	sess.hub.AddClient(conn, log)
 }
 
-// wsJoin adds the WebSocket to an existing session, or closes it if the
-// session does not exist.
 func (s *Server) wsJoin(conn *websocket.Conn, sessionID string, log *slog.Logger) {
 	log = log.With("session", sessionID, "action", "join")
 
