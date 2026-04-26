@@ -18,32 +18,19 @@ func TestDebugger(t *testing.T) {
 	RunSpecs(t, "Debugger Suite")
 }
 
-// ── fakeBackend ───────────────────────────────────────────────────────────────
-//
-// fakeBackend is a complete in-process Backend. Tests interact with it in two
-// ways:
-//
-//  1. seed — write data into mem / set register values before a test step.
-//  2. push — send a StopEvent that the engine's waitLoop will receive, which
-//     drives the engine through its state machine.
-//
-// All Backend interface methods record what was called so tests can assert on
-// observed side effects (e.g. "SingleStep was called exactly once on tid 1").
-
+// fakeBackend is an in-process Backend. Tests seed mem/regs, push StopEvents
+// to drive the state machine, and inspect recorded calls afterward.
 type fakeBackend struct {
 	mem  map[uint64]byte
 	regs map[int]debugger.Registers
 	tids []int
 
-	// stopCh delivers OS-level stop events to the engine's waitLoop.
-	// Buffer of 8 so tests can push stops before the engine is listening.
 	stopCh  chan debugger.StopEvent
-	stopped bool // true once stopCh has been closed
+	stopped bool
 
-	// Recorded calls — inspected by tests after the fact.
 	continueCalls   int
 	singleStepCalls []int
-	writtenAt       map[uint64][]byte // addr → last bytes written
+	writtenAt       map[uint64][]byte
 }
 
 func newFakeBackend() *fakeBackend {
@@ -56,21 +43,18 @@ func newFakeBackend() *fakeBackend {
 	}
 }
 
-// seedMem writes data into the fake address space starting at addr.
 func (f *fakeBackend) seedMem(addr uint64, data []byte) {
 	for i, b := range data {
 		f.mem[addr+uint64(i)] = b
 	}
 }
 
-// seedRegs sets the register state for tid 1 (the only thread the fake exposes).
 func (f *fakeBackend) seedRegs(r debugger.Registers) { f.regs[1] = r }
 
-// pushStop queues a stop event for the engine's waitLoop to receive.
 func (f *fakeBackend) pushStop(evt debugger.StopEvent) { f.stopCh <- evt }
 
-// closeStop simulates process exit by closing the stop channel, which causes
-// Wait to return ErrProcessExited.
+// closeStop simulates process exit by closing stopCh, making Wait return
+// ErrProcessExited.
 func (f *fakeBackend) closeStop() {
 	if !f.stopped {
 		close(f.stopCh)
@@ -78,7 +62,6 @@ func (f *fakeBackend) closeStop() {
 	}
 }
 
-// peekMem returns a copy of the bytes stored at addr..addr+n.
 func (f *fakeBackend) peekMem(addr uint64, n int) []byte {
 	out := make([]byte, n)
 	for i := range out {
@@ -86,8 +69,6 @@ func (f *fakeBackend) peekMem(addr uint64, n int) []byte {
 	}
 	return out
 }
-
-// Backend interface implementation.
 
 func (f *fakeBackend) ContinueProcess() error  { f.continueCalls++; return nil }
 func (f *fakeBackend) StopProcess() error      { return nil }
@@ -132,12 +113,8 @@ func (f *fakeBackend) Wait() (debugger.StopEvent, error) {
 	return evt, nil
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-
 const eventTimeout = 500 * time.Millisecond
 
-// nextEvent blocks until the engine emits an event or the timeout fires.
-// Returns the event and true, or the zero value and false on timeout.
 func nextEvent(d debugger.Debugger) (protocol.Event, bool) {
 	select {
 	case evt, ok := <-d.Events():
@@ -150,57 +127,39 @@ func nextEvent(d debugger.Debugger) (protocol.Event, bool) {
 	}
 }
 
-// mustNextEvent fails the test if no event arrives within the timeout.
 func mustNextEvent(d debugger.Debugger) protocol.Event {
 	evt, ok := nextEvent(d)
 	ExpectWithOffset(1, ok).To(BeTrue(), "expected an event but timed out")
 	return evt
 }
 
-// drainEvents discards all pending events from the channel without blocking.
-// Exits when the channel is empty (default) or closed (ok==false).
 func drainEvents(d debugger.Debugger) {
 	for {
 		select {
 		case _, ok := <-d.Events():
 			if !ok {
-				return // channel closed
+				return
 			}
 		default:
-			return // channel empty
+			return
 		}
 	}
 }
 
-// le8 encodes v as an 8-byte little-endian slice.
 func le8(v uint64) []byte {
 	b := make([]byte, 8)
 	binary.LittleEndian.PutUint64(b, v)
 	return b
 }
 
-// seedFrameChain writes a two-frame stack into fb's memory so walkStack
-// returns two PCs, enabling StackFrames tests without real DWARF.
-//
-// Frame layout Go uses:
-//
-//	[bp + 0]  saved bp  (8 bytes)
-//	[bp + 8]  return address (8 bytes)
-//
-// frame0BP is the current frame's base pointer (held in regs.BP).
-// frame1BP is the caller's base pointer (saved at [frame0BP]).
-// retAddr  is the return address (stored at [frame0BP+8]).
+// seedFrameChain writes a two-frame stack so walkStack returns two PCs.
+// Go frame layout: [bp+0]=saved bp, [bp+8]=return address.
 func seedFrameChain(fb *fakeBackend, frame0PC, frame0BP, frame1BP, retAddr uint64) {
 	fb.seedRegs(debugger.Registers{PC: frame0PC, SP: frame0BP - 8, BP: frame0BP})
-	// At frame0BP: saved bp for frame1
 	fb.seedMem(frame0BP, le8(frame1BP))
-	// At frame0BP+8: return address
 	fb.seedMem(frame0BP+8, le8(retAddr))
-	// Terminate the chain: frame1BP points to zero saved BP
 	fb.seedMem(frame1BP, le8(0))
 }
-
-// ── test suite ────────────────────────────────────────────────────────────────
 
 var _ = Describe("Engine", func() {
 
@@ -215,20 +174,14 @@ var _ = Describe("Engine", func() {
 	})
 
 	AfterEach(func() {
-		// Kill() sets stateExited and injects a synthetic StopExited into
-		// stopCh. The engine loop reads it, calls drainCmds, closes done,
-		// and returns — closing the events channel.
 		_ = d.Kill()
-		// Close fb.stopCh to unblock any waitLoop goroutine still blocked
-		// in fb.Wait(). The goroutine will try to send to e.stopCh but
-		// select on e.done and exit cleanly since the loop has exited.
+		// Unblock any waitLoop goroutine still in fb.Wait().
 		if !fb.stopped {
 			close(fb.stopCh)
 			fb.stopped = true
 		}
 	})
 
-	// ── state guards: stateNoProcess ─────────────────────────────────────
 
 	Describe("state guards — stateNoProcess", func() {
 		It("rejects Continue", func() {
@@ -257,7 +210,6 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
-	// ── state guards: stateRunning ────────────────────────────────────────
 
 	Describe("state guards — stateRunning", func() {
 		BeforeEach(func() {
@@ -276,7 +228,6 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
-	// ── Kill ──────────────────────────────────────────────────────────────
 
 	Describe("Kill", func() {
 		It("is a no-op in stateNoProcess", func() {
@@ -291,32 +242,25 @@ var _ = Describe("Engine", func() {
 
 		It("restores breakpoint bytes in memory on kill", func() {
 			const bpAddr = uint64(0x4000)
-			const orig = byte(0x90) // NOP
+			const orig = byte(0x90)
 			fb.seedMem(bpAddr, []byte{orig})
 			debugger.ExportedForceSuspended(d)
 
-			// Write a trap manually (simulating what SetBreakpoint does).
 			trap := debugger.ExportedTrapInstruction()
 			_ = fb.WriteMemory(bpAddr, trap)
 			Expect(fb.peekMem(bpAddr, 1)[0]).To(Equal(trap[0]))
 
-			// Kill should restore the bytes via bps.clearAll.
-			// Since we used WriteMemory directly (not SetBreakpoint), the
-			// breakpoint table is empty and clearAll is a no-op — but at least
-			// Kill must not panic and must return nil.
+			// WriteMemory directly bypasses the BP table, so clearAll is a
+			// no-op — verify Kill at least doesn't panic.
 			Expect(d.Kill()).To(Succeed())
 		})
 
 		It("restores original bytes when a breakpoint is set then killed", func() {
-			// This tests that bps.clearAll runs during Kill.
-			// We set a breakpoint via the engine so it's in the table,
-			// then kill and verify the original byte is back.
 			const bpAddr = uint64(0x5000)
 			const orig = byte(0x55)
 			fb.seedMem(bpAddr, []byte{orig})
 			debugger.ExportedForceSuspended(d)
 
-			// Use ExportedSetBreakpointAt to bypass DWARF lookup.
 			debugger.ExportedSetBreakpointAt(d, bpAddr)
 
 			trap := debugger.ExportedTrapInstruction()
@@ -329,7 +273,6 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
-	// ── arch / platform ───────────────────────────────────────────────────
 
 	Describe("arch trap instruction", func() {
 		It("is INT3 (0xCC) on amd64 or BRK#0 on arm64", func() {
@@ -345,22 +288,19 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
-	// ── breakpoints ───────────────────────────────────────────────────────
 
 	Describe("breakpoints", func() {
 		const (
 			bpAddr   = uint64(0x2000)
-			origByte = byte(0x48) // arbitrary instruction byte
+			origByte = byte(0x48)
 		)
 
 		BeforeEach(func() {
-			fb.seedMem(bpAddr, []byte{origByte, 0x89, 0xC0}) // 3 bytes of space
+			fb.seedMem(bpAddr, []byte{origByte, 0x89, 0xC0})
 			debugger.ExportedForceSuspended(d)
 		})
 
 		It("SetBreakpoint returns an error when no DWARF is loaded", func() {
-			// Engine has no dwarfReader since we never called Launch/Attach
-			// with a binary path.
 			_, err := d.SetBreakpoint("main.go", 10)
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("DWARF"))
@@ -368,7 +308,6 @@ var _ = Describe("Engine", func() {
 
 		It("writes the trap instruction to the breakpoint address", func() {
 			trap := debugger.ExportedTrapInstruction()
-			// Install via the low-level helper that bypasses DWARF.
 			debugger.ExportedSetBreakpointAt(d, bpAddr)
 			Expect(fb.peekMem(bpAddr, len(trap))).To(Equal(trap))
 		})
@@ -376,11 +315,9 @@ var _ = Describe("Engine", func() {
 		It("original bytes are saved and restored on ClearBreakpoint", func() {
 			trap := debugger.ExportedTrapInstruction()
 			id := debugger.ExportedSetBreakpointAt(d, bpAddr)
-			// Trap must be installed.
 			Expect(fb.peekMem(bpAddr, len(trap))).To(Equal(trap))
 
 			Expect(d.ClearBreakpoint(id)).To(Succeed())
-			// Original byte must be restored.
 			Expect(fb.peekMem(bpAddr, 1)[0]).To(Equal(origByte))
 		})
 
@@ -396,7 +333,6 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
-	// ── breakpoint hit event ──────────────────────────────────────────────
 
 	Describe("breakpoint hit event flow", func() {
 		const bpAddr = uint64(0x3000)
@@ -408,7 +344,6 @@ var _ = Describe("Engine", func() {
 		})
 
 		It("emits EventBreakpointHit when a breakpoint stop arrives", func() {
-			// Continue to stateRunning, then deliver a breakpoint stop.
 			Expect(d.Continue()).To(Succeed())
 			fb.pushStop(debugger.StopEvent{
 				Reason: debugger.StopBreakpoint,
@@ -422,36 +357,25 @@ var _ = Describe("Engine", func() {
 			var p protocol.BreakpointHitPayload
 			Expect(protocol.DecodeEventPayload(evt, &p)).To(Succeed())
 			Expect(p.Breakpoint.Location.File).To(Equal("<direct-addr>"))
-			// Frames may be nil when no DWARF is loaded — that is correct behaviour.
-			// We only verify the breakpoint metadata, not the frame list.
 		})
 
 		It("emits nothing (resumes silently) for an unrecognised breakpoint PC", func() {
 			Expect(d.Continue()).To(Succeed())
-			// Push a breakpoint at an address we never installed.
-			// The engine should resume the process silently without emitting
-			// EventBreakpointHit.
 			fb.pushStop(debugger.StopEvent{
 				Reason: debugger.StopBreakpoint,
 				TID:    1,
 				PC:     0x9999,
 			})
-			// Wait briefly and confirm no BreakpointHit arrived.
-			// The engine will call ContinueProcess and start another waitLoop;
-			// AfterEach will close fb.stopCh to unblock that goroutine cleanly.
 			evt, ok := nextEvent(d)
 			if ok {
-				// If any event arrived it must not be a BreakpointHit.
 				Expect(evt.Kind).NotTo(Equal(protocol.EventBreakpointHit))
 			}
 		})
 	})
 
-	// ── process exit ──────────────────────────────────────────────────────
 
 	Describe("process exit", func() {
 		It("emits EventProcessExited with exit code when StopExited arrives", func() {
-			// Use a fresh engine/backend so the outer AfterEach doesn't interfere.
 			fb2 := newFakeBackend()
 			d2 := debugger.NewWithBackend(fb2)
 			defer func() {
@@ -486,18 +410,14 @@ var _ = Describe("Engine", func() {
 
 			debugger.ExportedForceSuspended(d2)
 			Expect(d2.Continue()).To(Succeed())
-			// Closing stopCh causes Wait to return ErrProcessExited,
-			// which makes the engine emit EventProcessExited and exit its loop,
-			// which closes the events channel.
 			fb2.closeStop()
 
-			// Drain until the channel closes.
 			timeout := time.After(2 * time.Second)
 			for {
 				select {
 				case _, ok := <-d2.Events():
 					if !ok {
-						return // channel closed — test passes
+						return
 					}
 				case <-timeout:
 					Fail("events channel was not closed within 2s")
@@ -506,7 +426,6 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
-	// ── stepping ──────────────────────────────────────────────────────────
 
 	Describe("StepInto", func() {
 		BeforeEach(func() {
@@ -515,7 +434,7 @@ var _ = Describe("Engine", func() {
 
 		It("calls SingleStep on the main thread", func() {
 			Expect(d.StepInto()).To(Succeed())
-			Expect(fb.singleStepCalls).To(ConsistOf(1)) // tid 1
+			Expect(fb.singleStepCalls).To(ConsistOf(1))
 		})
 
 		It("emits EventStepped when a StopSingleStep arrives", func() {
@@ -537,9 +456,8 @@ var _ = Describe("Engine", func() {
 		It("puts the engine back into stateSuspended after the step", func() {
 			Expect(d.StepInto()).To(Succeed())
 			fb.pushStop(debugger.StopEvent{Reason: debugger.StopSingleStep, TID: 1})
-			mustNextEvent(d) // consume EventStepped
+			mustNextEvent(d)
 
-			// Engine is now suspended — Continue should succeed.
 			Expect(d.Continue()).To(Succeed())
 		})
 	})
@@ -571,10 +489,8 @@ var _ = Describe("Engine", func() {
 		)
 
 		BeforeEach(func() {
-			// Seed return address at the top of the stack (SP).
 			fb.seedRegs(debugger.Registers{PC: currentPC, SP: currentSP, BP: currentSP + 16})
 			fb.seedMem(currentSP, le8(retAddr))
-			// Seed a byte at the return address so the trap can be installed.
 			fb.seedMem(retAddr, []byte{0x90})
 			debugger.ExportedForceSuspended(d)
 		})
@@ -605,19 +521,17 @@ var _ = Describe("Engine", func() {
 				TID:    1,
 				PC:     retAddr,
 			})
-			mustNextEvent(d) // consume EventStepped
+			mustNextEvent(d)
 
-			// The return address should have its original byte restored.
 			Expect(fb.peekMem(retAddr, 1)[0]).To(Equal(byte(0x90)))
 		})
 
 		It("returns error when SP points to a null return address", func() {
-			fb.seedMem(currentSP, le8(0)) // overwrite with null
+			fb.seedMem(currentSP, le8(0))
 			Expect(d.StepOut()).To(HaveOccurred())
 		})
 	})
 
-	// ── Continue ──────────────────────────────────────────────────────────
 
 	Describe("Continue", func() {
 		BeforeEach(func() {
@@ -632,12 +546,10 @@ var _ = Describe("Engine", func() {
 
 		It("rejects a second Continue without an intervening stop", func() {
 			Expect(d.Continue()).To(Succeed())
-			// Engine is now running — second Continue must fail.
 			Expect(d.Continue()).To(MatchError(debugger.ErrNotSuspended))
 		})
 	})
 
-	// ── StackFrames ───────────────────────────────────────────────────────
 
 	Describe("StackFrames", func() {
 		BeforeEach(func() {
@@ -651,7 +563,6 @@ var _ = Describe("Engine", func() {
 		})
 
 		It("walks the frame pointer chain and returns one frame per PC", func() {
-			// Seed a two-frame chain in memory.
 			const (
 				frame0PC = uint64(0x1000)
 				frame0BP = uint64(0x7ffe0010)
@@ -660,10 +571,8 @@ var _ = Describe("Engine", func() {
 			)
 			seedFrameChain(fb, frame0PC, frame0BP, frame1BP, ret)
 
-			// StackFrames falls back to walkStack even without DWARF.
-			// Without DWARF, FramesForStack is not called, so we get nil.
-			// Verify that with DWARF the chain would produce 2 frames by
-			// checking walkStack indirectly via Goroutines (same code path).
+			// Without DWARF, StackFrames returns nil; verify walkStack via
+			// Goroutines (same code path).
 			gs, err := d.Goroutines()
 			Expect(err).NotTo(HaveOccurred())
 			Expect(gs).To(HaveLen(1))
@@ -671,7 +580,6 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
-	// ── Goroutines ────────────────────────────────────────────────────────
 
 	Describe("Goroutines", func() {
 		BeforeEach(func() {
@@ -687,7 +595,6 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
-	// ── Locals ────────────────────────────────────────────────────────────
 
 	Describe("Locals", func() {
 		BeforeEach(func() {
@@ -702,28 +609,22 @@ var _ = Describe("Engine", func() {
 
 		It("returns an error for a negative frame index", func() {
 			_, err := d.Locals(-1)
-			// Without DWARF, the DWARF error fires first.
 			Expect(err).To(HaveOccurred())
 		})
 
 		It("returns an out-of-range error for a frame index beyond the stack depth", func() {
-			// Seed only one frame (depth 1), ask for frame 5.
 			fb.seedRegs(debugger.Registers{PC: 0x100, SP: 0x1000, BP: 0x1008})
-			fb.seedMem(0x1008, le8(0)) // terminate chain
-			// Without DWARF the DWARF check fires first; test that with DWARF
-			// the engine bounds-checks properly by using the export helper.
+			fb.seedMem(0x1008, le8(0))
 			_, err := d.Locals(5)
 			Expect(err).To(HaveOccurred())
 		})
 	})
 
-	// ── sequence numbers ──────────────────────────────────────────────────
 
 	Describe("event sequence numbers", func() {
 		It("assigns strictly increasing sequence numbers across events", func() {
 			debugger.ExportedForceSuspended(d)
 
-			// Produce three events via three step cycles.
 			var seqs []uint64
 			for i := 0; i < 3; i++ {
 				Expect(d.StepInto()).To(Succeed())
@@ -739,7 +640,6 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
-	// ── concurrent dispatch ───────────────────────────────────────────────
 
 	Describe("concurrent dispatch", func() {
 		It("does not deadlock with many concurrent Kill calls", func() {
@@ -774,7 +674,6 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
-	// ── Events channel ────────────────────────────────────────────────────
 
 	Describe("Events channel", func() {
 		It("is non-nil immediately after construction", func() {

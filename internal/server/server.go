@@ -1,15 +1,5 @@
-// Package server provides the HTTP/WebSocket entry point for bingo. It manages
-// debug sessions and routes WebSocket connections to the appropriate hub.
-//
-// Endpoints:
-//
-//	GET  /api/sessions        — list active sessions
-//	GET  /ws?create           — create a new session and connect
-//	GET  /ws?session={id}     — join an existing session
-//
-// Each session is backed by one Hub and one Debugger (created lazily on
-// Launch/Attach). Sessions are automatically cleaned up when the last client
-// disconnects.
+// Package server provides the HTTP/WebSocket entry point for bingo. See
+// AGENTS.md for the endpoints and session lifecycle.
 package server
 
 import (
@@ -19,11 +9,10 @@ import (
 	"net"
 	"net/http"
 	"time"
-
 )
 
-// Server is the single global bingo server. It owns the HTTP listener, the
-// session store, and the lifecycle of all debug sessions.
+// Server owns the HTTP listener, the session store, and the lifecycle of all
+// debug sessions.
 type Server struct {
 	httpServer *http.Server
 	sessions   *sessionStore
@@ -60,8 +49,7 @@ func New(addr string, log *slog.Logger) *Server {
 	return s
 }
 
-// Start begins listening for connections. It blocks until the server is shut
-// down or a fatal listener error occurs.
+// Start blocks until shutdown or a fatal listener error.
 func (s *Server) Start() error {
 	ln, err := net.Listen("tcp4", s.httpServer.Addr)
 	if err != nil {
@@ -76,11 +64,11 @@ func (s *Server) Start() error {
 	return err
 }
 
-// Shutdown gracefully stops the server: closes the HTTP listener, waits for
-// in-flight requests to drain, and cancels all session contexts.
+// Shutdown closes the HTTP listener, drains in-flight requests, and cancels
+// all session contexts.
 func (s *Server) Shutdown(timeout time.Duration) {
 	s.log.Info("shutting down server")
-	s.cancel() // signal all sessions to stop
+	s.cancel()
 
 	ctx, done := context.WithTimeout(context.Background(), timeout)
 	defer done()

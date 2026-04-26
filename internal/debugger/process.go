@@ -6,8 +6,7 @@ import (
 	"os/exec"
 )
 
-// process tracks the OS handle for the tracee. It is embedded in engine and
-// provides Launch / Attach / Kill with the platform-specific hooks
+// process tracks the OS handle for the tracee, with platform-specific hooks
 // (startTracedProcess, attachToProcess, killProcess) defined per OS.
 type process struct {
 	pid  int
@@ -15,8 +14,6 @@ type process struct {
 	live bool
 }
 
-// launch starts binaryPath under the debugger. On return the tracee is stopped
-// at its first instruction and ready to receive breakpoints.
 func (p *process) launch(binaryPath string, args []string, env []string) error {
 	if p.live {
 		return ErrAlreadyRunning
@@ -35,8 +32,6 @@ func (p *process) launch(binaryPath string, args []string, env []string) error {
 	return nil
 }
 
-// attach connects to an already-running process. On return the tracee is
-// stopped and ready for inspection.
 func (p *process) attach(pid int) error {
 	if p.live {
 		return ErrAlreadyRunning
@@ -50,15 +45,13 @@ func (p *process) attach(pid int) error {
 	return nil
 }
 
-// kill terminates the tracee. Safe to call when !p.live; subsequent calls are
-// no-ops. Ignores the Backend argument (kept for interface symmetry with the
-// engine's Kill path which also calls bps.clearAll).
+// kill terminates the tracee. The Backend argument is unused but kept for
+// interface symmetry with the engine's Kill path which also runs bps.clearAll.
 func (p *process) kill(_ Backend) error {
 	if !p.live {
 		return nil
 	}
 	if p.pid == 0 {
-		// launch/attach never completed successfully; nothing to kill.
 		p.live = false
 		return nil
 	}

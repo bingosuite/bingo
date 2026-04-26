@@ -25,36 +25,18 @@ const (
 	stateExited
 )
 
-// engine implements Debugger.
-//
-// Concurrency model
-// -----------------
-// All state mutations happen inside the event loop goroutine (e.loop).
-// Public methods send a closure to cmdCh and block until it executes.
-//
-// Wait() runs in a dedicated goroutine (waitLoop). Each invocation calls
-// Backend.Wait() once and sends the result to stopCh. A new waitLoop is
-// started each time the process is resumed.
-//
-// Shutdown sequence
-// -----------------
-// When the process exits (StopExited/StopKilled/ErrProcessExited), the loop
-// sets stateExited, drains any pending commands with ErrProcessExited so
-// their callers unblock, then closes stopCh to signal any in-flight waitLoop
-// goroutine that nobody will read its result, and finally returns — which
-// closes the events channel via defer.
-//
-// Kill() dispatches a synthetic StopExited result into stopCh, which causes
-// the loop to set stateExited, call drainCmds, close done, and return.
-// bpResumeAction describes what to do after we finish stepping over a software
-// breakpoint (restore original bytes → single-step → reinstall trap).
+// engine implements Debugger. See AGENTS.md → engine concurrency model and
+// shutdown sequence for the loop / waitLoop / dispatch invariants.
+
+// bpResumeAction is what to do after stepping past a software breakpoint
+// (restore bytes → single-step → reinstall trap → action).
 type bpResumeAction uint8
 
 const (
-	bpResumeContinue    bpResumeAction = iota // call ContinueProcess and keep running
-	bpResumeStep                              // stay suspended and emit EventStepped (machine-instruction level)
-	bpResumeSourceStep                        // set temp BP at next source line then ContinueProcess
-	bpResumeStepOut                           // set return-addr BP then ContinueProcess
+	bpResumeContinue   bpResumeAction = iota // ContinueProcess and keep running
+	bpResumeStep                             // emit EventStepped (machine-instruction)
+	bpResumeSourceStep                       // set temp BP at next source line, then continue
+	bpResumeStepOut                          // set return-addr BP, then continue
 )
 
 type engine struct {
@@ -67,32 +49,27 @@ type engine struct {
 	cmdCh  chan engineCmd
 	stopCh chan stopResult
 
-	// done is closed by the loop when it exits. waitLoop goroutines select
-	// on done so they can abandon the send to stopCh and exit cleanly.
+	// done is closed by the loop on exit; waitLoop selects on it to abandon
+	// pending sends to stopCh.
 	done chan struct{}
 
 	seq   uint64
 	state engineState
 	mu    sync.Mutex
 
-	// Software-breakpoint step-over state.
-	//
-	// When the process stops at a user breakpoint, lastBP is set to that
-	// entry. On the next resume command (Continue/StepOver/StepInto/StepOut)
-	// we restore the original bytes, single-step past the instruction,
-	// reinstall the trap, and then perform bpResumeAction.
-	// steppingOverBP is non-nil while that single-step is in flight.
+	// Software-breakpoint step-over state. lastBP is the BP the process
+	// stopped at; on next resume we restore bytes, single-step, reinstall
+	// the trap, then perform bpResumeAction. steppingOverBP is non-nil
+	// during the in-flight single-step.
 	lastBP         *breakpointEntry
-	lastBPTID      int // TID (Mach thread port on Darwin) of the thread that hit lastBP
+	lastBPTID      int // thread that hit lastBP (Mach port on Darwin)
 	steppingOverBP *breakpointEntry
 	bpResume       bpResumeAction
-	bpRetAddr      uint64 // return address; only used for bpResumeStepOut
+	bpRetAddr      uint64 // bpResumeStepOut only
 
-	// stepOverFile and stepOverLine record the source line that the most
-	// recent <stepover-next> breakpoint was aimed at. sourceStepOver reads
-	// these instead of re-querying DWARF via locationForPC, which can be
-	// unreliable when PC lands exactly at a DWARF line-entry boundary.
-	// Consumed (zeroed) on each sourceStepOver call and on user-BP hits.
+	// Source-line target remembered from the previous step-over. More
+	// reliable than re-querying locationForPC, which can land on a DWARF
+	// boundary with line==0. Zeroed on each sourceStepOver and on user-BP hits.
 	stepOverFile string
 	stepOverLine int
 }
@@ -121,8 +98,6 @@ func newEngine(b Backend) *engine {
 	return e
 }
 
-// ── Debugger interface ────────────────────────────────────────────────────────
-
 func (e *engine) Events() <-chan protocol.Event { return e.events }
 
 func (e *engine) Launch(binaryPath string, args []string, env []string) error {
@@ -132,10 +107,8 @@ func (e *engine) Launch(binaryPath string, args []string, env []string) error {
 		}
 		setPID(e.backend, e.proc.pid)
 		e.loadDWARF(binaryPath)
-		// startTracedProcess already consumed the initial SIGTRAP — the
-		// process is stopped at its first instruction. Set suspended (not
-		// running) and emit a stopped event. No waitLoop: the process is
-		// not running, so there is nothing for Wait4 to report.
+		// startTracedProcess already consumed the initial SIGTRAP. The process
+		// is stopped — no waitLoop needed.
 		e.setState(stateSuspended)
 		e.emitStoppedAtCurrentPC()
 		return nil
@@ -151,8 +124,6 @@ func (e *engine) Attach(pid int, binaryPath string) error {
 		if binaryPath != "" {
 			e.loadDWARF(binaryPath)
 		}
-		// attachToProcess already consumed the post-attach stop — the
-		// process is stopped. No waitLoop needed (same rationale as Launch).
 		e.setState(stateSuspended)
 		e.emitStoppedAtCurrentPC()
 		return nil
@@ -161,7 +132,6 @@ func (e *engine) Attach(pid int, binaryPath string) error {
 
 // Kill terminates the tracee. Safe to call multiple times.
 func (e *engine) Kill() error {
-	// Fast path: if the loop has already exited, nothing to do.
 	select {
 	case <-e.done:
 		return nil
@@ -176,13 +146,10 @@ func (e *engine) Kill() error {
 			return killErr
 		}
 		e.setState(stateExited)
-		// Inject a synthetic StopExited into stopCh so the loop's next
-		// iteration sees stateExited and exits cleanly.
+		// Inject a synthetic StopExited so the loop sees stateExited and exits.
 		select {
 		case e.stopCh <- stopResult{evt: StopEvent{Reason: StopExited}}:
 		default:
-			// stopCh already has a result; the loop will process it and
-			// see stateExited regardless.
 		}
 		return nil
 	})
@@ -337,17 +304,13 @@ func (e *engine) Goroutines() ([]protocol.Goroutine, error) {
 	return goroutines, err
 }
 
-// ── Event loop ────────────────────────────────────────────────────────────────
-
 func (e *engine) loop() {
-	// All ptrace calls (Continue, SingleStep, ReadMemory, WriteMemory, …) are
-	// made from dispatch closures that execute on this goroutine. Pin it to one
-	// OS thread so the kernel always sees the same tracer thread — required on
-	// Linux (ptrace is thread-specific) and avoids scheduler surprises on macOS.
+	// All ptrace calls are made from dispatch closures running on this
+	// goroutine. Pin to one OS thread: ptrace is thread-specific on Linux.
 	runtime.LockOSThread()
 	defer func() {
-		close(e.done)   // signal waitLoop goroutines to abandon pending sends
-		close(e.events) // signal hub that no more events are coming
+		close(e.done)
+		close(e.events)
 	}()
 
 	for {
@@ -374,21 +337,15 @@ func (e *engine) loop() {
 	}
 }
 
-// waitLoop calls Backend.Wait() once and sends the result to stopCh.
-// It selects on e.done so that if the engine loop has already exited
-// (e.g. Kill was called), the goroutine exits cleanly without blocking.
 func (e *engine) waitLoop() {
-	// Lock to an OS thread for the duration of the wait4 call. On some
-	// platforms wait4 has per-thread semantics; locking also ensures the
-	// goroutine is not rescheduled onto a thread that has unrelated ptrace
-	// state while the syscall is in progress.
+	// Lock to an OS thread: wait4 has per-thread semantics on some platforms
+	// and we don't want a thread carrying unrelated ptrace state.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	evt, err := e.backend.Wait()
 	select {
 	case e.stopCh <- stopResult{evt: evt, err: err}:
 	case <-e.done:
-		// Engine loop has exited — discard the result and exit cleanly.
 	}
 }
 
@@ -396,7 +353,7 @@ func (e *engine) handleStop(stop StopEvent) {
 	switch stop.Reason {
 	case StopExited:
 		if e.getState() == stateExited {
-			return // already exited (e.g. from Kill's synthetic stop)
+			return
 		}
 		e.setState(stateExited)
 		e.emitProcessExited(stop.ExitCode)
@@ -415,12 +372,10 @@ func (e *engine) handleStop(stop StopEvent) {
 			"found", bp != nil,
 			"steppingOverBP", e.steppingOverBP != nil)
 		if bp == nil {
-			// Spurious SIGTRAP — a BRK we did not install (e.g. Go runtime
-			// internal breakpoint or system library assertion).
-			// On ARM64, BRK traps with PC pointing AT the BRK instruction.
-			// Calling ContinueProcess with signal=0 leaves PC unchanged and the
-			// CPU re-executes the BRK immediately — infinite trap loop.
-			// Advance PC past the 4-byte BRK before resuming.
+			// Spurious SIGTRAP — a BRK we did not install (Go runtime
+			// internal trap or libc assertion). On ARM64 PC points AT the
+			// BRK; ContinueProcess with signal=0 leaves PC unchanged and
+			// re-executes the trap forever. Advance PC past the 4-byte BRK.
 			slog.Warn("spurious SIGTRAP — advancing PC past BRK and resuming",
 				"pc", fmt.Sprintf("0x%x", stop.PC))
 			if regs, err := e.backend.GetRegisters(stop.TID); err == nil {
@@ -456,12 +411,10 @@ func (e *engine) handleStop(stop StopEvent) {
 		slog.Debug("StopSingleStep", "pc", fmt.Sprintf("0x%x", stop.PC),
 			"steppingOverBP", e.steppingOverBP != nil)
 		if sob := e.steppingOverBP; sob != nil {
-			// Finished stepping over the breakpoint instruction — reinstall it.
 			e.steppingOverBP = nil
 			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
-				// BP could not be reinstalled (WriteMemory failed). Do NOT resume —
-				// that would run the process indefinitely with no trap to stop it.
-				// Suspend and report the error so the client knows what happened.
+				// Reinstall failed. Suspend instead of resuming — running
+				// without the trap would let the process loose.
 				slog.Error("breakpoint reinstall failed — suspending to prevent runaway process",
 					"addr", fmt.Sprintf("0x%x", sob.addr), "err", rerr)
 				e.setState(stateSuspended)
@@ -478,11 +431,9 @@ func (e *engine) handleStop(stop StopEvent) {
 				e.setState(stateSuspended)
 				e.emitStepped(stop)
 			case bpResumeSourceStep:
-				// BP step-over complete. Set a temp BP at the next source line and continue.
-				// Use sob.file/sob.line (the BP's known location) rather than a DWARF
-				// lookup from stop.PC: stop.PC is one instruction past the BP and may
-				// land on a DWARF entry with line == 0, causing NextLinePC to pick the
-				// wrong address.
+				// Use sob.file/sob.line (the BP's known location) rather than
+				// a DWARF lookup from stop.PC: stop.PC is one instruction past
+				// the BP and can land on a DWARF entry with line==0.
 				if e.dw != nil && sob.file != "" && sob.line > 0 {
 					if nextPC, nextLine, ok := e.dw.NextLinePC(sob.file, sob.line); ok {
 						slog.Debug("sourceStepOver: setting <stepover-next>",
@@ -510,7 +461,6 @@ func (e *engine) handleStop(stop StopEvent) {
 							"file", sob.file, "line", sob.line)
 					}
 				}
-				// Fallback: emit Stepped at current position.
 				slog.Debug("sourceStepOver fallback: emitting Stepped")
 				e.setState(stateSuspended)
 				e.emitStepped(stop)
@@ -530,8 +480,7 @@ func (e *engine) handleStop(stop StopEvent) {
 		e.emitStepped(stop)
 
 	case StopSignal:
-		// If a step-over was in progress, its breakpoint has been removed from
-		// the table. Reinstall it before resuming so we don't lose the BP.
+		// Reinstall any in-flight step-over BP before resuming.
 		if sob := e.steppingOverBP; sob != nil {
 			e.steppingOverBP = nil
 			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
@@ -547,8 +496,8 @@ func (e *engine) handleStop(stop StopEvent) {
 	}
 }
 
-// drainCmds answers any queued commands with ErrProcessExited so that
-// any goroutine blocked in dispatch() unblocks immediately.
+// drainCmds answers queued commands with ErrProcessExited so blocked dispatchers
+// unblock immediately.
 func (e *engine) drainCmds() {
 	for {
 		select {
@@ -560,8 +509,6 @@ func (e *engine) drainCmds() {
 	}
 }
 
-// ── Stepping ──────────────────────────────────────────────────────────────────
-
 func (e *engine) stepOver() error {
 	if e.lastBP != nil {
 		return e.resumeFromBreakpoint(bpResumeSourceStep, 0)
@@ -569,21 +516,18 @@ func (e *engine) stepOver() error {
 	return e.sourceStepOver()
 }
 
-// sourceStepOver sets a temporary breakpoint at the first instruction of the
-// next source line and resumes. Falls back to a machine-instruction single-step
-// if the next line cannot be determined from DWARF.
+// sourceStepOver sets a temp BP at the next source line and resumes. Falls
+// back to a single machine-instruction step when DWARF can't resolve a target.
 func (e *engine) sourceStepOver() error {
 	if e.dw != nil {
-		// Prefer the remembered destination from the previous step-over; it is
-		// more reliable than re-querying locationForPC at the current PC, which
-		// may land on a DWARF boundary and return the wrong line.
+		// Prefer the remembered destination from the previous step-over over
+		// re-querying locationForPC, which can land on a DWARF boundary.
 		file := e.stepOverFile
 		line := e.stepOverLine
 		e.stepOverFile = ""
 		e.stepOverLine = 0
 
 		if file == "" || line == 0 {
-			// No remembered target — look up from current PC.
 			threads, err := e.backend.Threads()
 			if err == nil && len(threads) > 0 {
 				if regs, err := e.backend.GetRegisters(threads[0]); err == nil {
@@ -615,7 +559,6 @@ func (e *engine) sourceStepOver() error {
 			}
 		}
 	}
-	// Fallback: machine-instruction single-step.
 	threads, err := e.backend.Threads()
 	if err != nil || len(threads) == 0 {
 		return fmt.Errorf("StepOver: no threads")
@@ -660,9 +603,9 @@ func (e *engine) stepOut() error {
 	return nil
 }
 
-// resumeFromBreakpoint handles the step-over sequence for software breakpoints:
-// restore original bytes → single-step past the instruction → reinstall trap
-// (done in handleStop's StopSingleStep case) → then perform action.
+// resumeFromBreakpoint runs the step-over-software-BP sequence:
+// restore bytes → single-step → reinstall trap (in StopSingleStep handler)
+// → perform action.
 func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) error {
 	bp := e.lastBP
 	e.lastBP = nil
@@ -670,18 +613,15 @@ func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) err
 	e.bpResume = action
 	e.bpRetAddr = retAddr
 
-	// Temporarily remove from the table and restore original bytes so the
-	// single-step executes the real instruction, not the trap.
 	e.bps.removeFromTable(bp)
 	if err := e.backend.WriteMemory(bp.addr, bp.originalBytes); err != nil {
-		e.bps.addToTable(bp) // roll back
+		e.bps.addToTable(bp)
 		e.steppingOverBP = nil
 		return fmt.Errorf("resume BP: restore bytes: %w", err)
 	}
 
-	// Use the TID of the thread that hit the breakpoint. On Darwin, task_threads
-	// returns threads in creation order; blindly using threads[0] often picks an
-	// idle Go runtime M instead of the goroutine running user code.
+	// Use the TID that hit the breakpoint. On Darwin task_threads returns
+	// threads in creation order, so threads[0] is often an idle Go runtime M.
 	tid := e.lastBPTID
 	if tid == 0 {
 		threads, err := e.backend.Threads()
@@ -704,8 +644,6 @@ func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) err
 	go e.waitLoop()
 	return nil
 }
-
-// ── Stack walking ─────────────────────────────────────────────────────────────
 
 func (e *engine) collectFrames() ([]protocol.Frame, error) {
 	if e.dw == nil {
@@ -740,8 +678,6 @@ func (e *engine) walkStack(regs Registers) []uint64 {
 	return pcs
 }
 
-// ── Goroutines ────────────────────────────────────────────────────────────────
-
 func (e *engine) readGoroutines() ([]protocol.Goroutine, error) {
 	threads, err := e.backend.Threads()
 	if err != nil || len(threads) == 0 {
@@ -762,8 +698,6 @@ func (e *engine) readGoroutines() ([]protocol.Goroutine, error) {
 	}}, nil
 }
 
-// ── DWARF loading ─────────────────────────────────────────────────────────────
-
 func (e *engine) loadDWARF(binaryPath string) {
 	dr, err := openDWARF(binaryPath)
 	if err != nil {
@@ -771,14 +705,12 @@ func (e *engine) loadDWARF(binaryPath string) {
 		return
 	}
 	// On platforms that support ASLR (Darwin ARM64), ask the backend for the
-	// slide so DWARF addresses can be adjusted to match the actual load address.
+	// slide so DWARF addresses match the actual load address.
 	if sg, ok := e.backend.(interface{ TextSlide(string) int64 }); ok {
 		dr.slide = sg.TextSlide(binaryPath)
 	}
 	e.dw = dr
 }
-
-// ── Emission ──────────────────────────────────────────────────────────────────
 
 func (e *engine) nextSeq() uint64 {
 	e.mu.Lock()
@@ -813,10 +745,9 @@ func (e *engine) emitBreakpointHit(bp *breakpointEntry, stop StopEvent) {
 	})
 }
 
-// emitStoppedAtCurrentPC reads the current PC and emits an EventStepped so
-// clients know where the process is stopped (used after Launch/Attach).
-// Always emits even if registers cannot be read — the hub must receive a
-// suspending event or it loses track of state and drops resume commands.
+// emitStoppedAtCurrentPC emits EventStepped at the current PC (used after
+// Launch/Attach). Always emits even on register-read failure: the hub needs
+// a suspending event or it loses track of state and drops resume commands.
 func (e *engine) emitStoppedAtCurrentPC() {
 	stop := StopEvent{}
 	threads, err := e.backend.Threads()
@@ -858,8 +789,6 @@ func (e *engine) emitError(cmd protocol.CommandKind, err error) {
 	e.emit(protocol.EventError, protocol.ErrorPayload{Command: cmd, Message: err.Error()})
 }
 
-// ── State ─────────────────────────────────────────────────────────────────────
-
 func (e *engine) setState(s engineState) {
 	e.mu.Lock()
 	e.state = s
@@ -879,13 +808,10 @@ func (e *engine) requireSuspended() error {
 	return nil
 }
 
-// ── Dispatch ──────────────────────────────────────────────────────────────────
-
+// dispatch sends fn to the loop and waits for its result. Returns
+// ErrProcessExited if the loop has already exited.
 func (e *engine) dispatch(fn func() error) error {
 	ch := make(chan error, 1)
-	// Select on both cmdCh and done. If the engine loop has already exited
-	// (done is closed), return ErrProcessExited immediately rather than
-	// blocking forever or panicking on a send to a closed channel.
 	select {
 	case e.cmdCh <- engineCmd{fn: fn, err: ch}:
 	case <-e.done:

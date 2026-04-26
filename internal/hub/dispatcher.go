@@ -7,20 +7,17 @@ import (
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
-// dispatchResult carries the optional confirmation event produced by a command
-// alongside any error.  Most commands produce no event (the debugger emits one
-// asynchronously on its Events() channel); the ones below produce a result
-// synchronously and need the hub to broadcast it immediately.
+// dispatchResult carries an optional confirmation event the hub should
+// broadcast immediately. Most commands produce no event — the debugger emits
+// one asynchronously on its Events channel.
 type dispatchResult struct {
-	event *protocol.Event // nil if no immediate event to broadcast
+	event *protocol.Event
 }
 
-// dispatch translates cmd into a debugger call and returns a result that the
-// hub should broadcast, plus any error.
+// dispatch translates cmd into a debugger call and returns the immediate
+// confirmation event (if any) plus any error.
 func dispatch(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, error) {
 	switch cmd.Kind {
-
-	// ── Process lifecycle ─────────────────────────────────────────────────
 
 	case protocol.CmdLaunch:
 		var p protocol.LaunchPayload
@@ -38,8 +35,6 @@ func dispatch(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, erro
 
 	case protocol.CmdKill:
 		return dispatchResult{}, dbg.Kill()
-
-	// ── Breakpoints ───────────────────────────────────────────────────────
 
 	case protocol.CmdSetBreakpoint:
 		var p protocol.SetBreakpointPayload
@@ -74,25 +69,16 @@ func dispatch(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, erro
 		}
 		return dispatchResult{event: &evt}, nil
 
-	// ── Execution control ─────────────────────────────────────────────────
-	// These don't produce an immediate event; the debugger emits
-	// EventContinued / EventStepped asynchronously via Events().
-
+	// Execution control: no immediate event. The debugger emits Stepped /
+	// Continued asynchronously.
 	case protocol.CmdContinue:
 		return dispatchResult{}, dbg.Continue()
-
 	case protocol.CmdStepOver:
 		return dispatchResult{}, dbg.StepOver()
-
 	case protocol.CmdStepInto:
 		return dispatchResult{}, dbg.StepInto()
-
 	case protocol.CmdStepOut:
 		return dispatchResult{}, dbg.StepOut()
-
-	// ── Inspection ────────────────────────────────────────────────────────
-	// These are synchronous request/response: call the debugger and
-	// immediately broadcast the result as an event.
 
 	case protocol.CmdLocals:
 		var p protocol.LocalsPayloadCmd

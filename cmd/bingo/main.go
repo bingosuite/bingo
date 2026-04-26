@@ -1,10 +1,6 @@
 // Command bingo starts the bingo debug server.
 //
-// Usage:
-//
-//	bingo [flags]
-//	  -addr string    listen address (default ":6060")
-//	  -v              verbose logging (debug level)
+//	bingo [-addr host:port] [-v]
 package main
 
 import (
@@ -23,7 +19,6 @@ func main() {
 	verbose := flag.Bool("v", false, "enable verbose (debug) logging")
 	flag.Parse()
 
-	// Set up structured logging.
 	level := slog.LevelInfo
 	if *verbose {
 		level = slog.LevelDebug
@@ -34,7 +29,6 @@ func main() {
 
 	srv := server.New(*addr, log)
 
-	// Listen for interrupt/term signals for graceful shutdown.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 

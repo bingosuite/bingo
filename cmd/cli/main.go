@@ -1,10 +1,6 @@
 // Command cli is an interactive terminal client for the bingo debug server.
 //
-// Usage:
-//
-//	cli [flags]
-//	  -addr string    server address (default "localhost:6060")
-//	  -session string session ID to join (omit to create a new session)
+//	cli [-addr host:port] [-session id]
 package main
 
 import (
@@ -25,7 +21,6 @@ func main() {
 	sessionID := flag.String("session", "", "session ID to join (omit to create)")
 	flag.Parse()
 
-	// Connect to the server.
 	var c client.Client
 	var err error
 
@@ -44,10 +39,8 @@ func main() {
 
 	fmt.Printf("connected — session %s (state: %s)\n\n", c.SessionID(), c.State())
 
-	// Start a goroutine that prints incoming events.
 	go eventPrinter(c.Events())
 
-	// Configure readline with history support
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:          "bingo> ",
 		HistoryFile:     os.ExpandEnv("$HOME/.bingo_history"),
@@ -60,7 +53,6 @@ func main() {
 	}
 	defer rl.Close()
 
-	// Interactive command loop.
 	printHelp()
 	for {
 		line, err := rl.Readline()
@@ -82,7 +74,6 @@ func main() {
 
 		switch cmd {
 
-		// ── Session ──────────────────────────────────────────────────────
 
 		case "sessions", "ls":
 			sessions, err := client.ListSessions(*addr)
@@ -102,7 +93,6 @@ func main() {
 		case "state":
 			fmt.Printf("  session=%s  state=%s\n", c.SessionID(), c.State())
 
-		// ── Process lifecycle ────────────────────────────────────────────
 
 		case "launch":
 			if len(args) < 2 {
@@ -140,7 +130,6 @@ func main() {
 				printErr(err)
 			}
 
-		// ── Execution control ────────────────────────────────────────────
 
 		case "c", "continue":
 			if err := c.Continue(); err != nil {
@@ -162,7 +151,6 @@ func main() {
 				printErr(err)
 			}
 
-		// ── Breakpoints ──────────────────────────────────────────────────
 
 		case "b", "break":
 			if len(args) < 2 {
@@ -198,7 +186,6 @@ func main() {
 			}
 			fmt.Printf("  breakpoint %d cleared\n", id)
 
-		// ── Inspection ───────────────────────────────────────────────────
 
 		case "locals":
 			frame := 0
@@ -244,7 +231,6 @@ func main() {
 				}
 			}
 
-		// ── Meta ─────────────────────────────────────────────────────────
 
 		case "help", "h", "?":
 			printHelp()
@@ -259,9 +245,6 @@ func main() {
 	}
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-// eventPrinter drains the events channel and prints each event to stdout.
 func eventPrinter(events <-chan protocol.Event) {
 	for evt := range events {
 		switch evt.Kind {
@@ -319,7 +302,6 @@ func eventPrinter(events <-chan protocol.Event) {
 	}
 }
 
-// parseFileLine splits "file.go:42" into ("file.go", 42).
 func parseFileLine(s string) (string, int, bool) {
 	idx := strings.LastIndex(s, ":")
 	if idx < 0 || idx == len(s)-1 {

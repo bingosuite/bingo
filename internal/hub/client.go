@@ -15,8 +15,8 @@ const (
 	maxMessageSize = 64 * 1024
 )
 
-// WSConn is the subset of a WebSocket connection the Client needs.
-// Abstracting it lets tests inject a fake without importing a WS library.
+// WSConn is the subset of a WebSocket connection the Client needs. Abstracted
+// so tests can inject a fake without importing a WS library.
 type WSConn interface {
 	ReadMessage() (messageType int, p []byte, err error)
 	WriteMessage(messageType int, data []byte) error
@@ -27,7 +27,7 @@ type WSConn interface {
 	Close() error
 }
 
-// WebSocket message type constants matching gorilla/websocket values.
+// WebSocket message types matching gorilla/websocket values.
 const (
 	TextMessage  = 1
 	CloseMessage = 8
@@ -41,9 +41,8 @@ type Client struct {
 	hub  *Hub
 	log  *slog.Logger
 
-	// send is the buffered outbound message queue for this client.
-	// It is closed exactly once — either by the registry on shutdown, or by
-	// deliver() when the buffer overflows. closeOnce guards the close.
+	// send is closed exactly once — by the registry on shutdown, or by
+	// deliver() on buffer overflow. closeOnce guards the close.
 	send      chan []byte
 	closeOnce sync.Once
 }
@@ -60,14 +59,12 @@ func newClient(conn WSConn, h *Hub, log *slog.Logger) *Client {
 	}
 }
 
-// closeSend closes c.send exactly once. Subsequent calls are no-ops.
 func (c *Client) closeSend() {
 	c.closeOnce.Do(func() { close(c.send) })
 }
 
-// writePump serialises outbound messages onto the WebSocket.
-// Exactly one goroutine per client; it exits when c.send is closed or a
-// write error occurs.
+// writePump serialises outbound messages onto the WebSocket. One goroutine
+// per client; exits when c.send is closed or a write fails.
 func (c *Client) writePump() {
 	ticker := time.NewTicker(pingInterval)
 	defer func() {
@@ -80,7 +77,6 @@ func (c *Client) writePump() {
 		case msg, ok := <-c.send:
 			_ = c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 			if !ok {
-				// send was closed — send a WebSocket close frame and exit.
 				_ = c.conn.WriteMessage(CloseMessage, []byte{})
 				return
 			}
@@ -98,9 +94,8 @@ func (c *Client) writePump() {
 	}
 }
 
-// readPump reads inbound messages from the WebSocket and routes them to the
-// hub. Exactly one goroutine per client; when it returns the client is
-// considered disconnected and the hub is notified.
+// readPump reads inbound messages and routes them to the hub. One goroutine
+// per client; on return the client is considered disconnected.
 func (c *Client) readPump() {
 	defer func() {
 		c.hub.removeClient(c)
@@ -131,9 +126,8 @@ func (c *Client) readPump() {
 	}
 }
 
-// deliver queues msg for writing to this client.
-// Non-blocking: if the send buffer is full the client is too slow — it is
-// evicted (its send channel closed) so one slow client can't stall the hub.
+// deliver queues msg. Non-blocking: if the buffer is full the client is
+// evicted so one slow client can't stall the hub.
 func (c *Client) deliver(msg []byte) {
 	select {
 	case c.send <- msg:
@@ -144,7 +138,6 @@ func (c *Client) deliver(msg []byte) {
 	}
 }
 
-// isNormalClose returns true for errors that indicate a clean WebSocket close.
 func isNormalClose(err error) bool {
 	if err == nil {
 		return true
