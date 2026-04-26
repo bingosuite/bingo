@@ -6,24 +6,17 @@ import (
 )
 
 var _ = Describe("Example Integration Test", func() {
-	BeforeEach(func() {
-		// Setup before each test
-	})
+	BeforeEach(func() {})
 
-	AfterEach(func() {
-		// Cleanup after each test
-	})
+	AfterEach(func() {})
 
 	Context("when testing a feature", func() {
 		It("should work as expected", func() {
-			// Your test code here
 			Expect(true).To(BeTrue())
 		})
 
 		It("should handle edge cases", func() {
-			// Another test case
 			Expect(1 + 1).To(Equal(2))
-
 		})
 	})
 })

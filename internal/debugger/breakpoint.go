@@ -8,17 +8,14 @@ import (
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
-// errBreakpointExists is the sentinel returned by breakpointTable.set when a
-// breakpoint is already installed at the requested address.
 var errBreakpointExists = errors.New("breakpoint already installed at address")
 
-// breakpointEntry holds everything we need to manage one patched instruction.
 type breakpointEntry struct {
 	id            int
 	addr          uint64
 	file          string
 	line          int
-	originalBytes []byte // instruction bytes overwritten by the trap instruction
+	originalBytes []byte
 	enabled       bool
 }
 
@@ -33,8 +30,8 @@ func (b *breakpointEntry) toProtocol() protocol.Breakpoint {
 	}
 }
 
-// breakpointTable owns the installed breakpoints for one debug session.
-// It is not concurrency-safe; the engine's event loop serialises all access.
+// breakpointTable owns installed breakpoints for one debug session.
+// Not concurrency-safe: the engine's event loop serialises all access.
 type breakpointTable struct {
 	byID   map[int]*breakpointEntry
 	byAddr map[uint64]*breakpointEntry
@@ -48,9 +45,8 @@ func newBreakpointTable() *breakpointTable {
 	}
 }
 
-// set writes the arch trap instruction at addr in the tracee, saves the
-// overwritten bytes, and records the entry. Returns errBreakpointExists
-// (wrapped) if a breakpoint is already at that address.
+// set patches addr with the trap instruction, saves the overwritten bytes,
+// and records the entry. Returns errBreakpointExists if already installed.
 func (t *breakpointTable) set(b Backend, file string, line int, addr uint64) (*breakpointEntry, error) {
 	if _, exists := t.byAddr[addr]; exists {
 		return nil, fmt.Errorf("%w: 0x%x (%s:%d)", errBreakpointExists, addr, file, line)
@@ -80,7 +76,6 @@ func (t *breakpointTable) set(b Backend, file string, line int, addr uint64) (*b
 	return entry, nil
 }
 
-// clear restores the original instruction bytes and removes the entry.
 func (t *breakpointTable) clear(b Backend, id int) error {
 	entry, ok := t.byID[id]
 	if !ok {
@@ -94,12 +89,10 @@ func (t *breakpointTable) clear(b Backend, id int) error {
 	return nil
 }
 
-// atAddr returns the entry for the given address, or nil if none exists.
 func (t *breakpointTable) atAddr(addr uint64) *breakpointEntry {
 	return t.byAddr[addr]
 }
 
-// all returns protocol representations of all current breakpoints.
 func (t *breakpointTable) all() []protocol.Breakpoint {
 	out := make([]protocol.Breakpoint, 0, len(t.byID))
 	for _, e := range t.byID {
@@ -108,22 +101,18 @@ func (t *breakpointTable) all() []protocol.Breakpoint {
 	return out
 }
 
-// removeFromTable removes an entry from the index maps without touching tracee
-// memory. Used during the step-over sequence when we need the entry to survive.
+// removeFromTable / addToTable / reinstall: used by the step-over sequence to
+// keep the entry alive across a single-step. See AGENTS.md → step-over flow.
 func (t *breakpointTable) removeFromTable(entry *breakpointEntry) {
 	delete(t.byID, entry.id)
 	delete(t.byAddr, entry.addr)
 }
 
-// addToTable inserts an entry back into the index maps without touching tracee
-// memory.
 func (t *breakpointTable) addToTable(entry *breakpointEntry) {
 	t.byID[entry.id] = entry
 	t.byAddr[entry.addr] = entry
 }
 
-// reinstall writes the trap instruction back and re-registers the entry.
-// Called after a step-over single-step has completed.
 func (t *breakpointTable) reinstall(b Backend, entry *breakpointEntry) error {
 	trap := archTrapInstruction()
 	if err := b.WriteMemory(entry.addr, trap); err != nil {
@@ -133,8 +122,8 @@ func (t *breakpointTable) reinstall(b Backend, entry *breakpointEntry) error {
 	return nil
 }
 
-// clearAll is a best-effort restore of all breakpoints, used during Kill.
-// Continues on individual errors so a single bad write doesn't block shutdown.
+// clearAll best-effort restores all breakpoints during Kill; ignores per-entry
+// failures so a bad write doesn't block shutdown.
 func (t *breakpointTable) clearAll(b Backend) {
 	for id := range t.byID {
 		_ = t.clear(b, id)

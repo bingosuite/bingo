@@ -13,19 +13,15 @@ import (
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
-// dwarfReader wraps *dwarf.Data and provides the three operations the engine
-// needs: PC-for-file:line lookup, PC-to-location mapping, and local variable
-// reading.
+// dwarfReader wraps *dwarf.Data with the operations the engine needs:
+// PC-for-file:line lookup, PC-to-location mapping, and local variable reading.
 //
 // slide is the ASLR offset: actual_runtime_addr = dwarf_addr + slide.
-// It is zero on platforms without ASLR or when the binary has no slide.
 type dwarfReader struct {
 	data  *dwarf.Data
 	slide int64
 }
 
-// openDWARF loads DWARF information from binaryPath using the OS-appropriate
-// container format.
 func openDWARF(binaryPath string) (*dwarfReader, error) {
 	data, err := loadDWARFData(binaryPath)
 	if err != nil {
@@ -57,11 +53,8 @@ func loadDWARFData(binaryPath string) (*dwarf.Data, error) {
 	}
 }
 
-// ── PC for file:line ──────────────────────────────────────────────────────────
-
-// PCForFileLine returns the lowest address that corresponds to an is-stmt line
-// entry for file:line. The file comparison is suffix-based so short names like
-// "main.go" match absolute paths embedded in DWARF.
+// PCForFileLine returns the lowest is-stmt address for file:line. The file
+// comparison is suffix-based so short names match absolute paths in DWARF.
 func (r *dwarfReader) PCForFileLine(file string, line int) (uint64, error) {
 	rd := r.data.Reader()
 	for {
@@ -97,14 +90,8 @@ func (r *dwarfReader) PCForFileLine(file string, line int) (uint64, error) {
 	return 0, fmt.Errorf("no address for %s:%d", file, line)
 }
 
-// NextLinePC returns the lowest runtime address of the first is-stmt entry in
-// file whose line number is strictly greater than afterLine. Used by StepOver
-// to find where to place a temporary breakpoint.
-// Returns (0, false) if no such entry exists (e.g. last line of file).
-// NextLinePC returns the lowest runtime address of the first is-stmt entry in
-// file whose line number is strictly greater than afterLine. Also returns the
-// line number itself, so callers can chain calls without re-querying DWARF.
-// Returns (0, 0, false) if no such entry exists (e.g. last line of file).
+// NextLinePC returns the runtime address and line number of the first is-stmt
+// entry in file with line > afterLine. (0, 0, false) if none exists.
 func (r *dwarfReader) NextLinePC(file string, afterLine int) (uint64, int, bool) {
 	bestLine := -1
 	bestAddr := uint64(^uint64(0))
@@ -146,16 +133,11 @@ func (r *dwarfReader) NextLinePC(file string, afterLine int) (uint64, int, bool)
 	return uint64(int64(bestAddr) + r.slide), bestLine, true
 }
 
-// fileMatches reports whether candidate matches target using suffix comparison.
 func fileMatches(candidate, target string) bool {
 	return candidate == target || strings.HasSuffix(candidate, "/"+target)
 }
 
-// ── Location resolution ───────────────────────────────────────────────────────
-
-// locationForPC resolves pc to a source location and function name.
-// pc is the actual runtime address; the slide is subtracted internally before
-// comparing against DWARF addresses.
+// locationForPC resolves pc (runtime address) to a source location.
 func (r *dwarfReader) locationForPC(pc uint64) protocol.Location {
 	loc := protocol.Location{Function: r.functionAt(pc)}
 	dwarfPC := uint64(int64(pc) - r.slide)
@@ -170,8 +152,7 @@ func (r *dwarfReader) locationForPC(pc uint64) protocol.Location {
 			continue
 		}
 
-		// Check whether this CU's address range contains dwarfPC before reading
-		// the full line table — avoids scanning every CU for every lookup.
+		// Skip CUs whose range can't contain dwarfPC, before reading line tables.
 		if !cuContainsPC(entry, dwarfPC) {
 			rd.SkipChildren()
 			continue
@@ -182,8 +163,7 @@ func (r *dwarfReader) locationForPC(pc uint64) protocol.Location {
 			continue
 		}
 
-		// Walk the line table and keep the entry whose address is the
-		// greatest value <= dwarfPC.
+		// Keep the entry whose address is the greatest <= dwarfPC.
 		var best dwarf.LineEntry
 		var found bool
 		var le dwarf.LineEntry
@@ -207,14 +187,12 @@ func (r *dwarfReader) locationForPC(pc uint64) protocol.Location {
 	return loc
 }
 
-// cuContainsPC checks whether a compile-unit entry's address range includes pc.
-// A CU may declare its range via DW_AT_low_pc + DW_AT_high_pc, or via
-// DW_AT_ranges. If no range attributes are present we conservatively return
-// true so the caller falls through to the full line-table scan.
+// cuContainsPC checks whether a CU's address range includes pc. Returns true
+// when the CU has no range info, so the caller falls through to a full scan.
 func cuContainsPC(entry *dwarf.Entry, pc uint64) bool {
 	lowpc, hasLow := entry.Val(dwarf.AttrLowpc).(uint64)
 	if !hasLow {
-		return true // no range info — caller must scan
+		return true
 	}
 	highpc, high := highPCValue(entry, lowpc)
 	if !high {
@@ -223,10 +201,7 @@ func cuContainsPC(entry *dwarf.Entry, pc uint64) bool {
 	return pc >= lowpc && pc < highpc
 }
 
-// ── Function lookup ───────────────────────────────────────────────────────────
-
-// functionAt returns the name of the function that contains pc, or "".
-// pc is the actual runtime address; the slide is subtracted internally.
+// functionAt returns the function name containing pc (runtime address), or "".
 func (r *dwarfReader) functionAt(pc uint64) string {
 	dwarfPC := uint64(int64(pc) - r.slide)
 	rd := r.data.Reader()
@@ -255,12 +230,8 @@ func (r *dwarfReader) functionAt(pc uint64) string {
 	return ""
 }
 
-// highPCValue extracts the absolute high-PC value from a DWARF entry.
-// DW_AT_high_pc can be stored as:
-//   - uint64: an absolute address (DWARF v2)
-//   - int64:  an offset from low_pc (DWARF v4+)
-//
-// Returns (value, true) on success.
+// highPCValue extracts DW_AT_high_pc as an absolute address. The attribute may
+// be uint64 (DWARF v2 absolute) or int64 (v4+ offset from low_pc).
 func highPCValue(entry *dwarf.Entry, lowpc uint64) (uint64, bool) {
 	v := entry.Val(dwarf.AttrHighpc)
 	if v == nil {
@@ -275,10 +246,7 @@ func highPCValue(entry *dwarf.Entry, lowpc uint64) (uint64, bool) {
 	return 0, false
 }
 
-// ── Stack frames ──────────────────────────────────────────────────────────────
-
-// FramesForStack resolves a slice of raw PCs (from the frame-pointer walk in
-// engine.go) to protocol.Frame values with source locations.
+// FramesForStack resolves PCs (from the frame-pointer walk) to source frames.
 func (r *dwarfReader) FramesForStack(pcs []uint64) []protocol.Frame {
 	frames := make([]protocol.Frame, len(pcs))
 	for i, pc := range pcs {
@@ -290,16 +258,9 @@ func (r *dwarfReader) FramesForStack(pcs []uint64) []protocol.Frame {
 	return frames
 }
 
-// ── Local variables ───────────────────────────────────────────────────────────
-
-// LocalsForFrame returns the variables declared in the innermost subprogram
-// that contains pc. Values are read from tracee memory via b.
-//
-// Only the two most common DWARF location expression forms are evaluated:
-//   - DW_OP_addr  (0x03): absolute memory address
-//   - DW_OP_fbreg (0x91): signed LEB128 offset from frameBase (the BP register)
-//
-// Register-allocated variables are reported as "<optimized out>".
+// LocalsForFrame returns variables in the subprogram containing pc. Only
+// DW_OP_addr (0x03) and DW_OP_fbreg (0x91) are evaluated; register-allocated
+// variables come back as "<optimized out>".
 func (r *dwarfReader) LocalsForFrame(b Backend, pc, frameBase uint64) ([]protocol.Variable, error) {
 	dwarfPC := uint64(int64(pc) - r.slide)
 	rd := r.data.Reader()
@@ -326,7 +287,6 @@ func (r *dwarfReader) LocalsForFrame(b Backend, pc, frameBase uint64) ([]protoco
 			continue
 		}
 
-		// pc falls inside this subprogram — collect its variable children.
 		var vars []protocol.Variable
 		for {
 			child, err := rd.Next()
@@ -336,7 +296,7 @@ func (r *dwarfReader) LocalsForFrame(b Backend, pc, frameBase uint64) ([]protoco
 			if err != nil {
 				return nil, fmt.Errorf("DWARF child read: %w", err)
 			}
-			if child.Tag == 0 { // DW_TAG null — end of children
+			if child.Tag == 0 {
 				break
 			}
 			if child.Tag != dwarf.TagVariable && child.Tag != dwarf.TagFormalParameter {
@@ -358,8 +318,6 @@ func (r *dwarfReader) LocalsForFrame(b Backend, pc, frameBase uint64) ([]protoco
 	return nil, nil
 }
 
-// typeName resolves the human-readable type name for a variable entry by
-// following its DW_AT_type offset reference.
 func (r *dwarfReader) typeName(entry *dwarf.Entry) string {
 	off, ok := entry.Val(dwarf.AttrType).(dwarf.Offset)
 	if !ok {
@@ -378,8 +336,6 @@ func (r *dwarfReader) typeName(entry *dwarf.Entry) string {
 	return name
 }
 
-// evalLocation evaluates the DW_AT_location expression for entry and returns
-// a string representation of the variable's current value.
 func (r *dwarfReader) evalLocation(b Backend, entry *dwarf.Entry, frameBase uint64) string {
 	loc := entry.Val(dwarf.AttrLocation)
 	if loc == nil {
@@ -391,12 +347,12 @@ func (r *dwarfReader) evalLocation(b Backend, entry *dwarf.Entry, frameBase uint
 	}
 
 	switch expr[0] {
-	case 0x03: // DW_OP_addr — followed by an 8-byte LE address (DWARF-relative)
+	case 0x03: // DW_OP_addr — followed by an 8-byte LE DWARF-relative address
 		if len(expr) < 9 {
 			return "<optimized out>"
 		}
 		addr := binary.LittleEndian.Uint64(expr[1:9])
-		addr = uint64(int64(addr) + r.slide) // apply ASLR slide
+		addr = uint64(int64(addr) + r.slide)
 		return r.readValueAt(b, addr)
 
 	case 0x91: // DW_OP_fbreg — signed LEB128 offset from frame base
@@ -412,9 +368,8 @@ func (r *dwarfReader) evalLocation(b Backend, entry *dwarf.Entry, frameBase uint
 	}
 }
 
-// readValueAt reads 8 bytes from the tracee at addr and returns a hex string.
-// A complete implementation would use the variable's DWARF type to format the
-// value as int, string, slice header, etc.
+// readValueAt reads 8 bytes and returns a hex string. A complete impl would
+// use the DWARF type to format as int/string/slice header/etc.
 func (r *dwarfReader) readValueAt(b Backend, addr uint64) string {
 	var buf [8]byte
 	if err := b.ReadMemory(addr, buf[:]); err != nil {
@@ -423,10 +378,7 @@ func (r *dwarfReader) readValueAt(b Backend, addr uint64) string {
 	return fmt.Sprintf("0x%x", binary.LittleEndian.Uint64(buf[:]))
 }
 
-// ── LEB128 ────────────────────────────────────────────────────────────────────
-
-// decodeSLEB128 decodes a signed LEB128 integer from b.
-// Returns (value, bytesConsumed).
+// decodeSLEB128 decodes a signed LEB128 integer. Returns (value, bytesConsumed).
 func decodeSLEB128(b []byte) (int64, int) {
 	var result int64
 	var shift uint
@@ -434,7 +386,6 @@ func decodeSLEB128(b []byte) (int64, int) {
 		result |= int64(byt&0x7f) << shift
 		shift += 7
 		if byt&0x80 == 0 {
-			// Sign-extend if the sign bit of the last 7-bit group is set.
 			if shift < 64 && (byt&0x40) != 0 {
 				result |= -(1 << shift)
 			}

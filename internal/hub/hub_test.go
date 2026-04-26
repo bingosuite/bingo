@@ -20,7 +20,6 @@ func TestHub(t *testing.T) {
 	RunSpecs(t, "Hub Suite")
 }
 
-// ── fakeDebugger ──────────────────────────────────────────────────────────────
 
 type fakeDebugger struct {
 	mu     sync.Mutex
@@ -98,7 +97,6 @@ func (f *fakeDebugger) Goroutines() ([]protocol.Goroutine, error) {
 	return f.goroutinesResult, nil
 }
 
-// ── fakeWSConn ────────────────────────────────────────────────────────────────
 
 type fakeWSConn struct {
 	mu       sync.Mutex
@@ -109,15 +107,13 @@ type fakeWSConn struct {
 
 func newFakeWSConn() *fakeWSConn {
 	return &fakeWSConn{
-		// Use a large buffer so that WriteMessage (called from the hub's
-		// broadcast goroutine) never blocks even if a test doesn't drain
-		// immediately. Blocking WriteMessage would deadlock the hub's event loop.
+		// Large buffer so WriteMessage (called from the hub's event loop)
+		// never blocks if a test doesn't drain — blocking would deadlock.
 		incoming: make(chan []byte, 256),
 		outgoing: make(chan []byte, 32),
 	}
 }
 
-// recv returns the next server-written message, or (nil, false) on timeout.
 func (f *fakeWSConn) recv() ([]byte, bool) {
 	select {
 	case msg := <-f.incoming:
@@ -127,7 +123,6 @@ func (f *fakeWSConn) recv() ([]byte, bool) {
 	}
 }
 
-// inject simulates the client sending a command to the server.
 func (f *fakeWSConn) inject(cmd protocol.Command) {
 	data, _ := json.Marshal(cmd)
 	f.mu.Lock()
@@ -177,7 +172,6 @@ type connClosedErr struct{}
 
 func (e *connClosedErr) Error() string { return "use of closed network connection" }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
 
 func mustCommand(kind protocol.CommandKind, payload any) protocol.Command {
 	raw, _ := json.Marshal(payload)
@@ -196,7 +190,6 @@ func runHub(h *hub.Hub) context.CancelFunc {
 	return cancel
 }
 
-// recvEvent waits up to 300ms for the next event from conn.
 func recvEvent(conn *fakeWSConn) (protocol.Event, bool) {
 	msg, ok := conn.recv()
 	if !ok {
@@ -205,7 +198,6 @@ func recvEvent(conn *fakeWSConn) (protocol.Event, bool) {
 	return decodeEvent(msg), true
 }
 
-// ── specs ─────────────────────────────────────────────────────────────────────
 
 var _ = Describe("Hub", func() {
 
@@ -223,21 +215,16 @@ var _ = Describe("Hub", func() {
 
 	AfterEach(func() {
 		cancel()
-		// Close fd.events so the hub's Run loop unblocks and exits.
-		// Guard with recover in case a test already closed it.
 		func() {
 			defer func() { recover() }()
 			close(fd.events)
 		}()
-		// Wait for the hub to stop so goroutines don't bleed into the next test.
 		select {
 		case <-h.Done():
 		case <-time.After(2 * time.Second):
-			// Don't fail the test — just log and move on.
 		}
 	})
 
-	// ── client management ─────────────────────────────────────────────────
 
 	Describe("AddClient", func() {
 		It("accepts multiple concurrent clients without panicking", func() {
@@ -250,18 +237,16 @@ var _ = Describe("Hub", func() {
 		})
 	})
 
-	// ── seq restamping ────────────────────────────────────────────────────
 
 	Describe("event sequence numbers", func() {
 		It("assigns strictly increasing hub-managed seq to all outbound events", func() {
 			conn := newFakeWSConn()
 			h.AddClient(conn, nil)
 
-			// Push two debugger events with their own (engine-level) seq values.
-			// The hub must rewrite both with hub seq 1 and 2 respectively.
-			evt1, _ := protocol.NewEvent(protocol.EventOutput, 99, // engine seq 99
+			// Engine-level seq values 99 and 100 must both be rewritten.
+			evt1, _ := protocol.NewEvent(protocol.EventOutput, 99,
 				protocol.OutputPayload{Stream: "stdout", Content: "first"})
-			evt2, _ := protocol.NewEvent(protocol.EventOutput, 100, // engine seq 100
+			evt2, _ := protocol.NewEvent(protocol.EventOutput, 100,
 				protocol.OutputPayload{Stream: "stdout", Content: "second"})
 			fd.push(evt1)
 			fd.push(evt2)
@@ -280,8 +265,6 @@ var _ = Describe("Hub", func() {
 			h.AddClient(conn, nil)
 			fd.setBPResult = protocol.Breakpoint{ID: 1}
 
-			// Push a debugger output event, then send a SetBreakpoint command
-			// which produces a synchronous BreakpointSet confirmation.
 			fd.push(protocol.MustEvent(protocol.EventOutput, 1,
 				protocol.OutputPayload{Content: "x"}))
 			conn.inject(mustCommand(protocol.CmdSetBreakpoint,
@@ -295,7 +278,6 @@ var _ = Describe("Hub", func() {
 		})
 	})
 
-	// ── broadcast ─────────────────────────────────────────────────────────
 
 	Describe("event broadcast", func() {
 		It("delivers an informational event to all connected clients", func() {
@@ -329,7 +311,6 @@ var _ = Describe("Hub", func() {
 		})
 	})
 
-	// ── suspend / resume ──────────────────────────────────────────────────
 
 	Describe("BreakpointHit suspend/resume cycle", func() {
 		It("broadcasts the event then waits before calling Continue", func() {
@@ -339,16 +320,13 @@ var _ = Describe("Hub", func() {
 			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
 				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
 
-			// Client receives BreakpointHit.
 			e, ok := recvEvent(conn)
 			Expect(ok).To(BeTrue())
 			Expect(e.Kind).To(Equal(protocol.EventBreakpointHit))
 
-			// Continue must NOT have been called yet.
 			time.Sleep(20 * time.Millisecond)
 			Expect(fd.recordedCalls()).NotTo(ContainElement("Continue"))
 
-			// Client sends Continue — hub should unblock and call it.
 			conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
 
 			Eventually(fd.recordedCalls, "500ms", "10ms").
@@ -409,7 +387,6 @@ var _ = Describe("Hub", func() {
 			conn.inject(mustCommand(protocol.CmdSetBreakpoint,
 				protocol.SetBreakpointPayload{File: "main.go", Line: 10}))
 
-			// Hub executes SetBreakpoint and broadcasts BreakpointSet.
 			Eventually(func() protocol.EventKind {
 				e, ok := recvEvent(conn)
 				if !ok {
@@ -418,7 +395,6 @@ var _ = Describe("Hub", func() {
 				return e.Kind
 			}, "500ms", "10ms").Should(Equal(protocol.EventBreakpointSet))
 
-			// Hub is still suspended — now send Continue.
 			conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
 			Eventually(fd.recordedCalls, "500ms", "10ms").
 				Should(ContainElement("Continue"))
@@ -471,7 +447,6 @@ var _ = Describe("Hub", func() {
 		})
 	})
 
-	// ── confirmation events ───────────────────────────────────────────────
 
 	Describe("SetBreakpoint confirmation", func() {
 		It("broadcasts BreakpointSet with the assigned breakpoint", func() {
@@ -513,7 +488,6 @@ var _ = Describe("Hub", func() {
 		})
 	})
 
-	// ── error propagation ─────────────────────────────────────────────────
 
 	Describe("command error propagation", func() {
 		It("broadcasts EventError when a command fails", func() {
@@ -553,7 +527,6 @@ var _ = Describe("Hub", func() {
 		})
 	})
 
-	// ── shutdown ──────────────────────────────────────────────────────────
 
 	Describe("shutdown when last client disconnects", func() {
 		It("calls Kill on the debugger", func() {
@@ -598,16 +571,15 @@ var _ = Describe("Hub", func() {
 			conn := newFakeWSConn()
 			h.AddClient(conn, nil)
 
-			// Suspend the hub by delivering a BreakpointHit.
+			// Suspend the hub.
 			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
 				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
-			_, _ = recvEvent(conn) // consume BreakpointHit
+			_, _ = recvEvent(conn)
 
-			// While suspended, the process exits (e.g. Kill was called externally).
+			// Process exits while paused (Kill called externally).
 			fd.push(protocol.MustEvent(protocol.EventProcessExited, 2,
 				protocol.ProcessExitedPayload{ExitCode: 0}))
 
-			// The hub should broadcast ProcessExited and then unblock.
 			Eventually(func() protocol.EventKind {
 				e, ok := recvEvent(conn)
 				if !ok {
@@ -618,7 +590,6 @@ var _ = Describe("Hub", func() {
 		})
 	})
 
-	// ── unknown command ───────────────────────────────────────────────────
 
 	Describe("unknown command kind", func() {
 		It("broadcasts EventError without panicking", func() {

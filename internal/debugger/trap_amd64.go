@@ -2,17 +2,10 @@
 
 package debugger
 
-// trap_amd64.go defines the two architecture-specific constants that every
-// amd64 backend (only Linux) needs for breakpoint management.
-// Build tag is amd64 only — no OS restriction.
-
-// archTrapInstruction returns the single-byte INT3 instruction (0xCC).
-// Writing this byte over any instruction in the tracee's text segment causes
-// the CPU to deliver a trap when that address is executed.
+// archTrapInstruction is INT3 (0xCC). Patching this byte over any instruction
+// causes the CPU to deliver a trap when that address executes.
 func archTrapInstruction() []byte { return []byte{0xCC} }
 
-// archRewindPC corrects the program counter after an INT3 trap.
-// The x86 CPU advances RIP past the INT3 before delivering the exception,
-// so the reported PC is one byte past the address we patched.
-// We subtract 1 to recover the breakpoint address for table lookup.
+// archRewindPC corrects PC after INT3: x86 advances RIP past the trap before
+// delivering the exception, so we subtract 1 to recover the patched address.
 func archRewindPC(pc uint64) uint64 { return pc - 1 }

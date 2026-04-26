@@ -12,72 +12,48 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// Compile-time check that wsClient implements Client.
 var _ Client = (*wsClient)(nil)
 
 const (
-	// syncTimeout is how long synchronous methods (SetBreakpoint, Locals, …)
-	// wait for the server's confirmation event before giving up.
-	syncTimeout = 10 * time.Second
-
-	// dialTimeout is how long Create/Join wait for the initial SessionState
-	// event from the server.
-	dialTimeout = 5 * time.Second
-
-	// eventBufferSize is the capacity of the public Events channel.
-	// If the caller falls behind, events are dropped with a warning.
+	syncTimeout     = 10 * time.Second
+	dialTimeout     = 5 * time.Second
 	eventBufferSize = 64
 )
 
-// ── pendingReq ───────────────────────────────────────────────────────────────
-
-// pendingReq represents a synchronous method blocked waiting for a specific
-// confirmation event (or an error event for the same command kind).
+// pendingReq is a synchronous method blocked on its confirmation event (or an
+// EventError for the same command kind).
 type pendingReq struct {
-	wantKind protocol.EventKind   // expected success event kind
-	cmdKind  protocol.CommandKind // command sent (to match EventError)
-	ch       chan protocol.Event  // result (buffered capacity 1)
+	wantKind protocol.EventKind
+	cmdKind  protocol.CommandKind
+	ch       chan protocol.Event
 }
 
-// ── wsClient ─────────────────────────────────────────────────────────────────
-
-// wsClient is the gorilla/websocket-backed Client implementation.
 type wsClient struct {
 	conn *websocket.Conn
 	log  *slog.Logger
 
-	// Session metadata, updated by the read pump from SessionState events.
 	metaMu    sync.RWMutex
 	sessionID string
 	state     protocol.SessionState
 
-	// events is the public channel for async events. Closed by the read
-	// pump when the connection drops.
 	events chan protocol.Event
 
-	// syncMu serialises synchronous command calls so at most one
-	// send-and-wait cycle is active at any time.
+	// syncMu serialises sendAndWait so one in-flight pending request at a time.
 	syncMu sync.Mutex
 
-	// pending is the current sync request. Protected by pendingMu.
-	// The read pump checks this on every incoming event and routes
-	// matching confirmations / errors to pending.ch instead of events.
+	// pending: read-pump checks this on every event and routes matching
+	// confirmations / errors to pending.ch instead of the public events chan.
 	pendingMu sync.Mutex
 	pending   *pendingReq
 
-	// writeMu protects WebSocket writes. gorilla is safe for one
-	// concurrent reader and one concurrent writer — we guarantee the
-	// latter with this mutex.
+	// writeMu: gorilla allows one concurrent reader and one concurrent writer.
 	writeMu sync.Mutex
 
-	// done is closed when the client is shutting down (either Close was
-	// called or the connection dropped). Unblocks any pending syncMu wait.
 	done      chan struct{}
 	closeOnce sync.Once
 }
 
-// dial establishes a WebSocket connection and waits for the initial
-// SessionState welcome event from the server.
+// dial opens the WebSocket and waits for the server's welcome SessionState.
 func dial(addr, query string) (Client, error) {
 	url := fmt.Sprintf("ws://%s/ws?%s", addr, query)
 
@@ -95,8 +71,6 @@ func dial(addr, query string) (Client, error) {
 
 	go c.readPump()
 
-	// Block until the server sends the initial SessionState event so we
-	// know the session ID and current state before returning to the caller.
 	select {
 	case evt, ok := <-c.events:
 		if !ok {
@@ -105,7 +79,6 @@ func dial(addr, query string) (Client, error) {
 		if evt.Kind != protocol.EventSessionState {
 			return nil, fmt.Errorf("expected SessionState event, got %s", evt.Kind)
 		}
-		// State and session ID are already populated by the read pump.
 	case <-time.After(dialTimeout):
 		conn.Close()
 		return nil, fmt.Errorf("timeout waiting for session state from server")
@@ -114,10 +87,6 @@ func dial(addr, query string) (Client, error) {
 	return c, nil
 }
 
-// ── Read pump ────────────────────────────────────────────────────────────────
-
-// readPump runs in its own goroutine, reading events from the WebSocket and
-// routing them to either the pending sync request or the public Events channel.
 func (c *wsClient) readPump() {
 	defer func() {
 		c.signalDone()
@@ -127,7 +96,6 @@ func (c *wsClient) readPump() {
 	for {
 		_, data, err := c.conn.ReadMessage()
 		if err != nil {
-			// Connection closed (normal or error) — exit silently.
 			return
 		}
 
@@ -137,7 +105,6 @@ func (c *wsClient) readPump() {
 			continue
 		}
 
-		// Always update internal session metadata from state events.
 		if evt.Kind == protocol.EventSessionState {
 			var p protocol.SessionStatePayload
 			if protocol.DecodeEventPayload(evt, &p) == nil {
@@ -148,12 +115,10 @@ func (c *wsClient) readPump() {
 			}
 		}
 
-		// If a sync method is waiting, check whether this event matches.
 		if c.routeToPending(evt) {
 			continue
 		}
 
-		// Forward to the public events channel.
 		select {
 		case c.events <- evt:
 		default:
@@ -162,8 +127,6 @@ func (c *wsClient) readPump() {
 	}
 }
 
-// routeToPending checks if evt matches the current pending sync request.
-// Returns true if the event was consumed (sent to the pending channel).
 func (c *wsClient) routeToPending(evt protocol.Event) bool {
 	c.pendingMu.Lock()
 	p := c.pending
@@ -173,13 +136,11 @@ func (c *wsClient) routeToPending(evt protocol.Event) bool {
 		return false
 	}
 
-	// Direct match: this is the confirmation event we're waiting for.
 	if evt.Kind == p.wantKind {
 		p.ch <- evt
 		return true
 	}
 
-	// Error match: the server returned an error for the command we sent.
 	if evt.Kind == protocol.EventError {
 		var ep protocol.ErrorPayload
 		if protocol.DecodeEventPayload(evt, &ep) == nil && ep.Command == p.cmdKind {
@@ -191,9 +152,6 @@ func (c *wsClient) routeToPending(evt protocol.Event) bool {
 	return false
 }
 
-// ── Write helpers ────────────────────────────────────────────────────────────
-
-// send writes a command to the WebSocket. Thread-safe.
 func (c *wsClient) send(cmd protocol.Command) error {
 	data, err := json.Marshal(cmd)
 	if err != nil {
@@ -204,9 +162,8 @@ func (c *wsClient) send(cmd protocol.Command) error {
 	return c.conn.WriteMessage(websocket.TextMessage, data)
 }
 
-// sendAndWait sends cmd and blocks until the server sends the expected
-// confirmation event or an error event for the same command kind.
-// Only one sendAndWait may be active at a time (guarded by syncMu).
+// sendAndWait sends cmd and blocks for the matching confirmation event or an
+// EventError for the same command kind.
 func (c *wsClient) sendAndWait(cmd protocol.Command, wantKind protocol.EventKind) (protocol.Event, error) {
 	c.syncMu.Lock()
 	defer c.syncMu.Unlock()
@@ -243,20 +200,13 @@ func (c *wsClient) sendAndWait(cmd protocol.Command, wantKind protocol.EventKind
 	}
 }
 
-// newCommand creates a versioned Command envelope with a marshalled payload.
 func newCommand(kind protocol.CommandKind, payload any) (protocol.Command, error) {
 	raw, err := json.Marshal(payload)
 	if err != nil {
 		return protocol.Command{}, fmt.Errorf("marshal %s payload: %w", kind, err)
 	}
-	return protocol.Command{
-		Version: protocol.Version,
-		Kind:    kind,
-		Payload: raw,
-	}, nil
+	return protocol.Command{Version: protocol.Version, Kind: kind, Payload: raw}, nil
 }
-
-// ── Interface implementation: accessors ──────────────────────────────────────
 
 func (c *wsClient) SessionID() string {
 	c.metaMu.RLock()
@@ -271,8 +221,6 @@ func (c *wsClient) State() protocol.SessionState {
 }
 
 func (c *wsClient) Events() <-chan protocol.Event { return c.events }
-
-// ── Interface implementation: fire-and-forget commands ───────────────────────
 
 func (c *wsClient) Launch(program string, args, env []string) error {
 	cmd, err := newCommand(protocol.CmdLaunch, protocol.LaunchPayload{
@@ -333,8 +281,6 @@ func (c *wsClient) StepOut() error {
 	}
 	return c.send(cmd)
 }
-
-// ── Interface implementation: synchronous commands ───────────────────────────
 
 func (c *wsClient) SetBreakpoint(file string, line int) (protocol.Breakpoint, error) {
 	cmd, err := newCommand(protocol.CmdSetBreakpoint, protocol.SetBreakpointPayload{
@@ -411,16 +357,12 @@ func (c *wsClient) Goroutines() ([]protocol.Goroutine, error) {
 	return p.Goroutines, nil
 }
 
-// ── Interface implementation: lifecycle ──────────────────────────────────────
-
 // Close disconnects from the server. Safe to call multiple times.
 func (c *wsClient) Close() error {
 	c.signalDone()
 	return c.conn.Close()
 }
 
-// signalDone closes the done channel exactly once, unblocking any pending
-// synchronous wait. Called by Close and by the read pump on connection drop.
 func (c *wsClient) signalDone() {
 	c.closeOnce.Do(func() { close(c.done) })
 }
