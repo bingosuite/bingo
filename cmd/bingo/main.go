@@ -1,41 +1,45 @@
+// Command bingo starts the bingo debug server.
+//
+//	bingo [-addr host:port] [-v]
 package main
 
 import (
-	"log"
+	"flag"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
-	"github.com/bingosuite/bingo/config"
-	websocket "github.com/bingosuite/bingo/internal/ws"
+	"github.com/bingosuite/bingo/internal/server"
 )
 
 func main() {
-	cfg, err := config.Load("config/config.yml")
-	if err != nil {
-		log.Printf("Failed to load config: %v, using defaults", err)
-		cfg = config.Default()
-	}
+	addr := flag.String("addr", ":6060", "listen address (host:port)")
+	verbose := flag.Bool("v", false, "enable verbose (debug) logging")
+	flag.Parse()
 
-	server := websocket.NewServer(cfg.Server.Addr, &cfg.WebSocket)
+	level := slog.LevelInfo
+	if *verbose {
+		level = slog.LevelDebug
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: level,
+	}))
+
+	srv := server.New(*addr, log)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		if err := server.Serve(); err != nil {
-			log.Printf("WebSocket server error: %v", err)
-			panic(err)
-		}
+		<-sigCh
+		log.Info("received shutdown signal")
+		srv.Shutdown(10 * time.Second)
 	}()
 
-	// Set up signal handling for graceful shutdown
-	sigChan := make(chan os.Signal, 1)
-	// Use syscall.SIGTERM to handle graceful shutdown from docker, kill, systemctl stop, etc
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-
-	// Wait for shutdown signal
-	<-sigChan
-	log.Println("Received interrupt signal, shutting down gracefully...")
-
-	// Graceful shutdown
-	server.Shutdown()
-	log.Println("Server shutdown complete, exiting")
+	if err := srv.Start(); err != nil {
+		log.Error("server error", "err", err)
+		os.Exit(1)
+	}
 }

@@ -1,40 +1,58 @@
+// Package debugger implements a cross-platform Go process debugger.
+// Public surface: the Debugger interface, obtained via New() or
+// NewWithBackend(). See AGENTS.md for the engine concurrency model.
 package debugger
 
-// BreakpointEvent represents a breakpoint hit event
-type BreakpointEvent struct {
-	PID      int    `json:"pid"`
-	Filename string `json:"filename"`
-	Line     int    `json:"line"`
-	Function string `json:"function"`
-}
+import (
+	"errors"
 
-// InitialBreakpointHitEvent represents the initial breakpoint hit when debugging starts
-type InitialBreakpointHitEvent struct {
-	PID int `json:"pid"`
-}
+	"github.com/bingosuite/bingo/pkg/protocol"
+)
 
-// DebugCommand represents commands that can be sent to the debugger
-type DebugCommand struct {
-	Type string `json:"type"` // "continue", "stepover", "singlestep", "quit", "setBreakpoint"
-	Data any    `json:"data,omitempty"`
-}
+var (
+	ErrProcessExited  = errors.New("debugger: process exited")
+	ErrNotSuspended   = errors.New("debugger: process is not suspended")
+	ErrAlreadyRunning = errors.New("debugger: process already running")
+	ErrNoProcess      = errors.New("debugger: no process")
+)
 
+// Debugger is the interface consumed by the hub. All methods are goroutine-safe.
+// Inspection and step methods require the process to be suspended.
 type Debugger interface {
-	// StartWithDebug launches the target binary at the given path under debugger control
-	StartWithDebug(path string)
+	// Launch starts binaryPath stopped at its first instruction. DWARF info is
+	// loaded automatically. env is appended to the server's environment.
+	Launch(binaryPath string, args []string, env []string) error
 
-	// Continue resumes execution of the process with the given PID after a breakpoint
-	Continue(pid int)
+	// Attach connects to a running PID and stops it. binaryPath is optional but
+	// required for breakpoints/locals/frames (DWARF source).
+	Attach(pid int, binaryPath string) error
 
-	// SingleStep executes a single instruction in the process with the given PID
-	SingleStep(pid int)
+	// Kill terminates the tracee. Idempotent.
+	Kill() error
 
-	// StopDebug detaches from the target and ends the debug session
-	StopDebug()
+	SetBreakpoint(file string, line int) (protocol.Breakpoint, error)
+	ClearBreakpoint(id int) error
 
-	// SetBreakpoint inserts a breakpoint at the given source line in the target
-	SetBreakpoint(pid int, line int) error
+	Continue() error
+	StepOver() error
+	StepInto() error
+	StepOut() error
 
-	// ClearBreakpoint removes the breakpoint at the given source line
-	ClearBreakpoint(pid int, line int) error
+	// Locals: frame 0 is innermost.
+	Locals(frameIndex int) ([]protocol.Variable, error)
+	StackFrames() ([]protocol.Frame, error)
+	Goroutines() ([]protocol.Goroutine, error)
+
+	// Events delivers async notifications. Closed on shutdown; caller must drain.
+	Events() <-chan protocol.Event
+}
+
+// New returns a Debugger backed by the platform-native OS backend.
+func New() Debugger {
+	return newEngine(newBackend())
+}
+
+// NewWithBackend returns a Debugger using the supplied Backend. Tests only.
+func NewWithBackend(b Backend) Debugger {
+	return newEngine(b)
 }
