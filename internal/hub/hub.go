@@ -179,7 +179,11 @@ func (h *Hub) AddClient(conn WSConn, log *slog.Logger) *Client {
 }
 
 func (h *Hub) removeClient(c *Client) {
-	h.registry.remove(c)
+	removed := h.registry.remove(c)
+	c.closeSend()
+	if !removed {
+		return
+	}
 	remaining := h.registry.count()
 	h.log.Info("client disconnected", "remaining", remaining)
 	if remaining == 0 {
@@ -294,6 +298,9 @@ func (h *Hub) executeCommand(cmd protocol.Command) {
 	result, err := dispatch(h.dbg, cmd)
 	if err != nil {
 		h.log.Warn("command failed", "kind", cmd.Kind, "err", err)
+		if h.sessionID != "" && (cmd.Kind == protocol.CmdLaunch || cmd.Kind == protocol.CmdAttach) {
+			h.teardownFailedStart()
+		}
 		h.broadcastError(cmd.Kind, err)
 		return
 	}
@@ -308,6 +315,17 @@ func (h *Hub) executeCommand(cmd protocol.Command) {
 	if result.event != nil {
 		result.event.Seq = h.seq.Add(1)
 		h.broadcast(*result.event)
+	}
+}
+
+func (h *Hub) teardownFailedStart() {
+	dbg := h.dbg
+	h.dbg = nil
+	if dbg != nil {
+		_ = dbg.Kill()
+	}
+	if h.State() != protocol.StateIdle {
+		h.transitionState(protocol.StateIdle)
 	}
 }
 

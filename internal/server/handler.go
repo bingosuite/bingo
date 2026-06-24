@@ -4,16 +4,28 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"strings"
 
 	"github.com/gorilla/websocket"
 )
 
-// upgrader: CheckOrigin is permissive because bingo has no auth — tighten
-// when auth is added.
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
-	CheckOrigin:     func(r *http.Request) bool { return true },
+	CheckOrigin:     sameHostOrigin,
+}
+
+func sameHostOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
 }
 
 // handleListSessions: GET /api/sessions
