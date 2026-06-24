@@ -26,6 +26,7 @@ const linuxPtraceOptions = syscall.PTRACE_O_TRACEEXIT |
 // startTracedProcess forks under ptrace. The child is stopped at its first
 // instruction (execve SIGTRAP) ready for the engine to set breakpoints.
 func startTracedProcess(binaryPath string, args []string, env []string) (int, *exec.Cmd, error) {
+	// codeql[go/command-injection] The debugger intentionally launches the local binary selected by the operator.
 	cmd := exec.Command(binaryPath, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
