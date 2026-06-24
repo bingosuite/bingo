@@ -19,10 +19,14 @@ func (r *registry) add(c *Client) {
 	r.mu.Unlock()
 }
 
-func (r *registry) remove(c *Client) {
+func (r *registry) remove(c *Client) bool {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.clients[c]; !ok {
+		return false
+	}
 	delete(r.clients, c)
-	r.mu.Unlock()
+	return true
 }
 
 func (r *registry) count() int {

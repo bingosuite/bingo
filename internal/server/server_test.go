@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,12 @@ func TestServer(t *testing.T) {
 
 func toWS(ts *httptest.Server, path string) string {
 	return "ws" + strings.TrimPrefix(ts.URL, "http") + path
+}
+
+func serverOrigin(ts *httptest.Server) string {
+	u, err := url.Parse(ts.URL)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred())
+	return "http://" + u.Host
 }
 
 func recvState(conn *websocket.Conn) (protocol.SessionStatePayload, error) {
@@ -121,6 +128,25 @@ var _ = Describe("Server", func() {
 				Expect(p.State).To(Equal(protocol.StateIdle))
 				Expect(p.Clients).To(Equal(1))
 				Expect(p.SessionID).NotTo(BeEmpty())
+			})
+
+			It("allows same-host browser origins", func() {
+				header := http.Header{"Origin": []string{serverOrigin(ts)}}
+				conn, resp, err := websocket.DefaultDialer.Dial(toWS(ts, "/ws?create"), header)
+				Expect(err).NotTo(HaveOccurred())
+				defer closeWS(conn)
+				Expect(resp.StatusCode).To(Equal(http.StatusSwitchingProtocols))
+			})
+
+			It("rejects cross-host browser origins", func() {
+				header := http.Header{"Origin": []string{"http://evil.example"}}
+				conn, resp, err := websocket.DefaultDialer.Dial(toWS(ts, "/ws?create"), header)
+				if conn != nil {
+					closeWS(conn)
+				}
+				Expect(err).To(HaveOccurred())
+				Expect(resp).NotTo(BeNil())
+				Expect(resp.StatusCode).To(Equal(http.StatusForbidden))
 			})
 
 			It("generates a valid UUID session ID", func() {

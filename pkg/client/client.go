@@ -12,6 +12,8 @@ import (
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
+const listSessionsTimeout = 5 * time.Second
+
 // Client interacts with a bingo debug server. All methods are goroutine-safe.
 type Client interface {
 	SessionID() string
@@ -53,7 +55,8 @@ type SessionInfo struct {
 func ListSessions(addr string) ([]SessionInfo, error) {
 	url := fmt.Sprintf("http://%s/api/sessions", addr)
 
-	resp, err := http.Get(url) //nolint:gosec // no auth by design
+	httpClient := http.Client{Timeout: listSessionsTimeout}
+	resp, err := httpClient.Get(url) //nolint:gosec // no auth by design
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
 	}
