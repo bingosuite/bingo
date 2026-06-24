@@ -234,10 +234,6 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 			switch cause {
 			case syscall.PTRACE_EVENT_CLONE:
-				newTID, _ := syscall.PtraceGetEventMsg(tid)
-				if err := waitForCloneChild(int(newTID)); err != nil {
-					return StopEvent{}, err
-				}
 				if err := continueIfTraceeExists(tid, 0); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT clone parent tid %d: %w", tid, err)
 				}
@@ -290,6 +286,9 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		}
 
 		if sig == syscall.SIGSTOP && tid != b.pid {
+			if err := syscall.PtraceSetOptions(tid, linuxPtraceOptions); err != nil && !isNoSuchProcess(err) {
+				return StopEvent{}, fmt.Errorf("PTRACE_SETOPTIONS clone child tid %d: %w", tid, err)
+			}
 			if err := continueIfTraceeExists(tid, 0); err != nil {
 				return StopEvent{}, fmt.Errorf("PTRACE_CONT clone child tid %d: %w", tid, err)
 			}
@@ -343,34 +342,6 @@ func (b *linuxBackend) recordStop(tid int) {
 	if tid != 0 {
 		b.lastStopTID = tid
 	}
-}
-
-func waitForCloneChild(tid int) error {
-	if tid == 0 {
-		return nil
-	}
-
-	var ws syscall.WaitStatus
-	waitTID, err := syscall.Wait4(tid, &ws, syscall.WALL, nil)
-	if err != nil {
-		if isNoSuchProcess(err) {
-			return nil
-		}
-		return fmt.Errorf("wait clone child tid %d: %w", tid, err)
-	}
-	if waitTID != tid {
-		return fmt.Errorf("wait clone child tid %d: got tid %d", tid, waitTID)
-	}
-	if !ws.Stopped() {
-		return nil
-	}
-	if err := syscall.PtraceSetOptions(tid, linuxPtraceOptions); err != nil && !isNoSuchProcess(err) {
-		return fmt.Errorf("PTRACE_SETOPTIONS clone child tid %d: %w", tid, err)
-	}
-	if err := continueIfTraceeExists(tid, 0); err != nil {
-		return fmt.Errorf("PTRACE_CONT clone child tid %d: %w", tid, err)
-	}
-	return nil
 }
 
 func isNoSuchProcess(err error) bool {
