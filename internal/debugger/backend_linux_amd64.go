@@ -289,7 +289,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			if err := syscall.PtraceSetOptions(tid, linuxPtraceOptions); err != nil && !isNoSuchProcess(err) {
 				return StopEvent{}, fmt.Errorf("PTRACE_SETOPTIONS clone child tid %d: %w", tid, err)
 			}
-			if err := continueIfTraceeExists(tid, 0); err != nil {
+			if err := continueIfTraceeExists(tid, int(syscall.SIGCONT)); err != nil {
 				return StopEvent{}, fmt.Errorf("PTRACE_CONT clone child tid %d: %w", tid, err)
 			}
 			if err := continueIfTraceeExists(b.pid, 0); err != nil {
@@ -298,16 +298,16 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			continue
 		}
 
-		// SIGURG is Go's goroutine-preemption signal — must be re-delivered
-		// transparently or scheduling breaks.
-		if sig == syscall.SIGURG {
+		// SIGURG is Go's goroutine-preemption signal; SIGCONT may be injected
+		// above to release clone-child SIGSTOP. Both should stay transparent.
+		if sig == syscall.SIGURG || sig == syscall.SIGCONT {
 			if b.stepping {
 				if err := singleStepIfTraceeExists(tid); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_SINGLESTEP after SIGURG tid %d: %w", tid, err)
+					return StopEvent{}, fmt.Errorf("PTRACE_SINGLESTEP after %s tid %d: %w", sig, tid, err)
 				}
 			} else {
 				if err := continueIfTraceeExists(tid, int(sig)); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_CONT SIGURG tid %d: %w", tid, err)
+					return StopEvent{}, fmt.Errorf("PTRACE_CONT %s tid %d: %w", sig, tid, err)
 				}
 			}
 			continue
