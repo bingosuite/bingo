@@ -289,26 +289,33 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			if err := syscall.PtraceSetOptions(tid, linuxPtraceOptions); err != nil && !isNoSuchProcess(err) {
 				return StopEvent{}, fmt.Errorf("PTRACE_SETOPTIONS clone child tid %d: %w", tid, err)
 			}
-			if err := continueIfTraceeExists(tid, int(syscall.SIGCONT)); err != nil {
-				return StopEvent{}, fmt.Errorf("PTRACE_CONT clone child tid %d: %w", tid, err)
+			if err := syscall.Kill(b.pid, syscall.SIGCONT); err != nil && !isNoSuchProcess(err) {
+				return StopEvent{}, fmt.Errorf("SIGCONT tracee pid %d: %w", b.pid, err)
 			}
-			if err := continueIfTraceeExists(b.pid, 0); err != nil {
-				return StopEvent{}, fmt.Errorf("PTRACE_CONT clone parent pid %d: %w", b.pid, err)
+			if err := continueTraceeGroup(b.pid, 0); err != nil {
+				return StopEvent{}, err
 			}
 			continue
 		}
 
 		// SIGURG is Go's goroutine-preemption signal; SIGCONT may be injected
 		// above to release clone-child SIGSTOP. Both should stay transparent.
-		if sig == syscall.SIGURG || sig == syscall.SIGCONT {
+		if sig == syscall.SIGURG {
 			if b.stepping {
 				if err := singleStepIfTraceeExists(tid); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_SINGLESTEP after %s tid %d: %w", sig, tid, err)
+					return StopEvent{}, fmt.Errorf("PTRACE_SINGLESTEP after SIGURG tid %d: %w", tid, err)
 				}
 			} else {
 				if err := continueIfTraceeExists(tid, int(sig)); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_CONT %s tid %d: %w", sig, tid, err)
+					return StopEvent{}, fmt.Errorf("PTRACE_CONT SIGURG tid %d: %w", tid, err)
 				}
+			}
+			continue
+		}
+
+		if sig == syscall.SIGCONT {
+			if err := continueIfTraceeExists(tid, 0); err != nil {
+				return StopEvent{}, fmt.Errorf("PTRACE_CONT SIGCONT tid %d: %w", tid, err)
 			}
 			continue
 		}
@@ -348,7 +355,7 @@ func (b *linuxBackend) recordStop(tid int) {
 }
 
 func isNoSuchProcess(err error) bool {
-	return errors.Is(err, syscall.ESRCH)
+	return errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrNotExist)
 }
 
 func continueIfTraceeExists(tid int, signal int) error {
@@ -359,6 +366,40 @@ func continueIfTraceeExists(tid int, signal int) error {
 		return err
 	}
 	return nil
+}
+
+func continueTraceeGroup(pid int, signal int) error {
+	tids, err := taskTIDs(pid)
+	if err != nil {
+		if isNoSuchProcess(err) {
+			return nil
+		}
+		return err
+	}
+	if len(tids) == 0 {
+		return continueIfTraceeExists(pid, signal)
+	}
+	for _, tid := range tids {
+		if err := continueIfTraceeExists(tid, signal); err != nil {
+			return fmt.Errorf("PTRACE_CONT tid %d: %w", tid, err)
+		}
+	}
+	return nil
+}
+
+func taskTIDs(pid int) ([]int, error) {
+	entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
+	if err != nil {
+		return nil, err
+	}
+	tids := make([]int, 0, len(entries))
+	for _, entry := range entries {
+		var tid int
+		if _, err := fmt.Sscanf(entry.Name(), "%d", &tid); err == nil {
+			tids = append(tids, tid)
+		}
+	}
+	return tids, nil
 }
 
 func singleStepIfTraceeExists(tid int) error {
