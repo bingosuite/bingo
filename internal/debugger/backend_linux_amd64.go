@@ -292,6 +292,9 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			if err := continueIfTraceeExists(tid, 0); err != nil {
 				return StopEvent{}, fmt.Errorf("PTRACE_CONT clone child tid %d: %w", tid, err)
 			}
+			if err := continueIfTraceeExists(b.pid, 0); err != nil {
+				return StopEvent{}, fmt.Errorf("PTRACE_CONT clone parent pid %d: %w", b.pid, err)
+			}
 			continue
 		}
 
