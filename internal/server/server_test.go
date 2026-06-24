@@ -38,10 +38,6 @@ func recvState(conn *websocket.Conn) (protocol.SessionStatePayload, error) {
 	return p, protocol.DecodeEventPayload(evt, &p)
 }
 
-func closeResponse(resp *http.Response) {
-	ExpectWithOffset(1, resp.Body.Close()).To(Succeed())
-}
-
 func closeWS(conn *websocket.Conn) {
 	ExpectWithOffset(1, conn.Close()).To(Succeed())
 }
@@ -68,7 +64,7 @@ var _ = Describe("Server", func() {
 		It("returns an empty JSON array when no sessions exist", func() {
 			resp, err := http.Get(ts.URL + "/api/sessions")
 			Expect(err).NotTo(HaveOccurred())
-			defer closeResponse(resp)
+			defer resp.Body.Close() //nolint:errcheck
 
 			Expect(resp.StatusCode).To(Equal(http.StatusOK))
 			Expect(resp.Header.Get("Content-Type")).To(Equal("application/json"))
@@ -81,7 +77,7 @@ var _ = Describe("Server", func() {
 		It("rejects non-GET requests", func() {
 			resp, err := http.Post(ts.URL+"/api/sessions", "", nil)
 			Expect(err).NotTo(HaveOccurred())
-			defer closeResponse(resp)
+			defer resp.Body.Close() //nolint:errcheck
 			Expect(resp.StatusCode).To(Equal(http.StatusMethodNotAllowed))
 		})
 
@@ -94,7 +90,7 @@ var _ = Describe("Server", func() {
 
 			resp, err := http.Get(ts.URL + "/api/sessions")
 			Expect(err).NotTo(HaveOccurred())
-			defer closeResponse(resp)
+			defer resp.Body.Close() //nolint:errcheck
 
 			var sessions []SessionInfo
 			Expect(json.NewDecoder(resp.Body).Decode(&sessions)).To(Succeed())
@@ -109,7 +105,7 @@ var _ = Describe("Server", func() {
 		It("returns 400 when neither ?create nor ?session is specified", func() {
 			resp, err := http.Get(ts.URL + "/ws")
 			Expect(err).NotTo(HaveOccurred())
-			defer closeResponse(resp)
+			defer resp.Body.Close() //nolint:errcheck
 			Expect(resp.StatusCode).To(Equal(http.StatusBadRequest))
 		})
 

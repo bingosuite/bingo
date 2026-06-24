@@ -14,6 +14,9 @@ import (
 const (
 	eventBufSize  = 64
 	maxStackDepth = 64
+
+	stepOverNextFile  = "<stepover-next>"
+	stepOutReturnFile = "<stepout-return>"
 )
 
 type engineState uint8
@@ -390,13 +393,13 @@ func (e *engine) handleStop(stop StopEvent) {
 		}
 		slog.Debug("StopBreakpoint matched", "file", bp.file, "line", bp.line,
 			"addr", fmt.Sprintf("0x%x", bp.addr))
-		if bp.file == "<stepover-next>" {
+		if bp.file == stepOverNextFile {
 			_ = e.bps.clear(e.backend, bp.id)
 			e.lastBP = nil
 			e.emitStepped(stop)
 			return
 		}
-		if bp.file == "<stepout-return>" {
+		if bp.file == stepOutReturnFile {
 			_ = e.bps.clear(e.backend, bp.id)
 			e.lastBP = nil
 			e.emitStepped(stop)
@@ -437,10 +440,10 @@ func (e *engine) handleStop(stop StopEvent) {
 				// the BP and can land on a DWARF entry with line==0.
 				if e.dw != nil && sob.file != "" && sob.line > 0 {
 					if nextPC, nextLine, ok := e.dw.NextLinePC(sob.file, sob.line); ok {
-						slog.Debug("sourceStepOver: setting <stepover-next>",
+						slog.Debug("sourceStepOver: setting "+stepOverNextFile,
 							"from", fmt.Sprintf("%s:%d", sob.file, sob.line),
 							"nextPC", fmt.Sprintf("0x%x", nextPC), "nextLine", nextLine)
-						entry, setErr := e.bps.set(e.backend, "<stepover-next>", 0, nextPC)
+						entry, setErr := e.bps.set(e.backend, stepOverNextFile, 0, nextPC)
 						if setErr == nil || errors.Is(setErr, errBreakpointExists) {
 							e.stepOverFile = sob.file
 							e.stepOverLine = nextLine
@@ -454,7 +457,7 @@ func (e *engine) handleStop(stop StopEvent) {
 								e.stepOverLine = 0
 							}
 						} else {
-							slog.Warn("sourceStepOver: set <stepover-next> failed",
+							slog.Warn("sourceStepOver: set "+stepOverNextFile+" failed",
 								"addr", fmt.Sprintf("0x%x", nextPC), "err", setErr)
 						}
 					} else {
@@ -466,7 +469,7 @@ func (e *engine) handleStop(stop StopEvent) {
 				e.setState(stateSuspended)
 				e.emitStepped(stop)
 			case bpResumeStepOut:
-				_, setErr := e.bps.set(e.backend, "<stepout-return>", 0, e.bpRetAddr)
+				_, setErr := e.bps.set(e.backend, stepOutReturnFile, 0, e.bpRetAddr)
 				if setErr != nil && !errors.Is(setErr, errBreakpointExists) {
 					e.emitError(protocol.CmdStepOut, fmt.Errorf("StepOut: set return breakpoint: %w", setErr))
 					return
@@ -543,7 +546,7 @@ func (e *engine) sourceStepOver() error {
 
 		if file != "" && line > 0 {
 			if nextPC, nextLine, ok := e.dw.NextLinePC(file, line); ok {
-				entry, setErr := e.bps.set(e.backend, "<stepover-next>", 0, nextPC)
+				entry, setErr := e.bps.set(e.backend, stepOverNextFile, 0, nextPC)
 				if setErr == nil || errors.Is(setErr, errBreakpointExists) {
 					e.stepOverFile = file
 					e.stepOverLine = nextLine
@@ -594,7 +597,7 @@ func (e *engine) stepOut() error {
 	if e.lastBP != nil {
 		return e.resumeFromBreakpoint(bpResumeStepOut, retAddr)
 	}
-	_, setErr := e.bps.set(e.backend, "<stepout-return>", 0, retAddr)
+	_, setErr := e.bps.set(e.backend, stepOutReturnFile, 0, retAddr)
 	if setErr != nil && !errors.Is(setErr, errBreakpointExists) {
 		return fmt.Errorf("StepOut: set return breakpoint: %w", setErr)
 	}
