@@ -26,4 +26,4 @@
 
 ## Meeting 6: April 13th, 2025
 
-- Sixth meeting with Robert Laganière. We're nearing the end of the refactor and almost finished the basic debugger. We are deciding it's too much scope to support many versions, so we will focus on linux amd64 and darwin arm64. We have some architecural issues to deal with, such as multiples sources of truth in the code, race conditions and memory leaks. On track to finish phase 1 by end of April.
+- Sixth meeting with Robert Laganière. We're nearing the end of the refactor and almost finished the basic debugger. We are deciding it's too much scope to support many versions, so we will focus on linux amd64 and darwin arm64. We have some architectural issues to deal with, such as multiple sources of truth in the code, race conditions and memory leaks. On track to finish phase 1 by end of April.

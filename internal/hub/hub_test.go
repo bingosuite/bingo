@@ -3,6 +3,7 @@ package hub_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -254,6 +255,38 @@ var _ = Describe("Hub", func() {
 				closeFakeWS(conn)
 				Eventually(managed.Done(), "500ms", "10ms").Should(BeClosed())
 			}
+		})
+	})
+
+	Describe("managed session start failures", func() {
+		It("tears down a failed debugger so a later launch can retry", func() {
+			managed := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
+			cancelManaged := runHub(managed)
+			defer cancelManaged()
+
+			conn := newFakeWSConn()
+			managed.AddClient(conn, nil)
+			_, _ = recvEvent(conn)
+
+			fd.launchErr = errors.New("launch failed")
+			conn.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: "bad"}))
+			Eventually(fd.recordedCalls, "500ms", "10ms").Should(ContainElement("Kill"))
+			evt, ok := recvEvent(conn)
+			Expect(ok).To(BeTrue())
+			Expect(evt.Kind).To(Equal(protocol.EventError))
+
+			fd.launchErr = nil
+			conn.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: "good"}))
+
+			Eventually(func() int {
+				count := 0
+				for _, call := range fd.recordedCalls() {
+					if call == "Launch" {
+						count++
+					}
+				}
+				return count
+			}, "500ms", "10ms").Should(Equal(2))
 		})
 	})
 

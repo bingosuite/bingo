@@ -68,6 +68,12 @@ func dial(addr, query string) (Client, error) {
 		events: make(chan protocol.Event, eventBufferSize),
 		done:   make(chan struct{}),
 	}
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = c.Close()
+		}
+	}()
 
 	go c.readPump()
 
@@ -80,10 +86,10 @@ func dial(addr, query string) (Client, error) {
 			return nil, fmt.Errorf("expected SessionState event, got %s", evt.Kind)
 		}
 	case <-time.After(dialTimeout):
-		_ = conn.Close()
 		return nil, fmt.Errorf("timeout waiting for session state from server")
 	}
 
+	cleanup = false
 	return c, nil
 }
 
