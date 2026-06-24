@@ -353,6 +353,26 @@ var _ = Describe("Engine", func() {
 			Expect(p.Breakpoint.Location.File).To(Equal("<direct-addr>"))
 		})
 
+		It("resolves a raw trap stop to the thread parked on the breakpoint", func() {
+			trap := debugger.ExportedTrapInstruction()
+			fb.tids = []int{1, 2}
+			fb.regs[1] = debugger.Registers{PC: 0x4000}
+			hitPC := bpAddr
+			if len(trap) == 1 {
+				hitPC += 1
+			}
+			fb.regs[2] = debugger.Registers{PC: hitPC}
+
+			Expect(d.Continue()).To(Succeed())
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint})
+
+			evt := mustNextEvent(d)
+			Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit))
+
+			Expect(d.Continue()).To(Succeed())
+			Expect(fb.singleStepCalls).To(ContainElement(2))
+		})
+
 		It("emits nothing (resumes silently) for an unrecognised breakpoint PC", func() {
 			Expect(d.Continue()).To(Succeed())
 			fb.pushStop(debugger.StopEvent{
