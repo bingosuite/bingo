@@ -21,8 +21,7 @@ type linuxBackend struct {
 	lastStopTID int
 }
 
-const linuxPtraceOptions = syscall.PTRACE_O_TRACECLONE |
-	syscall.PTRACE_O_TRACEEXIT |
+const linuxPtraceOptions = syscall.PTRACE_O_TRACEEXIT |
 	syscall.PTRACE_O_TRACEEXEC
 
 // startTracedProcess forks under ptrace. The child is stopped at its first
