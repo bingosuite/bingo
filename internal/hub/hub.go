@@ -384,7 +384,9 @@ func (h *Hub) sendStateTo(c *Client) {
 		h.log.Error("failed to marshal welcome state event", "err", err)
 		return
 	}
-	c.deliver(wire)
+	if !c.deliver(wire) {
+		h.removeClient(c)
+	}
 }
 
 func (h *Hub) broadcast(evt protocol.Event) {
@@ -393,7 +395,11 @@ func (h *Hub) broadcast(evt protocol.Event) {
 		h.log.Error("marshal event failed", "err", err)
 		return
 	}
-	h.registry.broadcast(wire)
+	for _, c := range h.registry.snapshot() {
+		if !c.deliver(wire) {
+			h.removeClient(c)
+		}
+	}
 }
 
 func (h *Hub) broadcastError(kind protocol.CommandKind, err error) {

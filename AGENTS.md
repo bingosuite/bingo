@@ -202,9 +202,10 @@ engine advances PC by `len(archTrapInstruction())` and resumes. See the
   (the build embeds [entitlements.plist](entitlements.plist) via codesign).
 - `task_threads` returns threads in **creation order**. `threads[0]` is
   often an idle Go runtime M parked in `pthread_cond_wait`, **not** the
-  goroutine running user code. Use `findBreakpointThread` to locate the
-  thread sitting at a BRK; for SingleStep, save the thread port we issued
-  the step against (`b.stepTID`).
+  goroutine running user code. Darwin `Wait` returns raw SIGTRAP stops without
+  reading Mach thread/register state; the engine resolves the thread sitting at
+  a BRK on its serialized event loop. For SingleStep, save the thread port we
+  issued the step against (`b.stepTID`).
 - `PT_STEP` is per-PROCESS on Darwin (despite the API taking a tid). Always
   pass `b.pid`, not the Mach thread port.
 - `SIGURG` (Go preemption) and `SIGWINCH` must be re-delivered transparently

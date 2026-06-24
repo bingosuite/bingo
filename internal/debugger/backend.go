@@ -1,8 +1,11 @@
 package debugger
 
 // Backend is the OS-level contract every platform must satisfy. The engine
-// never calls ptrace/Mach directly — only Backend. All methods are called from
-// the engine's event-loop goroutine, so implementations need not be thread-safe.
+// never calls ptrace/Mach directly — only Backend. Except for Wait, methods are
+// called from the engine's event-loop goroutine. Wait runs in a separate locked
+// goroutine while the process is running; any backend state shared with Wait
+// must be synchronized, and Wait should avoid memory/register work that can race
+// with command handlers.
 type Backend interface {
 	ContinueProcess() error
 	SingleStep(tid int) error
@@ -43,7 +46,8 @@ const (
 	StopKilled                       // killed externally
 )
 
-// StopEvent is what Backend.Wait returns. PC is rewound for breakpoints.
+// StopEvent is what Backend.Wait returns. PC may be zero; the engine resolves
+// missing stop PCs on its serialized event loop before emitting user events.
 type StopEvent struct {
 	Reason   StopReason
 	TID      int

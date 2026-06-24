@@ -17,10 +17,11 @@ import "C"
 
 import (
 	"debug/macho"
+	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/exec"
+	"sync"
 	"syscall"
 	"unsafe"
 )
@@ -31,6 +32,7 @@ func newBackend() Backend {
 
 type darwinBackend struct {
 	pid      int
+	stepMu   sync.Mutex
 	stepping bool
 	stepTID  int // Mach thread port saved by SingleStep, reused on the step trap
 }
@@ -111,7 +113,7 @@ func isAlreadyExited(err error) bool {
 }
 
 func (b *darwinBackend) ContinueProcess() error {
-	b.stepping = false
+	b.clearStep()
 	if err := ptrace(ptDarwinContinue, uintptr(b.pid), 1, 0); err != nil {
 		return fmt.Errorf("PT_CONTINUE: %w", err)
 	}
@@ -119,11 +121,11 @@ func (b *darwinBackend) ContinueProcess() error {
 }
 
 func (b *darwinBackend) SingleStep(tid int) error {
-	b.stepping = true
-	b.stepTID = tid
+	b.setStep(tid)
 	// Darwin PT_STEP is per-process (by PID), not per-thread. The tid argument
 	// is a Mach thread port, not a valid ptrace identifier — use b.pid.
 	if err := ptrace(ptDarwinStep, uintptr(b.pid), 1, 0); err != nil {
+		b.clearStep()
 		return fmt.Errorf("PT_STEP: %w", err)
 	}
 	return nil
@@ -234,39 +236,15 @@ func (b *darwinBackend) Threads() ([]int, error) {
 	return tids, nil
 }
 
-// findBreakpointThread returns the Mach thread port and registers of the
-// thread whose PC points at a BRK #0 — i.e. the one that hit our software BP.
-// task_threads returns threads in creation order, so threads[0] is often an
-// idle Go runtime M parked in pthread_cond_wait, not the goroutine running
-// user code. Falls back to threads[0] if nothing is at a BRK.
-func (b *darwinBackend) findBreakpointThread(threads []int) (int, Registers) {
-	trap := archTrapInstruction()
-	for _, t := range threads {
-		regs, err := b.GetRegisters(t)
-		if err != nil {
-			continue
-		}
-		var buf [4]byte
-		if err := b.ReadMemory(regs.PC, buf[:]); err != nil {
-			continue
-		}
-		if buf[0] == trap[0] && buf[1] == trap[1] && buf[2] == trap[2] && buf[3] == trap[3] {
-			return t, regs
-		}
-	}
-	if len(threads) > 0 {
-		regs, _ := b.GetRegisters(threads[0])
-		return threads[0], regs
-	}
-	return 0, Registers{}
-}
-
-//nolint:gocognit // The wait loop is one serialized ptrace/Mach state machine.
+//nolint:gocognit // The wait loop is one serialized ptrace state machine.
 func (b *darwinBackend) Wait() (StopEvent, error) {
 	for {
 		var ws syscall.WaitStatus
 		tid, err := syscall.Wait4(b.pid, &ws, 0, nil)
 		if err != nil {
+			if isNoChildProcess(err) {
+				return StopEvent{Reason: StopExited, TID: b.pid}, nil
+			}
 			return StopEvent{}, fmt.Errorf("wait4: %w", err)
 		}
 		if ws.Exited() {
@@ -278,52 +256,34 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 		if !ws.Stopped() {
 			continue
 		}
-		// tid from Wait4 is the PID, not a Mach thread port. Use Threads()
-		// to get the actual thread ports before reading registers.
-		threads, terr := b.Threads()
-		if terr != nil || len(threads) == 0 {
-			return StopEvent{}, fmt.Errorf("Wait: get threads: %w", terr)
-		}
 
 		sig := ws.StopSignal()
 
 		if sig == syscall.SIGTRAP {
-			if b.stepping {
-				// Use the thread we saved in SingleStep — that's the one
-				// whose next instruction we asked to trap.
-				thread := b.stepTID
-				if thread == 0 {
-					thread = threads[0]
-				}
-				regs, err := b.GetRegisters(thread)
-				if err != nil {
-					return StopEvent{}, err
-				}
-				b.stepping = false
-				slog.Debug("Wait: SIGTRAP → SingleStep", "pc", fmt.Sprintf("0x%x", regs.PC))
-				return StopEvent{Reason: StopSingleStep, TID: thread, PC: regs.PC}, nil
+			if stepping, thread := b.consumeStep(); stepping {
+				return StopEvent{Reason: StopSingleStep, TID: thread}, nil
 			}
-			thread, regs := b.findBreakpointThread(threads)
-			slog.Debug("Wait: SIGTRAP → Breakpoint", "pc", fmt.Sprintf("0x%x", regs.PC), "tid", thread)
-			return StopEvent{Reason: StopBreakpoint, TID: thread, PC: archRewindPC(regs.PC)}, nil
+			return StopEvent{Reason: StopBreakpoint}, nil
 		}
 
 		// SIGURG is Go's goroutine-preemption signal. Re-deliver transparently.
 		if sig == syscall.SIGURG {
-			if b.stepping {
-				_ = ptrace(ptDarwinStep, uintptr(b.pid), 1, 0)
-			} else {
-				_ = ptrace(ptDarwinContinue, uintptr(b.pid), 1, uintptr(sig))
+			if err := b.resumeAfterSignal(sig); err != nil {
+				if isNoSuchProcess(err) {
+					return StopEvent{Reason: StopKilled, TID: tid}, nil
+				}
+				return StopEvent{}, err
 			}
 			continue
 		}
 
 		// SIGWINCH (terminal resize): handled by the Go runtime, re-deliver.
 		if sig == syscall.SIGWINCH {
-			if b.stepping {
-				_ = ptrace(ptDarwinStep, uintptr(b.pid), 1, uintptr(sig))
-			} else {
-				_ = ptrace(ptDarwinContinue, uintptr(b.pid), 1, uintptr(sig))
+			if err := b.resumeAfterSignal(sig); err != nil {
+				if isNoSuchProcess(err) {
+					return StopEvent{Reason: StopKilled, TID: tid}, nil
+				}
+				return StopEvent{}, err
 			}
 			continue
 		}
@@ -332,24 +292,70 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 		// completes. If PT_STEP fails, fall through to StopSignal so the
 		// engine can recover any in-flight step-over BP. Don't fall back to
 		// PT_CONTINUE+continue: that loops on SIGURG every ~10ms forever.
-		if b.stepping {
-			if ptrace(ptDarwinStep, uintptr(b.pid), 1, uintptr(sig)) == nil {
+		if b.isStepping() {
+			if err := ptrace(ptDarwinStep, uintptr(b.pid), 1, uintptr(sig)); err == nil {
 				continue
+			} else if isNoSuchProcess(err) {
+				return StopEvent{Reason: StopKilled, TID: tid}, nil
 			}
-			b.stepping = false
+			b.clearStep()
 		}
-		// For non-SIGTRAP signals use threads[0] — without Mach exceptions we
-		// have no way to know which thread received it.
-		sigThread := threads[0]
-		regs, err := b.GetRegisters(sigThread)
-		if err != nil {
-			return StopEvent{}, err
-		}
-		return StopEvent{Reason: StopSignal, TID: sigThread, PC: regs.PC, Signal: int(sig)}, nil
+		return StopEvent{Reason: StopSignal, Signal: int(sig)}, nil
 	}
 }
 
 func (b *darwinBackend) setPID(pid int) { b.pid = pid }
+
+func (b *darwinBackend) setStep(tid int) {
+	b.stepMu.Lock()
+	b.stepping = true
+	b.stepTID = tid
+	b.stepMu.Unlock()
+}
+
+func (b *darwinBackend) clearStep() {
+	b.stepMu.Lock()
+	b.stepping = false
+	b.stepTID = 0
+	b.stepMu.Unlock()
+}
+
+func (b *darwinBackend) isStepping() bool {
+	b.stepMu.Lock()
+	defer b.stepMu.Unlock()
+	return b.stepping
+}
+
+func (b *darwinBackend) consumeStep() (bool, int) {
+	b.stepMu.Lock()
+	defer b.stepMu.Unlock()
+	if !b.stepping {
+		return false, 0
+	}
+	tid := b.stepTID
+	b.stepping = false
+	b.stepTID = 0
+	return true, tid
+}
+
+func (b *darwinBackend) resumeAfterSignal(sig syscall.Signal) error {
+	request := ptDarwinContinue
+	if b.isStepping() {
+		request = ptDarwinStep
+	}
+	if err := ptrace(request, uintptr(b.pid), 1, uintptr(sig)); err != nil {
+		return fmt.Errorf("ptrace resume after %s: %w", sig, err)
+	}
+	return nil
+}
+
+func isNoSuchProcess(err error) bool {
+	return errors.Is(err, syscall.ESRCH)
+}
+
+func isNoChildProcess(err error) bool {
+	return errors.Is(err, syscall.ECHILD)
+}
 
 // TextSlide returns the ASLR slide for the main executable: actual load
 // address minus preferred __TEXT vmaddr. Returns 0 on any error.
