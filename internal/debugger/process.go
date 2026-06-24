@@ -18,7 +18,7 @@ func (p *process) launch(binaryPath string, args []string, env []string) error {
 	if p.live {
 		return ErrAlreadyRunning
 	}
-	// codeql[go/path-injection] The debugger must stat the operator-selected local binary before launching it.
+	// codeql-suppress[go/path-injection]: The debugger must stat the operator-selected local binary before launching it.
 	if _, err := os.Stat(binaryPath); err != nil {
 		return fmt.Errorf("launch: %w", err)
 	}
