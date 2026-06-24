@@ -20,7 +20,6 @@ func TestServer(t *testing.T) {
 	RunSpecs(t, "Server Suite")
 }
 
-
 func toWS(ts *httptest.Server, path string) string {
 	return "ws" + strings.TrimPrefix(ts.URL, "http") + path
 }
@@ -39,7 +38,6 @@ func recvState(conn *websocket.Conn) (protocol.SessionStatePayload, error) {
 	return p, protocol.DecodeEventPayload(evt, &p)
 }
 
-
 var _ = Describe("Server", func() {
 
 	var (
@@ -57,7 +55,6 @@ var _ = Describe("Server", func() {
 		ts.Close()
 		time.Sleep(50 * time.Millisecond)
 	})
-
 
 	Describe("GET /api/sessions", func() {
 		It("returns an empty JSON array when no sessions exist", func() {
@@ -98,7 +95,6 @@ var _ = Describe("Server", func() {
 			Expect(sessions[0].Clients).To(Equal(1))
 		})
 	})
-
 
 	Describe("WebSocket endpoint", func() {
 
@@ -181,7 +177,6 @@ var _ = Describe("Server", func() {
 		})
 	})
 
-
 	Describe("session lifecycle", func() {
 		It("removes the session when the sole client disconnects", func() {
 			conn, _, err := websocket.DefaultDialer.Dial(toWS(ts, "/ws?create"), nil)
@@ -224,7 +219,6 @@ var _ = Describe("Server", func() {
 			Eventually(srv.sessions.count, "2s", "50ms").Should(Equal(0))
 		})
 	})
-
 
 	Describe("Start and Shutdown", func() {
 		It("starts on a random port and shuts down cleanly", func() {

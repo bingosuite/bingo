@@ -182,7 +182,6 @@ var _ = Describe("Engine", func() {
 		}
 	})
 
-
 	Describe("state guards — stateNoProcess", func() {
 		It("rejects Continue", func() {
 			Expect(d.Continue()).To(MatchError(debugger.ErrNotSuspended))
@@ -210,7 +209,6 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
-
 	Describe("state guards — stateRunning", func() {
 		BeforeEach(func() {
 			debugger.ExportedForceRunning(d)
@@ -227,7 +225,6 @@ var _ = Describe("Engine", func() {
 			Expect(err).To(MatchError(debugger.ErrNotSuspended))
 		})
 	})
-
 
 	Describe("Kill", func() {
 		It("is a no-op in stateNoProcess", func() {
@@ -273,7 +270,6 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
-
 	Describe("arch trap instruction", func() {
 		It("is INT3 (0xCC) on amd64 or BRK#0 on arm64", func() {
 			trap := debugger.ExportedTrapInstruction()
@@ -287,7 +283,6 @@ var _ = Describe("Engine", func() {
 			}
 		})
 	})
-
 
 	Describe("breakpoints", func() {
 		const (
@@ -333,7 +328,6 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
-
 	Describe("breakpoint hit event flow", func() {
 		const bpAddr = uint64(0x3000)
 
@@ -372,7 +366,6 @@ var _ = Describe("Engine", func() {
 			}
 		})
 	})
-
 
 	Describe("process exit", func() {
 		It("emits EventProcessExited with exit code when StopExited arrives", func() {
@@ -425,7 +418,6 @@ var _ = Describe("Engine", func() {
 			}
 		})
 	})
-
 
 	Describe("StepInto", func() {
 		BeforeEach(func() {
@@ -532,7 +524,6 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
-
 	Describe("Continue", func() {
 		BeforeEach(func() {
 			debugger.ExportedForceSuspended(d)
@@ -549,7 +540,6 @@ var _ = Describe("Engine", func() {
 			Expect(d.Continue()).To(MatchError(debugger.ErrNotSuspended))
 		})
 	})
-
 
 	Describe("StackFrames", func() {
 		BeforeEach(func() {
@@ -580,7 +570,6 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
-
 	Describe("Goroutines", func() {
 		BeforeEach(func() {
 			debugger.ExportedForceSuspended(d)
@@ -594,7 +583,6 @@ var _ = Describe("Engine", func() {
 			Expect(gs[0].Status).To(Equal("waiting"))
 		})
 	})
-
 
 	Describe("Locals", func() {
 		BeforeEach(func() {
@@ -620,7 +608,6 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
-
 	Describe("event sequence numbers", func() {
 		It("assigns strictly increasing sequence numbers across events", func() {
 			debugger.ExportedForceSuspended(d)
@@ -639,7 +626,6 @@ var _ = Describe("Engine", func() {
 			Expect(seqs[2]).To(BeNumerically(">", seqs[1]))
 		})
 	})
-
 
 	Describe("concurrent dispatch", func() {
 		It("does not deadlock with many concurrent Kill calls", func() {
@@ -673,7 +659,6 @@ var _ = Describe("Engine", func() {
 			}
 		})
 	})
-
 
 	Describe("Events channel", func() {
 		It("is non-nil immediately after construction", func() {
