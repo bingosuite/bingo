@@ -109,6 +109,7 @@ func nextDebuggerEvent(t *testing.T, events <-chan protocol.Event, want protocol
 			if !ok {
 				t.Fatalf("events channel closed while waiting for %s", want)
 			}
+			t.Logf("observed event while waiting for %s: kind=%s payload=%s", want, evt.Kind, evt.Payload)
 			if evt.Kind == protocol.EventError {
 				var payload protocol.ErrorPayload
 				if err := protocol.DecodeEventPayload(evt, &payload); err != nil {
