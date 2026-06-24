@@ -259,21 +259,16 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				continue
 
 			case 0:
-				regs, err := b.GetRegisters(tid)
-				if err != nil {
-					return StopEvent{}, err
-				}
 				b.recordStop(tid)
 
 				if b.stepping {
 					b.stepping = false
-					return StopEvent{Reason: StopSingleStep, TID: tid, PC: regs.PC}, nil
+					return StopEvent{Reason: StopSingleStep, TID: tid}, nil
 				}
 
 				return StopEvent{
 					Reason: StopBreakpoint,
 					TID:    tid,
-					PC:     archRewindPC(regs.PC),
 				}, nil
 
 			default:
@@ -319,15 +314,10 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			continue
 		}
 
-		regs, err := b.GetRegisters(tid)
-		if err != nil {
-			return StopEvent{}, err
-		}
 		b.recordStop(tid)
 		return StopEvent{
 			Reason: StopSignal,
 			TID:    tid,
-			PC:     regs.PC,
 			Signal: int(sig),
 		}, nil
 	}

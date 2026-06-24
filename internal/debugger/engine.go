@@ -371,6 +371,12 @@ func (e *engine) handleStop(stop StopEvent) {
 
 	case StopBreakpoint:
 		e.setState(stateSuspended)
+		var err error
+		stop, err = e.populateStopPC(stop, true)
+		if err != nil {
+			e.emitError(protocol.CmdNone, err)
+			return
+		}
 		bp := e.bps.atAddr(stop.PC)
 		slog.Debug("StopBreakpoint", "pc", fmt.Sprintf("0x%x", stop.PC),
 			"found", bp != nil,
@@ -412,6 +418,13 @@ func (e *engine) handleStop(stop StopEvent) {
 		e.emitBreakpointHit(bp, stop)
 
 	case StopSingleStep:
+		var err error
+		stop, err = e.populateStopPC(stop, false)
+		if err != nil {
+			e.setState(stateSuspended)
+			e.emitError(protocol.CmdNone, err)
+			return
+		}
 		slog.Debug("StopSingleStep", "pc", fmt.Sprintf("0x%x", stop.PC),
 			"steppingOverBP", e.steppingOverBP != nil)
 		if sob := e.steppingOverBP; sob != nil {
@@ -498,6 +511,22 @@ func (e *engine) handleStop(stop StopEvent) {
 		e.setState(stateRunning)
 		go e.waitLoop()
 	}
+}
+
+func (e *engine) populateStopPC(stop StopEvent, rewind bool) (StopEvent, error) {
+	if stop.PC != 0 {
+		return stop, nil
+	}
+	regs, err := e.backend.GetRegisters(stop.TID)
+	if err != nil {
+		return stop, fmt.Errorf("get stop PC for tid %d: %w", stop.TID, err)
+	}
+	if rewind {
+		stop.PC = archRewindPC(regs.PC)
+	} else {
+		stop.PC = regs.PC
+	}
+	return stop, nil
 }
 
 // drainCmds answers queued commands with ErrProcessExited so blocked dispatchers
