@@ -11,6 +11,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/bingosuite/bingo/internal/debugger"
 	"github.com/bingosuite/bingo/internal/hub"
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
@@ -233,6 +234,26 @@ var _ = Describe("Hub", func() {
 			h.AddClient(conn2, nil)
 			closeFakeWS(conn1)
 			closeFakeWS(conn2)
+		})
+
+		It("does not panic when managed-session welcome delivery races shutdown", func() {
+			for i := 0; i < 50; i++ {
+				managed := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
+				cancelManaged := runHub(managed)
+				conn := newFakeWSConn()
+				done := make(chan struct{})
+
+				go func() {
+					defer GinkgoRecover()
+					managed.AddClient(conn, nil)
+					close(done)
+				}()
+				cancelManaged()
+
+				Eventually(done, "500ms", "10ms").Should(BeClosed())
+				closeFakeWS(conn)
+				Eventually(managed.Done(), "500ms", "10ms").Should(BeClosed())
+			}
 		})
 	})
 

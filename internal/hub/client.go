@@ -42,9 +42,10 @@ type Client struct {
 	log  *slog.Logger
 
 	// send is closed exactly once — by the registry on shutdown, or by
-	// deliver() on buffer overflow. closeOnce guards the close.
-	send      chan []byte
-	closeOnce sync.Once
+	// deliver() on buffer overflow. sendMu guards close-vs-send races.
+	send   chan []byte
+	sendMu sync.Mutex
+	closed bool
 }
 
 func newClient(conn WSConn, h *Hub, log *slog.Logger) *Client {
@@ -60,7 +61,13 @@ func newClient(conn WSConn, h *Hub, log *slog.Logger) *Client {
 }
 
 func (c *Client) closeSend() {
-	c.closeOnce.Do(func() { close(c.send) })
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	if c.closed {
+		return
+	}
+	c.closed = true
+	close(c.send)
 }
 
 // writePump serialises outbound messages onto the WebSocket. One goroutine
@@ -126,15 +133,22 @@ func (c *Client) readPump() {
 	}
 }
 
-// deliver queues msg. Non-blocking: if the buffer is full the client is
-// evicted so one slow client can't stall the hub.
-func (c *Client) deliver(msg []byte) {
+// deliver queues msg. Non-blocking: if the buffer is full the caller should
+// evict the client so one slow client can't stall the hub.
+func (c *Client) deliver(msg []byte) bool {
+	c.sendMu.Lock()
+	defer c.sendMu.Unlock()
+	if c.closed {
+		return false
+	}
 	select {
 	case c.send <- msg:
+		return true
 	default:
 		c.log.Warn("send buffer full — evicting slow client")
-		c.hub.removeClient(c)
-		c.closeSend()
+		c.closed = true
+		close(c.send)
+		return false
 	}
 }
 

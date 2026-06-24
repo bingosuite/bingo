@@ -372,7 +372,7 @@ func (e *engine) handleStop(stop StopEvent) {
 	case StopBreakpoint:
 		e.setState(stateSuspended)
 		var err error
-		stop, err = e.populateStopPC(stop, true)
+		stop, err = e.populateBreakpointStop(stop)
 		if err != nil {
 			e.emitError(protocol.CmdNone, err)
 			return
@@ -517,6 +517,16 @@ func (e *engine) populateStopPC(stop StopEvent, rewind bool) (StopEvent, error) 
 	if stop.PC != 0 {
 		return stop, nil
 	}
+	if stop.TID == 0 {
+		threads, err := e.backend.Threads()
+		if err != nil {
+			return stop, fmt.Errorf("get stop thread: %w", err)
+		}
+		if len(threads) == 0 {
+			return stop, fmt.Errorf("get stop thread: no threads")
+		}
+		stop.TID = threads[0]
+	}
 	regs, err := e.backend.GetRegisters(stop.TID)
 	if err != nil {
 		return stop, fmt.Errorf("get stop PC for tid %d: %w", stop.TID, err)
@@ -527,6 +537,79 @@ func (e *engine) populateStopPC(stop StopEvent, rewind bool) (StopEvent, error) 
 		stop.PC = regs.PC
 	}
 	return stop, nil
+}
+
+func (e *engine) populateBreakpointStop(stop StopEvent) (StopEvent, error) {
+	if stop.PC != 0 {
+		return stop, nil
+	}
+	if stop.TID != 0 {
+		return e.populateStopPC(stop, true)
+	}
+
+	threads, err := e.backend.Threads()
+	if err != nil {
+		return stop, fmt.Errorf("find breakpoint thread: %w", err)
+	}
+	if len(threads) == 0 {
+		return stop, fmt.Errorf("find breakpoint thread: no threads")
+	}
+
+	trap := archTrapInstruction()
+	var firstTrap *StopEvent
+	var fallback *StopEvent
+	var firstErr error
+	for _, tid := range threads {
+		regs, err := e.backend.GetRegisters(tid)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+
+		candidate := StopEvent{
+			Reason: stop.Reason,
+			TID:    tid,
+			PC:     archRewindPC(regs.PC),
+		}
+		if fallback == nil {
+			cp := candidate
+			fallback = &cp
+		}
+
+		if !e.instructionAt(candidate.PC, trap) {
+			continue
+		}
+		cp := candidate
+		if e.bps.atAddr(candidate.PC) != nil {
+			return cp, nil
+		}
+		if firstTrap == nil {
+			firstTrap = &cp
+		}
+	}
+
+	if firstTrap != nil {
+		return *firstTrap, nil
+	}
+	if fallback != nil {
+		return *fallback, nil
+	}
+	return stop, fmt.Errorf("find breakpoint thread: read registers: %w", firstErr)
+}
+
+func (e *engine) instructionAt(addr uint64, want []byte) bool {
+	buf := make([]byte, len(want))
+	if err := e.backend.ReadMemory(addr, buf); err != nil {
+		return false
+	}
+	for i := range want {
+		if buf[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // drainCmds answers queued commands with ErrProcessExited so blocked dispatchers

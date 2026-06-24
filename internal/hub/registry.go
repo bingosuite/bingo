@@ -31,12 +31,14 @@ func (r *registry) count() int {
 	return len(r.clients)
 }
 
-func (r *registry) broadcast(msg []byte) {
+func (r *registry) snapshot() []*Client {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	clients := make([]*Client, 0, len(r.clients))
 	for c := range r.clients {
-		c.deliver(msg)
+		clients = append(clients, c)
 	}
+	return clients
 }
 
 // closeAll closes every client's send channel and empties the registry.

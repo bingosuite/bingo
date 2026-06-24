@@ -197,6 +197,9 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		// WALL includes clone()d threads.
 		tid, err := syscall.Wait4(-1, &ws, syscall.WALL, nil)
 		if err != nil {
+			if isNoChildProcess(err) {
+				return StopEvent{Reason: StopExited, TID: b.pid}, nil
+			}
 			return StopEvent{}, fmt.Errorf("wait4: %w", err)
 		}
 
@@ -340,6 +343,10 @@ func (b *linuxBackend) recordStop(tid int) {
 
 func isNoSuchProcess(err error) bool {
 	return errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrNotExist)
+}
+
+func isNoChildProcess(err error) bool {
+	return errors.Is(err, syscall.ECHILD)
 }
 
 func continueIfTraceeExists(tid int, signal int) error {
