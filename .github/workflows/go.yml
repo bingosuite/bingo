@@ -47,6 +47,7 @@ jobs:
   linux-amd64-smoke:
     name: Linux AMD64 ptrace smoke
     runs-on: ubuntu-24.04
+    timeout-minutes: 3
     permissions:
       contents: read
     steps:

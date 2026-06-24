@@ -13,6 +13,8 @@ import (
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
+const optimizedOut = "<optimized out>"
+
 // dwarfReader wraps *dwarf.Data with the operations the engine needs:
 // PC-for-file:line lookup, PC-to-location mapping, and local variable reading.
 //
@@ -339,17 +341,17 @@ func (r *dwarfReader) typeName(entry *dwarf.Entry) string {
 func (r *dwarfReader) evalLocation(b Backend, entry *dwarf.Entry, frameBase uint64) string {
 	loc := entry.Val(dwarf.AttrLocation)
 	if loc == nil {
-		return "<optimized out>"
+		return optimizedOut
 	}
 	expr, ok := loc.([]byte)
 	if !ok || len(expr) == 0 {
-		return "<optimized out>"
+		return optimizedOut
 	}
 
 	switch expr[0] {
 	case 0x03: // DW_OP_addr — followed by an 8-byte LE DWARF-relative address
 		if len(expr) < 9 {
-			return "<optimized out>"
+			return optimizedOut
 		}
 		addr := binary.LittleEndian.Uint64(expr[1:9])
 		addr = uint64(int64(addr) + r.slide)
@@ -357,14 +359,14 @@ func (r *dwarfReader) evalLocation(b Backend, entry *dwarf.Entry, frameBase uint
 
 	case 0x91: // DW_OP_fbreg — signed LEB128 offset from frame base
 		if len(expr) < 2 {
-			return "<optimized out>"
+			return optimizedOut
 		}
 		offset, _ := decodeSLEB128(expr[1:])
 		addr := uint64(int64(frameBase) + offset)
 		return r.readValueAt(b, addr)
 
 	default:
-		return "<optimized out>"
+		return optimizedOut
 	}
 }
 
