@@ -57,7 +57,7 @@ func ListSessions(addr string) ([]SessionInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("list sessions: HTTP %d", resp.StatusCode)

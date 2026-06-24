@@ -50,13 +50,3 @@ func (r *registry) closeAll() {
 		delete(r.clients, c)
 	}
 }
-
-func (r *registry) snapshot() []*Client {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	out := make([]*Client, 0, len(r.clients))
-	for c := range r.clients {
-		out = append(out, c)
-	}
-	return out
-}

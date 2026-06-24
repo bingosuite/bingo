@@ -16,6 +16,8 @@ type dispatchResult struct {
 
 // dispatch translates cmd into a debugger call and returns the immediate
 // confirmation event (if any) plus any error.
+//
+//nolint:gocognit,gocyclo // Protocol command routing is intentionally centralized here.
 func dispatch(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, error) {
 	switch cmd.Kind {
 
@@ -61,9 +63,7 @@ func dispatch(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, erro
 		if err := dbg.ClearBreakpoint(p.ID); err != nil {
 			return dispatchResult{}, err
 		}
-		evt, err := protocol.NewEvent(protocol.EventBreakpointCleared, 0, protocol.BreakpointClearedPayload{
-			ID: p.ID,
-		})
+		evt, err := protocol.NewEvent(protocol.EventBreakpointCleared, 0, protocol.BreakpointClearedPayload(p))
 		if err != nil {
 			return dispatchResult{}, err
 		}

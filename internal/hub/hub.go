@@ -71,8 +71,7 @@ type Hub struct {
 }
 
 type clientCommand struct {
-	cmd    protocol.Command
-	client *Client
+	cmd protocol.Command
 }
 
 func newHub(log *slog.Logger) *Hub {

@@ -189,6 +189,8 @@ func (b *linuxBackend) Threads() ([]int, error) {
 // vs breakpoint disambiguation uses b.stepping (reliable because ptrace is
 // serialised). PTRACE_EVENT stops (clone/exec/exit) are handled internally
 // and don't surface to the engine.
+//
+//nolint:gocognit // The wait loop is one serialized ptrace state machine.
 func (b *linuxBackend) Wait() (StopEvent, error) {
 	for {
 		var ws syscall.WaitStatus
