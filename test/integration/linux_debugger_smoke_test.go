@@ -23,12 +23,12 @@ const (
 
 const linuxSmokeSource = `package main
 
-import "fmt"
+var sink int
 
 func main() {
 	value := 41
 	value++
-	fmt.Println(value)
+	sink = value
 }
 `
 
