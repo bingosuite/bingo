@@ -852,5 +852,20 @@ func (e *engine) dispatch(fn func() error) error {
 	case <-e.done:
 		return ErrProcessExited
 	}
-	return <-ch
+	select {
+	case err := <-ch:
+		return err
+	default:
+	}
+	select {
+	case err := <-ch:
+		return err
+	case <-e.done:
+		select {
+		case err := <-ch:
+			return err
+		default:
+			return ErrProcessExited
+		}
+	}
 }
