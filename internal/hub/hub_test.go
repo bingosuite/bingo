@@ -195,6 +195,10 @@ func recvEvent(conn *fakeWSConn) (protocol.Event, bool) {
 	return decodeEvent(msg), true
 }
 
+func closeFakeWS(conn *fakeWSConn) {
+	ExpectWithOffset(1, conn.Close()).To(Succeed())
+}
+
 var _ = Describe("Hub", func() {
 
 	var (
@@ -212,7 +216,7 @@ var _ = Describe("Hub", func() {
 	AfterEach(func() {
 		cancel()
 		func() {
-			defer func() { recover() }()
+			defer func() { _ = recover() }()
 			close(fd.events)
 		}()
 		select {
@@ -227,8 +231,8 @@ var _ = Describe("Hub", func() {
 			conn2 := newFakeWSConn()
 			h.AddClient(conn1, nil)
 			h.AddClient(conn2, nil)
-			conn1.Close()
-			conn2.Close()
+			closeFakeWS(conn1)
+			closeFakeWS(conn2)
 		})
 	})
 
@@ -293,7 +297,7 @@ var _ = Describe("Hub", func() {
 		It("does not deliver events to clients that disconnected before the event", func() {
 			conn := newFakeWSConn()
 			h.AddClient(conn, nil)
-			conn.Close()
+			closeFakeWS(conn)
 			time.Sleep(30 * time.Millisecond) // let readPump notice the close
 
 			fd.push(protocol.MustEvent(protocol.EventOutput, 1,
@@ -521,7 +525,7 @@ var _ = Describe("Hub", func() {
 		It("calls Kill on the debugger", func() {
 			conn := newFakeWSConn()
 			h.AddClient(conn, nil)
-			conn.Close()
+			closeFakeWS(conn)
 
 			Eventually(fd.recordedCalls, "500ms", "10ms").
 				Should(ContainElement("Kill"))
@@ -530,7 +534,7 @@ var _ = Describe("Hub", func() {
 		It("calls Kill exactly once even when cancel and disconnect race", func() {
 			conn := newFakeWSConn()
 			h.AddClient(conn, nil)
-			conn.Close()
+			closeFakeWS(conn)
 			cancel() // races with the disconnect-triggered shutdown
 
 			time.Sleep(50 * time.Millisecond)

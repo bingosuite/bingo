@@ -261,6 +261,7 @@ func (b *darwinBackend) findBreakpointThread(threads []int) (int, Registers) {
 	return 0, Registers{}
 }
 
+//nolint:gocognit // The wait loop is one serialized ptrace/Mach state machine.
 func (b *darwinBackend) Wait() (StopEvent, error) {
 	for {
 		var ws syscall.WaitStatus
@@ -304,7 +305,7 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 			}
 			thread, regs := b.findBreakpointThread(threads)
 			slog.Debug("Wait: SIGTRAP → Breakpoint", "pc", fmt.Sprintf("0x%x", regs.PC), "tid", thread)
-			return StopEvent{Reason: StopBreakpoint, TID: thread, PC: regs.PC}, nil
+			return StopEvent{Reason: StopBreakpoint, TID: thread, PC: archRewindPC(regs.PC)}, nil
 		}
 
 		// SIGURG is Go's goroutine-preemption signal. Re-deliver transparently.
@@ -380,7 +381,7 @@ func machoTextVmaddr(binaryPath string) (uint64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("macho.Open %s: %w", binaryPath, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	seg := f.Segment("__TEXT")
 	if seg == nil {
 		return 0, fmt.Errorf("no __TEXT segment in %s", binaryPath)

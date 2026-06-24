@@ -349,6 +349,7 @@ func (e *engine) waitLoop() {
 	}
 }
 
+//nolint:gocognit,gocyclo // Stop handling is a single serialized debugger state machine.
 func (e *engine) handleStop(stop StopEvent) {
 	switch stop.Reason {
 	case StopExited:
@@ -518,6 +519,8 @@ func (e *engine) stepOver() error {
 
 // sourceStepOver sets a temp BP at the next source line and resumes. Falls
 // back to a single machine-instruction step when DWARF can't resolve a target.
+//
+//nolint:gocognit // Source stepping fallback logic stays together to preserve state transitions.
 func (e *engine) sourceStepOver() error {
 	if e.dw != nil {
 		// Prefer the remembered destination from the previous step-over over

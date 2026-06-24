@@ -93,14 +93,6 @@ func (t *breakpointTable) atAddr(addr uint64) *breakpointEntry {
 	return t.byAddr[addr]
 }
 
-func (t *breakpointTable) all() []protocol.Breakpoint {
-	out := make([]protocol.Breakpoint, 0, len(t.byID))
-	for _, e := range t.byID {
-		out = append(out, e.toProtocol())
-	}
-	return out
-}
-
 // removeFromTable / addToTable / reinstall: used by the step-over sequence to
 // keep the entry alive across a single-step. See AGENTS.md → step-over flow.
 func (t *breakpointTable) removeFromTable(entry *breakpointEntry) {

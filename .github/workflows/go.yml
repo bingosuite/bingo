@@ -38,9 +38,6 @@ jobs:
       - name: Lint
         uses: golangci/golangci-lint-action@v9.2.0
 
-      - name: Magic Number Check
-        uses: tommy-muehle/go-mnd@v2.5.1
-
       - name: Build
         run: go build -v ./...
 

@@ -38,6 +38,14 @@ func recvState(conn *websocket.Conn) (protocol.SessionStatePayload, error) {
 	return p, protocol.DecodeEventPayload(evt, &p)
 }
 
+func closeResponse(resp *http.Response) {
+	ExpectWithOffset(1, resp.Body.Close()).To(Succeed())
+}
+
+func closeWS(conn *websocket.Conn) {
+	ExpectWithOffset(1, conn.Close()).To(Succeed())
+}
+
 var _ = Describe("Server", func() {
 
 	var (
@@ -60,7 +68,7 @@ var _ = Describe("Server", func() {
 		It("returns an empty JSON array when no sessions exist", func() {
 			resp, err := http.Get(ts.URL + "/api/sessions")
 			Expect(err).NotTo(HaveOccurred())
-			defer resp.Body.Close()
+			defer closeResponse(resp)
 
 			Expect(resp.StatusCode).To(Equal(http.StatusOK))
 			Expect(resp.Header.Get("Content-Type")).To(Equal("application/json"))
@@ -73,20 +81,20 @@ var _ = Describe("Server", func() {
 		It("rejects non-GET requests", func() {
 			resp, err := http.Post(ts.URL+"/api/sessions", "", nil)
 			Expect(err).NotTo(HaveOccurred())
-			defer resp.Body.Close()
+			defer closeResponse(resp)
 			Expect(resp.StatusCode).To(Equal(http.StatusMethodNotAllowed))
 		})
 
 		It("includes sessions created via WebSocket", func() {
 			conn, _, err := websocket.DefaultDialer.Dial(toWS(ts, "/ws?create"), nil)
 			Expect(err).NotTo(HaveOccurred())
-			defer conn.Close()
+			defer closeWS(conn)
 
 			_, _ = recvState(conn)
 
 			resp, err := http.Get(ts.URL + "/api/sessions")
 			Expect(err).NotTo(HaveOccurred())
-			defer resp.Body.Close()
+			defer closeResponse(resp)
 
 			var sessions []SessionInfo
 			Expect(json.NewDecoder(resp.Body).Decode(&sessions)).To(Succeed())
@@ -101,7 +109,7 @@ var _ = Describe("Server", func() {
 		It("returns 400 when neither ?create nor ?session is specified", func() {
 			resp, err := http.Get(ts.URL + "/ws")
 			Expect(err).NotTo(HaveOccurred())
-			defer resp.Body.Close()
+			defer closeResponse(resp)
 			Expect(resp.StatusCode).To(Equal(http.StatusBadRequest))
 		})
 
@@ -109,7 +117,7 @@ var _ = Describe("Server", func() {
 			It("upgrades to WebSocket and sends an idle welcome state", func() {
 				conn, resp, err := websocket.DefaultDialer.Dial(toWS(ts, "/ws?create"), nil)
 				Expect(err).NotTo(HaveOccurred())
-				defer conn.Close()
+				defer closeWS(conn)
 				Expect(resp.StatusCode).To(Equal(http.StatusSwitchingProtocols))
 
 				p, err := recvState(conn)
@@ -122,7 +130,7 @@ var _ = Describe("Server", func() {
 			It("generates a valid UUID session ID", func() {
 				conn, _, err := websocket.DefaultDialer.Dial(toWS(ts, "/ws?create"), nil)
 				Expect(err).NotTo(HaveOccurred())
-				defer conn.Close()
+				defer closeWS(conn)
 
 				p, err := recvState(conn)
 				Expect(err).NotTo(HaveOccurred())
@@ -133,12 +141,12 @@ var _ = Describe("Server", func() {
 			It("creates distinct sessions for each request", func() {
 				conn1, _, err := websocket.DefaultDialer.Dial(toWS(ts, "/ws?create"), nil)
 				Expect(err).NotTo(HaveOccurred())
-				defer conn1.Close()
+				defer closeWS(conn1)
 				p1, _ := recvState(conn1)
 
 				conn2, _, err := websocket.DefaultDialer.Dial(toWS(ts, "/ws?create"), nil)
 				Expect(err).NotTo(HaveOccurred())
-				defer conn2.Close()
+				defer closeWS(conn2)
 				p2, _ := recvState(conn2)
 
 				Expect(p1.SessionID).NotTo(Equal(p2.SessionID))
@@ -150,13 +158,13 @@ var _ = Describe("Server", func() {
 			It("joins an existing session with correct client count", func() {
 				conn1, _, err := websocket.DefaultDialer.Dial(toWS(ts, "/ws?create"), nil)
 				Expect(err).NotTo(HaveOccurred())
-				defer conn1.Close()
+				defer closeWS(conn1)
 				p1, _ := recvState(conn1)
 
 				conn2, _, err := websocket.DefaultDialer.Dial(
 					toWS(ts, "/ws?session="+p1.SessionID), nil)
 				Expect(err).NotTo(HaveOccurred())
-				defer conn2.Close()
+				defer closeWS(conn2)
 
 				p2, err := recvState(conn2)
 				Expect(err).NotTo(HaveOccurred())
@@ -172,7 +180,7 @@ var _ = Describe("Server", func() {
 				_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 				_, _, err = conn.ReadMessage()
 				Expect(err).To(HaveOccurred())
-				conn.Close()
+				closeWS(conn)
 			})
 		})
 	})
@@ -184,7 +192,7 @@ var _ = Describe("Server", func() {
 
 			Eventually(srv.sessions.count, "2s", "50ms").Should(Equal(1))
 
-			conn.Close()
+			closeWS(conn)
 
 			Eventually(srv.sessions.count, "2s", "50ms").Should(Equal(0))
 		})
@@ -192,7 +200,7 @@ var _ = Describe("Server", func() {
 		It("keeps the session alive while at least one client remains", func() {
 			conn1, _, err := websocket.DefaultDialer.Dial(toWS(ts, "/ws?create"), nil)
 			Expect(err).NotTo(HaveOccurred())
-			defer conn1.Close()
+			defer closeWS(conn1)
 
 			p, _ := recvState(conn1)
 
@@ -200,7 +208,7 @@ var _ = Describe("Server", func() {
 				toWS(ts, "/ws?session="+p.SessionID), nil)
 			Expect(err).NotTo(HaveOccurred())
 
-			conn2.Close()
+			closeWS(conn2)
 			time.Sleep(100 * time.Millisecond)
 
 			Expect(srv.sessions.count()).To(Equal(1))
@@ -210,7 +218,7 @@ var _ = Describe("Server", func() {
 		It("cleans up all sessions on context cancellation", func() {
 			conn, _, err := websocket.DefaultDialer.Dial(toWS(ts, "/ws?create"), nil)
 			Expect(err).NotTo(HaveOccurred())
-			defer conn.Close()
+			defer closeWS(conn)
 
 			Eventually(srv.sessions.count, "2s", "50ms").Should(Equal(1))
 

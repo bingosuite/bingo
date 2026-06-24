@@ -37,7 +37,7 @@ func loadDWARFData(binaryPath string) (*dwarf.Data, error) {
 		if err != nil {
 			return nil, fmt.Errorf("elf.Open: %w", err)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		return f.DWARF()
 
 	case "darwin":
@@ -45,7 +45,7 @@ func loadDWARFData(binaryPath string) (*dwarf.Data, error) {
 		if err != nil {
 			return nil, fmt.Errorf("macho.Open: %w", err)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		return f.DWARF()
 
 	default:

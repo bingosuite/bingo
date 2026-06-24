@@ -89,6 +89,13 @@ func nextDebuggerEvent(t *testing.T, events <-chan protocol.Event, want protocol
 			if !ok {
 				t.Fatalf("events channel closed while waiting for %s", want)
 			}
+			if evt.Kind == protocol.EventError {
+				var payload protocol.ErrorPayload
+				if err := protocol.DecodeEventPayload(evt, &payload); err != nil {
+					t.Fatalf("debugger emitted undecodable error while waiting for %s: %v", want, err)
+				}
+				t.Fatalf("debugger emitted error while waiting for %s: %s", want, payload.Message)
+			}
 			if evt.Kind == protocol.EventProcessExited && want != protocol.EventProcessExited {
 				t.Fatalf("process exited while waiting for %s", want)
 			}

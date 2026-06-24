@@ -15,22 +15,26 @@ var ExportedErrBreakpointExists = errBreakpointExists
 // can exercise suspended-state behaviour without launching a real process.
 func ExportedForceSuspended(d Debugger) {
 	e := d.(*engine)
-	e.dispatch(func() error {
+	if err := e.dispatch(func() error {
 		e.proc.live = true
 		e.proc.pid = 0
 		e.setState(stateSuspended)
 		return nil
-	})
+	}); err != nil {
+		panic("ExportedForceSuspended: " + err.Error())
+	}
 }
 
 func ExportedForceRunning(d Debugger) {
 	e := d.(*engine)
-	e.dispatch(func() error {
+	if err := e.dispatch(func() error {
 		e.proc.live = true
 		e.proc.pid = 0
 		e.setState(stateRunning)
 		return nil
-	})
+	}); err != nil {
+		panic("ExportedForceRunning: " + err.Error())
+	}
 }
 
 // ExportedSetBreakpointAt installs a BP at addr bypassing DWARF lookup.
