@@ -3,14 +3,10 @@
 package integration
 
 import (
-	"bytes"
 	"errors"
-	"log/slog"
 	"os"
 	"os/exec"
-	"path"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -37,8 +33,6 @@ func main() {
 `
 
 func TestLinuxAMD64DebuggerLaunchBreakpointSmoke(t *testing.T) {
-	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
-
 	dir := t.TempDir()
 	sourcePath := filepath.Join(dir, "main.go")
 	binaryPath := filepath.Join(dir, "target")
@@ -59,7 +53,7 @@ func TestLinuxAMD64DebuggerLaunchBreakpointSmoke(t *testing.T) {
 	if err := dbg.Launch(binaryPath, nil, []string{"GOMAXPROCS=1", "GODEBUG=asyncpreemptoff=1"}); err != nil {
 		t.Fatalf("launch smoke target: %v", err)
 	}
-	nextDebuggerEvent(t, dbg.Events(), protocol.EventStepped, nil)
+	nextDebuggerEvent(t, dbg.Events(), protocol.EventStepped)
 
 	bp, err := dbg.SetBreakpoint(sourcePath, linuxSmokeBreakpointLine)
 	if err != nil {
@@ -70,9 +64,7 @@ func TestLinuxAMD64DebuggerLaunchBreakpointSmoke(t *testing.T) {
 		t.Fatalf("continue to breakpoint: %v", err)
 	}
 
-	hit := nextDebuggerEvent(t, dbg.Events(), protocol.EventBreakpointHit, func() {
-		dumpTraceeTasks(t, binaryPath)
-	})
+	hit := nextDebuggerEvent(t, dbg.Events(), protocol.EventBreakpointHit)
 	var payload protocol.BreakpointHitPayload
 	if err := protocol.DecodeEventPayload(hit, &payload); err != nil {
 		t.Fatalf("decode breakpoint hit: %v", err)
@@ -84,7 +76,7 @@ func TestLinuxAMD64DebuggerLaunchBreakpointSmoke(t *testing.T) {
 	if err := dbg.Continue(); err != nil {
 		t.Fatalf("continue after breakpoint: %v", err)
 	}
-	nextDebuggerEvent(t, dbg.Events(), protocol.EventProcessExited, nil)
+	nextDebuggerEvent(t, dbg.Events(), protocol.EventProcessExited)
 }
 
 func cleanupDebugger(t *testing.T, dbg debugger.Debugger) {
@@ -105,12 +97,7 @@ func cleanupDebugger(t *testing.T, dbg debugger.Debugger) {
 	}
 }
 
-func nextDebuggerEvent(
-	t *testing.T,
-	events <-chan protocol.Event,
-	want protocol.EventKind,
-	onTimeout func(),
-) protocol.Event {
+func nextDebuggerEvent(t *testing.T, events <-chan protocol.Event, want protocol.EventKind) protocol.Event {
 	t.Helper()
 
 	timer := time.NewTimer(linuxSmokeEventTimeout)
@@ -122,7 +109,6 @@ func nextDebuggerEvent(
 			if !ok {
 				t.Fatalf("events channel closed while waiting for %s", want)
 			}
-			t.Logf("observed event while waiting for %s: kind=%s payload=%s", want, evt.Kind, evt.Payload)
 			if evt.Kind == protocol.EventError {
 				var payload protocol.ErrorPayload
 				if err := protocol.DecodeEventPayload(evt, &payload); err != nil {
@@ -137,80 +123,7 @@ func nextDebuggerEvent(
 				return evt
 			}
 		case <-timer.C:
-			if onTimeout != nil {
-				onTimeout()
-			}
 			t.Fatalf("timed out waiting for %s", want)
 		}
 	}
-}
-
-func dumpTraceeTasks(t *testing.T, binaryPath string) {
-	t.Helper()
-
-	pids := traceePIDs(t, binaryPath)
-	if len(pids) == 0 {
-		t.Logf("no tracee process found for %q", binaryPath)
-		return
-	}
-	for _, pid := range pids {
-		status, err := os.ReadFile(filepath.Join("/proc", pid, "status"))
-		if err != nil {
-			t.Logf("read /proc/%s/status: %v", pid, err)
-		} else {
-			t.Logf("/proc/%s/status:\n%s", pid, summarizeStatus(status))
-		}
-		tasks, err := os.ReadDir(filepath.Join("/proc", pid, "task"))
-		if err != nil {
-			t.Logf("read /proc/%s/task: %v", pid, err)
-			continue
-		}
-		for _, task := range tasks {
-			tid := task.Name()
-			taskStatus, err := os.ReadFile(filepath.Join("/proc", pid, "task", tid, "status"))
-			if err != nil {
-				t.Logf("read /proc/%s/task/%s/status: %v", pid, tid, err)
-				continue
-			}
-			wchan, _ := os.ReadFile(filepath.Join("/proc", pid, "task", tid, "wchan"))
-			t.Logf("/proc/%s/task/%s: %s wchan=%s", pid, tid, summarizeStatus(taskStatus), strings.TrimSpace(string(wchan)))
-		}
-	}
-}
-
-func traceePIDs(t *testing.T, binaryPath string) []string {
-	t.Helper()
-
-	cmdlines, err := filepath.Glob("/proc/[0-9]*/cmdline")
-	if err != nil {
-		t.Logf("glob proc cmdlines: %v", err)
-		return nil
-	}
-	var pids []string
-	for _, cmdlinePath := range cmdlines {
-		cmdline, err := os.ReadFile(cmdlinePath)
-		if err != nil || !bytes.Contains(cmdline, []byte(binaryPath)) {
-			continue
-		}
-		pids = append(pids, path.Base(path.Dir(cmdlinePath)))
-	}
-	return pids
-}
-
-func summarizeStatus(status []byte) string {
-	var b strings.Builder
-	for _, line := range strings.Split(string(status), "\n") {
-		switch {
-		case strings.HasPrefix(line, "Name:"),
-			strings.HasPrefix(line, "State:"),
-			strings.HasPrefix(line, "Tgid:"),
-			strings.HasPrefix(line, "Pid:"),
-			strings.HasPrefix(line, "PPid:"),
-			strings.HasPrefix(line, "TracerPid:"),
-			strings.HasPrefix(line, "Threads:"):
-			b.WriteString(line)
-			b.WriteByte('\n')
-		}
-	}
-	return strings.TrimSpace(b.String())
 }
