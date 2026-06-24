@@ -4,6 +4,7 @@ package integration
 
 import (
 	"errors"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,6 +34,8 @@ func main() {
 `
 
 func TestLinuxAMD64DebuggerLaunchBreakpointSmoke(t *testing.T) {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
 	dir := t.TempDir()
 	sourcePath := filepath.Join(dir, "main.go")
 	binaryPath := filepath.Join(dir, "target")
