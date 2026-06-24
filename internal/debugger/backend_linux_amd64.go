@@ -21,6 +21,10 @@ type linuxBackend struct {
 	lastStopTID int
 }
 
+const linuxPtraceOptions = syscall.PTRACE_O_TRACECLONE |
+	syscall.PTRACE_O_TRACEEXIT |
+	syscall.PTRACE_O_TRACEEXEC
+
 // startTracedProcess forks under ptrace. The child is stopped at its first
 // instruction (execve SIGTRAP) ready for the engine to set breakpoints.
 func startTracedProcess(binaryPath string, args []string, env []string) (int, *exec.Cmd, error) {
@@ -48,12 +52,7 @@ func startTracedProcess(binaryPath string, args []string, env []string) (int, *e
 		return 0, nil, fmt.Errorf("unexpected initial stop: %v", ws)
 	}
 
-	// Track child threads (TRACECLONE) and get a stop just before the main
-	// thread calls exit_group (TRACEEXIT).
-	const opts = syscall.PTRACE_O_TRACECLONE |
-		syscall.PTRACE_O_TRACEEXIT |
-		syscall.PTRACE_O_TRACEEXEC
-	if err := syscall.PtraceSetOptions(pid, opts); err != nil {
+	if err := syscall.PtraceSetOptions(pid, linuxPtraceOptions); err != nil {
 		_ = cmd.Process.Kill()
 		return 0, nil, fmt.Errorf("PTRACE_SETOPTIONS: %w", err)
 	}
@@ -236,8 +235,8 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			switch cause {
 			case syscall.PTRACE_EVENT_CLONE:
 				newTID, _ := syscall.PtraceGetEventMsg(tid)
-				if err := continueIfTraceeExists(int(newTID), 0); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_CONT clone child tid %d: %w", newTID, err)
+				if err := waitForCloneChild(int(newTID)); err != nil {
+					return StopEvent{}, err
 				}
 				if err := continueIfTraceeExists(tid, 0); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT clone parent tid %d: %w", tid, err)
@@ -344,6 +343,34 @@ func (b *linuxBackend) recordStop(tid int) {
 	if tid != 0 {
 		b.lastStopTID = tid
 	}
+}
+
+func waitForCloneChild(tid int) error {
+	if tid == 0 {
+		return nil
+	}
+
+	var ws syscall.WaitStatus
+	waitTID, err := syscall.Wait4(tid, &ws, syscall.WALL, nil)
+	if err != nil {
+		if isNoSuchProcess(err) {
+			return nil
+		}
+		return fmt.Errorf("wait clone child tid %d: %w", tid, err)
+	}
+	if waitTID != tid {
+		return fmt.Errorf("wait clone child tid %d: got tid %d", tid, waitTID)
+	}
+	if !ws.Stopped() {
+		return nil
+	}
+	if err := syscall.PtraceSetOptions(tid, linuxPtraceOptions); err != nil && !isNoSuchProcess(err) {
+		return fmt.Errorf("PTRACE_SETOPTIONS clone child tid %d: %w", tid, err)
+	}
+	if err := continueIfTraceeExists(tid, 0); err != nil {
+		return fmt.Errorf("PTRACE_CONT clone child tid %d: %w", tid, err)
+	}
+	return nil
 }
 
 func isNoSuchProcess(err error) bool {
