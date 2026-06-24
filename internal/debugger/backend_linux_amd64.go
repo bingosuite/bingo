@@ -5,6 +5,7 @@ package debugger
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"syscall"
@@ -222,6 +223,11 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		}
 
 		sig := ws.StopSignal()
+		slog.Debug("linux wait stop",
+			"tid", tid,
+			"status", fmt.Sprintf("0x%x", int(ws)),
+			"signal", sig.String(),
+			"trapCause", ws.TrapCause())
 
 		// PTRACE_EVENT stops are encoded as SIGTRAP | (event << 8).
 		if sig == syscall.SIGTRAP {
