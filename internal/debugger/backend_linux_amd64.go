@@ -3,6 +3,7 @@
 package debugger
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -190,7 +191,7 @@ func (b *linuxBackend) Threads() ([]int, error) {
 // serialised). PTRACE_EVENT stops (clone/exec/exit) are handled internally
 // and don't surface to the engine.
 //
-//nolint:gocognit // The wait loop is one serialized ptrace state machine.
+//nolint:gocognit,gocyclo // The wait loop is one serialized ptrace state machine.
 func (b *linuxBackend) Wait() (StopEvent, error) {
 	for {
 		var ws syscall.WaitStatus
@@ -229,6 +230,9 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			switch cause {
 			case syscall.PTRACE_EVENT_CLONE:
 				if err := syscall.PtraceCont(tid, 0); err != nil {
+					if isNoSuchProcess(err) {
+						continue
+					}
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT clone parent tid %d: %w", tid, err)
 				}
 				continue
@@ -236,6 +240,9 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			case syscall.PTRACE_EVENT_EXIT:
 				if tid != b.pid {
 					if err := syscall.PtraceCont(tid, 0); err != nil {
+						if isNoSuchProcess(err) {
+							continue
+						}
 						return StopEvent{}, fmt.Errorf("PTRACE_CONT exiting thread tid %d: %w", tid, err)
 					}
 					continue
@@ -273,6 +280,9 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 			default:
 				if err := syscall.PtraceCont(tid, 0); err != nil {
+					if isNoSuchProcess(err) {
+						continue
+					}
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT trap cause %d tid %d: %w", cause, tid, err)
 				}
 				continue
@@ -281,6 +291,9 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 		if sig == syscall.SIGSTOP && tid != b.pid {
 			if err := syscall.PtraceCont(tid, 0); err != nil {
+				if isNoSuchProcess(err) {
+					continue
+				}
 				return StopEvent{}, fmt.Errorf("PTRACE_CONT clone child tid %d: %w", tid, err)
 			}
 			continue
@@ -291,10 +304,16 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		if sig == syscall.SIGURG {
 			if b.stepping {
 				if err := syscall.PtraceSingleStep(tid); err != nil {
+					if isNoSuchProcess(err) {
+						continue
+					}
 					return StopEvent{}, fmt.Errorf("PTRACE_SINGLESTEP after SIGURG tid %d: %w", tid, err)
 				}
 			} else {
 				if err := syscall.PtraceCont(tid, int(sig)); err != nil {
+					if isNoSuchProcess(err) {
+						continue
+					}
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT SIGURG tid %d: %w", tid, err)
 				}
 			}
@@ -333,4 +352,8 @@ func (b *linuxBackend) recordStop(tid int) {
 	if tid != 0 {
 		b.lastStopTID = tid
 	}
+}
+
+func isNoSuchProcess(err error) bool {
+	return errors.Is(err, syscall.ESRCH)
 }
