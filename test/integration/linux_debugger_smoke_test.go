@@ -17,6 +17,7 @@ import (
 const (
 	linuxSmokeBreakpointLine = 7
 	linuxSmokeEventTimeout   = 10 * time.Second
+	linuxSmokeCleanupTimeout = 5 * time.Second
 	linuxSmokeSourcePerm     = 0o600
 )
 
@@ -47,11 +48,7 @@ func TestLinuxAMD64DebuggerLaunchBreakpointSmoke(t *testing.T) {
 	}
 
 	dbg := debugger.New()
-	defer func() {
-		if err := dbg.Kill(); err != nil && !errors.Is(err, debugger.ErrProcessExited) {
-			t.Logf("kill smoke target: %v", err)
-		}
-	}()
+	defer cleanupDebugger(t, dbg)
 
 	if err := dbg.Launch(binaryPath, nil, nil); err != nil {
 		t.Fatalf("launch smoke target: %v", err)
@@ -74,6 +71,29 @@ func TestLinuxAMD64DebuggerLaunchBreakpointSmoke(t *testing.T) {
 	}
 	if payload.Breakpoint.ID != bp.ID {
 		t.Fatalf("hit breakpoint ID %d, want %d", payload.Breakpoint.ID, bp.ID)
+	}
+
+	if err := dbg.Continue(); err != nil {
+		t.Fatalf("continue after breakpoint: %v", err)
+	}
+	nextDebuggerEvent(t, dbg.Events(), protocol.EventProcessExited)
+}
+
+func cleanupDebugger(t *testing.T, dbg debugger.Debugger) {
+	t.Helper()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- dbg.Kill()
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, debugger.ErrProcessExited) {
+			t.Logf("kill smoke target: %v", err)
+		}
+	case <-time.After(linuxSmokeCleanupTimeout):
+		t.Log("timed out waiting for debugger cleanup")
 	}
 }
 
