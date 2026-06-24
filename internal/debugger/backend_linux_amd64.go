@@ -246,7 +246,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 					continue
 				}
 				// Main thread is about to call exit_group — let it actually exit.
-				if err := syscall.PtraceCont(tid, 0); err != nil {
+				if err := continueIfTraceeExists(tid, 0); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT exiting process tid %d: %w", tid, err)
 				}
 				b.recordStop(tid)
