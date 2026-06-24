@@ -41,8 +41,8 @@ func TestLinuxAMD64DebuggerLaunchBreakpointSmoke(t *testing.T) {
 		t.Fatalf("write smoke target: %v", err)
 	}
 
-	cmd := exec.Command("go", "build", "-gcflags=all=-N -l", "-o", binaryPath, sourcePath)
-	cmd.Env = os.Environ()
+	cmd := exec.Command("go", "build", "-buildmode=exe", "-gcflags=all=-N -l", "-o", binaryPath, sourcePath)
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("build smoke target: %v\n%s", err, out)
 	}
@@ -50,7 +50,7 @@ func TestLinuxAMD64DebuggerLaunchBreakpointSmoke(t *testing.T) {
 	dbg := debugger.New()
 	defer cleanupDebugger(t, dbg)
 
-	if err := dbg.Launch(binaryPath, nil, nil); err != nil {
+	if err := dbg.Launch(binaryPath, nil, []string{"GOMAXPROCS=1", "GODEBUG=asyncpreemptoff=1"}); err != nil {
 		t.Fatalf("launch smoke target: %v", err)
 	}
 	nextDebuggerEvent(t, dbg.Events(), protocol.EventStepped)
