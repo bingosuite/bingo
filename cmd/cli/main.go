@@ -16,6 +16,7 @@ import (
 	"github.com/chzyer/readline"
 )
 
+//nolint:gocognit,gocyclo // The CLI keeps command routing in one switch while commands are still small.
 func main() {
 	addr := flag.String("addr", "localhost:6060", "server address (host:port)")
 	sessionID := flag.String("session", "", "session ID to join (omit to create)")
@@ -35,7 +36,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	fmt.Printf("connected — session %s (state: %s)\n\n", c.SessionID(), c.State())
 
@@ -51,7 +52,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error initializing readline: %v\n", err)
 		os.Exit(1)
 	}
-	defer rl.Close()
+	defer func() { _ = rl.Close() }()
 
 	printHelp()
 	for {

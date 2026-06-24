@@ -80,7 +80,7 @@ func dial(addr, query string) (Client, error) {
 			return nil, fmt.Errorf("expected SessionState event, got %s", evt.Kind)
 		}
 	case <-time.After(dialTimeout):
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("timeout waiting for session state from server")
 	}
 
