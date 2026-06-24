@@ -215,16 +215,15 @@ engine advances PC by `len(archTrapInstruction())` and resumes. See the
 
 ### Linux / amd64 ([backend_linux_amd64.go](internal/debugger/backend_linux_amd64.go))
 
-- Pure ptrace. `startTracedProcess` enables `PTRACE_O_TRACECLONE | TRACEEXIT
-  | TRACEEXEC` so child threads are tracked and we get a stop just before
-  `exit_group`.
+- Pure ptrace. `startTracedProcess` enables `PTRACE_O_TRACEEXIT |
+  PTRACE_O_TRACEEXEC`; clone-thread tracing is intentionally not enabled until
+  the backend can resume Go runtime clone stops without parking the thread group.
 - `Wait` uses `Wait4(-1, …, WALL)` to receive events for any thread.
   `PTRACE_EVENT_*` stops are absorbed (resumed and looped) and never surface
   to the engine.
 - ptrace stops are per-thread. The backend records the last stopped TID and
   targets `ContinueProcess` / memory reads / memory writes at that TID, not
-  blindly at the process PID. Clone-child `SIGSTOP`s and non-main thread exits
-  are absorbed inside `Wait`.
+  blindly at the process PID. Non-main thread exits are absorbed inside `Wait`.
 - `g` pointer for goroutine inspection lives at `FS_BASE` on amd64.
 - `SIGURG` re-delivery is mandatory here too.
 
