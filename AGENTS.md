@@ -221,6 +221,10 @@ engine advances PC by `len(archTrapInstruction())` and resumes. See the
 - `Wait` uses `Wait4(-1, …, WALL)` to receive events for any thread.
   `PTRACE_EVENT_*` stops are absorbed (resumed and looped) and never surface
   to the engine.
+- ptrace stops are per-thread. The backend records the last stopped TID and
+  targets `ContinueProcess` / memory reads / memory writes at that TID, not
+  blindly at the process PID. Clone-child `SIGSTOP`s and non-main thread exits
+  are absorbed inside `Wait`.
 - `g` pointer for goroutine inspection lives at `FS_BASE` on amd64.
 - `SIGURG` re-delivery is mandatory here too.
 
@@ -271,6 +275,8 @@ just build [linux amd64 | darwin arm64]   # produces ./build/bingo/...
 just test [PKG]                            # go test -v
 just coverage [PKG]                        # writes test/coverage.out
 just integration                           # ginkgo -r ./test/integration
+go test -tags linuxptrace ./test/integration -run TestLinuxAMD64DebuggerLaunchBreakpointSmoke
+                                           # CI-only native linux/amd64 ptrace smoke test
 ```
 
 On macOS, `go test ./...` without `-tags bingonative` will fail with

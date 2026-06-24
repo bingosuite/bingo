@@ -74,7 +74,6 @@ func main() {
 
 		switch cmd {
 
-
 		case "sessions", "ls":
 			sessions, err := client.ListSessions(*addr)
 			if err != nil {
@@ -92,7 +91,6 @@ func main() {
 
 		case "state":
 			fmt.Printf("  session=%s  state=%s\n", c.SessionID(), c.State())
-
 
 		case "launch":
 			if len(args) < 2 {
@@ -130,7 +128,6 @@ func main() {
 				printErr(err)
 			}
 
-
 		case "c", "continue":
 			if err := c.Continue(); err != nil {
 				printErr(err)
@@ -150,7 +147,6 @@ func main() {
 			if err := c.StepOut(); err != nil {
 				printErr(err)
 			}
-
 
 		case "b", "break":
 			if len(args) < 2 {
@@ -185,7 +181,6 @@ func main() {
 				continue
 			}
 			fmt.Printf("  breakpoint %d cleared\n", id)
-
 
 		case "locals":
 			frame := 0
@@ -230,7 +225,6 @@ func main() {
 					fmt.Printf("  G%-4d %-10s %s\n", g.ID, g.Status, loc)
 				}
 			}
-
 
 		case "help", "h", "?":
 			printHelp()

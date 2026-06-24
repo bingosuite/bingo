@@ -20,7 +20,6 @@ func TestHub(t *testing.T) {
 	RunSpecs(t, "Hub Suite")
 }
 
-
 type fakeDebugger struct {
 	mu     sync.Mutex
 	events chan protocol.Event
@@ -97,7 +96,6 @@ func (f *fakeDebugger) Goroutines() ([]protocol.Goroutine, error) {
 	return f.goroutinesResult, nil
 }
 
-
 type fakeWSConn struct {
 	mu       sync.Mutex
 	incoming chan []byte // messages written by the server (server → client)
@@ -172,7 +170,6 @@ type connClosedErr struct{}
 
 func (e *connClosedErr) Error() string { return "use of closed network connection" }
 
-
 func mustCommand(kind protocol.CommandKind, payload any) protocol.Command {
 	raw, _ := json.Marshal(payload)
 	return protocol.Command{Version: protocol.Version, Kind: kind, Payload: raw}
@@ -197,7 +194,6 @@ func recvEvent(conn *fakeWSConn) (protocol.Event, bool) {
 	}
 	return decodeEvent(msg), true
 }
-
 
 var _ = Describe("Hub", func() {
 
@@ -225,7 +221,6 @@ var _ = Describe("Hub", func() {
 		}
 	})
 
-
 	Describe("AddClient", func() {
 		It("accepts multiple concurrent clients without panicking", func() {
 			conn1 := newFakeWSConn()
@@ -236,7 +231,6 @@ var _ = Describe("Hub", func() {
 			conn2.Close()
 		})
 	})
-
 
 	Describe("event sequence numbers", func() {
 		It("assigns strictly increasing hub-managed seq to all outbound events", func() {
@@ -278,7 +272,6 @@ var _ = Describe("Hub", func() {
 		})
 	})
 
-
 	Describe("event broadcast", func() {
 		It("delivers an informational event to all connected clients", func() {
 			conn1 := newFakeWSConn()
@@ -310,7 +303,6 @@ var _ = Describe("Hub", func() {
 			Expect(ok).To(BeFalse(), "disconnected client must not receive events")
 		})
 	})
-
 
 	Describe("BreakpointHit suspend/resume cycle", func() {
 		It("broadcasts the event then waits before calling Continue", func() {
@@ -447,7 +439,6 @@ var _ = Describe("Hub", func() {
 		})
 	})
 
-
 	Describe("SetBreakpoint confirmation", func() {
 		It("broadcasts BreakpointSet with the assigned breakpoint", func() {
 			conn := newFakeWSConn()
@@ -488,7 +479,6 @@ var _ = Describe("Hub", func() {
 		})
 	})
 
-
 	Describe("command error propagation", func() {
 		It("broadcasts EventError when a command fails", func() {
 			conn := newFakeWSConn()
@@ -526,7 +516,6 @@ var _ = Describe("Hub", func() {
 			}, "500ms", "10ms").Should(BeTrue())
 		})
 	})
-
 
 	Describe("shutdown when last client disconnects", func() {
 		It("calls Kill on the debugger", func() {
@@ -589,7 +578,6 @@ var _ = Describe("Hub", func() {
 			}, "500ms", "10ms").Should(Equal(protocol.EventProcessExited))
 		})
 	})
-
 
 	Describe("unknown command kind", func() {
 		It("broadcasts EventError without panicking", func() {

@@ -14,8 +14,9 @@ func newBackend() Backend {
 }
 
 type linuxBackend struct {
-	pid      int
-	stepping bool // true after SingleStep; classifies the next SIGTRAP
+	pid         int
+	stepping    bool // true after SingleStep; classifies the next SIGTRAP
+	lastStopTID int
 }
 
 // startTracedProcess forks under ptrace. The child is stopped at its first
@@ -88,12 +89,19 @@ func isAlreadyExited(err error) bool {
 
 func (b *linuxBackend) ContinueProcess() error {
 	b.stepping = false
-	return syscall.PtraceCont(b.pid, 0)
+	tid := b.traceTID()
+	if err := syscall.PtraceCont(tid, 0); err != nil {
+		return fmt.Errorf("PTRACE_CONT tid %d: %w", tid, err)
+	}
+	return nil
 }
 
 func (b *linuxBackend) SingleStep(tid int) error {
 	b.stepping = true
-	return syscall.PtraceSingleStep(tid)
+	if err := syscall.PtraceSingleStep(tid); err != nil {
+		return fmt.Errorf("PTRACE_SINGLESTEP tid %d: %w", tid, err)
+	}
+	return nil
 }
 
 func (b *linuxBackend) StopProcess() error {
@@ -105,23 +113,25 @@ func (b *linuxBackend) StopProcess() error {
 }
 
 func (b *linuxBackend) ReadMemory(addr uint64, dst []byte) error {
-	n, err := syscall.PtracePeekData(b.pid, uintptr(addr), dst)
+	tid := b.traceTID()
+	n, err := syscall.PtracePeekData(tid, uintptr(addr), dst)
 	if err != nil {
-		return fmt.Errorf("PTRACE_PEEKDATA 0x%x: %w", addr, err)
+		return fmt.Errorf("PTRACE_PEEKDATA tid %d 0x%x: %w", tid, addr, err)
 	}
 	if n != len(dst) {
-		return fmt.Errorf("PTRACE_PEEKDATA 0x%x: short read %d/%d", addr, n, len(dst))
+		return fmt.Errorf("PTRACE_PEEKDATA tid %d 0x%x: short read %d/%d", tid, addr, n, len(dst))
 	}
 	return nil
 }
 
 func (b *linuxBackend) WriteMemory(addr uint64, src []byte) error {
-	n, err := syscall.PtracePokeData(b.pid, uintptr(addr), src)
+	tid := b.traceTID()
+	n, err := syscall.PtracePokeData(tid, uintptr(addr), src)
 	if err != nil {
-		return fmt.Errorf("PTRACE_POKEDATA 0x%x: %w", addr, err)
+		return fmt.Errorf("PTRACE_POKEDATA tid %d 0x%x: %w", tid, addr, err)
 	}
 	if n != len(src) {
-		return fmt.Errorf("PTRACE_POKEDATA 0x%x: short write %d/%d", addr, n, len(src))
+		return fmt.Errorf("PTRACE_POKEDATA tid %d 0x%x: short write %d/%d", tid, addr, n, len(src))
 	}
 	return nil
 }
@@ -190,12 +200,17 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 		if ws.Exited() {
 			if tid == b.pid {
+				b.recordStop(tid)
 				return StopEvent{Reason: StopExited, TID: tid, ExitCode: ws.ExitStatus()}, nil
 			}
 			continue
 		}
 
 		if ws.Signaled() {
+			if tid != b.pid {
+				continue
+			}
+			b.recordStop(tid)
 			return StopEvent{Reason: StopKilled, TID: tid}, nil
 		}
 
@@ -211,18 +226,29 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 			switch cause {
 			case syscall.PTRACE_EVENT_CLONE:
-				newTID, _ := syscall.PtraceGetEventMsg(tid)
-				_ = syscall.PtraceCont(int(newTID), 0)
-				_ = syscall.PtraceCont(tid, 0)
+				if err := syscall.PtraceCont(tid, 0); err != nil {
+					return StopEvent{}, fmt.Errorf("PTRACE_CONT clone parent tid %d: %w", tid, err)
+				}
 				continue
 
 			case syscall.PTRACE_EVENT_EXIT:
+				if tid != b.pid {
+					if err := syscall.PtraceCont(tid, 0); err != nil {
+						return StopEvent{}, fmt.Errorf("PTRACE_CONT exiting thread tid %d: %w", tid, err)
+					}
+					continue
+				}
 				// Main thread is about to call exit_group — let it actually exit.
-				_ = syscall.PtraceCont(tid, 0)
+				if err := syscall.PtraceCont(tid, 0); err != nil {
+					return StopEvent{}, fmt.Errorf("PTRACE_CONT exiting process tid %d: %w", tid, err)
+				}
+				b.recordStop(tid)
 				return StopEvent{Reason: StopExited, TID: tid, ExitCode: 0}, nil
 
 			case syscall.PTRACE_EVENT_EXEC:
-				_ = syscall.PtraceCont(tid, 0)
+				if err := syscall.PtraceCont(tid, 0); err != nil {
+					return StopEvent{}, fmt.Errorf("PTRACE_CONT exec tid %d: %w", tid, err)
+				}
 				continue
 
 			case 0:
@@ -230,6 +256,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				if err != nil {
 					return StopEvent{}, err
 				}
+				b.recordStop(tid)
 
 				if b.stepping {
 					b.stepping = false
@@ -243,18 +270,31 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				}, nil
 
 			default:
-				_ = syscall.PtraceCont(tid, 0)
+				if err := syscall.PtraceCont(tid, 0); err != nil {
+					return StopEvent{}, fmt.Errorf("PTRACE_CONT trap cause %d tid %d: %w", cause, tid, err)
+				}
 				continue
 			}
+		}
+
+		if sig == syscall.SIGSTOP && tid != b.pid {
+			if err := syscall.PtraceCont(tid, 0); err != nil {
+				return StopEvent{}, fmt.Errorf("PTRACE_CONT clone child tid %d: %w", tid, err)
+			}
+			continue
 		}
 
 		// SIGURG is Go's goroutine-preemption signal — must be re-delivered
 		// transparently or scheduling breaks.
 		if sig == syscall.SIGURG {
 			if b.stepping {
-				_ = syscall.PtraceSingleStep(tid)
+				if err := syscall.PtraceSingleStep(tid); err != nil {
+					return StopEvent{}, fmt.Errorf("PTRACE_SINGLESTEP after SIGURG tid %d: %w", tid, err)
+				}
 			} else {
-				_ = syscall.PtraceCont(tid, int(sig))
+				if err := syscall.PtraceCont(tid, int(sig)); err != nil {
+					return StopEvent{}, fmt.Errorf("PTRACE_CONT SIGURG tid %d: %w", tid, err)
+				}
 			}
 			continue
 		}
@@ -263,6 +303,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		if err != nil {
 			return StopEvent{}, err
 		}
+		b.recordStop(tid)
 		return StopEvent{
 			Reason: StopSignal,
 			TID:    tid,
@@ -274,4 +315,20 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 var _ Backend = (*linuxBackend)(nil)
 
-func (b *linuxBackend) setPID(pid int) { b.pid = pid }
+func (b *linuxBackend) setPID(pid int) {
+	b.pid = pid
+	b.lastStopTID = pid
+}
+
+func (b *linuxBackend) traceTID() int {
+	if b.lastStopTID != 0 {
+		return b.lastStopTID
+	}
+	return b.pid
+}
+
+func (b *linuxBackend) recordStop(tid int) {
+	if tid != 0 {
+		b.lastStopTID = tid
+	}
+}
