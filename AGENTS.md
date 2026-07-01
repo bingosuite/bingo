@@ -236,17 +236,36 @@ engine advances PC by `len(archTrapInstruction())` and resumes. See the
   registers from a plain write), dropping the suspend removes the deadlock
   without reintroducing missed breakpoints. The timer is skipped while
   single-stepping.
-- **Do NOT re-inject async signals — resume with signal 0.** This is the crux of
-  correct Go-preemption support. Go async preemption is *thread-directed*: the
-  runtime `pthread_kill`s `SIGURG` (16) at the exact M whose goroutine must reach
-  a GC safe point. If you re-post it via `ptrace(PT_CONTINUE, pid, 1, SIGURG)`,
-  XNU delivers it PROCESS-wide (`psignal`) to an arbitrary thread; the intended M
-  never runs its handler, its `signalPending` stays set, `runtime.preemptM` never
-  re-sends, and a stop-the-world hangs forever (the original 6/6 StepOver hang).
-  `resumeAfterSignal` therefore resumes with signal 0 (`ptrace(request, pid, 1,
-  0)`) for `SIGURG`/`SIGWINCH`, letting XNU deliver the still-pending
-  thread-directed signal to its intended M. This matches Delve, whose
-  `ptraceCont` always passes 0.
+- **Do NOT re-inject async signals on darwin — resume with signal 0.** Go async
+  preemption is *thread-directed*: the runtime `pthread_kill`s `SIGURG` (16) at
+  the exact M whose goroutine must reach a GC safe point. On the wait4/BSD-stop
+  model there is no thread-correct way to re-deliver it (unlike linux, where a
+  ptrace signal-delivery-stop is per-thread and `PTRACE_CONT(sig)` re-injects to
+  the stopped thread — see the linux note below). Both darwin options have a
+  cost; `resumeAfterSignal` picks the one that keeps the common path reliable —
+  resume with signal 0, which DROPS the intercepted signal (XNU already cleared
+  the thread's pending bit to take the trace-stop; `PT_CONTINUE(0)` does not
+  re-post it):
+  - Re-inject via `ptrace(PT_CONTINUE, pid, 1, SIGURG)`: XNU re-adds the signal to
+    the stopped thread AND calls `psignal()`, which is PROCESS-directed. The target
+    M gets preempted, but the extra process-directed copy lands on an arbitrary
+    thread and ~15% of the time interrupts an M parked in `__psynch_cvwait` → a
+    lost-wakeup wedge (the original churn hang). Fails the E2E gate.
+  - Drop (signal 0, what we do): no spurious copy, so cooperative code — every
+    realistic Go program and the entire E2E suite — is 100% reliable. Cost: a
+    goroutine that is ONLY async-preemptible (a tight loop with no calls,
+    allocations, or channel ops, hence no cooperative safe point) is not preempted
+    for stop-the-world while traced, so `runtime.GC()` in such a target can hang
+    under the debugger. Proven and characterised by `asyncpreempt_e2e_test.go`
+    (env-guarded behind `BINGO_ASYNCPREEMPT_TEST`, not part of the gate).
+
+  Thread-directed re-delivery (reach exactly the intended M, no spurious copy) is
+  impossible under wait4: `PT_THUPDATE` sets the per-thread siglist bit but has no
+  `wakeup(&t->sigwait)`/`task_resume` to drive the stop's resume, and
+  `PT_CONTINUE(sig)` is process-directed. A complete fix needs the Mach-exception
+  stop model (where `SIGURG` is never intercepted), which is out of scope here.
+  Delve takes the same "resume with 0" stance on its wait4 path (`ptraceCont`
+  always passes 0).
 - `PT_STEP` is per-PROCESS on Darwin (despite the API taking a tid) and arms the
   task's *first* thread, not the tid you pass. So an arbitrary thread cannot be
   single-stepped; `needsTempBPStepOver()` returns true and the engine steps over

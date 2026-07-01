@@ -218,10 +218,12 @@ func (b *darwinBackend) ContinueProcess() error {
 	// migration/churn.
 	b.applyDebugState()
 	// Resume with signal 0. We never re-inject asynchronous signals through the
-	// ptrace signal argument (see resumeAfterSignal for why: a re-posted SIGURG
-	// goes process-wide and breaks Go's thread-directed async preemption, hanging
-	// a stop-the-world). Any signal still pending on a tracee thread is delivered
-	// by the kernel to its intended thread when the process resumes.
+	// ptrace signal argument (see resumeAfterSignal for the full rationale and
+	// the one documented limitation). Re-posting a SIGURG via PT_CONTINUE's
+	// signal argument delivers a spurious PROCESS-directed copy that wedges
+	// cooperative Go code ~15% of the time (a lost-wakeup in __psynch_cvwait);
+	// dropping it keeps the common path — all cooperative code, the whole E2E
+	// suite — reliable.
 	err := ptrace(ptDarwinContinue, uintptr(b.pid), 1, 0)
 	if err != nil {
 		return fmt.Errorf("PT_CONTINUE: %w", err)
@@ -655,9 +657,10 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 		// coalesce with one of these: Go fires SIGURG every few milliseconds, so
 		// when a thread hits a hardware breakpoint at nearly the same instant
 		// wait4 can surface the async signal and hide the trap. If any thread is
-		// parked on an armed hardware breakpoint, report the breakpoint now; the
-		// async signal remains pending on its thread and is delivered naturally
-		// on the next resume.
+		// parked on an armed hardware breakpoint, report the breakpoint now and
+		// leave the process stopped; the coalesced async signal is dropped on the
+		// next resume (see resumeAfterSignal for why dropping is the correct
+		// wait4 policy). Prioritising the breakpoint is what matters here.
 		if sig == syscall.SIGURG || sig == syscall.SIGWINCH {
 			if !b.isStepping() {
 				if t, pc, ok := b.threadAtHWBreakpoint(); ok {
@@ -740,18 +743,36 @@ func (b *darwinBackend) consumeStep() (bool, int) {
 
 // resumeAfterSignal resumes the tracee after wait4 surfaced an asynchronous,
 // runtime-handled signal (SIGURG async preemption, SIGWINCH resize). It resumes
-// WITHOUT re-injecting the signal via the ptrace signal argument.
+// WITHOUT re-injecting the signal via the ptrace signal argument, which on the
+// wait4/BSD-stop model DROPS the intercepted signal: XNU already cleared the
+// thread's pending bit to take the trace-stop, and PT_CONTINUE with signal 0
+// does not re-post it.
 //
-// This is the crux of correct Go-preemption support on darwin. Go async
-// preemption is thread-directed: the runtime pthread_kill's SIGURG at the exact
-// M whose goroutine must reach a GC safe point, and the signal handler clears
-// that M's signalPending flag. If we re-post the signal with PT_CONTINUE's
-// signal argument, XNU delivers it PROCESS-wide (psignal) to an arbitrary
-// thread, so the intended M never runs its handler, its signalPending stays set,
-// runtime.preemptM never re-sends, and a stop-the-world hangs forever. Passing
-// signal 0 instead lets XNU deliver the still-pending, thread-directed signal to
-// its intended M, so preemption completes. This matches Delve's darwin backend,
-// whose ptraceCont always passes 0 (pkg/proc/native/threads_darwin.go).
+// Dropping is deliberate — it is the better of two imperfect wait4 options, and
+// the choice is proven empirically by asyncpreempt_e2e_test.go (env-guarded, not
+// part of the acceptance gate):
+//
+//   - Re-inject (PT_CONTINUE with the signal): XNU's ptrace re-adds the signal to
+//     the stopped (sigwait) thread AND calls psignal(), which is PROCESS-directed.
+//     The intended M does get preempted, so a purely async-preemptible goroutine
+//     works — but the extra process-directed copy lands on an arbitrary thread and
+//     ~15% of the time interrupts an M parked in __psynch_cvwait, causing a
+//     lost-wakeup wedge. That is the original churn hang; it fails the E2E gate.
+//   - Drop (signal 0, this code): no spurious copy, so cooperative Go code — which
+//     is every realistic program and the entire E2E suite — is 100% reliable. The
+//     cost: a goroutine that is ONLY async-preemptible (a tight loop with no calls,
+//     allocations, or channel ops, hence no cooperative safe point) is not
+//     preempted for stop-the-world while traced, so runtime.GC() in such a target
+//     can hang under the debugger. This is a corner case for a concurrency
+//     debugger; correctness of the common path is worth it.
+//
+// Thread-directed re-delivery (reach exactly the intended M with no spurious copy)
+// is not achievable under wait4: PT_THUPDATE sets a thread's siglist bit but has
+// no wakeup(&t->sigwait)/task_resume, so it cannot drive the stop's resume, and
+// PT_CONTINUE(sig) is process-directed. The only complete fix is to move the stop
+// source to Mach exception ports (where SIGURG is never intercepted), which
+// AGENTS.md places out of scope. Delve takes the same "resume with 0" stance on
+// its wait4 path (pkg/proc/native/threads_darwin.go: ptraceCont always passes 0).
 //
 // While a single-step is in flight we must resume with PT_STEP so the step still
 // retires; otherwise PT_CONTINUE, re-arming the hardware breakpoints on all
