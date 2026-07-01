@@ -29,6 +29,7 @@ func newBackend() Backend {
 type linuxBackend struct {
 	pid         int
 	stepping    bool // true after SingleStep; classifies the next SIGTRAP
+	stepTID     int  // thread the in-flight single-step was issued against
 	lastStopTID int
 
 	// delayedSignal holds a non-fault signal (e.g. SIGURG async preemption)
@@ -39,8 +40,15 @@ type linuxBackend struct {
 	delayedSignal int
 }
 
-const linuxPtraceOptions = syscall.PTRACE_O_TRACEEXIT |
-	syscall.PTRACE_O_TRACEEXEC
+// PTRACE_O_TRACECLONE auto-traces every thread the Go runtime spawns. Without
+// it only the main thread is traced, so when the goroutine under inspection is
+// async-preempted onto a fresh OS thread and hits a breakpoint there, the
+// SIGTRAP escapes ptrace and the Go runtime aborts with "unexpected signal:
+// trace/breakpoint trap". The option is inherited by cloned children (the
+// kernel copies the tracer's ptrace flags to each new thread), so setting it
+// once on the main thread covers the whole thread tree. Mirrors Delve's
+// ptraceOptionsNormal.
+const linuxPtraceOptions = syscall.PTRACE_O_TRACECLONE
 
 // startTracedProcess forks under ptrace. The child is stopped at its first
 // instruction (execve SIGTRAP) ready for the engine to set breakpoints.
@@ -120,6 +128,7 @@ func (b *linuxBackend) ContinueProcess() error {
 
 func (b *linuxBackend) SingleStep(tid int) error {
 	b.stepping = true
+	b.stepTID = tid
 	dbgLog("SingleStep", "tid", tid)
 	if err := ptraceSingleStepSig(tid, 0); err != nil {
 		return fmt.Errorf("PTRACE_SINGLESTEP tid %d: %w", tid, err)
@@ -252,87 +261,62 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 		sig := ws.StopSignal()
 
-		// PTRACE_EVENT stops are encoded as SIGTRAP | (event << 8).
+		// SIGTRAP is either a genuine trap (INT3 breakpoint or the completion
+		// of a single-step) or a PTRACE_EVENT stop (clone/exec/exit) encoded as
+		// SIGTRAP | (event << 8).
 		if sig == syscall.SIGTRAP {
-			cause := ws.TrapCause()
-
-			switch cause {
-			case syscall.PTRACE_EVENT_CLONE:
-				if err := continueIfTraceeExists(tid, 0); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_CONT clone parent tid %d: %w", tid, err)
-				}
-				continue
-
-			case syscall.PTRACE_EVENT_EXIT:
-				if tid != b.pid {
-					if err := continueIfTraceeExists(tid, 0); err != nil {
-						return StopEvent{}, fmt.Errorf("PTRACE_CONT exiting thread tid %d: %w", tid, err)
-					}
-					continue
-				}
-				// Main thread is about to call exit_group — let it actually exit.
-				if err := continueIfTraceeExists(tid, 0); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_CONT exiting process tid %d: %w", tid, err)
-				}
-				b.recordStop(tid)
-				return StopEvent{Reason: StopExited, TID: tid, ExitCode: 0}, nil
-
-			case syscall.PTRACE_EVENT_EXEC:
-				if err := syscall.PtraceCont(tid, 0); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_CONT exec tid %d: %w", tid, err)
-				}
-				continue
-
-			case 0:
-				b.recordStop(tid)
-
-				if b.stepping {
-					b.stepping = false
-					dbgLog("-> StopSingleStep", "tid", tid)
-					return StopEvent{Reason: StopSingleStep, TID: tid}, nil
-				}
-
-				dbgLog("-> StopBreakpoint", "tid", tid)
-				return StopEvent{
-					Reason: StopBreakpoint,
-					TID:    tid,
-				}, nil
-
-			default:
-				if err := continueIfTraceeExists(tid, 0); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_CONT trap cause %d tid %d: %w", cause, tid, err)
-				}
-				continue
+			if ws.TrapCause() != 0 {
+				// PTRACE_EVENT stop. The stopped thread must be resumed by the
+				// tracer goroutine (the engine loop), so hand it back as a
+				// transparent thread event. Do NOT recordStop — that would
+				// repoint traceTID at an unrelated churn thread and misdirect
+				// the next ContinueProcess.
+				dbgLog("-> StopThreadEvent (ptrace-event)", "tid", tid, "cause", ws.TrapCause())
+				return StopEvent{Reason: StopThreadEvent, TID: tid}, nil
 			}
+			// Genuine trap. If it is the completion of the single-step we
+			// issued (same thread), report a single-step; otherwise a
+			// breakpoint (INT3) was hit — in these targets only the goroutine
+			// under inspection executes breakpoint addresses, on whichever OS
+			// thread it currently occupies.
+			b.recordStop(tid)
+			if b.stepping && tid == b.stepTID {
+				b.stepping = false
+				dbgLog("-> StopSingleStep", "tid", tid)
+				return StopEvent{Reason: StopSingleStep, TID: tid}, nil
+			}
+			dbgLog("-> StopBreakpoint", "tid", tid)
+			return StopEvent{Reason: StopBreakpoint, TID: tid}, nil
 		}
 
+		// A freshly cloned thread reports an initial SIGSTOP before it runs
+		// (PTRACE_O_TRACECLONE). Resume it from the tracer goroutine.
 		if sig == syscall.SIGSTOP && tid != b.pid {
-			if err := syscall.PtraceSetOptions(tid, linuxPtraceOptions); err != nil && !isNoSuchProcess(err) {
-				return StopEvent{}, fmt.Errorf("PTRACE_SETOPTIONS clone child tid %d: %w", tid, err)
-			}
-			if err := syscall.Kill(b.pid, syscall.SIGCONT); err != nil && !isNoSuchProcess(err) {
-				return StopEvent{}, fmt.Errorf("SIGCONT tracee pid %d: %w", b.pid, err)
-			}
-			if err := continueTraceeGroup(b.pid, 0); err != nil {
-				return StopEvent{}, err
-			}
-			continue
+			dbgLog("-> StopThreadEvent (clone-sigstop)", "tid", tid)
+			return StopEvent{Reason: StopThreadEvent, TID: tid}, nil
 		}
 
-		// A real (non-SIGTRAP) signal was delivered to the tracee. On Linux
-		// ptrace resume commands (PTRACE_CONT/SINGLESTEP) are restricted to the
-		// tracer thread — the engine's event-loop goroutine — so this wait
-		// goroutine must NOT resume here (doing so returns ESRCH and wedges the
-		// tracee). Hand the signal to the engine, which re-steps or continues
-		// from the tracer goroutine via ResumeSignal, forwarding a synchronous
-		// fault or deferring an async signal (SIGURG preemption) — mirroring
-		// Delve's singleStep() / resumeWithSig(). Report whether we were mid
-		// single-step so the engine re-issues the right resume.
-		stepping := b.stepping
-		b.stepping = false
-		b.recordStop(tid)
-		dbgLog("-> StopSignal", "tid", tid, "sig", int(sig), "stepping", stepping)
-		return StopEvent{Reason: StopSignal, TID: tid, Signal: int(sig), Stepping: stepping}, nil
+		// A real (non-trap) signal. On Linux ptrace resume commands
+		// (PTRACE_CONT/SINGLESTEP) are restricted to the tracer thread — the
+		// engine's event-loop goroutine — so this wait goroutine must NOT
+		// resume here (doing so returns ESRCH and wedges the tracee).
+		//
+		// If the signal interrupted the single-step we issued (same thread),
+		// hand it back as a StopSignal so the engine re-steps from the tracer
+		// goroutine, forwarding a synchronous fault or deferring an async
+		// signal (SIGURG preemption) — mirroring Delve's singleStep() /
+		// resumeWithSig(). A signal delivered to any OTHER thread (e.g. a churn
+		// worker being async-preempted) is forwarded to that thread as a
+		// transparent thread event, without disturbing the debug thread's
+		// step-over state or traceTID.
+		if b.stepping && tid == b.stepTID {
+			b.stepping = false
+			b.recordStop(tid)
+			dbgLog("-> StopSignal (mid-step)", "tid", tid, "sig", int(sig))
+			return StopEvent{Reason: StopSignal, TID: tid, Signal: int(sig), Stepping: true}, nil
+		}
+		dbgLog("-> StopThreadEvent (signal-forward)", "tid", tid, "sig", int(sig))
+		return StopEvent{Reason: StopThreadEvent, TID: tid, Signal: int(sig)}, nil
 	}
 }
 
@@ -378,8 +362,28 @@ func (b *linuxBackend) ResumeSignal(tid, signal int, stepping bool) error {
 	return continueIfTraceeExists(tid, forward)
 }
 
+// ResumeThread resumes a thread that stopped for a clone/thread lifecycle event
+// (a freshly cloned thread's initial SIGSTOP, a PTRACE_EVENT stop) or a signal
+// delivered to a thread other than the one under active step/continue. It runs
+// on the engine (tracer) goroutine because Linux restricts ptrace resume to the
+// tracer thread. Any signal is forwarded so the tracee's runtime observes it; a
+// bare SIGSTOP is never re-delivered (it would immediately re-stop the thread).
+// Do NOT touch stepping/lastStopTID here — the debug thread's state must be
+// preserved across churn-thread events.
+func (b *linuxBackend) ResumeThread(tid, signal int) error {
+	if tid == 0 {
+		return nil
+	}
+	forward := signal
+	if forward == int(syscall.SIGSTOP) {
+		forward = 0
+	}
+	dbgLog("ResumeThread", "tid", tid, "sig", signal, "forward", forward)
+	return continueIfTraceeExists(tid, forward)
+}
+
 var _ Backend = (*linuxBackend)(nil)
-var _ signalResumer = (*linuxBackend)(nil)
+var _ ptraceResumer = (*linuxBackend)(nil)
 
 func (b *linuxBackend) setPID(pid int) {
 	b.pid = pid
@@ -415,40 +419,6 @@ func continueIfTraceeExists(tid int, signal int) error {
 		return err
 	}
 	return nil
-}
-
-func continueTraceeGroup(pid int, signal int) error {
-	tids, err := taskTIDs(pid)
-	if err != nil {
-		if isNoSuchProcess(err) {
-			return nil
-		}
-		return err
-	}
-	if len(tids) == 0 {
-		return continueIfTraceeExists(pid, signal)
-	}
-	for _, tid := range tids {
-		if err := continueIfTraceeExists(tid, signal); err != nil {
-			return fmt.Errorf("PTRACE_CONT tid %d: %w", tid, err)
-		}
-	}
-	return nil
-}
-
-func taskTIDs(pid int) ([]int, error) {
-	entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
-	if err != nil {
-		return nil, err
-	}
-	tids := make([]int, 0, len(entries))
-	for _, entry := range entries {
-		var tid int
-		if _, err := fmt.Sscanf(entry.Name(), "%d", &tid); err == nil {
-			tids = append(tids, tid)
-		}
-	}
-	return tids, nil
 }
 
 // ptraceSingleStepSig issues PTRACE_SINGLESTEP delivering signal sig to the

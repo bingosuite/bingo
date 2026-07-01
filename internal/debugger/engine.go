@@ -402,6 +402,16 @@ func (e *engine) handleStop(stop StopEvent) {
 		}
 		slog.Debug("StopBreakpoint matched", "file", bp.file, "line", bp.line,
 			"addr", fmt.Sprintf("0x%x", bp.addr))
+		// Rewind the stopped thread's PC to the breakpoint address. On amd64 the
+		// INT3 trap leaves the register PC one byte PAST bp.addr; populate*Stop
+		// only rewinds the *reported* StopEvent.PC, never the tracee register.
+		// User breakpoints get their register rewound later in
+		// resumeFromBreakpoint, but the temporary <stepover-next>/<stepout-return>
+		// breakpoints are cleared here and resumed with a plain ContinueProcess
+		// that does NOT go through resumeFromBreakpoint — so without this the
+		// thread would resume one byte into the restored instruction and corrupt
+		// the stream. Guarded by archRewindPC so it is a no-op on arm64/darwin.
+		e.rewindTraceePC(stop.TID, bp.addr)
 		if bp.file == stepOverNextFile {
 			_ = e.bps.clear(e.backend, bp.id)
 			e.lastBP = nil
@@ -499,8 +509,25 @@ func (e *engine) handleStop(stop StopEvent) {
 		e.setState(stateSuspended)
 		e.emitStepped(stop)
 
+	case StopThreadEvent:
+		// Linux with PTRACE_O_TRACECLONE: a clone/thread lifecycle stop (a new
+		// thread's initial SIGSTOP, a PTRACE_EVENT stop, or a signal delivered
+		// to a thread other than the one under active step/continue). ptrace
+		// resume must run on this (tracer) goroutine, so the wait goroutine
+		// handed it back. Resume the thread transparently — forwarding any
+		// signal — and keep waiting. No user-visible state change: the debug
+		// thread's step-over/continue is still in flight on another thread.
+		if sr, ok := e.backend.(ptraceResumer); ok {
+			if err := sr.ResumeThread(stop.TID, stop.Signal); err != nil {
+				slog.Warn("resume thread event failed",
+					"tid", stop.TID, "signal", stop.Signal, "err", err)
+			}
+		}
+		go e.waitLoop()
+		return
+
 	case StopSignal:
-		if sr, ok := e.backend.(signalResumer); ok {
+		if sr, ok := e.backend.(ptraceResumer); ok {
 			// Linux: ptrace resume must run on this (tracer) goroutine, not the
 			// wait goroutine. If a signal interrupted an in-flight single-step,
 			// re-issue the step (deferring async / forwarding fault signals)
@@ -755,6 +782,30 @@ func (e *engine) stepOut() error {
 	e.setState(stateRunning)
 	go e.waitLoop()
 	return nil
+}
+
+// rewindTraceePC moves a stopped thread's register PC back to a software
+// breakpoint's address. On amd64 the INT3 trap leaves PC one byte past the
+// breakpoint, so a subsequent resume (after the original byte is restored) would
+// execute from the middle of that instruction. The guard makes this a no-op on
+// arm64/darwin, where the CPU stops with PC already AT the trap and archRewindPC
+// is the identity. Mirrors Delve's setPC(bp.Addr) when Arch.BreakInstrMovesPC().
+func (e *engine) rewindTraceePC(tid int, addr uint64) {
+	if tid == 0 {
+		return
+	}
+	regs, err := e.backend.GetRegisters(tid)
+	if err != nil {
+		return
+	}
+	if regs.PC == addr || archRewindPC(regs.PC) != addr {
+		return
+	}
+	regs.PC = addr
+	if err := e.backend.SetRegisters(tid, regs); err != nil {
+		slog.Warn("rewind tracee PC to breakpoint failed",
+			"tid", tid, "addr", fmt.Sprintf("0x%x", addr), "err", err)
+	}
 }
 
 // resumeFromBreakpoint runs the step-over-software-BP sequence:

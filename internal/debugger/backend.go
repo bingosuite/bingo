@@ -30,20 +30,28 @@ type pidSetter interface {
 	setPID(pid int)
 }
 
-// signalResumer is an optional Backend capability for platforms (Linux) where
+// ptraceResumer is an optional Backend capability for platforms (Linux) where
 // ptrace resume commands are restricted to the tracer thread — the engine's
 // event-loop goroutine — and therefore cannot be issued from the wait
-// goroutine. When a real (non-trap) signal stops the tracee, Wait returns a
-// StopSignal event and the engine calls ResumeSignal from its own goroutine to
-// re-step or continue, forwarding or deferring the signal. Backends whose
-// ptrace is process-wide (Darwin/Mach) don't implement this; the engine falls
-// back to a plain continue for them.
-type signalResumer interface {
-	// ResumeSignal resumes tracee thread tid after a non-trap signal. When
-	// stepping is true the tracee was mid single-step and must be re-stepped
-	// (fault signals delivered on the step, async signals deferred to the next
-	// continue); otherwise the signal is forwarded on a plain continue.
+// goroutine. When Wait observes a stop that needs a ptrace resume (a real
+// signal, or a clone/thread lifecycle event under PTRACE_O_TRACECLONE), it
+// hands the stop back to the engine, which calls back here from its own
+// goroutine. Backends whose ptrace is process-wide (Darwin/Mach) don't
+// implement this; the engine falls back to a plain continue for them.
+type ptraceResumer interface {
+	// ResumeSignal resumes tracee thread tid after a non-trap signal that
+	// interrupted the single-step we issued. Fault signals are delivered on the
+	// re-step, async signals (SIGURG) are deferred to the next continue.
 	ResumeSignal(tid, signal int, stepping bool) error
+
+	// ResumeThread resumes a thread stopped for a clone/thread lifecycle event
+	// (a freshly cloned thread's initial SIGSTOP, a PTRACE_EVENT stop, or a
+	// signal delivered to a non-debug thread). signal is forwarded to the
+	// thread (0 for lifecycle stops); a bare SIGSTOP is never re-delivered.
+	// Keeping every tracee thread traced means a goroutine that migrated onto a
+	// fresh OS thread and hits a breakpoint there is caught, not lost to a
+	// runtime crash.
+	ResumeThread(tid, signal int) error
 }
 
 func setPID(b Backend, pid int) {
@@ -60,6 +68,11 @@ const (
 	StopSignal                       // any other signal
 	StopExited                       // process exit()
 	StopKilled                       // killed externally
+	// StopThreadEvent is internal to the Linux backend: a clone/thread
+	// lifecycle stop (new-thread SIGSTOP, PTRACE_EVENT_*, or a signal delivered
+	// to a non-debug thread) that the engine must resume from its tracer
+	// goroutine via ptraceResumer.ResumeThread. It never surfaces to clients.
+	StopThreadEvent
 )
 
 // StopEvent is what Backend.Wait returns. PC may be zero; the engine resolves
@@ -69,6 +82,6 @@ type StopEvent struct {
 	TID      int
 	PC       uint64
 	ExitCode int  // StopExited only
-	Signal   int  // StopSignal only
+	Signal   int  // StopSignal / StopThreadEvent: signal to forward on resume
 	Stepping bool // StopSignal only: the signal interrupted an in-flight single-step
 }
