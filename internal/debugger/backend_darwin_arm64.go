@@ -792,7 +792,11 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 //
 //	(a) suspend_count >= 2                         -> a held/leaked task suspend
 //	(b) threads run_state==STOPPED at user PCs      -> task-suspend freeze
-//	(c) threads run_state==WAITING, static kernel PCs (__psynch_cvwait, …),
+//	(c) a thread run_state==RUNNING, task not        -> a non-preemptible run the
+//	    suspended                                       runtime can't stop (STW
+//	                                                    stall; e.g. asyncpreemptoff
+//	                                                    disabling async preemption)
+//	(d) threads run_state==WAITING, static kernel PCs (__psynch_cvwait, …),
 //	    suspend ∈ {0,1}                             -> pthread-condvar lost-wakeup
 func (b *darwinBackend) suspendProbeWatchdog() {
 	const probeWedgeThreshold = 9 * time.Second
@@ -833,9 +837,9 @@ func (b *darwinBackend) dumpSuspendState(waitStart int64) {
 	}
 	fmt.Fprintf(os.Stderr, "[suspendprobe] pid=%d waited=%s TASK_SUSPEND_COUNT=%s\n", b.pid, waited, scStr)
 
-	pcs0, _, stopped0 := b.dumpThreads(task, "s0")
+	pcs0, _, stopped0, _ := b.dumpThreads(task, "s0")
 	time.Sleep(300 * time.Millisecond)
-	pcs1, waiting1, stopped1 := b.dumpThreads(task, "s1")
+	pcs1, waiting1, stopped1, running1 := b.dumpThreads(task, "s1")
 
 	static := len(pcs0) > 0
 	for port, pc := range pcs0 {
@@ -850,22 +854,24 @@ func (b *darwinBackend) dumpSuspendState(waitStart int64) {
 		verdict = "task-suspend LEAK (suspend_count exceeds ptrace baseline)"
 	case stopped0 > 0 || stopped1 > 0:
 		verdict = "task-suspend FREEZE (threads STOPPED, not voluntarily waiting)"
+	case running1 > 0:
+		verdict = "non-preemptible RUN (a thread is RUNNING and cannot be stopped -> STW stall, e.g. asyncpreemptoff); NOT a suspend leak"
 	case waiting1 > 0 && static:
 		verdict = "pthread-condvar LOST-WAKEUP (threads WAITING in kernel, PCs static, suspend<=1)"
 	}
-	fmt.Fprintf(os.Stderr, "[suspendprobe]   VERDICT: %s (waiting=%d stopped=%d staticPCs=%v)\n",
-		verdict, waiting1, stopped1, static)
+	fmt.Fprintf(os.Stderr, "[suspendprobe]   VERDICT: %s (waiting=%d running=%d stopped=%d staticPCs=%v)\n",
+		verdict, waiting1, running1, stopped1, static)
 }
 
-// dumpThreads logs each thread and returns its PC map plus WAITING/STOPPED tallies.
-func (b *darwinBackend) dumpThreads(task C.mach_port_t, label string) (map[int]uint64, int, int) {
+// dumpThreads logs each thread and returns its PC map plus WAITING/STOPPED/RUNNING tallies.
+func (b *darwinBackend) dumpThreads(task C.mach_port_t, label string) (map[int]uint64, int, int, int) {
 	pcs := map[int]uint64{}
-	waiting, stopped := 0, 0
+	waiting, stopped, running := 0, 0, 0
 	var threads C.thread_act_port_array_t
 	var count C.mach_msg_type_number_t
 	if kr := C.bingo_thread_list(task, &threads, &count); kr != C.KERN_SUCCESS {
 		fmt.Fprintf(os.Stderr, "[suspendprobe]   %s task_threads err: %s\n", label, machErrString(kr))
-		return pcs, waiting, stopped
+		return pcs, waiting, stopped, running
 	}
 	defer C.vm_deallocate(
 		C.mach_task_self_,
@@ -886,12 +892,14 @@ func (b *darwinBackend) dumpThreads(task C.mach_port_t, label string) (map[int]u
 			waiting++
 		case 2: // TH_STATE_STOPPED
 			stopped++
+		case 1: // TH_STATE_RUNNING
+			running++
 		}
 		pcs[int(p)] = uint64(pc)
 		fmt.Fprintf(os.Stderr, "[suspendprobe]   %s th[%d] port=%d run_state=%d suspend=%d pc=%#x\n",
 			label, i, int(p), int(rs), int(tsc), uint64(pc))
 	}
-	return pcs, waiting, stopped
+	return pcs, waiting, stopped, running
 }
 
 func (b *darwinBackend) setPID(pid int) { b.pid = pid }
