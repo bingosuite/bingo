@@ -118,10 +118,16 @@ This is the most fragile code in the repo. Read this section before changing
 anything in [internal/debugger/](internal/debugger/).
 
 1. **All ptrace/Mach calls run on a single OS thread.** The engine event loop
-   (`engine.loop`) calls `runtime.LockOSThread()` and never unlocks. ptrace
-   on Linux is thread-specific — calling it from a different OS thread fails.
-   Public `Debugger` methods (`Continue`, `SetBreakpoint`, …) submit a closure
-   to `cmdCh`; the loop executes it. They don't make ptrace calls themselves.
+   (`engine.loop`) calls `runtime.LockOSThread()` and never unlocks. Public
+   `Debugger` methods (`Continue`, `SetBreakpoint`, …) submit a closure to
+   `cmdCh`; the loop executes it. They don't make ptrace calls themselves.
+   ptrace is thread-bound on Linux, so the linux backend goes further: it owns
+   a **dedicated tracer thread** (`tracerThread`) and funnels *every* ptrace
+   control op through `execPtrace`, because they must issue from the exact
+   thread that forked/attached the tracee. `wait4` is the one exception — legal
+   from any thread of the tracer process, so `Wait` runs it directly off the
+   tracer thread. On Darwin the ptrace/Mach calls run on the engine-loop thread
+   itself (Mach ports are task-wide). Mirrors Delve's `execPtraceFunc`.
 
 2. **`waitLoop` is a one-shot, locked goroutine.** Every time the process is
    resumed, a fresh `waitLoop` goroutine is started. It calls `Backend.Wait()`
@@ -184,6 +190,14 @@ Per-arch in [trap_amd64.go](internal/debugger/trap_amd64.go) and
 | amd64 | `INT3` (1 byte, 0xCC) | RIP = bp+1 (advanced past INT3) | subtract 1 |
 | arm64 | `BRK #0` (4 bytes) | PC = bp (at the BRK) | identity |
 
+On a matched software-BP stop the engine calls `rewindToBreakpoint` to write
+the rewound PC back into the tracee's **live** register (not just the local
+`StopEvent`). On amd64 the CPU leaves RIP one byte past the `INT3`, so every
+resume path — plain continue and the restore→single-step→reinstall step-over
+dance — would otherwise start mid-instruction and corrupt the tracee (this
+manifested as a hung `StepOver`). No-op on arm64/Darwin, whose rewind is
+identity.
+
 Be careful: spurious SIGTRAPs (Go runtime internal traps, libc assertions)
 arrive as `StopBreakpoint` with no entry in our table. On ARM64, calling
 `ContinueProcess` with PC unchanged re-executes the BRK — infinite loop. The
@@ -216,9 +230,21 @@ engine advances PC by `len(archTrapInstruction())` and resumes. See the
 
 ### Linux / amd64 ([backend_linux_amd64.go](internal/debugger/backend_linux_amd64.go))
 
-- Pure ptrace. `startTracedProcess` enables `PTRACE_O_TRACEEXIT |
-  PTRACE_O_TRACEEXEC`; clone-thread tracing is intentionally not enabled until
-  the backend can resume Go runtime clone stops without parking the thread group.
+- Pure ptrace, funnelled through one dedicated tracer thread
+  (`tracerThread` / `execPtrace`) because ptrace is thread-bound: the initial
+  fork/exec, attach, and every control op (`CONT` / `SINGLESTEP` /
+  `GET`·`SETREGS` / `PEEK`·`POKEDATA` / `SETOPTIONS`) must originate from the
+  one thread that became the tracer. `wait4` runs off that thread (valid from
+  any tracer thread). Splitting the wait from the control ops was the original
+  step-over hang: cross-thread `PTRACE_SINGLESTEP` failed with `ESRCH`.
+- `startTracedProcess` enables `PTRACE_O_TRACEEXIT | PTRACE_O_TRACEEXEC |
+  PTRACE_O_TRACECLONE`. Clone tracing is set at the single-threaded execve stop
+  so every later Go-runtime worker thread inherits it; without it a goroutine
+  migrated (e.g. by `time.Sleep`) onto an untraced clone thread would deliver
+  its breakpoint `SIGTRAP` to the Go runtime ("fatal: trace trap") instead of
+  the tracer. Each new thread's initial `SIGSTOP` is resumed **individually** —
+  never a group-continue, which would let a thread parked at a breakpoint run
+  away (the "parking the thread group" hazard).
 - `Wait` uses `Wait4(-1, …, WALL)` to receive events for any thread.
   `PTRACE_EVENT_*` stops are absorbed (resumed and looped) and never surface
   to the engine.
