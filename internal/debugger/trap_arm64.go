@@ -8,3 +8,8 @@ package debugger
 func archTrapInstruction() []byte { return []byte{0x00, 0x00, 0x20, 0xD4} }
 
 func archRewindPC(pc uint64) uint64 { return pc }
+
+// archBreakpointTrapMovesPC reports whether the CPU leaves PC past the trap
+// instruction after a software breakpoint. On arm64 the BRK leaves PC AT the
+// instruction, so no PC rewind is needed before restore + single-step.
+func archBreakpointTrapMovesPC() bool { return false }

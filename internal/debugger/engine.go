@@ -399,6 +399,13 @@ func (e *engine) handleStop(stop StopEvent) {
 		}
 		slog.Debug("StopBreakpoint matched", "file", bp.file, "line", bp.line,
 			"addr", fmt.Sprintf("0x%x", bp.addr))
+		// On x86 the CPU leaves RIP one byte past the INT3. Rewind the trapping
+		// thread's real PC to the breakpoint address (stop.PC already holds the
+		// rewound value) so that once the original instruction is restored the
+		// thread re-executes it from the start instead of running from
+		// mid-instruction. Uniform for user and sentinel breakpoints; a no-op
+		// on arm64/Darwin where BRK leaves PC at the instruction.
+		e.rewindTrapPC(stop.TID, stop.PC)
 		if bp.file == stepOverNextFile {
 			_ = e.bps.clear(e.backend, bp.id)
 			e.lastBP = nil
@@ -537,6 +544,25 @@ func (e *engine) populateStopPC(stop StopEvent, rewind bool) (StopEvent, error) 
 		stop.PC = regs.PC
 	}
 	return stop, nil
+}
+
+// rewindTrapPC resets a trapping thread's real PC to the breakpoint address on
+// architectures where the software-breakpoint trap advances PC past the trap
+// instruction (x86 INT3). Without this, restoring the original instruction and
+// single-stepping would run from mid-instruction. No-op on arm64/Darwin.
+func (e *engine) rewindTrapPC(tid int, pc uint64) {
+	if !archBreakpointTrapMovesPC() || tid == 0 {
+		return
+	}
+	regs, err := e.backend.GetRegisters(tid)
+	if err != nil {
+		return
+	}
+	if regs.PC == pc {
+		return
+	}
+	regs.PC = pc
+	_ = e.backend.SetRegisters(tid, regs)
 }
 
 func (e *engine) populateBreakpointStop(stop StopEvent) (StopEvent, error) {
