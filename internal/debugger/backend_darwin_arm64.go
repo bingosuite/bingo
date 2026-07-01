@@ -23,7 +23,9 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 )
 
@@ -70,6 +72,15 @@ type darwinBackend struct {
 	sobAddr        uint64
 	sobBranch      bool
 	sobSteps       int
+
+	// Diagnostic-only (BINGO_DARWIN_SUSPEND_PROBE): waitStartNanos records when
+	// Wait() blocked in wait4 (0 = not blocked). A watchdog goroutine, started
+	// once, reads it to detect a wedge and dump the task/thread suspend state.
+	// suspendProbeOn caches the env gate so a disabled probe adds no per-wait
+	// work beyond one bool check.
+	waitStartNanos int64
+	probeOnce      sync.Once
+	suspendProbeOn bool
 }
 
 // Darwin ptrace request codes from <sys/ptrace.h>. PT_ATTACH (10) makes the
@@ -113,6 +124,15 @@ func darwinAsyncPreemptOffEnabled() bool {
 	default:
 		return asyncPreemptOffDefault
 	}
+}
+
+// darwinSuspendProbeEnabled gates a diagnostic-only watchdog that, on a wedge,
+// reads and logs the tracee's TASK-level Mach suspend_count plus per-thread
+// run_state/suspend/PC. It never changes control flow and only does work after
+// a multi-second wait4 stall, so it does not perturb the pre-wedge timing that
+// the race depends on.
+func darwinSuspendProbeEnabled() bool {
+	return os.Getenv("BINGO_DARWIN_SUSPEND_PROBE") == "1"
 }
 
 func ptrace(request, pid, addr, data uintptr) error {
@@ -647,9 +667,21 @@ func (b *darwinBackend) Threads() ([]int, error) {
 
 //nolint:gocognit // The wait loop is one serialized ptrace state machine.
 func (b *darwinBackend) Wait() (StopEvent, error) {
+	b.probeOnce.Do(func() {
+		if darwinSuspendProbeEnabled() {
+			b.suspendProbeOn = true
+			go b.suspendProbeWatchdog()
+		}
+	})
 	for {
 		var ws syscall.WaitStatus
+		if b.suspendProbeOn {
+			atomic.StoreInt64(&b.waitStartNanos, time.Now().UnixNano())
+		}
 		tid, err := syscall.Wait4(b.pid, &ws, 0, nil)
+		if b.suspendProbeOn {
+			atomic.StoreInt64(&b.waitStartNanos, 0)
+		}
 		if err != nil {
 			if isNoChildProcess(err) {
 				return StopEvent{Reason: StopExited, TID: b.pid}, nil
@@ -741,6 +773,125 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 		}
 		return StopEvent{Reason: StopSignal, Signal: int(sig)}, nil
 	}
+}
+
+// suspendProbeWatchdog (diagnostic only) polls waitStartNanos and, when Wait()
+// has been blocked in wait4 for longer than probeWedgeThreshold, dumps the
+// tracee's TASK-level suspend_count and per-thread state once per stall episode.
+//
+// Interpreting the numbers (validated by a task_suspend positive control):
+//   - A ptrace-STOPPED darwin task already reads task suspend_count == 1 (BSD
+//     SSTOP shares the single Mach task suspend_count). So suspend_count == 1
+//     is the ORDINARY stop baseline, NOT evidence of a leak on its own.
+//   - task_suspend/task_resume increment/decrement that SAME counter, so a
+//     LEAKED task_suspend (e.g. an unbalanced bingo_write_memory) stacked on a
+//     ptrace stop would read suspend_count >= 2.
+//   - A resumed/running task reads 0.
+//
+// Therefore the discriminators for the residual wedge are:
+//
+//	(a) suspend_count >= 2                         -> a held/leaked task suspend
+//	(b) threads run_state==STOPPED at user PCs      -> task-suspend freeze
+//	(c) threads run_state==WAITING, static kernel PCs (__psynch_cvwait, …),
+//	    suspend ∈ {0,1}                             -> pthread-condvar lost-wakeup
+func (b *darwinBackend) suspendProbeWatchdog() {
+	const probeWedgeThreshold = 9 * time.Second
+	var lastDumped int64
+	for {
+		time.Sleep(1 * time.Second)
+		start := atomic.LoadInt64(&b.waitStartNanos)
+		if start == 0 || start == lastDumped {
+			continue
+		}
+		if time.Duration(time.Now().UnixNano()-start) < probeWedgeThreshold {
+			continue
+		}
+		lastDumped = start
+		b.dumpSuspendState(start)
+	}
+}
+
+func (b *darwinBackend) dumpSuspendState(waitStart int64) {
+	task, err := b.task()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[suspendprobe] pid=%d task() err: %v\n", b.pid, err)
+		return
+	}
+	waited := time.Duration(time.Now().UnixNano() - waitStart).Round(time.Millisecond)
+	var sc C.uint32_t
+	if kr := C.bingo_task_suspend_count(task, &sc); kr != C.KERN_SUCCESS {
+		fmt.Fprintf(os.Stderr, "[suspendprobe] pid=%d waited=%s task_suspend_count err: %s\n",
+			b.pid, waited, machErrString(kr))
+		return
+	}
+	scStr := "0 (task resumed/running)"
+	switch {
+	case int(sc) == 1:
+		scStr = "1 (== ordinary ptrace-stop baseline; NOT a leak by itself)"
+	case int(sc) >= 2:
+		scStr = fmt.Sprintf("%d (>=2: hold BEYOND ptrace baseline -> candidate task-suspend LEAK)", int(sc))
+	}
+	fmt.Fprintf(os.Stderr, "[suspendprobe] pid=%d waited=%s TASK_SUSPEND_COUNT=%s\n", b.pid, waited, scStr)
+
+	pcs0, _, stopped0 := b.dumpThreads(task, "s0")
+	time.Sleep(300 * time.Millisecond)
+	pcs1, waiting1, stopped1 := b.dumpThreads(task, "s1")
+
+	static := len(pcs0) > 0
+	for port, pc := range pcs0 {
+		if pcs1[port] != pc {
+			static = false
+			break
+		}
+	}
+	verdict := "INCONCLUSIVE"
+	switch {
+	case int(sc) >= 2:
+		verdict = "task-suspend LEAK (suspend_count exceeds ptrace baseline)"
+	case stopped0 > 0 || stopped1 > 0:
+		verdict = "task-suspend FREEZE (threads STOPPED, not voluntarily waiting)"
+	case waiting1 > 0 && static:
+		verdict = "pthread-condvar LOST-WAKEUP (threads WAITING in kernel, PCs static, suspend<=1)"
+	}
+	fmt.Fprintf(os.Stderr, "[suspendprobe]   VERDICT: %s (waiting=%d stopped=%d staticPCs=%v)\n",
+		verdict, waiting1, stopped1, static)
+}
+
+// dumpThreads logs each thread and returns its PC map plus WAITING/STOPPED tallies.
+func (b *darwinBackend) dumpThreads(task C.mach_port_t, label string) (map[int]uint64, int, int) {
+	pcs := map[int]uint64{}
+	waiting, stopped := 0, 0
+	var threads C.thread_act_port_array_t
+	var count C.mach_msg_type_number_t
+	if kr := C.bingo_thread_list(task, &threads, &count); kr != C.KERN_SUCCESS {
+		fmt.Fprintf(os.Stderr, "[suspendprobe]   %s task_threads err: %s\n", label, machErrString(kr))
+		return pcs, waiting, stopped
+	}
+	defer C.vm_deallocate(
+		C.mach_task_self_,
+		C.vm_address_t(uintptr(unsafe.Pointer(threads))),
+		C.vm_size_t(uintptr(count)*unsafe.Sizeof(C.mach_port_t(0))),
+	)
+	ports := unsafe.Slice((*C.mach_port_t)(unsafe.Pointer(threads)), int(count))
+	for i, p := range ports {
+		var rs, tsc C.int
+		var pc C.uint64_t
+		if kr := C.bingo_thread_probe(p, &rs, &tsc, &pc); kr != C.KERN_SUCCESS {
+			fmt.Fprintf(os.Stderr, "[suspendprobe]   %s th[%d] port=%d probe err: %s\n",
+				label, i, int(p), machErrString(kr))
+			continue
+		}
+		switch int(rs) {
+		case 3: // TH_STATE_WAITING
+			waiting++
+		case 2: // TH_STATE_STOPPED
+			stopped++
+		}
+		pcs[int(p)] = uint64(pc)
+		fmt.Fprintf(os.Stderr, "[suspendprobe]   %s th[%d] port=%d run_state=%d suspend=%d pc=%#x\n",
+			label, i, int(p), int(rs), int(tsc), uint64(pc))
+	}
+	return pcs, waiting, stopped
 }
 
 func (b *darwinBackend) setPID(pid int) { b.pid = pid }
