@@ -135,7 +135,7 @@ func (e *engine) Events() <-chan protocol.Event { return e.events }
 
 func (e *engine) Launch(binaryPath string, args []string, env []string) error {
 	return e.dispatch(func() error {
-		if err := e.proc.launch(binaryPath, args, env); err != nil {
+		if err := e.proc.launch(e.backend, binaryPath, args, env); err != nil {
 			return err
 		}
 		setPID(e.backend, e.proc.pid)
@@ -150,7 +150,7 @@ func (e *engine) Launch(binaryPath string, args []string, env []string) error {
 
 func (e *engine) Attach(pid int, binaryPath string) error {
 	return e.dispatch(func() error {
-		if err := e.proc.attach(pid); err != nil {
+		if err := e.proc.attach(e.backend, pid); err != nil {
 			return err
 		}
 		setPID(e.backend, pid)
@@ -341,12 +341,19 @@ func (e *engine) Goroutines() ([]protocol.Goroutine, error) {
 }
 
 func (e *engine) loop() {
-	// All ptrace calls are made from dispatch closures running on this
-	// goroutine. Pin to one OS thread: ptrace is thread-specific on Linux.
+	// Pin to one OS thread. On Darwin the backend issues ptrace/Mach calls
+	// directly from these dispatch closures, so they must stay on one thread.
+	// On Linux the backend owns a dedicated tracer thread (see tracerThread)
+	// and this lock is merely belt-and-braces.
 	runtime.LockOSThread()
 	defer func() {
 		close(e.done)
 		close(e.events)
+		// Release the linux tracer thread now that no more ptrace ops can be
+		// issued (the loop has exited). No-op on backends without one.
+		if c, ok := e.backend.(interface{ closeTracer() }); ok {
+			c.closeTracer()
+		}
 	}()
 
 	for {
@@ -432,6 +439,7 @@ func (e *engine) handleStop(stop StopEvent) {
 		}
 		slog.Debug("StopBreakpoint matched", "file", bp.file, "line", bp.line,
 			"addr", fmt.Sprintf("0x%x", bp.addr))
+		e.rewindToBreakpoint(stop)
 		if bp.file == stepOverNextFile {
 			_ = e.bps.clear(e.backend, bp.id)
 			e.lastBP = nil
@@ -584,6 +592,37 @@ func (e *engine) populateStopPC(stop StopEvent, rewind bool) (StopEvent, error) 
 		stop.PC = regs.PC
 	}
 	return stop, nil
+}
+
+// rewindToBreakpoint writes the breakpoint address back into the tracee's live
+// PC register. On amd64 the CPU advances RIP past the INT3 before delivering
+// the trap, so after a software-breakpoint stop the register points one byte
+// past the patched instruction even though stop.PC has already been rewound
+// for table lookup. Every resume path (plain continue after a sentinel step
+// breakpoint, or the restore→single-step→reinstall step-over dance) would then
+// execute starting one byte into the original instruction, corrupting the
+// tracee and letting it run away — which manifests as a hung Continue/StepOver.
+// Writing the rewound PC back makes every resume start at the real
+// instruction. It is a no-op where the register already matches (e.g. arm64,
+// whose BRK leaves PC in place, and Darwin).
+func (e *engine) rewindToBreakpoint(stop StopEvent) {
+	if stop.TID == 0 {
+		return
+	}
+	regs, err := e.backend.GetRegisters(stop.TID)
+	if err != nil {
+		slog.Warn("rewindToBreakpoint: get registers failed",
+			"tid", stop.TID, "err", err)
+		return
+	}
+	if regs.PC == stop.PC {
+		return
+	}
+	regs.PC = stop.PC
+	if err := e.backend.SetRegisters(stop.TID, regs); err != nil {
+		slog.Warn("rewindToBreakpoint: set registers failed",
+			"tid", stop.TID, "pc", fmt.Sprintf("0x%x", stop.PC), "err", err)
+	}
 }
 
 func (e *engine) populateBreakpointStop(stop StopEvent) (StopEvent, error) {
