@@ -404,7 +404,26 @@ func (b *darwinBackend) Threads() ([]int, error) {
 func (b *darwinBackend) Wait() (StopEvent, error) {
 	for {
 		var ws syscall.WaitStatus
-		tid, err := syscall.Wait4(b.pid, &ws, 0, nil)
+		// Reactive task-suspend drain — the race backstop for resumeTraced's
+		// resume-time drain. Poll for a pending stop without blocking. If none
+		// is reapable yet the task is still Mach-suspended, a surplus
+		// task_suspend leaked past the resume-time drain (resumeTraced reads the
+		// count once, before the resume, so a suspend from the same stop cluster
+		// that lands just after that read is missed). A Mach-suspended task
+		// cannot run to create a new stop, and WNOHANG proves none is queued, so
+		// any positive count here is pure leaked surplus: drain one and re-poll
+		// until the task is runnable again or a real stop surfaces. Bounded so a
+		// misbehaving task_resume can never spin forever.
+		tid, err := syscall.Wait4(b.pid, &ws, syscall.WNOHANG, nil)
+		for drains := 0; err == nil && tid == 0 && drains < 64 && b.taskSuspendCount() > 0; drains++ {
+			if rerr := b.taskResume(); rerr != nil {
+				break
+			}
+			tid, err = syscall.Wait4(b.pid, &ws, syscall.WNOHANG, nil)
+		}
+		if err == nil && tid == 0 {
+			tid, err = syscall.Wait4(b.pid, &ws, 0, nil)
+		}
 		if err != nil {
 			if isNoChildProcess(err) {
 				return StopEvent{Reason: StopExited, TID: b.pid}, nil
@@ -613,10 +632,14 @@ func (b *darwinBackend) taskResume() error {
 //
 // We read the suspend count while the task is still stopped, issue the request,
 // then perform exactly (pre-1) extra task_resume calls to cancel the leaked
-// suspends. This is race-free: whenever the post-request count is still positive
-// the task cannot execute, so no new suspend can interleave with the drain, and
-// we never resume past the single legitimate suspend of a healthy stop (pre==1
-// drains nothing).
+// suspends. This handles the common case cheaply at resume time, but it is NOT
+// sufficient on its own: `pre` is sampled once, before the request, so a surplus
+// suspend from the same stop cluster that lands just after the read is missed and
+// the count sticks at 1. The reactive drain-before-block in Wait() is the
+// authoritative backstop that closes that race; this drain merely keeps the
+// common case off the reactive path. (It cannot over-drain: XNU serializes ptrace
+// stops per process, so a positive count never covers a second, independently
+// wait4-reportable stop — only leaked surplus.)
 func (b *darwinBackend) resumeTraced(request, addr, data uintptr) error {
 	pre := b.taskSuspendCount()
 	if err := ptrace(request, uintptr(b.pid), addr, data); err != nil {
