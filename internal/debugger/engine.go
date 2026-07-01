@@ -354,9 +354,6 @@ func (e *engine) waitLoop() {
 
 //nolint:gocognit,gocyclo // Stop handling is a single serialized debugger state machine.
 func (e *engine) handleStop(stop StopEvent) {
-	slog.Info("E2EDBG handleStop", "reason", stop.Reason, "tid", stop.TID,
-		"pc", fmt.Sprintf("0x%x", stop.PC), "signal", stop.Signal,
-		"steppingOverBP", e.steppingOverBP != nil, "bpResume", e.bpResume)
 	switch stop.Reason {
 	case StopExited:
 		if e.getState() == stateExited {
@@ -840,18 +837,17 @@ func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) err
 	}
 	e.lastBPTID = 0
 
-	// Rewind the tracee's PC to the breakpoint address before stepping. On
-	// amd64 the INT3 trap leaves RIP one byte PAST bp.addr, so single-stepping
-	// now (after restoring the original byte) would execute from the middle of
-	// the original instruction, corrupting the stream. Put PC back at bp.addr
-	// so the restored instruction runs from its first byte. On arm64 the CPU
-	// stops with PC already AT the BRK (archRewindPC is identity), so the
-	// read-back PC equals bp.addr and the guard makes this a no-op. Mirrors
-	// Delve's (*nativeThread).SetCurrentBreakpoint -> setPC(bp.Addr) when
+	// Backstop PC rewind. On amd64 the INT3 trap leaves RIP one byte PAST
+	// bp.addr, so single-stepping now (after restoring the original byte) would
+	// execute from the middle of the original instruction and corrupt the
+	// stream. rewindTraceePC already put the register PC back at bp.addr when
+	// the breakpoint was hit, so this guard is normally false here; it is kept
+	// so any future path that sets lastBP without pre-rewinding still resumes
+	// correctly. On arm64/darwin PC is already AT the trap (archRewindPC is the
+	// identity) and the guard is a no-op. Mirrors Delve's
+	// (*nativeThread).SetCurrentBreakpoint -> setPC(bp.Addr) when
 	// Arch.BreakInstrMovesPC() is true.
 	if regs, gerr := e.backend.GetRegisters(tid); gerr == nil && regs.PC != bp.addr {
-		slog.Info("E2EDBG resumeFromBreakpoint rewind", "tid", tid,
-			"oldPC", fmt.Sprintf("0x%x", regs.PC), "bpAddr", fmt.Sprintf("0x%x", bp.addr), "action", action)
 		regs.PC = bp.addr
 		if serr := e.backend.SetRegisters(tid, regs); serr != nil {
 			_ = e.backend.WriteMemory(bp.addr, archTrapInstruction())
@@ -859,9 +855,6 @@ func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) err
 			e.steppingOverBP = nil
 			return fmt.Errorf("resume BP: rewind PC to 0x%x: %w", bp.addr, serr)
 		}
-	} else {
-		slog.Info("E2EDBG resumeFromBreakpoint no-rewind", "tid", tid, "gerr", gerr,
-			"bpAddr", fmt.Sprintf("0x%x", bp.addr), "action", action)
 	}
 
 	if err := e.backend.SingleStep(tid); err != nil {

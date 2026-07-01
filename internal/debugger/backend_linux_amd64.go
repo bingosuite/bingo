@@ -5,22 +5,10 @@ package debugger
 import (
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/exec"
-	"sync/atomic"
 	"syscall"
 )
-
-// E2EDBG temporary instrumentation (removed before final). Logs at Info so it
-// surfaces in CI without BINGO_E2E_DEBUG. Capped to avoid flooding on livelock.
-var dbgWaitN atomic.Int64
-
-func dbgLog(msg string, args ...any) {
-	if dbgWaitN.Add(1) <= 600 {
-		slog.Info("E2EDBG "+msg, args...)
-	}
-}
 
 func newBackend() Backend {
 	return &linuxBackend{}
@@ -119,7 +107,6 @@ func (b *linuxBackend) ContinueProcess() error {
 	sig := b.delayedSignal
 	b.delayedSignal = 0
 	tid := b.traceTID()
-	dbgLog("ContinueProcess", "tid", tid, "sig", sig)
 	if err := syscall.PtraceCont(tid, sig); err != nil {
 		return fmt.Errorf("PTRACE_CONT tid %d (sig %d): %w", tid, sig, err)
 	}
@@ -129,7 +116,6 @@ func (b *linuxBackend) ContinueProcess() error {
 func (b *linuxBackend) SingleStep(tid int) error {
 	b.stepping = true
 	b.stepTID = tid
-	dbgLog("SingleStep", "tid", tid)
 	if err := ptraceSingleStepSig(tid, 0); err != nil {
 		return fmt.Errorf("PTRACE_SINGLESTEP tid %d: %w", tid, err)
 	}
@@ -217,10 +203,14 @@ func (b *linuxBackend) Threads() ([]int, error) {
 	return tids, nil
 }
 
-// Wait blocks until the tracee produces a meaningful debug stop. Single-step
-// vs breakpoint disambiguation uses b.stepping (reliable because ptrace is
-// serialised). PTRACE_EVENT stops (clone/exec/exit) are handled internally
-// and don't surface to the engine.
+// Wait blocks until the tracee produces a debug stop and classifies it. The
+// single-step SIGTRAP is disambiguated from a breakpoint (INT3) SIGTRAP by
+// stepTID (the thread the step was issued against). Stops that require a ptrace
+// resume from the tracer goroutine — clone/thread lifecycle events and signals
+// delivered to non-debug threads — are handed back as StopThreadEvent (or a
+// mid-step StopSignal); the engine resumes them via ptraceResumer. Wait itself
+// only reaps exited/killed siblings and never issues a ptrace resume, since
+// PTRACE_CONT/SINGLESTEP from this (non-tracer) goroutine would return ESRCH.
 //
 //nolint:gocognit,gocyclo // The wait loop is one serialized ptrace state machine.
 func (b *linuxBackend) Wait() (StopEvent, error) {
@@ -228,10 +218,6 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		var ws syscall.WaitStatus
 		// WALL includes clone()d threads.
 		tid, err := syscall.Wait4(-1, &ws, syscall.WALL, nil)
-		dbgLog("wait4 return", "tid", tid, "err", err, "raw", uint32(ws),
-			"stopped", ws.Stopped(), "stopsig", int(ws.StopSignal()),
-			"cause", ws.TrapCause(), "exited", ws.Exited(),
-			"signaled", ws.Signaled(), "stepping", b.stepping, "pid", b.pid)
 		if err != nil {
 			if isNoChildProcess(err) {
 				return StopEvent{Reason: StopExited, TID: b.pid}, nil
@@ -271,7 +257,6 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				// transparent thread event. Do NOT recordStop — that would
 				// repoint traceTID at an unrelated churn thread and misdirect
 				// the next ContinueProcess.
-				dbgLog("-> StopThreadEvent (ptrace-event)", "tid", tid, "cause", ws.TrapCause())
 				return StopEvent{Reason: StopThreadEvent, TID: tid}, nil
 			}
 			// Genuine trap. If it is the completion of the single-step we
@@ -282,17 +267,14 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			b.recordStop(tid)
 			if b.stepping && tid == b.stepTID {
 				b.stepping = false
-				dbgLog("-> StopSingleStep", "tid", tid)
 				return StopEvent{Reason: StopSingleStep, TID: tid}, nil
 			}
-			dbgLog("-> StopBreakpoint", "tid", tid)
 			return StopEvent{Reason: StopBreakpoint, TID: tid}, nil
 		}
 
 		// A freshly cloned thread reports an initial SIGSTOP before it runs
 		// (PTRACE_O_TRACECLONE). Resume it from the tracer goroutine.
 		if sig == syscall.SIGSTOP && tid != b.pid {
-			dbgLog("-> StopThreadEvent (clone-sigstop)", "tid", tid)
 			return StopEvent{Reason: StopThreadEvent, TID: tid}, nil
 		}
 
@@ -312,10 +294,8 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		if b.stepping && tid == b.stepTID {
 			b.stepping = false
 			b.recordStop(tid)
-			dbgLog("-> StopSignal (mid-step)", "tid", tid, "sig", int(sig))
 			return StopEvent{Reason: StopSignal, TID: tid, Signal: int(sig), Stepping: true}, nil
 		}
-		dbgLog("-> StopThreadEvent (signal-forward)", "tid", tid, "sig", int(sig))
 		return StopEvent{Reason: StopThreadEvent, TID: tid, Signal: int(sig)}, nil
 	}
 }
@@ -336,18 +316,15 @@ func (b *linuxBackend) ResumeSignal(tid, signal int, stepping bool) error {
 			int(syscall.SIGSEGV), int(syscall.SIGSTKFLT):
 			// Synchronous fault from the stepped instruction: re-issue the
 			// step delivering the signal so the tracee's handler observes it.
-			dbgLog("ResumeSignal re-step fault", "tid", tid, "sig", signal)
 			return singleStepSig(tid, signal)
 		case int(syscall.SIGSTOP):
 			// Spurious/late SIGSTOP: swallow and keep stepping.
-			dbgLog("ResumeSignal re-step drop-stop", "tid", tid)
 			return singleStepSig(tid, 0)
 		default:
 			// Asynchronous signal (SIGURG preemption, SIGCHLD, ...): defer to
 			// the next continue so entering a handler mid-step doesn't perturb
 			// the step's trap PC; re-step suppressing it now.
 			b.delayedSignal = signal
-			dbgLog("ResumeSignal re-step defer", "tid", tid, "sig", signal)
 			return singleStepSig(tid, 0)
 		}
 	}
@@ -358,7 +335,6 @@ func (b *linuxBackend) ResumeSignal(tid, signal int, stepping bool) error {
 		forward = 0
 	}
 	b.stepping = false
-	dbgLog("ResumeSignal continue-forward", "tid", tid, "sig", signal, "forward", forward)
 	return continueIfTraceeExists(tid, forward)
 }
 
@@ -378,7 +354,6 @@ func (b *linuxBackend) ResumeThread(tid, signal int) error {
 	if forward == int(syscall.SIGSTOP) {
 		forward = 0
 	}
-	dbgLog("ResumeThread", "tid", tid, "sig", signal, "forward", forward)
 	return continueIfTraceeExists(tid, forward)
 }
 
