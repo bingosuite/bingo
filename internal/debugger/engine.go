@@ -399,6 +399,18 @@ func (e *engine) handleStop(stop StopEvent) {
 		}
 		slog.Debug("StopBreakpoint matched", "file", bp.file, "line", bp.line,
 			"addr", fmt.Sprintf("0x%x", bp.addr))
+		// On amd64 the CPU leaves RIP one byte past the INT3 (0xCC) after the
+		// trap. populateBreakpointStop rewinds the *reported* stop.PC via
+		// archRewindPC, but the thread's PC register still points at addr+1.
+		// Write the rewound PC back into the register now, before any restore +
+		// single-step (resumeFromBreakpoint) or plain continue: otherwise the
+		// resume restarts from the middle of the restored original instruction,
+		// corrupting the tracee and wedging step-over / continue-past-BP. On
+		// arm64 BRK leaves PC at addr (archRewindPC is identity), so stop.PC
+		// already equals the register and rewindTrapPC is a no-op. Mirrors
+		// Delve's nativeThread.SetCurrentBreakpoint -> setPC(bp.Addr), gated on
+		// Arch.BreakInstrMovesPC().
+		e.rewindTrapPC(stop.TID, stop.PC)
 		if bp.file == stepOverNextFile {
 			_ = e.bps.clear(e.backend, bp.id)
 			e.lastBP = nil
@@ -597,6 +609,29 @@ func (e *engine) populateBreakpointStop(stop StopEvent) (StopEvent, error) {
 		return *fallback, nil
 	}
 	return stop, fmt.Errorf("find breakpoint thread: read registers: %w", firstErr)
+}
+
+// rewindTrapPC writes pc into tid's PC register, unless it is already there.
+// After a software-breakpoint trap on amd64 the CPU leaves PC one byte past the
+// INT3; the engine rewinds the reported stop PC via archRewindPC, but the actual
+// register still points mid-instruction. Rewinding the register keeps the whole
+// suspended state consistent and lets the subsequent restore + single-step (or
+// continue) re-execute the trapped instruction from its start. The guard makes
+// this a no-op on arm64/Darwin, where BRK leaves PC at the trap address.
+func (e *engine) rewindTrapPC(tid int, pc uint64) {
+	regs, err := e.backend.GetRegisters(tid)
+	if err != nil {
+		slog.Warn("rewindTrapPC: get registers failed", "tid", tid, "err", err)
+		return
+	}
+	if regs.PC == pc {
+		return
+	}
+	regs.PC = pc
+	if err := e.backend.SetRegisters(tid, regs); err != nil {
+		slog.Warn("rewindTrapPC: set registers failed",
+			"tid", tid, "pc", fmt.Sprintf("0x%x", pc), "err", err)
+	}
 }
 
 func (e *engine) instructionAt(addr uint64, want []byte) bool {
