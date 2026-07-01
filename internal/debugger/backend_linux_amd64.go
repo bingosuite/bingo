@@ -7,24 +7,107 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
+	"sync"
 	"syscall"
 )
 
 func newBackend() Backend {
-	return &linuxBackend{}
+	return &linuxBackend{pt: ptraceThread()}
 }
 
 type linuxBackend struct {
+	pt          *ptraceExec
 	pid         int
 	stepping    bool // true after SingleStep; classifies the next SIGTRAP
+	stepTID     int  // the exact thread SingleStep was issued against
 	lastStopTID int
 }
 
-const linuxPtraceOptions = syscall.PTRACE_O_TRACEEXIT |
+// ptraceExec serializes every ptrace(2) command onto one dedicated OS thread.
+//
+// Linux ties a tracee to the specific "tracer" thread that established the
+// trace relationship — here the thread that forks the child under
+// PTRACE_TRACEME. Every later ptrace request (PTRACE_CONT, PTRACE_SINGLESTEP,
+// register/memory access, PTRACE_SETOPTIONS, PTRACE_DETACH) must be issued
+// from that same thread; from any other thread the kernel rejects it with
+// ESRCH. The engine's wait loop runs on a *different* OS thread than the one
+// that forked the tracee, so ptrace commands re-issued from inside Wait()
+// (the transparent SIGURG / SIGCONT / clone re-steps) used to fail with ESRCH
+// — an error the helpers silently swallowed — leaving the tracee parked and
+// wedging step-over forever. Funnelling every command through this single
+// locked thread guarantees they all originate from the tracer.
+//
+// wait4(2) is deliberately NOT routed here: any thread in the tracer's thread
+// group may reap the tracee, and blocking this thread inside wait4 would stop
+// it from servicing the very commands the wait loop needs. This mirrors
+// Delve's model (dedicated ptrace thread for commands; wait4 on regular
+// goroutines — see pkg/proc/native/proc.go execPtraceFunc and
+// proc_linux.go trapWait).
+type ptraceExec struct {
+	mu    sync.Mutex
+	reqCh chan func()
+	ackCh chan struct{}
+}
+
+var (
+	ptraceOnce sync.Once
+	ptraceInst *ptraceExec
+)
+
+// ptraceThread returns the process-wide ptrace command thread, creating it on
+// first use. Exactly one debug target is traced at a time in this codebase, so
+// a single shared tracer thread keeps the fork (in startTracedProcess) and all
+// of the backend's subsequent commands on the same thread.
+func ptraceThread() *ptraceExec {
+	ptraceOnce.Do(func() { ptraceInst = newPtraceExec() })
+	return ptraceInst
+}
+
+func newPtraceExec() *ptraceExec {
+	p := &ptraceExec{
+		reqCh: make(chan func()),
+		ackCh: make(chan struct{}),
+	}
+	started := make(chan struct{})
+	go func() {
+		// Never unlocked: this thread must remain the tracer for the lifetime
+		// of the process so every ptrace command originates from it.
+		runtime.LockOSThread()
+		close(started)
+		for fn := range p.reqCh {
+			fn()
+			p.ackCh <- struct{}{}
+		}
+	}()
+	<-started
+	return p
+}
+
+// run executes fn on the ptrace thread and blocks until it completes. The
+// mutex makes each request/ack pair atomic so concurrent callers can't steal
+// one another's acknowledgement.
+func (p *ptraceExec) run(fn func()) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reqCh <- fn
+	<-p.ackCh
+}
+
+// PTRACE_O_TRACECLONE auto-traces every thread the tracee spawns, so a
+// breakpoint hit on ANY OS thread is caught by us. Without it the Go
+// scheduler can migrate the goroutine that owns a breakpoint onto an untraced
+// runtime thread; when that thread executes the INT3 the SIGTRAP is delivered
+// to the tracee's own runtime ("SIGTRAP: trace trap") and it dies. The clone
+// bookkeeping (parent PTRACE_EVENT_CLONE + child SIGSTOP) is handled in Wait.
+const linuxPtraceOptions = syscall.PTRACE_O_TRACECLONE |
+	syscall.PTRACE_O_TRACEEXIT |
 	syscall.PTRACE_O_TRACEEXEC
 
 // startTracedProcess forks under ptrace. The child is stopped at its first
-// instruction (execve SIGTRAP) ready for the engine to set breakpoints.
+// instruction (execve SIGTRAP) ready for the engine to set breakpoints. The
+// fork and initial setup run on the ptrace thread so that thread becomes the
+// tracer for every subsequent command.
 func startTracedProcess(binaryPath string, args []string, env []string) (int, *exec.Cmd, error) {
 	// codeql-suppress[go/command-injection]: The debugger intentionally launches the local binary selected by the operator.
 	cmd := exec.Command(binaryPath, args...)
@@ -35,39 +118,54 @@ func startTracedProcess(binaryPath string, args []string, env []string) (int, *e
 	if len(env) > 0 {
 		cmd.Env = append(os.Environ(), env...)
 	}
-	if err := cmd.Start(); err != nil {
-		return 0, nil, fmt.Errorf("exec %q: %w", binaryPath, err)
-	}
 
-	pid := cmd.Process.Pid
+	var (
+		pid int
+		err error
+	)
+	ptraceThread().run(func() {
+		if serr := cmd.Start(); serr != nil {
+			err = fmt.Errorf("exec %q: %w", binaryPath, serr)
+			return
+		}
+		pid = cmd.Process.Pid
 
-	var ws syscall.WaitStatus
-	if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
-		_ = cmd.Process.Kill()
-		return 0, nil, fmt.Errorf("wait for execve stop: %w", err)
+		var ws syscall.WaitStatus
+		if _, werr := syscall.Wait4(pid, &ws, 0, nil); werr != nil {
+			_ = cmd.Process.Kill()
+			err = fmt.Errorf("wait for execve stop: %w", werr)
+			return
+		}
+		if !ws.Stopped() || ws.StopSignal() != syscall.SIGTRAP {
+			_ = cmd.Process.Kill()
+			err = fmt.Errorf("unexpected initial stop: %v", ws)
+			return
+		}
+		if serr := syscall.PtraceSetOptions(pid, linuxPtraceOptions); serr != nil {
+			_ = cmd.Process.Kill()
+			err = fmt.Errorf("PTRACE_SETOPTIONS: %w", serr)
+			return
+		}
+	})
+	if err != nil {
+		return 0, nil, err
 	}
-	if !ws.Stopped() || ws.StopSignal() != syscall.SIGTRAP {
-		_ = cmd.Process.Kill()
-		return 0, nil, fmt.Errorf("unexpected initial stop: %v", ws)
-	}
-
-	if err := syscall.PtraceSetOptions(pid, linuxPtraceOptions); err != nil {
-		_ = cmd.Process.Kill()
-		return 0, nil, fmt.Errorf("PTRACE_SETOPTIONS: %w", err)
-	}
-
 	return pid, cmd, nil
 }
 
 func attachToProcess(pid int) error {
-	if err := syscall.PtraceAttach(pid); err != nil {
-		return fmt.Errorf("PTRACE_ATTACH pid %d: %w", pid, err)
-	}
-	var ws syscall.WaitStatus
-	if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
-		return fmt.Errorf("wait after PTRACE_ATTACH: %w", err)
-	}
-	return nil
+	var err error
+	ptraceThread().run(func() {
+		if aerr := syscall.PtraceAttach(pid); aerr != nil {
+			err = fmt.Errorf("PTRACE_ATTACH pid %d: %w", pid, aerr)
+			return
+		}
+		var ws syscall.WaitStatus
+		if _, werr := syscall.Wait4(pid, &ws, 0, nil); werr != nil {
+			err = fmt.Errorf("wait after PTRACE_ATTACH: %w", werr)
+		}
+	})
+	return err
 }
 
 func killProcess(pid int, cmd *exec.Cmd) error {
@@ -79,7 +177,7 @@ func killProcess(pid int, cmd *exec.Cmd) error {
 		return nil
 	}
 	// Attached (not launched): detach, don't kill — we don't own the process.
-	_ = syscall.PtraceDetach(pid)
+	ptraceThread().run(func() { _ = syscall.PtraceDetach(pid) })
 	return nil
 }
 
@@ -89,8 +187,11 @@ func isAlreadyExited(err error) bool {
 
 func (b *linuxBackend) ContinueProcess() error {
 	b.stepping = false
+	b.stepTID = 0
 	tid := b.traceTID()
-	if err := syscall.PtraceCont(tid, 0); err != nil {
+	var err error
+	b.pt.run(func() { err = syscall.PtraceCont(tid, 0) })
+	if err != nil {
 		return fmt.Errorf("PTRACE_CONT tid %d: %w", tid, err)
 	}
 	return nil
@@ -98,13 +199,18 @@ func (b *linuxBackend) ContinueProcess() error {
 
 func (b *linuxBackend) SingleStep(tid int) error {
 	b.stepping = true
-	if err := syscall.PtraceSingleStep(tid); err != nil {
+	b.stepTID = tid
+	var err error
+	b.pt.run(func() { err = syscall.PtraceSingleStep(tid) })
+	if err != nil {
 		return fmt.Errorf("PTRACE_SINGLESTEP tid %d: %w", tid, err)
 	}
 	return nil
 }
 
 func (b *linuxBackend) StopProcess() error {
+	// SIGSTOP is delivered via kill(2), not ptrace, so it is safe from any
+	// thread.
 	p, err := os.FindProcess(b.pid)
 	if err != nil {
 		return err
@@ -114,7 +220,11 @@ func (b *linuxBackend) StopProcess() error {
 
 func (b *linuxBackend) ReadMemory(addr uint64, dst []byte) error {
 	tid := b.traceTID()
-	n, err := syscall.PtracePeekData(tid, uintptr(addr), dst)
+	var (
+		n   int
+		err error
+	)
+	b.pt.run(func() { n, err = syscall.PtracePeekData(tid, uintptr(addr), dst) })
 	if err != nil {
 		return fmt.Errorf("PTRACE_PEEKDATA tid %d 0x%x: %w", tid, addr, err)
 	}
@@ -126,7 +236,11 @@ func (b *linuxBackend) ReadMemory(addr uint64, dst []byte) error {
 
 func (b *linuxBackend) WriteMemory(addr uint64, src []byte) error {
 	tid := b.traceTID()
-	n, err := syscall.PtracePokeData(tid, uintptr(addr), src)
+	var (
+		n   int
+		err error
+	)
+	b.pt.run(func() { n, err = syscall.PtracePokeData(tid, uintptr(addr), src) })
 	if err != nil {
 		return fmt.Errorf("PTRACE_POKEDATA tid %d 0x%x: %w", tid, addr, err)
 	}
@@ -138,8 +252,12 @@ func (b *linuxBackend) WriteMemory(addr uint64, src []byte) error {
 
 // GetRegisters reads PTRACE_GETREGS. The Go runtime stores g at FS_BASE on amd64.
 func (b *linuxBackend) GetRegisters(tid int) (Registers, error) {
-	var r syscall.PtraceRegs
-	if err := syscall.PtraceGetRegs(tid, &r); err != nil {
+	var (
+		r   syscall.PtraceRegs
+		err error
+	)
+	b.pt.run(func() { err = syscall.PtraceGetRegs(tid, &r) })
+	if err != nil {
 		return Registers{}, fmt.Errorf("PTRACE_GETREGS tid %d: %w", tid, err)
 	}
 	return Registers{
@@ -151,33 +269,31 @@ func (b *linuxBackend) GetRegisters(tid int) (Registers, error) {
 }
 
 // SetRegisters writes back the engine-owned fields, preserving everything else
-// by reading the full register set first.
+// by reading the full register set first. Both the read and the write run on
+// the ptrace thread as one unit.
 func (b *linuxBackend) SetRegisters(tid int, reg Registers) error {
-	var r syscall.PtraceRegs
-	if err := syscall.PtraceGetRegs(tid, &r); err != nil {
-		return fmt.Errorf("PTRACE_GETREGS (pre-set) tid %d: %w", tid, err)
-	}
-	r.Rip = reg.PC
-	r.Rsp = reg.SP
-	r.Rbp = reg.BP
-	r.Fs_base = reg.TLS
-	if err := syscall.PtraceSetRegs(tid, &r); err != nil {
-		return fmt.Errorf("PTRACE_SETREGS tid %d: %w", tid, err)
-	}
-	return nil
+	var err error
+	b.pt.run(func() {
+		var r syscall.PtraceRegs
+		if err = syscall.PtraceGetRegs(tid, &r); err != nil {
+			err = fmt.Errorf("PTRACE_GETREGS (pre-set) tid %d: %w", tid, err)
+			return
+		}
+		r.Rip = reg.PC
+		r.Rsp = reg.SP
+		r.Rbp = reg.BP
+		r.Fs_base = reg.TLS
+		if err = syscall.PtraceSetRegs(tid, &r); err != nil {
+			err = fmt.Errorf("PTRACE_SETREGS tid %d: %w", tid, err)
+		}
+	})
+	return err
 }
 
 func (b *linuxBackend) Threads() ([]int, error) {
-	entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", b.pid))
+	tids, err := taskTIDs(b.pid)
 	if err != nil {
 		return nil, fmt.Errorf("read /proc/%d/task: %w", b.pid, err)
-	}
-	tids := make([]int, 0, len(entries))
-	for _, e := range entries {
-		var tid int
-		if _, err := fmt.Sscanf(e.Name(), "%d", &tid); err == nil {
-			tids = append(tids, tid)
-		}
 	}
 	if len(tids) == 0 {
 		return nil, fmt.Errorf("no threads for pid %d", b.pid)
@@ -189,6 +305,10 @@ func (b *linuxBackend) Threads() ([]int, error) {
 // vs breakpoint disambiguation uses b.stepping (reliable because ptrace is
 // serialised). PTRACE_EVENT stops (clone/exec/exit) are handled internally
 // and don't surface to the engine.
+//
+// wait4 runs directly on the caller's (wait-loop) thread — that is legal from
+// any thread in the tracer's group — but every ptrace command re-issued in
+// response goes through b.pt so it executes on the tracer thread.
 //
 //nolint:gocognit,gocyclo // The wait loop is one serialized ptrace state machine.
 func (b *linuxBackend) Wait() (StopEvent, error) {
@@ -231,27 +351,27 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 			switch cause {
 			case syscall.PTRACE_EVENT_CLONE:
-				if err := continueIfTraceeExists(tid, 0); err != nil {
+				if err := b.contIfExists(tid, 0); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT clone parent tid %d: %w", tid, err)
 				}
 				continue
 
 			case syscall.PTRACE_EVENT_EXIT:
 				if tid != b.pid {
-					if err := continueIfTraceeExists(tid, 0); err != nil {
+					if err := b.contIfExists(tid, 0); err != nil {
 						return StopEvent{}, fmt.Errorf("PTRACE_CONT exiting thread tid %d: %w", tid, err)
 					}
 					continue
 				}
 				// Main thread is about to call exit_group — let it actually exit.
-				if err := continueIfTraceeExists(tid, 0); err != nil {
+				if err := b.contIfExists(tid, 0); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT exiting process tid %d: %w", tid, err)
 				}
 				b.recordStop(tid)
 				return StopEvent{Reason: StopExited, TID: tid, ExitCode: 0}, nil
 
 			case syscall.PTRACE_EVENT_EXEC:
-				if err := syscall.PtraceCont(tid, 0); err != nil {
+				if err := b.contIfExists(tid, 0); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT exec tid %d: %w", tid, err)
 				}
 				continue
@@ -259,8 +379,14 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			case 0:
 				b.recordStop(tid)
 
-				if b.stepping {
+				// A single-step completes only on the exact thread we issued
+				// the step against. Any other cause==0 SIGTRAP is a software
+				// breakpoint hit — possibly on a different OS thread, since the
+				// goroutine that owns the breakpoint can migrate between the Go
+				// runtime's threads.
+				if b.stepping && tid == b.stepTID {
 					b.stepping = false
+					b.stepTID = 0
 					return StopEvent{Reason: StopSingleStep, TID: tid}, nil
 				}
 
@@ -270,35 +396,41 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				}, nil
 
 			default:
-				if err := continueIfTraceeExists(tid, 0); err != nil {
+				if err := b.contIfExists(tid, 0); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT trap cause %d tid %d: %w", cause, tid, err)
 				}
 				continue
 			}
 		}
 
+		// A newly cloned thread reports an initial SIGSTOP signal-delivery-stop
+		// (its parent separately reports PTRACE_EVENT_CLONE above). Propagate
+		// our trace options to it — so its own future clones are traced too —
+		// then release it with signal 0 (swallow the synthetic SIGSTOP). This
+		// mirrors Delve's addThread; resuming the child independently (rather
+		// than stopping the whole group) avoids the historical clone deadlock.
 		if sig == syscall.SIGSTOP && tid != b.pid {
-			if err := syscall.PtraceSetOptions(tid, linuxPtraceOptions); err != nil && !isNoSuchProcess(err) {
+			if err := b.setOptionsIfExists(tid); err != nil {
 				return StopEvent{}, fmt.Errorf("PTRACE_SETOPTIONS clone child tid %d: %w", tid, err)
 			}
-			if err := syscall.Kill(b.pid, syscall.SIGCONT); err != nil && !isNoSuchProcess(err) {
-				return StopEvent{}, fmt.Errorf("SIGCONT tracee pid %d: %w", b.pid, err)
-			}
-			if err := continueTraceeGroup(b.pid, 0); err != nil {
-				return StopEvent{}, err
+			if err := b.contIfExists(tid, 0); err != nil {
+				return StopEvent{}, fmt.Errorf("PTRACE_CONT clone child tid %d: %w", tid, err)
 			}
 			continue
 		}
 
-		// SIGURG is Go's goroutine-preemption signal; SIGCONT may be injected
-		// above to release clone-child SIGSTOP. Both should stay transparent.
+		// SIGURG is Go's goroutine-preemption signal; keep it transparent.
+		// While single-stepping we must re-issue on the SAME thread we stepped
+		// (swallowing the signal); every other thread — including a preempted
+		// sibling during a step-over — is simply continued with the signal
+		// re-injected so the runtime scheduler keeps working.
 		if sig == syscall.SIGURG {
-			if b.stepping {
-				if err := singleStepIfTraceeExists(tid); err != nil {
+			if b.stepping && tid == b.stepTID {
+				if err := b.stepIfExists(tid); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_SINGLESTEP after SIGURG tid %d: %w", tid, err)
 				}
 			} else {
-				if err := continueIfTraceeExists(tid, int(sig)); err != nil {
+				if err := b.contIfExists(tid, int(sig)); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT SIGURG tid %d: %w", tid, err)
 				}
 			}
@@ -306,7 +438,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		}
 
 		if sig == syscall.SIGCONT {
-			if err := continueIfTraceeExists(tid, 0); err != nil {
+			if err := b.contIfExists(tid, 0); err != nil {
 				return StopEvent{}, fmt.Errorf("PTRACE_CONT SIGCONT tid %d: %w", tid, err)
 			}
 			continue
@@ -349,31 +481,40 @@ func isNoChildProcess(err error) bool {
 	return errors.Is(err, syscall.ECHILD)
 }
 
-func continueIfTraceeExists(tid int, signal int) error {
+// contIfExists issues PTRACE_CONT on the ptrace thread, tolerating a vanished
+// thread (ESRCH) — a clone child can exit before we act on its stop.
+func (b *linuxBackend) contIfExists(tid int, signal int) error {
 	if tid == 0 {
 		return nil
 	}
-	if err := syscall.PtraceCont(tid, signal); err != nil && !isNoSuchProcess(err) {
+	var err error
+	b.pt.run(func() { err = syscall.PtraceCont(tid, signal) })
+	if err != nil && !isNoSuchProcess(err) {
 		return err
 	}
 	return nil
 }
 
-func continueTraceeGroup(pid int, signal int) error {
-	tids, err := taskTIDs(pid)
-	if err != nil {
-		if isNoSuchProcess(err) {
-			return nil
-		}
+// stepIfExists issues PTRACE_SINGLESTEP on the ptrace thread, tolerating a
+// vanished thread.
+func (b *linuxBackend) stepIfExists(tid int) error {
+	if tid == 0 {
+		return nil
+	}
+	var err error
+	b.pt.run(func() { err = syscall.PtraceSingleStep(tid) })
+	if err != nil && !isNoSuchProcess(err) {
 		return err
 	}
-	if len(tids) == 0 {
-		return continueIfTraceeExists(pid, signal)
-	}
-	for _, tid := range tids {
-		if err := continueIfTraceeExists(tid, signal); err != nil {
-			return fmt.Errorf("PTRACE_CONT tid %d: %w", tid, err)
-		}
+	return nil
+}
+
+// setOptionsIfExists issues PTRACE_SETOPTIONS on the ptrace thread.
+func (b *linuxBackend) setOptionsIfExists(tid int) error {
+	var err error
+	b.pt.run(func() { err = syscall.PtraceSetOptions(tid, linuxPtraceOptions) })
+	if err != nil && !isNoSuchProcess(err) {
+		return err
 	}
 	return nil
 }
@@ -391,14 +532,4 @@ func taskTIDs(pid int) ([]int, error) {
 		}
 	}
 	return tids, nil
-}
-
-func singleStepIfTraceeExists(tid int) error {
-	if tid == 0 {
-		return nil
-	}
-	if err := syscall.PtraceSingleStep(tid); err != nil && !isNoSuchProcess(err) {
-		return err
-	}
-	return nil
 }
