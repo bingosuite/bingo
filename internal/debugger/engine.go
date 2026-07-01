@@ -399,6 +399,15 @@ func (e *engine) handleStop(stop StopEvent) {
 		}
 		slog.Debug("StopBreakpoint matched", "file", bp.file, "line", bp.line,
 			"addr", fmt.Sprintf("0x%x", bp.addr))
+		// On amd64 the INT3 trap leaves PC one byte past the breakpoint. Rewind
+		// the trapped thread's PC to the breakpoint address so that, once the
+		// original instruction byte is restored, resuming (plain continue for a
+		// temp step BP, or restore→single-step→reinstall for a user BP) re-runs
+		// the real instruction instead of executing from its middle. stop.PC is
+		// already the rewound address; on arm64 PC sits at the trap so this is
+		// a no-op. Do this BEFORE the temp-BP branches, which resume via a
+		// plain continue and would otherwise run from the corrupted PC.
+		e.rewindTrapPC(stop)
 		if bp.file == stepOverNextFile {
 			_ = e.bps.clear(e.backend, bp.id)
 			e.lastBP = nil
@@ -537,6 +546,31 @@ func (e *engine) populateStopPC(stop StopEvent, rewind bool) (StopEvent, error) 
 		stop.PC = regs.PC
 	}
 	return stop, nil
+}
+
+// rewindTrapPC sets the trapped thread's PC back to the breakpoint address.
+// stop.PC is the rewound (breakpoint) address; on amd64 the hardware PC sits
+// one byte past the INT3 after the trap, so we write it back. On arm64 the PC
+// already sits at the BRK (archRewindPC is the identity), so the read-back
+// matches stop.PC and no write happens. Failures are non-fatal: the resume
+// path re-reads and re-checks state, and a missing rewind only degrades to the
+// pre-existing behaviour rather than corrupting anything new.
+func (e *engine) rewindTrapPC(stop StopEvent) {
+	if stop.TID == 0 {
+		return
+	}
+	regs, err := e.backend.GetRegisters(stop.TID)
+	if err != nil {
+		return
+	}
+	if regs.PC == stop.PC {
+		return
+	}
+	regs.PC = stop.PC
+	if err := e.backend.SetRegisters(stop.TID, regs); err != nil {
+		slog.Warn("rewind trap PC failed",
+			"tid", stop.TID, "pc", fmt.Sprintf("0x%x", stop.PC), "err", err)
+	}
 }
 
 func (e *engine) populateBreakpointStop(stop StopEvent) (StopEvent, error) {
