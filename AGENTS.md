@@ -195,21 +195,72 @@ engine advances PC by `len(archTrapInstruction())` and resumes. See the
 ### Darwin / arm64 ([backend_darwin_arm64.go](internal/debugger/backend_darwin_arm64.go))
 
 - Uses ptrace for control flow (`PT_CONTINUE`, `PT_STEP`, `PT_ATTACH`) and
-  Mach (`thread_get_state`, `mach_vm_read/write`, `task_threads`) for state.
-  `PT_ATTACHEXC` is NOT used — it routes signals through Mach exceptions,
-  incompatible with our `wait4`-based loop.
+  Mach (`thread_get_state`, `mach_vm_read/write`, `task_threads`,
+  `thread_set_state`) for state. `PT_ATTACHEXC` is NOT used — it routes signals
+  through Mach exceptions, incompatible with our `wait4`-based loop.
 - `task_for_pid` requires the `com.apple.security.cs.debugger` entitlement
   (the build embeds [entitlements.plist](entitlements.plist) via codesign).
-- `task_threads` returns threads in **creation order**. `threads[0]` is
-  often an idle Go runtime M parked in `pthread_cond_wait`, **not** the
-  goroutine running user code. Darwin `Wait` returns raw SIGTRAP stops without
-  reading Mach thread/register state; the engine resolves the thread sitting at
-  a BRK on its serialized event loop. For SingleStep, save the thread port we
-  issued the step against (`b.stepTID`).
-- `PT_STEP` is per-PROCESS on Darwin (despite the API taking a tid). Always
-  pass `b.pid`, not the Mach thread port.
-- `SIGURG` (Go preemption) and `SIGWINCH` must be re-delivered transparently
-  during both step and continue, or scheduling breaks.
+- **Breakpoints are HARDWARE, not software.** The E2E target is an ad-hoc-signed
+  Go binary; patching its `__TEXT` with a `BRK` invalidates the code signature,
+  and on the next page-in AMFI SIGKILLs the tracee ("has no CMS blob? …
+  Unrecoverable CT signature issue, bailing out"). Instead the backend arms the
+  AArch64 debug registers (`DBGBVR`/`DBGBCR` via `ARM_DEBUG_STATE64`) — see
+  `bingo_set_thread_hw_breakpoints`. No memory is patched, so the signature
+  stays valid and there is no i-cache coherency problem. `WriteMemory`
+  transparently maps the engine's breakpoint pokes onto debug registers: a write
+  of the trap instruction → `armHWBreakpoint`; a write of the original bytes at a
+  known bp → `disarmHWBreakpoint`; anything else → a genuine `rawWriteMemory`
+  (never hit for breakpoints in normal operation).
+- **HW breakpoints are per-thread; re-arm on every resume.** ARM debug registers
+  live in each thread's context, so a thread created after the last arm (Go
+  spins up new M's constantly under load) would not trap. `applyDebugState`
+  re-writes the full breakpoint set into *every* current thread's debug
+  registers on each `ContinueProcess` and each `resumeAfterSignal`. `Wait`
+  resolves a SIGTRAP by scanning threads for one whose PC equals an armed
+  address (`threadAtHWBreakpoint`) and returns `StopBreakpoint{TID, PC}`, so the
+  engine never falls back to a (now nonexistent) in-memory trap scan.
+- **The mid-run re-arm timer must NOT Mach-suspend the task.** Arming on resume
+  covers threads that exist at resume time, but the target can create a new M
+  and migrate the main goroutine onto it *between* two stops (no stop of its own
+  is produced), so `rearmWhileRunning` re-applies the breakpoint set on a
+  `rearmInterval` (10 ms) timer while `wait4` is blocked. It calls
+  `applyDebugState` (a plain per-thread `thread_set_state`) and deliberately does
+  **not** `task_suspend` the whole task. An earlier version suspended the task
+  every tick to force threads off-core (so the CPU reloads their debug registers
+  for certain); that armed reliably but froze the Go runtime — sysmon, the
+  netpoller, the timer-lock holder — at a 10 ms cadence and would occasionally
+  lose `main`'s `time.Sleep` wakeup, deadlocking the tracee with every M parked,
+  correctly armed, and none reaching the breakpoint. Because arming-on-resume is
+  the reliable path and the timer only needs to catch newly-created M's (which
+  context-switch within microseconds on a yielding target and pick up the debug
+  registers from a plain write), dropping the suspend removes the deadlock
+  without reintroducing missed breakpoints. The timer is skipped while
+  single-stepping.
+- **Do NOT re-inject async signals — resume with signal 0.** This is the crux of
+  correct Go-preemption support. Go async preemption is *thread-directed*: the
+  runtime `pthread_kill`s `SIGURG` (16) at the exact M whose goroutine must reach
+  a GC safe point. If you re-post it via `ptrace(PT_CONTINUE, pid, 1, SIGURG)`,
+  XNU delivers it PROCESS-wide (`psignal`) to an arbitrary thread; the intended M
+  never runs its handler, its `signalPending` stays set, `runtime.preemptM` never
+  re-sends, and a stop-the-world hangs forever (the original 6/6 StepOver hang).
+  `resumeAfterSignal` therefore resumes with signal 0 (`ptrace(request, pid, 1,
+  0)`) for `SIGURG`/`SIGWINCH`, letting XNU deliver the still-pending
+  thread-directed signal to its intended M. This matches Delve, whose
+  `ptraceCont` always passes 0.
+- `PT_STEP` is per-PROCESS on Darwin (despite the API taking a tid) and arms the
+  task's *first* thread, not the tid you pass. So an arbitrary thread cannot be
+  single-stepped; `needsTempBPStepOver()` returns true and the engine steps over
+  a breakpoint with a transient next-line breakpoint + continue
+  (`stepOverBreakpointViaTempBP`) instead of the restore→single-step→reinstall
+  dance. For genuine machine single-steps (`SingleStep`) always pass `b.pid` and
+  save the stepped thread port (`b.stepTID`) so `consumeStep` can label the stop.
+- **Kill must be deterministic even from a wedged state.** A ptrace-stopped
+  tracee ignores SIGKILL until resumed, and a Mach-suspended thread blocks
+  termination. `killProcess` first drains every thread's suspend count
+  (`bingo_resume_all_threads`), then delivers SIGKILL by every avenue
+  (`PT_CONTINUE(SIGKILL)` → out-of-band `SIGKILL` → `PT_KILL` →
+  `PT_DETACH(SIGKILL)`), then reaps with a 3 s bound so a truly stuck tracee can
+  never wedge the engine loop (and hence `Kill`) past the harness's 5 s window.
 - ASLR slide is computed in `TextSlide` by scanning the VM map for the first
   exec region with the 64-bit Mach-O magic. Do NOT use `TASK_DYLD_INFO` — its
   image array is unpopulated at the very first ptrace stop.

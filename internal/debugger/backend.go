@@ -36,6 +36,27 @@ func setPID(b Backend, pid int) {
 	}
 }
 
+// tempBPStepper is an optional Backend capability. A backend implements it and
+// returns true when it CANNOT reliably hardware single-step an arbitrary thread,
+// so the engine must step over a software breakpoint by planting a temporary
+// breakpoint on the next source line and continuing, instead of the
+// restore→single-step→reinstall dance.
+//
+// Darwin/arm64 needs this: its ptrace PT_STEP always arms the single-step on the
+// task's FIRST thread (get_firstthread), not the tid we pass. When the thread
+// that hit the breakpoint is not thread[0] and we Mach-suspend thread[0] to keep
+// it from running free, the kernel's per-process step never retires and wait4
+// blocks forever. Linux ptrace single-steps a specific thread, so it does not
+// implement this interface (single-stepping stays the default).
+type tempBPStepper interface {
+	needsTempBPStepOver() bool
+}
+
+func needsTempBPStepOver(b Backend) bool {
+	s, ok := b.(tempBPStepper)
+	return ok && s.needsTempBPStepOver()
+}
+
 type StopReason uint8
 
 const (

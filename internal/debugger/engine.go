@@ -75,6 +75,13 @@ type engine struct {
 	// boundary with line==0. Zeroed on each sourceStepOver and on user-BP hits.
 	stepOverFile string
 	stepOverLine int
+
+	// pendingReinstall is a user breakpoint whose trap byte was removed to
+	// step over it WITHOUT single-stepping (Darwin/arm64 temp-BP step-over,
+	// see stepOverBreakpointViaTempBP). It is reinstalled when the transient
+	// next-line breakpoint is hit. nil on platforms that use the
+	// single-step-based step-over dance.
+	pendingReinstall *breakpointEntry
 }
 
 type engineCmd struct {
@@ -401,6 +408,17 @@ func (e *engine) handleStop(stop StopEvent) {
 			"addr", fmt.Sprintf("0x%x", bp.addr))
 		if bp.file == stepOverNextFile {
 			_ = e.bps.clear(e.backend, bp.id)
+			// If we stepped over a user breakpoint by temporarily removing its
+			// trap byte (Darwin temp-BP step-over), reinstall it now that the
+			// thread has advanced past it to the next line.
+			if pr := e.pendingReinstall; pr != nil {
+				e.pendingReinstall = nil
+				if rerr := e.bps.reinstall(e.backend, pr); rerr != nil {
+					e.setState(stateSuspended)
+					e.emitError(protocol.CmdNone, fmt.Errorf("reinstall breakpoint 0x%x: %w", pr.addr, rerr))
+					return
+				}
+			}
 			e.lastBP = nil
 			e.emitStepped(stop)
 			return
@@ -627,9 +645,83 @@ func (e *engine) drainCmds() {
 
 func (e *engine) stepOver() error {
 	if e.lastBP != nil {
+		// On backends that cannot single-step an arbitrary thread (Darwin/arm64,
+		// see tempBPStepper), stepping over the breakpoint by restoring the
+		// instruction, single-stepping, and reinstalling can wedge wait4. Step
+		// over it with a temporary next-line breakpoint + continue instead.
+		if needsTempBPStepOver(e.backend) {
+			if ok, err := e.stepOverBreakpointViaTempBP(); ok {
+				return err
+			}
+			// Could not plant a temp BP (no DWARF / no next line): fall through
+			// to the single-step dance as a best effort.
+		}
 		return e.resumeFromBreakpoint(bpResumeSourceStep, 0)
 	}
 	return e.sourceStepOver()
+}
+
+// stepOverBreakpointViaTempBP steps over the software breakpoint the process is
+// stopped at WITHOUT single-stepping. It restores the original instruction,
+// plants a transient breakpoint on the next source line, and continues. When
+// that transient breakpoint is hit, the stepOverNextFile handler reinstalls the
+// original breakpoint (e.pendingReinstall) and emits EventStepped.
+//
+// This is the Darwin/arm64-safe path: ptrace PT_STEP there always single-steps
+// the task's first thread, so stepping a breakpoint that a non-first thread hit
+// is impossible — see tempBPStepper. Correctness relies on the transient
+// breakpoint being coherent with the target core's instruction cache; the
+// darwin backend flushes it in WriteMemory (mach_vm_machine_attribute).
+//
+// Returns ok=false (having changed nothing) when it cannot resolve/plant the
+// next-line breakpoint, so the caller can fall back to the single-step dance.
+func (e *engine) stepOverBreakpointViaTempBP() (ok bool, err error) {
+	bp := e.lastBP
+	if e.dw == nil || bp == nil || bp.file == "" || bp.line <= 0 {
+		return false, nil
+	}
+	nextPC, nextLine, found := e.dw.NextLinePC(bp.file, bp.line)
+	if !found {
+		return false, nil
+	}
+
+	// Restore the original instruction so the thread can execute past the BP.
+	e.bps.removeFromTable(bp)
+	if werr := e.backend.WriteMemory(bp.addr, bp.originalBytes); werr != nil {
+		e.bps.addToTable(bp)
+		return false, nil
+	}
+
+	// Plant the transient next-line breakpoint.
+	entry, setErr := e.bps.set(e.backend, stepOverNextFile, 0, nextPC)
+	if setErr != nil && !errors.Is(setErr, errBreakpointExists) {
+		_ = e.backend.WriteMemory(bp.addr, archTrapInstruction())
+		e.bps.addToTable(bp)
+		return false, nil
+	}
+
+	e.lastBP = nil
+	e.lastBPTID = 0
+	e.pendingReinstall = bp
+	e.stepOverFile = bp.file
+	e.stepOverLine = nextLine
+
+	if cerr := e.backend.ContinueProcess(); cerr != nil {
+		// Roll back to a consistent stopped state at the original breakpoint.
+		if entry != nil {
+			_ = e.bps.clear(e.backend, entry.id)
+		}
+		_ = e.backend.WriteMemory(bp.addr, archTrapInstruction())
+		e.bps.addToTable(bp)
+		e.pendingReinstall = nil
+		e.stepOverFile = ""
+		e.stepOverLine = 0
+		e.lastBP = bp
+		return true, cerr
+	}
+	e.setState(stateRunning)
+	go e.waitLoop()
+	return true, nil
 }
 
 // sourceStepOver sets a temp BP at the next source line and resumes. Falls
