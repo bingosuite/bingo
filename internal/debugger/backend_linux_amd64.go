@@ -120,11 +120,9 @@ func (b *linuxBackend) ContinueProcess() error {
 
 func (b *linuxBackend) SingleStep(tid int) error {
 	b.stepping = true
-	sig := b.delayedSignal
-	b.delayedSignal = 0
-	dbgLog("SingleStep", "tid", tid, "sig", sig)
-	if err := ptraceSingleStepSig(tid, sig); err != nil {
-		return fmt.Errorf("PTRACE_SINGLESTEP tid %d (sig %d): %w", tid, sig, err)
+	dbgLog("SingleStep", "tid", tid)
+	if err := ptraceSingleStepSig(tid, 0); err != nil {
+		return fmt.Errorf("PTRACE_SINGLESTEP tid %d: %w", tid, err)
 	}
 	return nil
 }
@@ -321,55 +319,67 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			continue
 		}
 
-		// Any non-SIGTRAP stop is a real signal delivered to the tracee.
-		// Forward it instead of swallowing it (Delve's resumeWithSig /
-		// singleStep). Dropping a synchronous fault (SIGSEGV/SIGBUS/... from
-		// e.g. the Go runtime's nil-check machinery) makes the faulting
-		// instruction re-execute forever and wedges the tracee; dropping
-		// SIGURG breaks Go's async goroutine preemption.
-		if b.stepping {
-			// Mid single-step: classify like Delve's singleStep() loop.
-			dbgLog("signal mid-step", "tid", tid, "sig", int(sig))
-			switch sig {
-			case syscall.SIGILL, syscall.SIGBUS, syscall.SIGFPE, syscall.SIGSEGV, syscall.SIGSTKFLT:
-				// Fault triggered by the instruction being stepped: re-issue
-				// the step WITH the signal so the tracee's handler observes it.
-				if err := singleStepSig(tid, int(sig)); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_SINGLESTEP fault %d tid %d: %w", sig, tid, err)
-				}
-			case syscall.SIGSTOP:
-				// Spurious/late SIGSTOP: swallow it and keep stepping.
-				if err := singleStepSig(tid, 0); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_SINGLESTEP after SIGSTOP tid %d: %w", tid, err)
-				}
-			default:
-				// Asynchronous signal (SIGURG preemption, SIGCHLD, ...): defer
-				// delivery to the next resume and keep stepping so the trap PC
-				// is not perturbed by entering a signal handler mid-step.
-				b.delayedSignal = int(sig)
-				if err := singleStepSig(tid, 0); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_SINGLESTEP deferring %d tid %d: %w", sig, tid, err)
-				}
-			}
-			continue
-		}
-
-		// Running (continue): forward the signal transparently so the tracee's
-		// own handlers/runtime see it. Never re-deliver a bare SIGSTOP — it
-		// would immediately re-stop the thread.
-		forward := int(sig)
-		if sig == syscall.SIGSTOP {
-			forward = 0
-		}
-		dbgLog("signal running-forward", "tid", tid, "sig", int(sig), "forward", forward)
-		if err := continueIfTraceeExists(tid, forward); err != nil {
-			return StopEvent{}, fmt.Errorf("PTRACE_CONT forwarding signal %d tid %d: %w", sig, tid, err)
-		}
-		continue
+		// A real (non-SIGTRAP) signal was delivered to the tracee. On Linux
+		// ptrace resume commands (PTRACE_CONT/SINGLESTEP) are restricted to the
+		// tracer thread — the engine's event-loop goroutine — so this wait
+		// goroutine must NOT resume here (doing so returns ESRCH and wedges the
+		// tracee). Hand the signal to the engine, which re-steps or continues
+		// from the tracer goroutine via ResumeSignal, forwarding a synchronous
+		// fault or deferring an async signal (SIGURG preemption) — mirroring
+		// Delve's singleStep() / resumeWithSig(). Report whether we were mid
+		// single-step so the engine re-issues the right resume.
+		stepping := b.stepping
+		b.stepping = false
+		b.recordStop(tid)
+		dbgLog("-> StopSignal", "tid", tid, "sig", int(sig), "stepping", stepping)
+		return StopEvent{Reason: StopSignal, TID: tid, Signal: int(sig), Stepping: stepping}, nil
 	}
 }
 
+// ResumeSignal resumes the tracee after a non-trap signal. It runs on the
+// engine goroutine (the ptrace tracer thread), which is why Wait defers signal
+// resumes here instead of issuing them itself. Mirrors Delve: fault signals are
+// re-delivered on the next single-step, asynchronous signals are deferred to the
+// next continue, and a signal that interrupted a continue is forwarded.
+func (b *linuxBackend) ResumeSignal(tid, signal int, stepping bool) error {
+	if tid == 0 {
+		tid = b.traceTID()
+	}
+	if stepping {
+		b.stepping = true
+		switch signal {
+		case int(syscall.SIGILL), int(syscall.SIGBUS), int(syscall.SIGFPE),
+			int(syscall.SIGSEGV), int(syscall.SIGSTKFLT):
+			// Synchronous fault from the stepped instruction: re-issue the
+			// step delivering the signal so the tracee's handler observes it.
+			dbgLog("ResumeSignal re-step fault", "tid", tid, "sig", signal)
+			return singleStepSig(tid, signal)
+		case int(syscall.SIGSTOP):
+			// Spurious/late SIGSTOP: swallow and keep stepping.
+			dbgLog("ResumeSignal re-step drop-stop", "tid", tid)
+			return singleStepSig(tid, 0)
+		default:
+			// Asynchronous signal (SIGURG preemption, SIGCHLD, ...): defer to
+			// the next continue so entering a handler mid-step doesn't perturb
+			// the step's trap PC; re-step suppressing it now.
+			b.delayedSignal = signal
+			dbgLog("ResumeSignal re-step defer", "tid", tid, "sig", signal)
+			return singleStepSig(tid, 0)
+		}
+	}
+	// The signal interrupted a continue: forward it transparently so the
+	// tracee's runtime/handlers see it. Never re-deliver a bare SIGSTOP.
+	forward := signal
+	if signal == int(syscall.SIGSTOP) {
+		forward = 0
+	}
+	b.stepping = false
+	dbgLog("ResumeSignal continue-forward", "tid", tid, "sig", signal, "forward", forward)
+	return continueIfTraceeExists(tid, forward)
+}
+
 var _ Backend = (*linuxBackend)(nil)
+var _ signalResumer = (*linuxBackend)(nil)
 
 func (b *linuxBackend) setPID(pid int) {
 	b.pid = pid

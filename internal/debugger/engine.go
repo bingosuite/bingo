@@ -500,7 +500,40 @@ func (e *engine) handleStop(stop StopEvent) {
 		e.emitStepped(stop)
 
 	case StopSignal:
-		// Reinstall any in-flight step-over BP before resuming.
+		if sr, ok := e.backend.(signalResumer); ok {
+			// Linux: ptrace resume must run on this (tracer) goroutine, not the
+			// wait goroutine. If a signal interrupted an in-flight single-step,
+			// re-issue the step (deferring async / forwarding fault signals)
+			// WITHOUT reinstalling the trap — the step-over is still in flight
+			// and its StopSingleStep will reinstall and finish the action.
+			// Otherwise a continue was interrupted: reinstall any pending
+			// step-over trap and forward the signal on the next continue.
+			if !stop.Stepping {
+				if sob := e.steppingOverBP; sob != nil {
+					e.steppingOverBP = nil
+					if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
+						e.setState(stateSuspended)
+						e.emitError(protocol.CmdNone, fmt.Errorf("reinstall breakpoint 0x%x after signal: %w", sob.addr, rerr))
+						return
+					}
+				}
+			}
+			if err := sr.ResumeSignal(stop.TID, stop.Signal, stop.Stepping); err != nil {
+				if sob := e.steppingOverBP; sob != nil {
+					e.steppingOverBP = nil
+					_ = e.bps.reinstall(e.backend, sob)
+				}
+				e.setState(stateSuspended)
+				e.emitError(protocol.CmdNone, fmt.Errorf("resume from signal %d: %w", stop.Signal, err))
+				return
+			}
+			e.setState(stateRunning)
+			go e.waitLoop()
+			return
+		}
+		// Non-Linux fallback (Darwin handles signals inside Wait and only
+		// surfaces StopSignal as a last resort): reinstall any in-flight
+		// step-over BP before resuming, then continue.
 		if sob := e.steppingOverBP; sob != nil {
 			e.steppingOverBP = nil
 			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {

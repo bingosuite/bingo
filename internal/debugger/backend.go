@@ -30,6 +30,22 @@ type pidSetter interface {
 	setPID(pid int)
 }
 
+// signalResumer is an optional Backend capability for platforms (Linux) where
+// ptrace resume commands are restricted to the tracer thread — the engine's
+// event-loop goroutine — and therefore cannot be issued from the wait
+// goroutine. When a real (non-trap) signal stops the tracee, Wait returns a
+// StopSignal event and the engine calls ResumeSignal from its own goroutine to
+// re-step or continue, forwarding or deferring the signal. Backends whose
+// ptrace is process-wide (Darwin/Mach) don't implement this; the engine falls
+// back to a plain continue for them.
+type signalResumer interface {
+	// ResumeSignal resumes tracee thread tid after a non-trap signal. When
+	// stepping is true the tracee was mid single-step and must be re-stepped
+	// (fault signals delivered on the step, async signals deferred to the next
+	// continue); otherwise the signal is forwarded on a plain continue.
+	ResumeSignal(tid, signal int, stepping bool) error
+}
+
 func setPID(b Backend, pid int) {
 	if ps, ok := b.(pidSetter); ok {
 		ps.setPID(pid)
@@ -52,6 +68,7 @@ type StopEvent struct {
 	Reason   StopReason
 	TID      int
 	PC       uint64
-	ExitCode int // StopExited only
-	Signal   int // StopSignal only
+	ExitCode int  // StopExited only
+	Signal   int  // StopSignal only
+	Stepping bool // StopSignal only: the signal interrupted an in-flight single-step
 }
