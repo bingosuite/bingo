@@ -165,3 +165,48 @@ static inline kern_return_t bingo_thread_list(
 {
     return task_threads(task, threads_out, count_out);
 }
+
+// bingo_thread_suspend / bingo_thread_resume adjust one thread's Mach suspend
+// count. These are independent of the ptrace task-level stop, so they let us
+// hold every thread EXCEPT the one we want to single-step over a breakpoint.
+static inline kern_return_t bingo_thread_suspend(mach_port_t thread) {
+    return thread_suspend(thread);
+}
+
+static inline kern_return_t bingo_thread_resume(mach_port_t thread) {
+    return thread_resume(thread);
+}
+
+// bingo_set_single_step turns ARMv8 hardware software-step on/off for ONE
+// specific thread, independent of ptrace PT_STEP (which is per-process and
+// applies single-step to the kernel's first task thread, not the thread that
+// hit the breakpoint). This is the same mechanism LLDB debugserver uses
+// (DNBArchMachARM64::EnableHardwareSingleStep):
+//   - MDSCR_EL1.SS (bit 0) via ARM_DEBUG_STATE64 enables the software-step
+//     state machine for the thread;
+//   - PSTATE.SS (CPSR bit 21) via ARM_THREAD_STATE64 arms "active-not-pending"
+//     so exactly one instruction executes before the step exception fires.
+// With every other thread Mach-suspended and this bit set on the target, a
+// per-process PT_STEP steps precisely the intended thread.
+static inline kern_return_t bingo_set_single_step(mach_port_t thread, int on) {
+    arm_debug_state64_t dbg;
+    mach_msg_type_number_t dcount = ARM_DEBUG_STATE64_COUNT;
+    kern_return_t kr = thread_get_state(
+        thread, ARM_DEBUG_STATE64, (thread_state_t)&dbg, &dcount);
+    if (kr != KERN_SUCCESS) return kr;
+    if (on) dbg.__mdscr_el1 |= 1ULL;
+    else    dbg.__mdscr_el1 &= ~1ULL;
+    kr = thread_set_state(
+        thread, ARM_DEBUG_STATE64, (thread_state_t)&dbg, ARM_DEBUG_STATE64_COUNT);
+    if (kr != KERN_SUCCESS) return kr;
+
+    arm_thread_state64_t st;
+    mach_msg_type_number_t tcount = ARM_THREAD_STATE64_COUNT;
+    kr = thread_get_state(
+        thread, ARM_THREAD_STATE64, (thread_state_t)&st, &tcount);
+    if (kr != KERN_SUCCESS) return kr;
+    if (on) st.__cpsr |= (1U << 21);
+    else    st.__cpsr &= ~(1U << 21);
+    return thread_set_state(
+        thread, ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
+}

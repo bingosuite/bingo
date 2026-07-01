@@ -82,6 +82,36 @@ type engineCmd struct {
 	err chan error
 }
 
+// threadStepper is implemented by backends (currently darwin/arm64) that can
+// single-step one specific thread over a disarmed breakpoint while holding
+// every other thread, then tear that critical section down. On such backends
+// the per-process single-step primitive alone cannot guarantee the breakpoint
+// thread (rather than some other thread) is the one that steps, so the engine
+// prefers this path. Backends that don't implement it fall back to SingleStep.
+type threadStepper interface {
+	singleStepThread(tid int, addr uint64) error
+	endThreadStep()
+}
+
+// stepThreadOverBP single-steps tid over a just-disarmed breakpoint at addr. On
+// darwin it holds all other threads and steps tid specifically; elsewhere it
+// falls back to a plain per-process single-step (ptrace stops are per-thread
+// there).
+func (e *engine) stepThreadOverBP(tid int, addr uint64) error {
+	if ts, ok := e.backend.(threadStepper); ok {
+		return ts.singleStepThread(tid, addr)
+	}
+	return e.backend.SingleStep(tid)
+}
+
+// endThreadStep releases the threads held for an atomic step-over. No-op on
+// backends without a threadStepper. Safe to call when no step is in flight.
+func (e *engine) endThreadStep() {
+	if ts, ok := e.backend.(threadStepper); ok {
+		ts.endThreadStep()
+	}
+}
+
 type stopResult struct {
 	evt StopEvent
 	err error
@@ -144,6 +174,9 @@ func (e *engine) Kill() error {
 		if e.getState() == stateExited {
 			return nil
 		}
+		// Release any threads held for an in-flight atomic step-over first, so
+		// a detach (attached-process Kill) never leaves them Mach-suspended.
+		e.endThreadStep()
 		e.bps.clearAll(e.backend)
 		if killErr := e.proc.kill(e.backend); killErr != nil {
 			return killErr
@@ -288,7 +321,7 @@ func (e *engine) StackFrames() ([]protocol.Frame, error) {
 			return err
 		}
 		var err error
-		frames, err = e.collectFrames()
+		frames, err = e.collectFrames(e.lastBPTID)
 		return err
 	})
 	return frames, err
@@ -421,6 +454,13 @@ func (e *engine) handleStop(stop StopEvent) {
 		var err error
 		stop, err = e.populateStopPC(stop, false)
 		if err != nil {
+			// Rearm the in-flight step-over BP and release held threads before
+			// surfacing the error, so the process is left in a clean state.
+			if sob := e.steppingOverBP; sob != nil {
+				e.steppingOverBP = nil
+				_ = e.bps.reinstall(e.backend, sob)
+			}
+			e.endThreadStep()
 			e.setState(stateSuspended)
 			e.emitError(protocol.CmdNone, err)
 			return
@@ -432,12 +472,16 @@ func (e *engine) handleStop(stop StopEvent) {
 			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
 				// Reinstall failed. Suspend instead of resuming — running
 				// without the trap would let the process loose.
+				e.endThreadStep()
 				slog.Error("breakpoint reinstall failed — suspending to prevent runaway process",
 					"addr", fmt.Sprintf("0x%x", sob.addr), "err", rerr)
 				e.setState(stateSuspended)
 				e.emitError(protocol.CmdNone, fmt.Errorf("reinstall breakpoint 0x%x: %w", sob.addr, rerr))
 				return
 			}
+			// The trap byte is back in place; only now is it safe to release
+			// the threads we held for the atomic step-over.
+			e.endThreadStep()
 			slog.Debug("breakpoint reinstalled", "addr", fmt.Sprintf("0x%x", sob.addr))
 			switch e.bpResume {
 			case bpResumeContinue:
@@ -493,6 +537,7 @@ func (e *engine) handleStop(stop StopEvent) {
 			}
 			return
 		}
+		e.endThreadStep()
 		e.setState(stateSuspended)
 		e.emitStepped(stop)
 
@@ -501,10 +546,12 @@ func (e *engine) handleStop(stop StopEvent) {
 		if sob := e.steppingOverBP; sob != nil {
 			e.steppingOverBP = nil
 			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
+				e.endThreadStep()
 				e.setState(stateSuspended)
 				e.emitError(protocol.CmdNone, fmt.Errorf("reinstall breakpoint 0x%x after signal: %w", sob.addr, rerr))
 				return
 			}
+			e.endThreadStep()
 		}
 		e.emitOutput("stderr", fmt.Sprintf("signal %d", stop.Signal))
 		_ = e.backend.ContinueProcess()
@@ -752,7 +799,7 @@ func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) err
 		tid = threads[0]
 	}
 	e.lastBPTID = 0
-	if err := e.backend.SingleStep(tid); err != nil {
+	if err := e.stepThreadOverBP(tid, bp.addr); err != nil {
 		_ = e.backend.WriteMemory(bp.addr, archTrapInstruction())
 		e.bps.addToTable(bp)
 		e.steppingOverBP = nil
@@ -763,15 +810,24 @@ func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) err
 	return nil
 }
 
-func (e *engine) collectFrames() ([]protocol.Frame, error) {
+// collectFrames walks the stack of the thread identified by tid (the thread
+// that actually stopped) and resolves each PC to a source frame. When tid is 0
+// it falls back to the first task thread. Walking the correct thread matters on
+// Darwin: threads[0] is frequently an idle runtime M parked in libsystem, whose
+// frame-pointer chain does not follow the Go ABI and can wander the full
+// maxStackDepth, turning frame resolution into dozens of costly DWARF lookups.
+func (e *engine) collectFrames(tid int) ([]protocol.Frame, error) {
 	if e.dw == nil {
 		return nil, nil
 	}
-	threads, err := e.backend.Threads()
-	if err != nil || len(threads) == 0 {
-		return nil, fmt.Errorf("StackFrames: no threads")
+	if tid == 0 {
+		threads, err := e.backend.Threads()
+		if err != nil || len(threads) == 0 {
+			return nil, fmt.Errorf("StackFrames: no threads")
+		}
+		tid = threads[0]
 	}
-	regs, err := e.backend.GetRegisters(threads[0])
+	regs, err := e.backend.GetRegisters(tid)
 	if err != nil {
 		return nil, fmt.Errorf("StackFrames: %w", err)
 	}
@@ -850,7 +906,7 @@ func (e *engine) emit(kind protocol.EventKind, payload any) {
 }
 
 func (e *engine) emitBreakpointHit(bp *breakpointEntry, stop StopEvent) {
-	frames, _ := e.collectFrames()
+	frames, _ := e.collectFrames(stop.TID)
 	goroutines, _ := e.readGoroutines()
 	var g protocol.Goroutine
 	if len(goroutines) > 0 {
@@ -878,7 +934,7 @@ func (e *engine) emitStoppedAtCurrentPC() {
 }
 
 func (e *engine) emitStepped(stop StopEvent) {
-	frames, _ := e.collectFrames()
+	frames, _ := e.collectFrames(stop.TID)
 	goroutines, _ := e.readGoroutines()
 	var g protocol.Goroutine
 	if len(goroutines) > 0 {

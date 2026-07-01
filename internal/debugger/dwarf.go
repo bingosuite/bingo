@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"sort"
 	"strings"
+	"sync"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
@@ -22,6 +24,21 @@ const optimizedOut = "<optimized out>"
 type dwarfReader struct {
 	data  *dwarf.Data
 	slide int64
+
+	// funcIndex is a lazily-built, lowpc-sorted table of every subprogram's
+	// [low,high) DWARF PC range and name. functionAt binary-searches it instead
+	// of linearly scanning every DIE in the binary on each call. Without this,
+	// resolving a stack (up to maxStackDepth PCs, each a full scan of the tens of
+	// thousands of DIEs in a Go binary) can take many seconds under -race and
+	// wedge the single-threaded engine loop past the client's timeout.
+	funcIndexOnce sync.Once
+	funcIndex     []funcRange
+}
+
+// funcRange is one subprogram's DWARF PC range (unslid) and name.
+type funcRange struct {
+	low, high uint64
+	name      string
 }
 
 func openDWARF(binaryPath string) (*dwarfReader, error) {
@@ -203,9 +220,10 @@ func cuContainsPC(entry *dwarf.Entry, pc uint64) bool {
 	return pc >= lowpc && pc < highpc
 }
 
-// functionAt returns the function name containing pc (runtime address), or "".
-func (r *dwarfReader) functionAt(pc uint64) string {
-	dwarfPC := uint64(int64(pc) - r.slide)
+// buildFuncIndex scans the DWARF once, recording every subprogram's PC range
+// and name, sorted by low PC for binary search. Ranges are stored unslid
+// (as they appear in DWARF); functionAt unslides the query PC to match.
+func (r *dwarfReader) buildFuncIndex() {
 	rd := r.data.Reader()
 	for {
 		entry, err := rd.Next()
@@ -215,7 +233,6 @@ func (r *dwarfReader) functionAt(pc uint64) string {
 		if entry.Tag != dwarf.TagSubprogram {
 			continue
 		}
-
 		lowpc, hasLow := entry.Val(dwarf.AttrLowpc).(uint64)
 		if !hasLow {
 			continue
@@ -225,9 +242,30 @@ func (r *dwarfReader) functionAt(pc uint64) string {
 			continue
 		}
 		name, _ := entry.Val(dwarf.AttrName).(string)
-		if dwarfPC >= lowpc && dwarfPC < highpc && name != "" {
-			return name
+		if name == "" {
+			continue
 		}
+		r.funcIndex = append(r.funcIndex, funcRange{low: lowpc, high: highpc, name: name})
+	}
+	sort.Slice(r.funcIndex, func(i, j int) bool {
+		return r.funcIndex[i].low < r.funcIndex[j].low
+	})
+}
+
+// functionAt returns the function name containing pc (runtime address), or "".
+func (r *dwarfReader) functionAt(pc uint64) string {
+	r.funcIndexOnce.Do(r.buildFuncIndex)
+	dwarfPC := uint64(int64(pc) - r.slide)
+	// Rightmost subprogram whose low PC is <= dwarfPC.
+	i := sort.Search(len(r.funcIndex), func(i int) bool {
+		return r.funcIndex[i].low > dwarfPC
+	})
+	if i == 0 {
+		return ""
+	}
+	fn := r.funcIndex[i-1]
+	if dwarfPC >= fn.low && dwarfPC < fn.high {
+		return fn.name
 	}
 	return ""
 }
