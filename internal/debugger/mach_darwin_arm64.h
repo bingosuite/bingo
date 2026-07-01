@@ -77,9 +77,20 @@ static inline kern_return_t bingo_read_memory(
 // on Apple Silicon — the kernel returns KERN_NOT_SUPPORTED. The correct
 // approach is to wrap the write with task_suspend + task_resume: the resume
 // call drains the instruction pipeline for all threads in the task, ensuring
-// the CPU sees the new bytes. task_suspend/resume use an independent suspend
-// count from ptrace, so this is safe to call while the process is
-// ptrace-stopped (the ptrace stop is unaffected).
+// the CPU sees the new bytes.
+//
+// Suspend-count accounting: Mach maintains a SINGLE task-level suspend_count
+// per task, and ptrace's own task hold shares it — task_suspend/task_resume
+// are NOT an independent counter (an earlier version of this comment claimed
+// they were; that was wrong). This is safe anyway because the suspend/resume
+// here are strictly balanced (every exit path below calls task_resume) and
+// this function only ever runs on the engine's single locked OS thread (see
+// AGENTS.md — all ptrace/Mach calls are serialized there), so the pair can
+// never interleave with itself and the count returns to its ptrace baseline
+// before we return. A leaked task suspend (count stuck >= 1) is therefore not
+// possible from this path; the residual step-over wedge was measured with
+// task suspend_count == 0 at the hang, confirming it is a pthread-condvar
+// lost-wakeup, not a suspend-count imbalance.
 static inline kern_return_t bingo_write_memory(
     mach_port_t task, mach_vm_address_t addr,
     const void *src, mach_vm_size_t n)
@@ -209,4 +220,47 @@ static inline kern_return_t bingo_set_single_step(mach_port_t thread, int on) {
     else    st.__cpsr &= ~(1U << 21);
     return thread_set_state(
         thread, ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
+}
+
+// --- Diagnostic-only helpers (gated behind BINGO_DARWIN_SUSPEND_PROBE) --------
+// These are PURE READS (task_info / thread_info / thread_get_state) and do NOT
+// perturb any suspend count, so they are safe to call against a wedged/hung
+// task. They exist to answer, empirically, whether a residual step-over wedge
+// coincides with a leaked TASK-level Mach suspend count.
+
+// bingo_task_suspend_count reads the task-level Mach suspend_count via
+// task_info(MACH_TASK_BASIC_INFO). A running (un-suspended) task reports 0;
+// any value >= 1 means the task is held suspended (nothing will run, so a
+// wait4 for the next ptrace stop can never return).
+static inline kern_return_t bingo_task_suspend_count(
+    mach_port_t task, uint32_t *out)
+{
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    kern_return_t kr = task_info(
+        task, MACH_TASK_BASIC_INFO, (task_info_t)&info, &count);
+    if (kr != KERN_SUCCESS) return kr;
+    *out = (uint32_t)info.suspend_count;
+    return KERN_SUCCESS;
+}
+
+// bingo_thread_probe reads run_state, per-thread suspend_count and PC for one
+// thread. run_state: 1=RUNNING 2=STOPPED 3=WAITING 4=UNINTERRUPTIBLE 5=HALTED.
+static inline kern_return_t bingo_thread_probe(
+    mach_port_t thread, int *run_state, int *suspend_count, uint64_t *pc)
+{
+    struct thread_basic_info tbi;
+    mach_msg_type_number_t bcount = THREAD_BASIC_INFO_COUNT;
+    kern_return_t kr = thread_info(
+        thread, THREAD_BASIC_INFO, (thread_info_t)&tbi, &bcount);
+    if (kr != KERN_SUCCESS) return kr;
+    *run_state = (int)tbi.run_state;
+    *suspend_count = (int)tbi.suspend_count;
+
+    arm_thread_state64_t st;
+    mach_msg_type_number_t tcount = ARM_THREAD_STATE64_COUNT;
+    kr = thread_get_state(
+        thread, ARM_THREAD_STATE64, (thread_state_t)&st, &tcount);
+    *pc = (kr == KERN_SUCCESS) ? (uint64_t)st.__pc : 0;
+    return KERN_SUCCESS;
 }
