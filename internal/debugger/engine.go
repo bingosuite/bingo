@@ -753,6 +753,18 @@ func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) err
 	}
 	e.lastBPTID = 0
 	if err := e.backend.SingleStep(tid); err != nil {
+		if errors.Is(err, ErrProcessExited) {
+			// The tracee died between removing the trap and issuing the step
+			// (e.g. it was killed). Funnel into the normal exit path: inject a
+			// synthetic stop so the loop emits ProcessExited and shuts down,
+			// instead of surfacing the step failure as an error event.
+			e.steppingOverBP = nil
+			select {
+			case e.stopCh <- stopResult{evt: StopEvent{Reason: StopKilled}}:
+			default:
+			}
+			return nil
+		}
 		_ = e.backend.WriteMemory(bp.addr, archTrapInstruction())
 		e.bps.addToTable(bp)
 		e.steppingOverBP = nil
