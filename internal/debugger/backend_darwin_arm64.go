@@ -155,7 +155,7 @@ func ptrace(request, pid, addr, data uintptr) error {
 	return nil
 }
 
-func startTracedProcess(binaryPath string, args []string, env []string) (int, *exec.Cmd, error) {
+func startTracedProcess(_ Backend, binaryPath string, args []string, env []string) (int, *exec.Cmd, error) {
 	cmd := exec.Command(binaryPath, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
@@ -247,7 +247,7 @@ func godebugHasKey(godebug, key string) bool {
 	return false
 }
 
-func attachToProcess(pid int) error {
+func attachToProcess(_ Backend, pid int) error {
 	if err := ptrace(ptDarwinAttach, uintptr(pid), 0, 0); err != nil {
 		return fmt.Errorf("PT_ATTACH pid %d: %w", pid, err)
 	}
@@ -258,7 +258,7 @@ func attachToProcess(pid int) error {
 	return nil
 }
 
-func killProcess(pid int, cmd *exec.Cmd) error {
+func killProcess(_ Backend, pid int, cmd *exec.Cmd) error {
 	if cmd != nil {
 		if err := cmd.Process.Kill(); err != nil && !isAlreadyExited(err) {
 			return err

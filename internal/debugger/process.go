@@ -14,7 +14,7 @@ type process struct {
 	live bool
 }
 
-func (p *process) launch(binaryPath string, args []string, env []string) error {
+func (p *process) launch(b Backend, binaryPath string, args []string, env []string) error {
 	if p.live {
 		return ErrAlreadyRunning
 	}
@@ -23,7 +23,7 @@ func (p *process) launch(binaryPath string, args []string, env []string) error {
 		return fmt.Errorf("launch: %w", err)
 	}
 
-	pid, cmd, err := startTracedProcess(binaryPath, args, env)
+	pid, cmd, err := startTracedProcess(b, binaryPath, args, env)
 	if err != nil {
 		return fmt.Errorf("launch: %w", err)
 	}
@@ -33,11 +33,11 @@ func (p *process) launch(binaryPath string, args []string, env []string) error {
 	return nil
 }
 
-func (p *process) attach(pid int) error {
+func (p *process) attach(b Backend, pid int) error {
 	if p.live {
 		return ErrAlreadyRunning
 	}
-	if err := attachToProcess(pid); err != nil {
+	if err := attachToProcess(b, pid); err != nil {
 		return fmt.Errorf("attach: %w", err)
 	}
 	p.pid = pid
@@ -46,9 +46,10 @@ func (p *process) attach(pid int) error {
 	return nil
 }
 
-// kill terminates the tracee. The Backend argument is unused but kept for
-// interface symmetry with the engine's Kill path which also runs bps.clearAll.
-func (p *process) kill(_ Backend) error {
+// kill terminates the tracee. The Backend argument lets platform kill paths run
+// PTRACE_DETACH on the tracer thread; the engine's Kill path also runs
+// bps.clearAll.
+func (p *process) kill(b Backend) error {
 	if !p.live {
 		return nil
 	}
@@ -57,7 +58,7 @@ func (p *process) kill(_ Backend) error {
 		return nil
 	}
 	p.live = false
-	if err := killProcess(p.pid, p.cmd); err != nil {
+	if err := killProcess(b, p.pid, p.cmd); err != nil {
 		return fmt.Errorf("kill: %w", err)
 	}
 	return nil
