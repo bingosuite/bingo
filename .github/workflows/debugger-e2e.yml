@@ -1,0 +1,71 @@
+name: Debugger E2E
+
+# Real end-to-end acceptance tests for the low-level debugging backends.
+# Unlike the default `go test ./...` (which exercises only the in-process
+# fakeBackend), these launch a real target and drive the native ptrace / Mach
+# backend. Gated behind the `e2e` build tag.
+#
+# Runs on every push so each debugger-fix branch is verified automatically.
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-e2e:
+    name: Linux amd64 E2E (ptrace)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Confirm native target
+        run: test "$(go env GOOS)/$(go env GOARCH)" = "linux/amd64"
+
+      - name: Show ptrace policy
+        run: cat /proc/sys/kernel/yama/ptrace_scope || true
+
+      - name: E2E basic (continue + step-over correctness)
+        run: go test -tags e2e -race -count=1 -v -timeout 300s -run TestE2EBasic ./internal/debugger
+
+      - name: E2E churn (multi-thread robustness)
+        run: go test -tags e2e -race -count=1 -v -timeout 600s -run TestE2EChurn ./internal/debugger
+
+  darwin-e2e:
+    name: Darwin arm64 E2E (ptrace + Mach)
+    runs-on: macos-14
+    timeout-minutes: 25
+    # GitHub-hosted macOS runners may restrict task_for_pid even with the
+    # entitlement; darwin fixes are primarily verified locally. Don't fail the
+    # whole workflow if the runner blocks it.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Confirm native target
+        run: test "$(go env GOOS)/$(go env GOARCH)" = "darwin/arm64"
+
+      - name: Build and codesign the E2E test binary
+        run: |
+          CGO_ENABLED=1 go test -tags 'e2e bingonative' -race -c -o e2e.test ./internal/debugger
+          codesign --sign - --entitlements entitlements.plist --force e2e.test
+          codesign -d --entitlements - e2e.test || true
+
+      - name: E2E basic (continue + step-over correctness)
+        run: ./e2e.test -test.v -test.timeout 300s -test.run TestE2EBasic
+
+      - name: E2E churn (single-step race under thread churn)
+        run: ./e2e.test -test.v -test.timeout 600s -test.run TestE2EChurn
