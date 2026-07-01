@@ -82,6 +82,39 @@ const (
 	ptDarwinDetach   = uintptr(11)
 )
 
+// The two darwin/arm64 step-over correctness fixes are independently toggleable
+// so an operator can run the behavior-preserving atomic step-over (#1) without
+// the async-preemption workaround (#2), which alters the tracee's goroutine
+// scheduling. See singleStepThread (#1) and withDarwinAsyncPreemptOff (#2).
+//
+//	BINGO_DARWIN_ATOMIC_STEPOVER     default ON  — "0" disables (falls back to a
+//	                                 plain per-process single-step; reproduces
+//	                                 the original wrong-thread hang; ablation
+//	                                 only).
+//	BINGO_DARWIN_ASYNC_PREEMPT_OFF   default OFF — "1" injects
+//	                                 GODEBUG=asyncpreemptoff=1 into the tracee.
+//
+// Fix #2 defaults OFF because bingo is a visual concurrency debugger: disabling
+// async preemption changes the very scheduling behavior a user may be trying to
+// observe. It is offered as an opt-in reliability knob for the residual
+// SIGURG-misdirection wedge under heavy step-over churn.
+const asyncPreemptOffDefault = false
+
+func darwinAtomicStepOverEnabled() bool {
+	return os.Getenv("BINGO_DARWIN_ATOMIC_STEPOVER") != "0"
+}
+
+func darwinAsyncPreemptOffEnabled() bool {
+	switch os.Getenv("BINGO_DARWIN_ASYNC_PREEMPT_OFF") {
+	case "1":
+		return true
+	case "0":
+		return false
+	default:
+		return asyncPreemptOffDefault
+	}
+}
+
 func ptrace(request, pid, addr, data uintptr) error {
 	_, _, errno := syscall.Syscall6(
 		syscall.SYS_PTRACE,
@@ -100,7 +133,10 @@ func startTracedProcess(binaryPath string, args []string, env []string) (int, *e
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true}
-	cmd.Env = withDarwinAsyncPreemptOff(append(os.Environ(), env...))
+	cmd.Env = append(os.Environ(), env...)
+	if darwinAsyncPreemptOffEnabled() {
+		cmd.Env = withDarwinAsyncPreemptOff(cmd.Env)
+	}
 	if err := cmd.Start(); err != nil {
 		return 0, nil, fmt.Errorf("exec %q: %w", binaryPath, err)
 	}
@@ -117,9 +153,10 @@ func startTracedProcess(binaryPath string, args []string, env []string) (int, *e
 	return pid, cmd, nil
 }
 
-// withDarwinAsyncPreemptOff forces GODEBUG=asyncpreemptoff=1 into the tracee's
-// environment. This is a darwin-specific correctness requirement, NOT a perf
-// tweak.
+// withDarwinAsyncPreemptOff merges GODEBUG=asyncpreemptoff=1 into the tracee's
+// environment. It is applied only when fix #2 is enabled
+// (darwinAsyncPreemptOffEnabled); see the toggle block above for why it is
+// opt-in. This is a darwin-specific correctness workaround, NOT a perf tweak.
 //
 // Go async preemption sends a THREAD-directed SIGURG (pthread_kill to a
 // specific M) at a runtime-chosen moment. In our wait4/BSD-stop model that
@@ -274,6 +311,12 @@ func (b *darwinBackend) SingleStep(tid int) error {
 // re-arms the breakpoint) to disarm single-step on tid and resume the suspended
 // threads. On any error here we roll back fully so no thread is left suspended.
 func (b *darwinBackend) singleStepThread(tid int, addr uint64) error {
+	if !darwinAtomicStepOverEnabled() {
+		// Ablation path (BINGO_DARWIN_ATOMIC_STEPOVER=0): fall back to the plain
+		// per-process single-step. This reproduces the original wrong-thread
+		// hang and is intended only for measuring fix #1 in isolation.
+		return b.SingleStep(tid)
+	}
 	if err := b.suspendOthers(tid); err != nil {
 		return fmt.Errorf("single step thread: suspend others: %w", err)
 	}
