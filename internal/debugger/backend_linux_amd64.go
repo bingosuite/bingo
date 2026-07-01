@@ -18,6 +18,13 @@ type linuxBackend struct {
 	pid         int
 	stepping    bool // true after SingleStep; classifies the next SIGTRAP
 	lastStopTID int
+
+	// delayedSignal holds a non-fault signal (e.g. SIGURG async preemption)
+	// observed mid-single-step. It is deferred and injected on the next
+	// ContinueProcess/SingleStep rather than dropped. Mirrors Delve's
+	// nativeThread.delayedSignal / resumeWithSig so signals are forwarded to
+	// the tracee instead of being swallowed.
+	delayedSignal int
 }
 
 const linuxPtraceOptions = syscall.PTRACE_O_TRACEEXIT |
@@ -89,17 +96,21 @@ func isAlreadyExited(err error) bool {
 
 func (b *linuxBackend) ContinueProcess() error {
 	b.stepping = false
+	sig := b.delayedSignal
+	b.delayedSignal = 0
 	tid := b.traceTID()
-	if err := syscall.PtraceCont(tid, 0); err != nil {
-		return fmt.Errorf("PTRACE_CONT tid %d: %w", tid, err)
+	if err := syscall.PtraceCont(tid, sig); err != nil {
+		return fmt.Errorf("PTRACE_CONT tid %d (sig %d): %w", tid, sig, err)
 	}
 	return nil
 }
 
 func (b *linuxBackend) SingleStep(tid int) error {
 	b.stepping = true
-	if err := syscall.PtraceSingleStep(tid); err != nil {
-		return fmt.Errorf("PTRACE_SINGLESTEP tid %d: %w", tid, err)
+	sig := b.delayedSignal
+	b.delayedSignal = 0
+	if err := ptraceSingleStepSig(tid, sig); err != nil {
+		return fmt.Errorf("PTRACE_SINGLESTEP tid %d (sig %d): %w", tid, sig, err)
 	}
 	return nil
 }
@@ -290,34 +301,49 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			continue
 		}
 
-		// SIGURG is Go's goroutine-preemption signal; SIGCONT may be injected
-		// above to release clone-child SIGSTOP. Both should stay transparent.
-		if sig == syscall.SIGURG {
-			if b.stepping {
-				if err := singleStepIfTraceeExists(tid); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_SINGLESTEP after SIGURG tid %d: %w", tid, err)
+		// Any non-SIGTRAP stop is a real signal delivered to the tracee.
+		// Forward it instead of swallowing it (Delve's resumeWithSig /
+		// singleStep). Dropping a synchronous fault (SIGSEGV/SIGBUS/... from
+		// e.g. the Go runtime's nil-check machinery) makes the faulting
+		// instruction re-execute forever and wedges the tracee; dropping
+		// SIGURG breaks Go's async goroutine preemption.
+		if b.stepping {
+			// Mid single-step: classify like Delve's singleStep() loop.
+			switch sig {
+			case syscall.SIGILL, syscall.SIGBUS, syscall.SIGFPE, syscall.SIGSEGV, syscall.SIGSTKFLT:
+				// Fault triggered by the instruction being stepped: re-issue
+				// the step WITH the signal so the tracee's handler observes it.
+				if err := singleStepSig(tid, int(sig)); err != nil {
+					return StopEvent{}, fmt.Errorf("PTRACE_SINGLESTEP fault %d tid %d: %w", sig, tid, err)
 				}
-			} else {
-				if err := continueIfTraceeExists(tid, int(sig)); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_CONT SIGURG tid %d: %w", tid, err)
+			case syscall.SIGSTOP:
+				// Spurious/late SIGSTOP: swallow it and keep stepping.
+				if err := singleStepSig(tid, 0); err != nil {
+					return StopEvent{}, fmt.Errorf("PTRACE_SINGLESTEP after SIGSTOP tid %d: %w", tid, err)
+				}
+			default:
+				// Asynchronous signal (SIGURG preemption, SIGCHLD, ...): defer
+				// delivery to the next resume and keep stepping so the trap PC
+				// is not perturbed by entering a signal handler mid-step.
+				b.delayedSignal = int(sig)
+				if err := singleStepSig(tid, 0); err != nil {
+					return StopEvent{}, fmt.Errorf("PTRACE_SINGLESTEP deferring %d tid %d: %w", sig, tid, err)
 				}
 			}
 			continue
 		}
 
-		if sig == syscall.SIGCONT {
-			if err := continueIfTraceeExists(tid, 0); err != nil {
-				return StopEvent{}, fmt.Errorf("PTRACE_CONT SIGCONT tid %d: %w", tid, err)
-			}
-			continue
+		// Running (continue): forward the signal transparently so the tracee's
+		// own handlers/runtime see it. Never re-deliver a bare SIGSTOP — it
+		// would immediately re-stop the thread.
+		forward := int(sig)
+		if sig == syscall.SIGSTOP {
+			forward = 0
 		}
-
-		b.recordStop(tid)
-		return StopEvent{
-			Reason: StopSignal,
-			TID:    tid,
-			Signal: int(sig),
-		}, nil
+		if err := continueIfTraceeExists(tid, forward); err != nil {
+			return StopEvent{}, fmt.Errorf("PTRACE_CONT forwarding signal %d tid %d: %w", sig, tid, err)
+		}
+		continue
 	}
 }
 
@@ -393,11 +419,23 @@ func taskTIDs(pid int) ([]int, error) {
 	return tids, nil
 }
 
-func singleStepIfTraceeExists(tid int) error {
+// ptraceSingleStepSig issues PTRACE_SINGLESTEP delivering signal sig to the
+// tracee (the syscall.PtraceSingleStep wrapper always passes signal 0, which
+// would drop a pending signal). Mirrors Delve's ptraceSingleStep(pid, sig).
+func ptraceSingleStepSig(tid, sig int) error {
+	_, _, errno := syscall.Syscall6(syscall.SYS_PTRACE,
+		uintptr(syscall.PTRACE_SINGLESTEP), uintptr(tid), 0, uintptr(sig), 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func singleStepSig(tid, sig int) error {
 	if tid == 0 {
 		return nil
 	}
-	if err := syscall.PtraceSingleStep(tid); err != nil && !isNoSuchProcess(err) {
+	if err := ptraceSingleStepSig(tid, sig); err != nil && !isNoSuchProcess(err) {
 		return err
 	}
 	return nil

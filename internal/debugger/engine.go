@@ -752,6 +752,26 @@ func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) err
 		tid = threads[0]
 	}
 	e.lastBPTID = 0
+
+	// Rewind the tracee's PC to the breakpoint address before stepping. On
+	// amd64 the INT3 trap leaves RIP one byte PAST bp.addr, so single-stepping
+	// now (after restoring the original byte) would execute from the middle of
+	// the original instruction, corrupting the stream. Put PC back at bp.addr
+	// so the restored instruction runs from its first byte. On arm64 the CPU
+	// stops with PC already AT the BRK (archRewindPC is identity), so the
+	// read-back PC equals bp.addr and the guard makes this a no-op. Mirrors
+	// Delve's (*nativeThread).SetCurrentBreakpoint -> setPC(bp.Addr) when
+	// Arch.BreakInstrMovesPC() is true.
+	if regs, gerr := e.backend.GetRegisters(tid); gerr == nil && regs.PC != bp.addr {
+		regs.PC = bp.addr
+		if serr := e.backend.SetRegisters(tid, regs); serr != nil {
+			_ = e.backend.WriteMemory(bp.addr, archTrapInstruction())
+			e.bps.addToTable(bp)
+			e.steppingOverBP = nil
+			return fmt.Errorf("resume BP: rewind PC to 0x%x: %w", bp.addr, serr)
+		}
+	}
+
 	if err := e.backend.SingleStep(tid); err != nil {
 		_ = e.backend.WriteMemory(bp.addr, archTrapInstruction())
 		e.bps.addToTable(bp)
