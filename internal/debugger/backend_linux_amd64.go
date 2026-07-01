@@ -5,10 +5,22 @@ package debugger
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
+	"sync/atomic"
 	"syscall"
 )
+
+// E2EDBG temporary instrumentation (removed before final). Logs at Info so it
+// surfaces in CI without BINGO_E2E_DEBUG. Capped to avoid flooding on livelock.
+var dbgWaitN atomic.Int64
+
+func dbgLog(msg string, args ...any) {
+	if dbgWaitN.Add(1) <= 600 {
+		slog.Info("E2EDBG "+msg, args...)
+	}
+}
 
 func newBackend() Backend {
 	return &linuxBackend{}
@@ -99,6 +111,7 @@ func (b *linuxBackend) ContinueProcess() error {
 	sig := b.delayedSignal
 	b.delayedSignal = 0
 	tid := b.traceTID()
+	dbgLog("ContinueProcess", "tid", tid, "sig", sig)
 	if err := syscall.PtraceCont(tid, sig); err != nil {
 		return fmt.Errorf("PTRACE_CONT tid %d (sig %d): %w", tid, sig, err)
 	}
@@ -109,6 +122,7 @@ func (b *linuxBackend) SingleStep(tid int) error {
 	b.stepping = true
 	sig := b.delayedSignal
 	b.delayedSignal = 0
+	dbgLog("SingleStep", "tid", tid, "sig", sig)
 	if err := ptraceSingleStepSig(tid, sig); err != nil {
 		return fmt.Errorf("PTRACE_SINGLESTEP tid %d (sig %d): %w", tid, sig, err)
 	}
@@ -207,6 +221,10 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		var ws syscall.WaitStatus
 		// WALL includes clone()d threads.
 		tid, err := syscall.Wait4(-1, &ws, syscall.WALL, nil)
+		dbgLog("wait4 return", "tid", tid, "err", err, "raw", uint32(ws),
+			"stopped", ws.Stopped(), "stopsig", int(ws.StopSignal()),
+			"cause", ws.TrapCause(), "exited", ws.Exited(),
+			"signaled", ws.Signaled(), "stepping", b.stepping, "pid", b.pid)
 		if err != nil {
 			if isNoChildProcess(err) {
 				return StopEvent{Reason: StopExited, TID: b.pid}, nil
@@ -272,9 +290,11 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 				if b.stepping {
 					b.stepping = false
+					dbgLog("-> StopSingleStep", "tid", tid)
 					return StopEvent{Reason: StopSingleStep, TID: tid}, nil
 				}
 
+				dbgLog("-> StopBreakpoint", "tid", tid)
 				return StopEvent{
 					Reason: StopBreakpoint,
 					TID:    tid,
@@ -309,6 +329,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		// SIGURG breaks Go's async goroutine preemption.
 		if b.stepping {
 			// Mid single-step: classify like Delve's singleStep() loop.
+			dbgLog("signal mid-step", "tid", tid, "sig", int(sig))
 			switch sig {
 			case syscall.SIGILL, syscall.SIGBUS, syscall.SIGFPE, syscall.SIGSEGV, syscall.SIGSTKFLT:
 				// Fault triggered by the instruction being stepped: re-issue
@@ -340,6 +361,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		if sig == syscall.SIGSTOP {
 			forward = 0
 		}
+		dbgLog("signal running-forward", "tid", tid, "sig", int(sig), "forward", forward)
 		if err := continueIfTraceeExists(tid, forward); err != nil {
 			return StopEvent{}, fmt.Errorf("PTRACE_CONT forwarding signal %d tid %d: %w", sig, tid, err)
 		}
