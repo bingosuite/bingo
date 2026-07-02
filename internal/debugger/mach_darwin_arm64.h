@@ -7,12 +7,86 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <mach/arm/thread_status.h>
+#include <mach/vm_attributes.h>
 #include <stdint.h>
+#include <string.h>
+#include <stdlib.h>
+#include <spawn.h>
+#include <errno.h>
+
+extern char **environ;
+
+// MDSCR_EL1.SS (bit 0) is the AArch64 "software step" enable. It is not
+// declared in the userspace SDK headers, so define it here.
+#ifndef MDSCR_SS
+#define MDSCR_SS 0x1u
+#endif
 
 // bingo_task_for_pid obtains the Mach task port for the given PID.
 // Requires the com.apple.security.cs.debugger entitlement or SIP disabled.
 static inline kern_return_t bingo_task_for_pid(int pid, mach_port_t *task_out) {
     return task_for_pid(mach_task_self(), pid, task_out);
+}
+
+// bingo_posix_spawn_suspended launches path (argv/envp) with the task created
+// suspended (POSIX_SPAWN_START_SUSPENDED). The image is exec'd but no user code
+// runs, so the debugger can PT_ATTACH on the post-exec image — that is what
+// makes the kernel run cs_allow_invalid() (sets CS_DEBUGGED, clears
+// CS_KILL|CS_HARD, enables the vm_map W^X bypass) on the FINAL image, which is
+// required to patch software breakpoints on Apple Silicon without the kernel
+// SIGKILLing the tracee. Returns the child pid, or -errno on failure.
+static inline int bingo_posix_spawn_suspended(
+    const char *path, char *const argv[], char *const envp[])
+{
+    posix_spawnattr_t attr;
+    if (posix_spawnattr_init(&attr) != 0) {
+        return -errno;
+    }
+    (void)posix_spawnattr_setflags(&attr, POSIX_SPAWN_START_SUSPENDED);
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, path, NULL, &attr, argv, envp);
+    posix_spawnattr_destroy(&attr);
+    if (rc != 0) {
+        return -rc;
+    }
+    return (int)pid;
+}
+
+// bingo_task_drain_suspend lifts EVERY outstanding task-level Mach suspend on
+// pid (calling task_resume until the count reaches 0). The launch path spawns
+// the tracee POSIX_SPAWN_START_SUSPENDED (task suspend count 1) and expects
+// PT_ATTACH to lift that hold; on Apple Silicon that lift is racy, and when it
+// is missed the tracee stays frozen at _dyld_start (threads read suspend=0
+// because the hold is at the TASK level) and the first Continue after launch
+// never runs it. Draining here guarantees the hold is gone; the pending
+// attach-SIGSTOP is what actually stops the tracee at the entry point, so
+// resuming to 0 does not let it run away. Returns the number of resumes done,
+// or -1 on task_for_pid error.
+static inline int bingo_task_drain_suspend(int pid) {
+    mach_port_t task = MACH_PORT_NULL;
+    if (task_for_pid(mach_task_self(), pid, &task) != KERN_SUCCESS) {
+        return -1;
+    }
+    int resumed = 0;
+    for (;;) {
+        struct task_basic_info info;
+        mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
+        if (task_info(task, TASK_BASIC_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) {
+            break;
+        }
+        if (info.suspend_count <= 0) {
+            break;
+        }
+        if (task_resume(task) != KERN_SUCCESS) {
+            break;
+        }
+        resumed++;
+        if (resumed > 8) { // safety bound; never seen >1 in practice
+            break;
+        }
+    }
+    mach_port_deallocate(mach_task_self(), task);
+    return resumed;
 }
 
 // bingo_get_registers reads ARM_THREAD_STATE64 for the given thread port,
@@ -72,40 +146,46 @@ static inline kern_return_t bingo_read_memory(
 // patch read-only text segments (e.g. to install breakpoints), then restores
 // execute permission.
 //
-// Icache coherency on Apple Silicon (ARM64):
-// mach_vm_machine_attribute(MATTR_CACHE, MATTR_VAL_ICACHE_FLUSH) is a no-op
-// on Apple Silicon — the kernel returns KERN_NOT_SUPPORTED. The correct
-// approach is to wrap the write with task_suspend + task_resume: the resume
-// call drains the instruction pipeline for all threads in the task, ensuring
-// the CPU sees the new bytes. task_suspend/resume use an independent suspend
-// count from ptrace, so this is safe to call while the process is
-// ptrace-stopped (the ptrace stop is unaffected).
+// Icache coherency on Apple Silicon (ARM64): after patching instruction bytes
+// we must clean the D-cache to the point of unification (so the freshly-written
+// bytes reach unified memory) and THEN invalidate the I-cache (so cores refetch
+// the new bytes from PoU rather than a stale line). MATTR_VAL_CACHE_SYNC alone
+// can invalidate the I-cache before the write has drained past PoU, leaving a
+// stale instruction line, so we issue the two attribute calls explicitly in
+// order.
+//
+// We deliberately do NOT wrap the write in task_suspend/task_resume. bingo only
+// ever writes memory while the tracee is ptrace-stopped (Darwin ptrace stops
+// are process-wide, so every thread is already quiesced), and the explicit
+// D-cache/I-cache flush provides the coherency the task_resume pipeline drain
+// used to. task_suspend/task_resume use a suspend count independent of ptrace,
+// and on Apple Silicon a task_resume issued near a ptrace state transition
+// (PT_CONTINUE / PT_STEP on the wait4 thread) can be dropped, pinning the task
+// at suspend_count 1 — a pinned task never runs, so the next wait4 blocks
+// forever and the debugger wedges. Dropping the suspend/resume entirely removes
+// that race; single-step isolation uses per-THREAD suspends (never task-level).
 static inline kern_return_t bingo_write_memory(
     mach_port_t task, mach_vm_address_t addr,
     const void *src, mach_vm_size_t n)
 {
-    // Suspend the task so all threads are quiesced while we patch memory.
-    // This also causes task_resume to flush the instruction pipeline.
-    task_suspend(task);
-
     kern_return_t kr = mach_vm_protect(task, addr, n, FALSE,
         VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
     if (kr != KERN_SUCCESS) {
-        task_resume(task);
         return kr;
     }
     kr = mach_vm_write(task, addr,
         (vm_offset_t)src, (mach_msg_type_number_t)n);
     if (kr != KERN_SUCCESS) {
-        task_resume(task);
         return kr;
     }
     kr = mach_vm_protect(task, addr, n, FALSE,
         VM_PROT_READ | VM_PROT_EXECUTE);
 
-    // Resume lifts the task suspension and flushes the instruction pipeline
-    // for all threads, ensuring the CPU fetches the new bytes on next execute.
-    task_resume(task);
+    vm_machine_attribute_val_t flush = MATTR_VAL_DCACHE_FLUSH;
+    mach_vm_machine_attribute(task, addr, n, MATTR_CACHE, &flush);
+    flush = MATTR_VAL_ICACHE_FLUSH;
+    mach_vm_machine_attribute(task, addr, n, MATTR_CACHE, &flush);
+
     return kr;
 }
 
@@ -164,4 +244,43 @@ static inline kern_return_t bingo_thread_list(
     mach_msg_type_number_t *count_out)
 {
     return task_threads(task, threads_out, count_out);
+}
+
+// bingo_set_single_step enables (enable != 0) or disables the AArch64 hardware
+// software-step for a single thread by toggling MDSCR_EL1.SS in its debug
+// state. XNU honours this bit set via thread_set_state(ARM_DEBUG_STATE64) and
+// engages the single-step state machine for that thread only on its next return
+// to EL0 — this is exactly how lldb-debugserver single-steps on Apple Silicon.
+//
+// We deliberately write a zeroed debug state (only MDSCR_EL1.SS may be set):
+// the debugger installs breakpoints as software BRK traps, never via the ARM
+// hardware breakpoint/watchpoint registers, so there is nothing else to
+// preserve. Disabling clears every bit, so XNU frees the thread's debug state.
+static inline kern_return_t bingo_set_single_step(mach_port_t thread, int enable) {
+    arm_debug_state64_t ds;
+    memset(&ds, 0, sizeof(ds));
+    if (enable) {
+        ds.__mdscr_el1 |= MDSCR_SS;
+    }
+    return thread_set_state(thread, ARM_DEBUG_STATE64,
+        (thread_state_t)&ds, ARM_DEBUG_STATE64_COUNT);
+}
+
+// bingo_thread_suspend / bingo_thread_resume adjust a single thread's Mach
+// suspend count. This is independent of the task-level ptrace stop, so it lets
+// us hold every thread except the one being single-stepped while the task is
+// resumed for that step.
+static inline kern_return_t bingo_thread_suspend(mach_port_t thread) {
+    return thread_suspend((thread_act_t)thread);
+}
+
+static inline kern_return_t bingo_thread_resume(mach_port_t thread) {
+    return thread_resume((thread_act_t)thread);
+}
+
+// bingo_port_deallocate drops one user reference on a send right, matching the
+// ref that task_for_pid / task_threads inserted. Used to release the cached
+// task port when the tracee is replaced.
+static inline kern_return_t bingo_port_deallocate(mach_port_t name) {
+    return mach_port_deallocate(mach_task_self(), name);
 }

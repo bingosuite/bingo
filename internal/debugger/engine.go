@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
@@ -69,6 +71,17 @@ type engine struct {
 	steppingOverBP *breakpointEntry
 	bpResume       bpResumeAction
 	bpRetAddr      uint64 // bpResumeStepOut only
+
+	// curTID is the thread the process last stopped on (the BP-hitting or
+	// single-stepped thread). Stack/goroutine inspection must unwind THIS
+	// thread, not threads[0]: on Darwin task_threads returns threads in
+	// creation order and threads[0] is frequently a parked runtime M sitting
+	// in pthread_cond_wait, whose frames are all in the dyld shared cache.
+	// Unwinding that thread yields libsystem PCs that functionAt then scans the
+	// entire binary DWARF for (finding nothing) on every frame of every step —
+	// which is slow enough under load to stall the engine loop and hang the
+	// suspend/resume handshake.
+	curTID int
 
 	// Source-line target remembered from the previous step-over. More
 	// reliable than re-querying locationForPC, which can land on a DWARF
@@ -345,11 +358,56 @@ func (e *engine) waitLoop() {
 	// and we don't want a thread carrying unrelated ptrace state.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
+	stopWD := e.startWaitWatchdog()
 	evt, err := e.backend.Wait()
+	stopWD()
 	select {
 	case e.stopCh <- stopResult{evt: evt, err: err}:
 	case <-e.done:
 	}
+}
+
+// startWaitWatchdog (BINGO_HANG_DIAG only) dumps thread state if backend.Wait()
+// stalls, to root-cause the single-step hang. Off by default; never ships hot.
+func (e *engine) startWaitWatchdog() func() {
+	if os.Getenv("BINGO_HANG_DIAG") == "" {
+		return func() {}
+	}
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-time.After(6 * time.Second):
+			e.dumpHangState()
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
+}
+
+func (e *engine) dumpHangState() {
+	fmt.Fprintf(os.Stderr, "\n=== BINGO_HANG_DIAG: Wait() stalled >6s ===\n")
+	fmt.Fprintf(os.Stderr, "lastBPTID=%d steppingOverBP=%v bpResume=%d curTID=%d state=%d\n",
+		e.lastBPTID, e.steppingOverBP != nil, e.bpResume, e.curTID, e.getState())
+	if sob := e.steppingOverBP; sob != nil {
+		fmt.Fprintf(os.Stderr, "steppingOverBP addr=0x%x file=%s line=%d\n", sob.addr, sob.file, sob.line)
+	}
+	threads, err := e.backend.Threads()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Threads() err: %v\n", err)
+		return
+	}
+	trap := archTrapInstruction()
+	fmt.Fprintf(os.Stderr, "threads=%d\n", len(threads))
+	for _, tid := range threads {
+		regs, err := e.backend.GetRegisters(tid)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "  tid=%d GetRegisters err: %v\n", tid, err)
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "  tid=%d PC=0x%x trapHere=%v ourBP=%v\n",
+			tid, regs.PC, e.instructionAt(regs.PC, trap), e.bps.atAddr(regs.PC) != nil)
+	}
+	fmt.Fprintf(os.Stderr, "=== end BINGO_HANG_DIAG ===\n")
 }
 
 //nolint:gocognit,gocyclo // Stop handling is a single serialized debugger state machine.
@@ -767,15 +825,29 @@ func (e *engine) collectFrames() ([]protocol.Frame, error) {
 	if e.dw == nil {
 		return nil, nil
 	}
-	threads, err := e.backend.Threads()
-	if err != nil || len(threads) == 0 {
-		return nil, fmt.Errorf("StackFrames: no threads")
+	tid, err := e.stackTID()
+	if err != nil {
+		return nil, fmt.Errorf("StackFrames: %w", err)
 	}
-	regs, err := e.backend.GetRegisters(threads[0])
+	regs, err := e.backend.GetRegisters(tid)
 	if err != nil {
 		return nil, fmt.Errorf("StackFrames: %w", err)
 	}
 	return e.dw.FramesForStack(e.walkStack(regs)), nil
+}
+
+// stackTID returns the thread to unwind for stack/goroutine inspection: the
+// thread the process last stopped on (curTID). Falls back to threads[0] only
+// when no stop thread has been resolved yet (e.g. right after attach).
+func (e *engine) stackTID() (int, error) {
+	if e.curTID != 0 {
+		return e.curTID, nil
+	}
+	threads, err := e.backend.Threads()
+	if err != nil || len(threads) == 0 {
+		return 0, fmt.Errorf("no threads")
+	}
+	return threads[0], nil
 }
 
 func (e *engine) walkStack(regs Registers) []uint64 {
@@ -797,11 +869,11 @@ func (e *engine) walkStack(regs Registers) []uint64 {
 }
 
 func (e *engine) readGoroutines() ([]protocol.Goroutine, error) {
-	threads, err := e.backend.Threads()
-	if err != nil || len(threads) == 0 {
+	tid, err := e.stackTID()
+	if err != nil {
 		return nil, nil
 	}
-	regs, err := e.backend.GetRegisters(threads[0])
+	regs, err := e.backend.GetRegisters(tid)
 	if err != nil {
 		return nil, fmt.Errorf("Goroutines: %w", err)
 	}
@@ -850,6 +922,9 @@ func (e *engine) emit(kind protocol.EventKind, payload any) {
 }
 
 func (e *engine) emitBreakpointHit(bp *breakpointEntry, stop StopEvent) {
+	if stop.TID != 0 {
+		e.curTID = stop.TID
+	}
 	frames, _ := e.collectFrames()
 	goroutines, _ := e.readGoroutines()
 	var g protocol.Goroutine
@@ -878,6 +953,9 @@ func (e *engine) emitStoppedAtCurrentPC() {
 }
 
 func (e *engine) emitStepped(stop StopEvent) {
+	if stop.TID != 0 {
+		e.curTID = stop.TID
+	}
 	frames, _ := e.collectFrames()
 	goroutines, _ := e.readGoroutines()
 	var g protocol.Goroutine

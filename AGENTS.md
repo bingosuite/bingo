@@ -207,7 +207,26 @@ engine advances PC by `len(archTrapInstruction())` and resumes. See the
   a BRK on its serialized event loop. For SingleStep, save the thread port we
   issued the step against (`b.stepTID`).
 - `PT_STEP` is per-PROCESS on Darwin (despite the API taking a tid). Always
-  pass `b.pid`, not the Mach thread port.
+  pass `b.pid`, not the Mach thread port. Worse, XNU arms the CPU single-step
+  (`MDSCR_EL1.SS`) on `get_firstthread(task)` — usually a parked runtime M, NOT
+  the thread that hit the breakpoint — so a bare `PT_STEP` lets every thread run
+  and the kernel may retire the step on the wrong thread. The one that hit the
+  BP then runs straight through the byte-restored breakpoint window before the
+  trap is reinstalled, and the next `Continue` wedges: the ~2% single-step hang.
+  **Fix (`isolateForStep`/`endStepIsolation`, mirrors lldb-debugserver / Delve
+  `singleStep`):** before `PT_STEP`, Mach-`thread_suspend` every thread except
+  the target and set the hardware `MDSCR_EL1.SS` bit on the target only; after
+  the step trap retires, clear the SS bit on ALL threads (XNU left a stray one
+  on `get_firstthread`) and `thread_resume` the rest. Exactly one thread
+  advances one instruction. See `SingleStep` and the `StopSingleStep` teardown
+  in `Wait`.
+- Go's `syscall.WaitStatus.Stopped()` returns **false for a SIGSTOP** stop (Unix
+  job-control convention: `w&0x7f==0x7f && sig != SIGSTOP`). Under ptrace a
+  SIGSTOP-delivery-stop is a REAL stop that has task-suspended the tracee, so
+  `Wait` must NOT skip it — decode the raw wait status directly
+  (`raw&0x7f==0x7f` → `sig=(raw>>8)&0xff`) and swallow-resume SIGSTOP like
+  SIGURG (`resumeAfterSignal(0)`). Falling through to a bare `continue` leaves
+  the tracee suspended and the next `wait4` blocks forever — a second ~2% hang.
 - `SIGURG` (Go preemption) and `SIGWINCH` must be re-delivered transparently
   during both step and continue, or scheduling breaks.
 - ASLR slide is computed in `TextSlide` by scanning the VM map for the first

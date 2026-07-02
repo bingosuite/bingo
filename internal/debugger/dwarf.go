@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"sort"
 	"strings"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
@@ -22,6 +23,21 @@ const optimizedOut = "<optimized out>"
 type dwarfReader struct {
 	data  *dwarf.Data
 	slide int64
+
+	// funcIndex holds every subprogram's [low,high) DWARF address range sorted
+	// by low address, so functionAt can binary-search instead of linearly
+	// decoding the whole .debug_info on every frame of every stop. A Go binary
+	// has tens of thousands of subprograms and they are NOT emitted in address
+	// order, so the old full scan was O(N) even for a hit; collecting frames for
+	// each BreakpointHit/Stepped ran it once per frame and, under load, could
+	// stall the (single-threaded) engine loop past the client's step timeout.
+	funcIndex []funcRange
+}
+
+// funcRange is one subprogram's DWARF address range and name.
+type funcRange struct {
+	low, high uint64
+	name      string
 }
 
 func openDWARF(binaryPath string) (*dwarfReader, error) {
@@ -29,7 +45,42 @@ func openDWARF(binaryPath string) (*dwarfReader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("openDWARF %q: %w", binaryPath, err)
 	}
-	return &dwarfReader{data: data}, nil
+	r := &dwarfReader{data: data}
+	r.buildFuncIndex()
+	return r, nil
+}
+
+// buildFuncIndex scans .debug_info once and records every subprogram's address
+// range, sorted by low PC, for O(log N) functionAt lookups. Called once at load
+// time (off the stepping hot path). A failure to decode simply leaves the index
+// empty and functionAt falls back to a linear scan.
+func (r *dwarfReader) buildFuncIndex() {
+	rd := r.data.Reader()
+	for {
+		entry, err := rd.Next()
+		if err != nil || entry == nil {
+			break
+		}
+		if entry.Tag != dwarf.TagSubprogram {
+			continue
+		}
+		lowpc, hasLow := entry.Val(dwarf.AttrLowpc).(uint64)
+		if !hasLow {
+			continue
+		}
+		highpc, ok := highPCValue(entry, lowpc)
+		if !ok {
+			continue
+		}
+		name, _ := entry.Val(dwarf.AttrName).(string)
+		if name == "" {
+			continue
+		}
+		r.funcIndex = append(r.funcIndex, funcRange{low: lowpc, high: highpc, name: name})
+	}
+	sort.Slice(r.funcIndex, func(i, j int) bool {
+		return r.funcIndex[i].low < r.funcIndex[j].low
+	})
 }
 
 func loadDWARFData(binaryPath string) (*dwarf.Data, error) {
@@ -142,6 +193,14 @@ func fileMatches(candidate, target string) bool {
 // locationForPC resolves pc (runtime address) to a source location.
 func (r *dwarfReader) locationForPC(pc uint64) protocol.Location {
 	loc := protocol.Location{Function: r.functionAt(pc)}
+	// When the subprogram index is populated, an empty function name is
+	// authoritative: pc is not in any of our functions (e.g. a deep frame that
+	// walked into libsystem/dyld). There is no source line to find, so skip the
+	// compile-unit/line-table scan entirely — that scan is the other O(N) DWARF
+	// walk that could stall the engine loop on a bad PC.
+	if loc.Function == "" && len(r.funcIndex) > 0 {
+		return loc
+	}
 	dwarfPC := uint64(int64(pc) - r.slide)
 
 	rd := r.data.Reader()
@@ -206,6 +265,23 @@ func cuContainsPC(entry *dwarf.Entry, pc uint64) bool {
 // functionAt returns the function name containing pc (runtime address), or "".
 func (r *dwarfReader) functionAt(pc uint64) string {
 	dwarfPC := uint64(int64(pc) - r.slide)
+
+	// Fast path: binary-search the sorted subprogram index. Find the last range
+	// whose low <= dwarfPC and check whether dwarfPC falls inside it.
+	if len(r.funcIndex) > 0 {
+		i := sort.Search(len(r.funcIndex), func(i int) bool {
+			return r.funcIndex[i].low > dwarfPC
+		})
+		if i > 0 {
+			fr := r.funcIndex[i-1]
+			if dwarfPC >= fr.low && dwarfPC < fr.high {
+				return fr.name
+			}
+		}
+		return ""
+	}
+
+	// Fallback (index unavailable): linear scan of .debug_info.
 	rd := r.data.Reader()
 	for {
 		entry, err := rd.Next()
