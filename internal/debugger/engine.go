@@ -75,6 +75,13 @@ type engine struct {
 	// boundary with line==0. Zeroed on each sourceStepOver and on user-BP hits.
 	stepOverFile string
 	stepOverLine int
+
+	// Destination address of an in-flight continue-based step-over/step-out.
+	// A one-shot sentinel trap is planted here and the origin trap removed, so
+	// the thread runs to the destination with a plain continue (no hardware
+	// single-step, which is unreliable on Darwin/arm64). Zero when no
+	// step-over is in flight. See resumeFromBreakpoint / finishStepOverContinue.
+	stepDestAddr uint64
 }
 
 type engineCmd struct {
@@ -249,11 +256,11 @@ func (e *engine) Locals(frameIndex int) ([]protocol.Variable, error) {
 		if e.dw == nil {
 			return fmt.Errorf("Locals: no DWARF info")
 		}
-		threads, err := e.backend.Threads()
-		if err != nil || len(threads) == 0 {
+		tid := e.inspectionTID(0)
+		if tid == 0 {
 			return fmt.Errorf("Locals: no threads")
 		}
-		regs, err := e.backend.GetRegisters(threads[0])
+		regs, err := e.backend.GetRegisters(tid)
 		if err != nil {
 			return fmt.Errorf("Locals: get registers: %w", err)
 		}
@@ -288,7 +295,7 @@ func (e *engine) StackFrames() ([]protocol.Frame, error) {
 			return err
 		}
 		var err error
-		frames, err = e.collectFrames()
+		frames, err = e.collectFrames(0)
 		return err
 	})
 	return frames, err
@@ -301,7 +308,7 @@ func (e *engine) Goroutines() ([]protocol.Goroutine, error) {
 			return err
 		}
 		var err error
-		goroutines, err = e.readGoroutines()
+		goroutines, err = e.readGoroutines(0)
 		return err
 	})
 	return goroutines, err
@@ -401,20 +408,21 @@ func (e *engine) handleStop(stop StopEvent) {
 			"addr", fmt.Sprintf("0x%x", bp.addr))
 		if bp.file == stepOverNextFile {
 			_ = e.bps.clear(e.backend, bp.id)
-			e.lastBP = nil
-			e.emitStepped(stop)
+			e.finishStepOverContinue(stop)
 			return
 		}
 		if bp.file == stepOutReturnFile {
 			_ = e.bps.clear(e.backend, bp.id)
-			e.lastBP = nil
-			e.emitStepped(stop)
+			e.finishStepOverContinue(stop)
 			return
 		}
 		e.lastBP = bp
 		e.lastBPTID = stop.TID
-		e.stepOverFile = ""
-		e.stepOverLine = 0
+		// A genuine user breakpoint. If a step-over/step-out was in flight
+		// (its origin trap removed, destination sentinel armed), tear that
+		// state down — reinstalling the origin and clearing the sentinel —
+		// before reporting the hit.
+		e.abandonStepOver()
 		e.emitBreakpointHit(bp, stop)
 
 	case StopSingleStep:
@@ -428,6 +436,9 @@ func (e *engine) handleStop(stop StopEvent) {
 		slog.Debug("StopSingleStep", "pc", fmt.Sprintf("0x%x", stop.PC),
 			"steppingOverBP", e.steppingOverBP != nil)
 		if sob := e.steppingOverBP; sob != nil {
+			// The single-step moved the thread off sob.addr (whose original
+			// bytes were restored for the step); reinstall the trap before
+			// resuming so the breakpoint stays active.
 			e.steppingOverBP = nil
 			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
 				// Reinstall failed. Suspend instead of resuming — running
@@ -444,52 +455,15 @@ func (e *engine) handleStop(stop StopEvent) {
 				_ = e.backend.ContinueProcess()
 				e.setState(stateRunning)
 				go e.waitLoop()
-			case bpResumeStep:
+			default:
+				// bpResumeStep, and the rare bpResumeSourceStep/bpResumeStepOut
+				// fallback where no destination address was available (missing
+				// DWARF / return addr) so resumeFromBreakpoint single-stepped
+				// instead of continuing to a sentinel. We've advanced one
+				// instruction off the origin and reinstalled the trap; report
+				// that as the step result rather than risk a hang.
 				e.setState(stateSuspended)
 				e.emitStepped(stop)
-			case bpResumeSourceStep:
-				// Use sob.file/sob.line (the BP's known location) rather than
-				// a DWARF lookup from stop.PC: stop.PC is one instruction past
-				// the BP and can land on a DWARF entry with line==0.
-				if e.dw != nil && sob.file != "" && sob.line > 0 {
-					if nextPC, nextLine, ok := e.dw.NextLinePC(sob.file, sob.line); ok {
-						slog.Debug("sourceStepOver: setting "+stepOverNextFile,
-							"from", fmt.Sprintf("%s:%d", sob.file, sob.line),
-							"nextPC", fmt.Sprintf("0x%x", nextPC), "nextLine", nextLine)
-						entry, setErr := e.bps.set(e.backend, stepOverNextFile, 0, nextPC)
-						if setErr == nil || errors.Is(setErr, errBreakpointExists) {
-							e.stepOverFile = sob.file
-							e.stepOverLine = nextLine
-							if cerr := e.backend.ContinueProcess(); cerr == nil {
-								e.setState(stateRunning)
-								go e.waitLoop()
-								return
-							} else if entry != nil {
-								_ = e.bps.clear(e.backend, entry.id)
-								e.stepOverFile = ""
-								e.stepOverLine = 0
-							}
-						} else {
-							slog.Warn("sourceStepOver: set "+stepOverNextFile+" failed",
-								"addr", fmt.Sprintf("0x%x", nextPC), "err", setErr)
-						}
-					} else {
-						slog.Warn("sourceStepOver: NextLinePC found no next line",
-							"file", sob.file, "line", sob.line)
-					}
-				}
-				slog.Debug("sourceStepOver fallback: emitting Stepped")
-				e.setState(stateSuspended)
-				e.emitStepped(stop)
-			case bpResumeStepOut:
-				_, setErr := e.bps.set(e.backend, stepOutReturnFile, 0, e.bpRetAddr)
-				if setErr != nil && !errors.Is(setErr, errBreakpointExists) {
-					e.emitError(protocol.CmdStepOut, fmt.Errorf("StepOut: set return breakpoint: %w", setErr))
-					return
-				}
-				_ = e.backend.ContinueProcess()
-				e.setState(stateRunning)
-				go e.waitLoop()
 			}
 			return
 		}
@@ -721,23 +695,88 @@ func (e *engine) stepOut() error {
 	return nil
 }
 
-// resumeFromBreakpoint runs the step-over-software-BP sequence:
-// restore bytes → single-step → reinstall trap (in StopSingleStep handler)
-// → perform action.
+// resumeFromBreakpoint advances past the software breakpoint the process is
+// stopped on (e.lastBP) and then performs the requested action.
+//
+// For source-level step-over and step-out we know the destination address (the
+// next source line, or the return address), so we plant a one-shot sentinel trap
+// there, remove the origin trap, single-step the trapped thread one instruction
+// off the just-fired origin BRK PC (see stepOffClearedBP — a plain continue from
+// a just-fired-BRK PC intermittently wedges on Darwin/arm64), then let it run to
+// the sentinel with a plain continue. The destination trap is guaranteed to be on
+// the execution path. The origin trap is reinstalled when the sentinel is hit
+// (finishStepOverContinue), which also steps the thread off the sentinel PC.
+//
+// For plain continue and machine-instruction step we have no destination, so we
+// fall back to the classic restore → single-step → reinstall sequence (the
+// StopSingleStep handler reinstalls the trap and performs the action). That path
+// single-steps off the origin directly, so it also never plain-continues from a
+// just-fired-BRK PC.
 func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) error {
 	bp := e.lastBP
 	e.lastBP = nil
+	originTID := e.lastBPTID
 	e.steppingOverBP = bp
 	e.bpResume = action
 	e.bpRetAddr = retAddr
 
+	// Determine a known destination for step-over / step-out and plant the
+	// sentinel there before touching the origin.
+	e.stepDestAddr = 0
+	dest, haveDest := uint64(0), false
+	switch action {
+	case bpResumeSourceStep:
+		if e.dw != nil && bp.file != "" && bp.line > 0 {
+			if nextPC, nextLine, ok := e.dw.NextLinePC(bp.file, bp.line); ok && nextPC != bp.addr {
+				if _, serr := e.bps.set(e.backend, stepOverNextFile, 0, nextPC); serr == nil || errors.Is(serr, errBreakpointExists) {
+					e.stepOverFile = bp.file
+					e.stepOverLine = nextLine
+					dest, haveDest = nextPC, true
+				}
+			}
+		}
+	case bpResumeStepOut:
+		if retAddr != 0 && retAddr != bp.addr {
+			if _, serr := e.bps.set(e.backend, stepOutReturnFile, 0, retAddr); serr == nil || errors.Is(serr, errBreakpointExists) {
+				dest, haveDest = retAddr, true
+			}
+		}
+	}
+
+	// Restore the original instruction at the origin so the thread can execute
+	// it. For the continue path the trap stays off until the sentinel is hit;
+	// for the single-step path it is reinstalled in the StopSingleStep handler.
 	e.bps.removeFromTable(bp)
 	if err := e.backend.WriteMemory(bp.addr, bp.originalBytes); err != nil {
 		e.bps.addToTable(bp)
 		e.steppingOverBP = nil
+		if haveDest {
+			if entry := e.bps.atAddr(dest); entry != nil {
+				_ = e.bps.clear(e.backend, entry.id)
+			}
+		}
 		return fmt.Errorf("resume BP: restore bytes: %w", err)
 	}
 
+	if haveDest {
+		e.stepDestAddr = dest
+		e.stepOffClearedBP(originTID)
+		if err := e.backend.ContinueProcess(); err != nil {
+			_ = e.backend.WriteMemory(bp.addr, archTrapInstruction())
+			e.bps.addToTable(bp)
+			e.steppingOverBP = nil
+			if entry := e.bps.atAddr(dest); entry != nil {
+				_ = e.bps.clear(e.backend, entry.id)
+			}
+			e.stepDestAddr = 0
+			return fmt.Errorf("resume BP: continue to destination: %w", err)
+		}
+		e.setState(stateRunning)
+		go e.waitLoop()
+		return nil
+	}
+
+	// Fallback single-step path (plain continue / instruction step).
 	// Use the TID that hit the breakpoint. On Darwin task_threads returns
 	// threads in creation order, so threads[0] is often an idle Go runtime M.
 	tid := e.lastBPTID
@@ -763,15 +802,123 @@ func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) err
 	return nil
 }
 
-func (e *engine) collectFrames() ([]protocol.Frame, error) {
-	if e.dw == nil {
-		return nil, nil
+// finishStepOverContinue completes a continue-based step-over/step-out: the
+// origin trap was removed and a one-shot sentinel planted at the destination,
+// which has just been hit (and cleared by the caller, restoring the original
+// bytes there). It reinstalls the origin trap, steps the trapped thread off the
+// just-cleared destination PC, and emits Stepped.
+//
+// The step-off is essential: the thread is parked on the PC where the sentinel
+// BRK just fired, and on Darwin/arm64 a plain task continue from a just-fired-BRK
+// PC intermittently wedges (the thread stays in the kernel exception-return path
+// and the next wait4 blocks forever). Single-stepping one instruction off it now
+// — while the process is stopped and no wait loop is active — leaves the thread
+// on a clean PC so the following user Continue/Step resumes reliably. On backends
+// that resume an ex-breakpoint PC fine (Linux) the step-off is a no-op.
+//
+// stepOverFile/stepOverLine are left intact so the next step-over can reuse the
+// remembered destination line (the reported Stepped PC is still the destination;
+// the extra instruction retired by the step-off stays within that source line).
+func (e *engine) finishStepOverContinue(stop StopEvent) {
+	if sob := e.steppingOverBP; sob != nil {
+		e.steppingOverBP = nil
+		if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
+			// Reinstall failed. Suspend instead of resuming — running without
+			// the trap would let the process loose.
+			slog.Error("breakpoint reinstall failed — suspending to prevent runaway process",
+				"addr", fmt.Sprintf("0x%x", sob.addr), "err", rerr)
+			e.stepDestAddr = 0
+			e.lastBP = nil
+			e.setState(stateSuspended)
+			e.emitError(protocol.CmdNone, fmt.Errorf("reinstall breakpoint 0x%x: %w", sob.addr, rerr))
+			return
+		}
+	}
+	e.stepOffClearedBP(stop.TID)
+	e.stepDestAddr = 0
+	e.lastBP = nil
+	e.setState(stateSuspended)
+	e.emitStepped(stop)
+}
+
+// abandonStepOver tears down an in-flight continue-based step-over when a
+// *different* genuine breakpoint is hit before the destination sentinel. It
+// reinstalls the origin trap and clears the leftover sentinel so the reported
+// breakpoint hit leaves consistent state.
+func (e *engine) abandonStepOver() {
+	if sob := e.steppingOverBP; sob != nil {
+		e.steppingOverBP = nil
+		_ = e.bps.reinstall(e.backend, sob)
+	}
+	if e.stepDestAddr != 0 {
+		if entry := e.bps.atAddr(e.stepDestAddr); entry != nil &&
+			(entry.file == stepOverNextFile || entry.file == stepOutReturnFile) {
+			_ = e.bps.clear(e.backend, entry.id)
+		}
+		e.stepDestAddr = 0
+	}
+	e.stepOverFile = ""
+	e.stepOverLine = 0
+}
+
+// stepOffClearedBP advances tid one instruction off the PC where a software
+// breakpoint just fired, before the next resume. It is used both for the origin
+// user breakpoint (in resumeFromBreakpoint, before continuing to the destination
+// sentinel) and for a just-cleared internal sentinel (in finishStepOverContinue,
+// before handing control back for the next user resume). On Darwin/arm64 a thread
+// parked on a just-fired-BRK PC cannot be reliably resumed by a plain task
+// continue — it must be single-stepped off first. Backends that don't need it —
+// Linux, where PTRACE_CONT resumes an ex-breakpoint PC fine — don't implement
+// StepOffBreakpoint and this is a no-op. Runs synchronously while the process is
+// stopped and no wait loop is active.
+func (e *engine) stepOffClearedBP(tid int) {
+	if tid == 0 {
+		return
+	}
+	if so, ok := e.backend.(interface{ StepOffBreakpoint(tid int) error }); ok {
+		if err := so.StepOffBreakpoint(tid); err != nil {
+			slog.Warn("step off cleared breakpoint failed", "tid", tid, "err", err)
+		}
+	}
+}
+
+// inspectionTID resolves the thread whose state should be inspected while the
+// process is suspended. Prefer the explicitly-provided trapped thread (tid);
+// fall back to the last thread known to have stopped (lastBPTID), then to
+// threads[0].
+//
+// Using the trapped thread is essential on Darwin/arm64: task_threads returns
+// threads in creation order, so threads[0] is frequently an idle Go runtime M
+// (or, under churn, a thread mid-create/teardown) whose transient stack yields a
+// garbage frame-pointer chain. Walking that garbage produces dozens of bogus
+// return addresses, and resolving each one drives DWARF into a full linear scan
+// of .debug_info — up to maxStackDepth such scans back-to-back, which wedges the
+// engine loop for many seconds and makes the caller's waitFor time out. The
+// thread that actually hit the breakpoint/step has a valid chain that terminates
+// at the top of its goroutine stack, so its walk is short and every PC resolves.
+func (e *engine) inspectionTID(tid int) int {
+	if tid != 0 {
+		return tid
+	}
+	if e.lastBPTID != 0 {
+		return e.lastBPTID
 	}
 	threads, err := e.backend.Threads()
 	if err != nil || len(threads) == 0 {
+		return 0
+	}
+	return threads[0]
+}
+
+func (e *engine) collectFrames(tid int) ([]protocol.Frame, error) {
+	if e.dw == nil {
+		return nil, nil
+	}
+	tid = e.inspectionTID(tid)
+	if tid == 0 {
 		return nil, fmt.Errorf("StackFrames: no threads")
 	}
-	regs, err := e.backend.GetRegisters(threads[0])
+	regs, err := e.backend.GetRegisters(tid)
 	if err != nil {
 		return nil, fmt.Errorf("StackFrames: %w", err)
 	}
@@ -790,18 +937,27 @@ func (e *engine) walkStack(regs Registers) []uint64 {
 		if retAddr == 0 {
 			break
 		}
+		nextBP := binary.LittleEndian.Uint64(frame[:8])
 		pcs = append(pcs, retAddr)
-		bp = binary.LittleEndian.Uint64(frame[:8])
+		// Saved frame pointers must climb monotonically toward the top of the
+		// stack (higher addresses). If the chain stalls or moves backward we've
+		// wandered off real frames onto a transient/garbage stack — stop rather
+		// than emit up to maxStackDepth bogus PCs, each of which would trigger a
+		// full-DWARF scan and stall the engine loop.
+		if nextBP <= bp {
+			break
+		}
+		bp = nextBP
 	}
 	return pcs
 }
 
-func (e *engine) readGoroutines() ([]protocol.Goroutine, error) {
-	threads, err := e.backend.Threads()
-	if err != nil || len(threads) == 0 {
+func (e *engine) readGoroutines(tid int) ([]protocol.Goroutine, error) {
+	tid = e.inspectionTID(tid)
+	if tid == 0 {
 		return nil, nil
 	}
-	regs, err := e.backend.GetRegisters(threads[0])
+	regs, err := e.backend.GetRegisters(tid)
 	if err != nil {
 		return nil, fmt.Errorf("Goroutines: %w", err)
 	}
@@ -850,8 +1006,8 @@ func (e *engine) emit(kind protocol.EventKind, payload any) {
 }
 
 func (e *engine) emitBreakpointHit(bp *breakpointEntry, stop StopEvent) {
-	frames, _ := e.collectFrames()
-	goroutines, _ := e.readGoroutines()
+	frames, _ := e.collectFrames(stop.TID)
+	goroutines, _ := e.readGoroutines(stop.TID)
 	var g protocol.Goroutine
 	if len(goroutines) > 0 {
 		g = goroutines[0]
@@ -878,8 +1034,8 @@ func (e *engine) emitStoppedAtCurrentPC() {
 }
 
 func (e *engine) emitStepped(stop StopEvent) {
-	frames, _ := e.collectFrames()
-	goroutines, _ := e.readGoroutines()
+	frames, _ := e.collectFrames(stop.TID)
+	goroutines, _ := e.readGoroutines(stop.TID)
 	var g protocol.Goroutine
 	if len(goroutines) > 0 {
 		g = goroutines[0]
