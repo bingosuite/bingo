@@ -51,6 +51,14 @@ type darwinBackend struct {
 	taskPort C.mach_port_t
 	taskOK   bool
 
+	// One retained send-right per live tracee thread, keyed by Mach port name.
+	// task_threads hands out a fresh send-right per thread on every call; we
+	// keep exactly one and deallocate the rest (and the rights of threads that
+	// have exited) so the debugger doesn't leak ports under thread churn and so
+	// a given thread keeps a stable port name across enumerations.
+	threadMu    sync.Mutex
+	threadPorts map[C.mach_port_t]struct{}
+
 	// Atomic step-over-breakpoint bookkeeping.
 	//
 	// suspended and the suspend/resume of held threads are touched ONLY from the
@@ -652,16 +660,41 @@ func (b *darwinBackend) Threads() ([]int, error) {
 	if kr != C.KERN_SUCCESS {
 		return nil, fmt.Errorf("task_threads pid %d: %s", b.pid, machErrString(kr))
 	}
-	defer C.vm_deallocate(
+	ports := unsafe.Slice((*C.mach_port_t)(unsafe.Pointer(threads)), int(count))
+
+	// task_threads inserts a fresh send-right per thread on every call. Retain
+	// exactly one right per live thread; deallocate the duplicate rights this
+	// call produced and the rights of threads that have since exited. Without
+	// this the debugger leaks one send-right per thread per enumeration, and
+	// Threads() runs on nearly every step/suspend/register operation.
+	b.threadMu.Lock()
+	if b.threadPorts == nil {
+		b.threadPorts = make(map[C.mach_port_t]struct{})
+	}
+	seen := make(map[C.mach_port_t]struct{}, len(ports))
+	tids := make([]int, len(ports))
+	for i, p := range ports {
+		seen[p] = struct{}{}
+		if _, ok := b.threadPorts[p]; ok {
+			C.bingo_port_deallocate(p)
+		} else {
+			b.threadPorts[p] = struct{}{}
+		}
+		tids[i] = int(p)
+	}
+	for p := range b.threadPorts {
+		if _, ok := seen[p]; !ok {
+			C.bingo_port_deallocate(p)
+			delete(b.threadPorts, p)
+		}
+	}
+	b.threadMu.Unlock()
+
+	C.vm_deallocate(
 		C.mach_task_self_,
 		C.vm_address_t(uintptr(unsafe.Pointer(threads))),
 		C.vm_size_t(uintptr(count)*unsafe.Sizeof(C.mach_port_t(0))),
 	)
-	ports := unsafe.Slice((*C.mach_port_t)(unsafe.Pointer(threads)), int(count))
-	tids := make([]int, len(ports))
-	for i, p := range ports {
-		tids[i] = int(p)
-	}
 	return tids, nil
 }
 
@@ -882,7 +915,9 @@ func (b *darwinBackend) dumpThreads(task C.mach_port_t, label string) (map[int]u
 	for i, p := range ports {
 		var rs, tsc C.int
 		var pc C.uint64_t
-		if kr := C.bingo_thread_probe(p, &rs, &tsc, &pc); kr != C.KERN_SUCCESS {
+		kr := C.bingo_thread_probe(p, &rs, &tsc, &pc)
+		C.bingo_port_deallocate(p) // release this call's send-right; retained set lives in threadPorts
+		if kr != C.KERN_SUCCESS {
 			fmt.Fprintf(os.Stderr, "[suspendprobe]   %s th[%d] port=%d probe err: %s\n",
 				label, i, int(p), machErrString(kr))
 			continue
