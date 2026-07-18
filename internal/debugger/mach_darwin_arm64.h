@@ -168,13 +168,20 @@ static inline kern_return_t bingo_find_macho_load_addr(
 }
 
 // bingo_thread_list enumerates all threads in task.
-// The caller must vm_deallocate the returned threads array.
+// The caller must vm_deallocate the returned threads array and
+// mach_port_deallocate every returned thread port (each is a send right).
 static inline kern_return_t bingo_thread_list(
     mach_port_t task,
     thread_act_port_array_t *threads_out,
     mach_msg_type_number_t *count_out)
 {
     return task_threads(task, threads_out, count_out);
+}
+
+// bingo_port_deallocate releases one user reference to a Mach port name in our
+// own IPC space (used to release thread send-rights returned by task_threads).
+static inline kern_return_t bingo_port_deallocate(mach_port_t port) {
+    return mach_port_deallocate(mach_task_self(), port);
 }
 
 // bingo_thread_suspend / bingo_thread_resume adjust one thread's Mach suspend
