@@ -251,8 +251,17 @@ engine advances PC by `len(archTrapInstruction())` and resumes. See the
 - ptrace stops are per-thread. The backend records the last stopped TID and
   targets `ContinueProcess` / memory reads / memory writes at that TID, not
   blindly at the process PID. Non-main thread exits are absorbed inside `Wait`.
+- Single-step vs breakpoint disambiguation uses **both** `stepping` and
+  `stepTID` (the exact TID `SingleStep` was issued against). Only a `cause==0`
+  SIGTRAP on `stepTID` is the step's completion; the same stop on any other
+  thread is that thread hitting an INT3 and is reported as a breakpoint. This
+  matters because `Wait4(-1, …)` can return a sibling thread's concurrent
+  breakpoint (or SIGURG) while a step is in flight — keying off `stepping`
+  alone would misclassify it and corrupt the engine's step-over state machine.
 - `g` pointer for goroutine inspection lives at `FS_BASE` on amd64.
-- `SIGURG` re-delivery is mandatory here too.
+- `SIGURG` re-delivery is mandatory here too — but only the `stepTID` thread is
+  re-single-stepped on SIGURG; a SIGURG on any other thread is re-delivered and
+  that thread continued.
 
 ## DWARF reader notes
 
