@@ -92,6 +92,7 @@ type tracerExecer interface {
 type linuxBackend struct {
 	pid         int
 	stepping    bool // true after SingleStep; classifies the next SIGTRAP
+	stepTID     int  // the exact thread SingleStep was issued against
 	lastStopTID int
 	tracer      *tracerThread
 }
@@ -205,6 +206,7 @@ func isAlreadyExited(err error) bool {
 
 func (b *linuxBackend) ContinueProcess() error {
 	b.stepping = false
+	b.stepTID = 0
 	tid := b.traceTID()
 	var err error
 	b.execPtrace(func() { err = syscall.PtraceCont(tid, 0) })
@@ -216,6 +218,7 @@ func (b *linuxBackend) ContinueProcess() error {
 
 func (b *linuxBackend) SingleStep(tid int) error {
 	b.stepping = true
+	b.stepTID = tid
 	var err error
 	b.execPtrace(func() { err = syscall.PtraceSingleStep(tid) })
 	if err != nil {
@@ -319,9 +322,11 @@ func (b *linuxBackend) Threads() ([]int, error) {
 }
 
 // Wait blocks until the tracee produces a meaningful debug stop. Single-step
-// vs breakpoint disambiguation uses b.stepping (reliable because ptrace is
-// serialised). PTRACE_EVENT stops (clone/exec/exit) are handled internally
-// and don't surface to the engine.
+// vs breakpoint disambiguation uses b.stepping AND b.stepTID: only a cause==0
+// SIGTRAP on the exact thread we stepped is the step's completion; the same
+// stop on any other thread is that thread hitting a software breakpoint.
+// PTRACE_EVENT stops (clone/exec/exit) are handled internally and don't
+// surface to the engine.
 //
 // wait4 runs on the calling (waitLoop) thread, NOT the tracer thread: waiting
 // for a tracee is legal from any thread of the tracer process, and keeping it
@@ -398,8 +403,15 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			case 0:
 				b.recordStop(tid)
 
-				if b.stepping {
+				// Only the exact thread we single-stepped produces a
+				// single-step SIGTRAP. A cause==0 SIGTRAP on any OTHER thread
+				// while a step is in flight is that thread hitting a software
+				// breakpoint (INT3), not the step completing — classify it as a
+				// breakpoint so the engine's step-over state machine isn't fed a
+				// bogus StopSingleStep for the wrong thread.
+				if b.stepping && tid == b.stepTID {
 					b.stepping = false
+					b.stepTID = 0
 					return StopEvent{Reason: StopSingleStep, TID: tid}, nil
 				}
 
@@ -433,7 +445,10 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		// SIGURG is Go's goroutine-preemption signal; it must be re-delivered
 		// transparently during both step and continue or scheduling breaks.
 		if sig == syscall.SIGURG {
-			if b.stepping {
+			// Re-issue the single-step only for the thread actually being
+			// stepped; a SIGURG on any other thread must be re-delivered and
+			// the thread continued, never single-stepped.
+			if b.stepping && tid == b.stepTID {
 				if err := b.singleStepIfTraceeExists(tid); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_SINGLESTEP after SIGURG tid %d: %w", tid, err)
 				}
