@@ -129,6 +129,20 @@ func main() {
 				printErr(err)
 			}
 
+		case "restart":
+			p, err := c.Restart(nil, nil)
+			if err != nil {
+				printErr(err)
+				continue
+			}
+			fmt.Printf("  restarted %s\n", p.Program)
+			for _, bp := range p.Breakpoints {
+				fmt.Printf("  breakpoint %d reinstalled at %s:%d\n", bp.ID, bp.Location.File, bp.Location.Line)
+			}
+			for _, d := range p.Discarded {
+				fmt.Printf("  breakpoint at %s:%d discarded: %s\n", d.Location.File, d.Location.Line, d.Reason)
+			}
+
 		case "c", "continue":
 			if err := c.Continue(); err != nil {
 				printErr(err)
@@ -291,6 +305,13 @@ func eventPrinter(events <-chan protocol.Event) {
 				fmt.Printf("\n  [error] %s: %s\nbingo> ", p.Command, p.Message)
 			}
 
+		case protocol.EventRestarted:
+			var p protocol.RestartedPayload
+			if protocol.DecodeEventPayload(evt, &p) == nil {
+				fmt.Printf("\n  [restarted] %s (%d breakpoint(s), %d discarded)\nbingo> ",
+					p.Program, len(p.Breakpoints), len(p.Discarded))
+			}
+
 		default:
 			fmt.Printf("\n  [%s] seq=%d\nbingo> ", evt.Kind, evt.Seq)
 		}
@@ -321,6 +342,7 @@ func printHelp() {
   launch <binary> [args...]  start a process under the debugger
   attach <pid> [binary]      attach to a running process  (find pid: pgrep <name>)
   kill                       terminate the debuggee
+  restart                    kill and relaunch, reinstalling breakpoints
 
   c / continue               resume execution
   n / next                   step over
