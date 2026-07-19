@@ -199,6 +199,22 @@ func main() {
 }
 `
 
+// exitCodeTargetSrc exits with a fixed, distinctive non-zero status the instant
+// it is resumed — no breakpoints, no threads to manage. It pins the exit-status
+// reporting path: EventProcessExited must carry the tracee's real code, not a
+// hardcoded 0. Regression guard for the linux backend dropping the
+// PTRACE_EVENT_EXIT status (issue #94); darwin already reported ws.ExitStatus().
+const exitCodeTargetExpected = 42
+
+const exitCodeTargetSrc = `package main
+
+import "os"
+
+func main() {
+	os.Exit(42)
+}
+`
+
 // declareBasicStepOverSpec adds the continue+step-over acceptance spec to the
 // enclosing Ginkgo container. It is the correctness gate: set a breakpoint on a
 // line that calls a function, repeatedly Continue to it and StepOver the call,
@@ -561,6 +577,29 @@ func assertTerminated(ch <-chan protocol.Event, timeout time.Duration) {
 			Fail(fmt.Sprintf("TIMEOUT after %s: Kill did not terminate the running tracee", timeout))
 		}
 	}
+}
+
+// declareExitCodeSpec adds the process-exit-status spec. It launches a target
+// that exits with a fixed non-zero code the moment it is resumed and asserts the
+// EventProcessExited payload carries that exact code. On linux this is the
+// regression guard for the backend dropping the PTRACE_EVENT_EXIT status and
+// reporting a hardcoded 0 (issue #94); on darwin it pins the ws.ExitStatus()
+// path. Runs on both containers so the two backends stay in agreement.
+func declareExitCodeSpec() {
+	It("reports the tracee's real exit code", Label("exit"), func() {
+		bin := buildTarget("exit_target", exitCodeTargetSrc)
+
+		h := newE2EHarness(bin)
+		h.waitFor(15*time.Second, protocol.EventStepped) // initial launch stop
+
+		Expect(h.d.Continue()).To(Succeed(), "Continue so the tracee runs to os.Exit")
+
+		evt := h.waitFor(15*time.Second, protocol.EventProcessExited)
+		var payload protocol.ProcessExitedPayload
+		Expect(json.Unmarshal(evt.Payload, &payload)).To(Succeed(), "decode ProcessExited")
+		Expect(payload.ExitCode).To(Equal(exitCodeTargetExpected),
+			"EventProcessExited must carry the tracee's real exit code, not a hardcoded 0")
+	})
 }
 
 // bpLine decodes a BreakpointHit event and returns its resolved line.
