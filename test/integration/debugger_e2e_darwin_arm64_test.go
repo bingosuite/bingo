@@ -11,4 +11,5 @@ import . "github.com/onsi/ginkgo/v2"
 var _ = Describe("Darwin arm64 debugger backend (ptrace+Mach) E2E", Label("darwin"), func() {
 	declareBasicStepOverSpec()
 	declareChurnSpec()
+	declareFullStackSpec()
 })
