@@ -33,7 +33,7 @@ Other GOOS/GOARCH combos fail with `undefined: newBackend`.
 | [internal/server](internal/server/) | HTTP/WebSocket entry. `Server`, `sessionStore`, `/api/sessions` and `/ws` handlers. |
 | [internal/hub](internal/hub/) | Per-session bridge between connected clients and one `Debugger`. |
 | [internal/debugger](internal/debugger/) | The actual debugger. Engine + per-platform Backend. |
-| [test/integration](test/integration/) | Ginkgo integration suite (currently a skeleton). |
+| [test/integration](test/integration/) | Ginkgo suite. Placeholder specs + the platform-split debugger E2E acceptance tests (`e2e` build tag). |
 
 ## Architecture in one diagram
 
@@ -301,7 +301,16 @@ they'd see two overlapping monotonic sequences and couldn't detect drops.
   The fake conn uses a 256-deep `incoming` buffer so `WriteMessage` never
   blocks the hub event loop.
 - `internal/server`: `httptest.Server` + real gorilla websocket client.
-- `test/integration`: skeleton (placeholder Ginkgo suite).
+- `test/integration`: Ginkgo suite. A trivial placeholder spec runs by default;
+  the real content is the **debugger E2E acceptance tests** — Ginkgo specs gated
+  behind the `e2e` build tag that launch a real target and drive the ACTUAL
+  native backend (ptrace on linux/amd64, ptrace+Mach on darwin/arm64), NOT the
+  `fakeBackend`. These need a real kernel, so they only run on native runners
+  (they can't run under emulation or with fakes). Split into:
+  `debugger_e2e_common_test.go` (harness + target sources + shared spec bodies),
+  `debugger_e2e_linux_amd64_test.go`, `debugger_e2e_darwin_arm64_test.go`. Two
+  Ginkgo labels: `basic` (continue+step-over correctness) and `churn`
+  (multi-thread robustness). CI: [.github/workflows/debugger-e2e.yml](.github/workflows/debugger-e2e.yml).
 
 Build/test commands:
 
@@ -309,9 +318,11 @@ Build/test commands:
 just build [linux amd64 | darwin arm64]   # produces ./build/bingo/...
 just test [PKG]                            # go test -v
 just coverage [PKG]                        # writes test/coverage.out
-just integration                           # ginkgo -r ./test/integration
-go test -tags linuxptrace ./test/integration -run TestLinuxAMD64DebuggerLaunchBreakpointSmoke
-                                           # CI-only native linux/amd64 ptrace smoke test
+just integration                           # ginkgo -r ./test/integration (no e2e tag)
+just e2e-linux                             # native linux/amd64 ptrace E2E (basic + churn)
+just e2e-darwin                            # native darwin/arm64 ptrace+Mach E2E (codesigned)
+# Filter to one label, e.g. only the correctness gate:
+go test -tags e2e -race -ginkgo.label-filter=basic ./test/integration
 ```
 
 On macOS, `go test ./...` without `-tags bingonative` will fail with
