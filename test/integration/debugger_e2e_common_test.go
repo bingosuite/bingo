@@ -157,29 +157,7 @@ func declareBasicStepOverSpec() {
 		Expect(bp.Location.Line).To(Equal(line), "breakpoint resolved to the requested line")
 
 		iters := envInt("BINGO_E2E_ITERS", 25)
-		for i := 0; i < iters; i++ {
-			Expect(h.d.Continue()).To(Succeed(), "Continue #%d", i)
-			evt := h.waitFor(15*time.Second,
-				protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
-			Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit),
-				"Continue #%d expected BreakpointHit, got %s: %s", i, evt.Kind, evt.Payload)
-
-			var hit protocol.BreakpointHitPayload
-			Expect(json.Unmarshal(evt.Payload, &hit)).To(Succeed(), "decode BreakpointHit #%d", i)
-			Expect(hit.Breakpoint.Location.Line).To(Equal(line), "BreakpointHit #%d at BP line", i)
-
-			// Step over the call on the BP line — the most fragile sequence
-			// (restore original byte -> single-step -> reinstall trap -> resume).
-			Expect(h.d.StepOver()).To(Succeed(), "StepOver #%d", i)
-			evt = h.waitFor(15*time.Second,
-				protocol.EventStepped, protocol.EventProcessExited, protocol.EventError)
-			Expect(evt.Kind).To(Equal(protocol.EventStepped),
-				"StepOver #%d expected Stepped, got %s: %s", i, evt.Kind, evt.Payload)
-
-			var st protocol.SteppedPayload
-			Expect(json.Unmarshal(evt.Payload, &st)).To(Succeed(), "decode Stepped #%d", i)
-			Expect(st.Location.Line).NotTo(Equal(line), "StepOver #%d advanced past the BP line", i)
-		}
+		assertContinueStepOver(h.d, line, iters)
 		AddReportEntry("basic-iterations", iters)
 	})
 }
@@ -216,6 +194,48 @@ func declareChurnSpec() {
 		}
 		AddReportEntry("churn-iterations", iters)
 	})
+}
+
+// --- shared acceptance loop ---
+
+// stepDriver is the subset of debugger.Debugger and client.Client that the
+// continue+step-over acceptance loop needs. Sharing it lets the in-process
+// (basic) spec and the full-stack (over-the-WebSocket) spec assert against one
+// implementation — they differ only in whether commands cross the transport.
+type stepDriver interface {
+	Continue() error
+	StepOver() error
+	Events() <-chan protocol.Event
+}
+
+// assertContinueStepOver runs the core correctness loop `iters` times: Continue
+// to the breakpoint on `line`, confirm the hit, StepOver the call on that line
+// (the most fragile sequence — restore original byte -> single-step -> reinstall
+// trap -> resume), and confirm the step advanced past `line`. Never hangs
+// (waitFor fails on timeout), errors, or exits early.
+func assertContinueStepOver(d stepDriver, line, iters int) {
+	GinkgoHelper()
+	for i := 0; i < iters; i++ {
+		Expect(d.Continue()).To(Succeed(), "Continue #%d", i)
+		evt := awaitEvent(d.Events(), 20*time.Second,
+			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit),
+			"Continue #%d expected BreakpointHit, got %s: %s", i, evt.Kind, evt.Payload)
+
+		var hit protocol.BreakpointHitPayload
+		Expect(json.Unmarshal(evt.Payload, &hit)).To(Succeed(), "decode BreakpointHit #%d", i)
+		Expect(hit.Breakpoint.Location.Line).To(Equal(line), "BreakpointHit #%d at BP line", i)
+
+		Expect(d.StepOver()).To(Succeed(), "StepOver #%d", i)
+		evt = awaitEvent(d.Events(), 20*time.Second,
+			protocol.EventStepped, protocol.EventProcessExited, protocol.EventError)
+		Expect(evt.Kind).To(Equal(protocol.EventStepped),
+			"StepOver #%d expected Stepped, got %s: %s", i, evt.Kind, evt.Payload)
+
+		var st protocol.SteppedPayload
+		Expect(json.Unmarshal(evt.Payload, &st)).To(Succeed(), "decode Stepped #%d", i)
+		Expect(st.Location.Line).NotTo(Equal(line), "StepOver #%d advanced past the BP line", i)
+	}
 }
 
 // --- harness ---
