@@ -227,12 +227,28 @@ func (b *linuxBackend) SingleStep(tid int) error {
 	return nil
 }
 
+// StopProcess sends a whole-thread-group SIGSTOP, mirroring Delve's
+// requestManualStop-adjacent halt primitive (pkg/proc/native/proc_linux.go
+// sends a process-wide signal rather than per-thread, since a ptrace-stopped
+// tracee still delivers signals to the group). This is Pause groundwork
+// only: it does not implement Delve's trapWaitInternal halt-flag state
+// machine that distinguishes a manual stop from a spontaneous trap, so no
+// Pause command is wired to it yet — see AGENTS.md.
+//
+// syscall.Kill is used directly instead of os.FindProcess(pid).Signal:
+// os.FindProcess never fails to find a process on Unix (it just wraps the
+// pid), so the previous os.FindProcess/Signal pair was never distinguishing
+// "no such process" from any other error. ESRCH (process already gone) is
+// treated as an idempotent no-op, matching engine.Kill's idempotency
+// convention elsewhere in this package.
 func (b *linuxBackend) StopProcess() error {
-	p, err := os.FindProcess(b.pid)
-	if err != nil {
-		return err
+	if b.pid == 0 {
+		return fmt.Errorf("StopProcess: no process")
 	}
-	return p.Signal(syscall.SIGSTOP)
+	if err := syscall.Kill(b.pid, syscall.SIGSTOP); err != nil && err != syscall.ESRCH {
+		return fmt.Errorf("StopProcess: %w", err)
+	}
+	return nil
 }
 
 func (b *linuxBackend) ReadMemory(addr uint64, dst []byte) error {
