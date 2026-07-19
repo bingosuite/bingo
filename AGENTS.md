@@ -337,8 +337,15 @@ they'd see two overlapping monotonic sequences and couldn't detect drops.
   `test/integration/*_darwin_*_test.go`, and `entitlements.plist`. The "Darwin
   E2E verified" check fails until the label is present; it re-runs on
   `labeled`/`unlabeled` so adding the label flips it green without a new push,
-  and is a green no-op for PRs that don't touch those paths. Mark it a required
-  status check in branch protection to actually block merges.
+  and is a green no-op for PRs that don't touch those paths. On `synchronize`
+  (new commits pushed) the workflow removes the `darwin-e2e-verified` label
+  itself before evaluating the gate — a verification only covers the commits
+  it was run against, so it must not silently carry forward onto new,
+  unverified commits — then re-checks the label live via `gh pr view` rather
+  than the stale `github.event.pull_request.labels` payload, since that
+  payload predates the removal. This needs `pull-requests: write` permission
+  (not just `read`). Mark it a required status check in branch protection to
+  actually block merges.
 
 Build/test commands:
 
