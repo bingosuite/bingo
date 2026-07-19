@@ -18,7 +18,11 @@ Built and tested only on:
   `com.apple.security.cs.debugger` entitlement (or SIP off)
 - `linux/amd64`
 
-Other GOOS/GOARCH combos fail with `undefined: newBackend`.
+Other GOOS/GOARCH combos (and darwin/arm64 without `-tags bingonative`) build
+fine via the fallback backend in
+[backend_unsupported.go](internal/debugger/backend_unsupported.go), but panic
+with a clear "unsupported platform" message the moment `debugger.New()` is
+called.
 
 ## Layout
 
@@ -356,9 +360,10 @@ go test -tags e2e -race ./test/integration -ginkgo.label-filter=basic
 go test -tags e2e -race ./test/integration -ginkgo.label-filter=fullstack
 ```
 
-On macOS, `go test ./...` without `-tags bingonative` will fail with
-`undefined: newBackend`. Always use `go test -tags bingonative ./...` or run
-through the justfile.
+On macOS, `go test ./...` without `-tags bingonative` now compiles and passes
+(unit tests use `fakeBackend`, not the real Mach backend), but to exercise the
+actual darwin backend — and for the E2E suite — always use
+`go test -tags bingonative ./...` or run through the justfile.
 
 ## Things that look weird but are intentional
 
@@ -382,8 +387,10 @@ through the justfile.
   `resumingCommands` in [hub.go](internal/hub/hub.go), and the matching
   hub_test cases.
 - **New OS or arch**: add a new `backend_<goos>_<goarch>.go` and a matching
-  `trap_<goarch>.go` if the trap differs. Update [README.md](README.md) and
-  the build matrix in [.github/workflows/](.github/workflows/) and
-  [justfile](justfile).
+  `trap_<goarch>.go` if the trap differs. Update
+  [backend_unsupported.go](internal/debugger/backend_unsupported.go)'s
+  `//go:build` constraint to exclude the newly-supported combo. Update
+  [README.md](README.md) and the build matrix in
+  [.github/workflows/](.github/workflows/) and [justfile](justfile).
 - **AGENTS.md drift**: if you introduce a new invariant or change one of the
   ones documented above, update this file in the same commit.

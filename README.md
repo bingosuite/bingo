@@ -31,7 +31,7 @@ BinGo is currently built and tested on:
 - `darwin/arm64` (Apple Silicon) — build with `-tags bingonative`
 - `linux/amd64`
 
-Builds on other GOOS/GOARCH combinations will fail with `undefined: newBackend` and similar errors from the [internal/debugger](internal/debugger/) package.
+Other GOOS/GOARCH combinations (and darwin/arm64 built without `-tags bingonative`) build successfully but panic with a clear "unsupported platform" message from [internal/debugger](internal/debugger/) as soon as a debug session is started.
 
 ## Documentation
 
