@@ -304,6 +304,16 @@ func (c *wsClient) StepOut() error {
 	return c.send(cmd)
 }
 
+// Pause is fire-and-forget like Continue: it sends CmdPause and returns. The
+// resulting halt arrives asynchronously as EventPaused on Events().
+func (c *wsClient) Pause() error {
+	cmd, err := newCommand(protocol.CmdPause, struct{}{})
+	if err != nil {
+		return err
+	}
+	return c.send(cmd)
+}
+
 func (c *wsClient) SetBreakpoint(file string, line int) (protocol.Breakpoint, error) {
 	cmd, err := newCommand(protocol.CmdSetBreakpoint, protocol.SetBreakpointPayload{
 		File: file, Line: line,

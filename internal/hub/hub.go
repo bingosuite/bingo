@@ -17,14 +17,19 @@ import (
 )
 
 // suspendingEvents pause the hub and require a resuming command before the
-// process is allowed to continue.
+// process is allowed to continue. EventPaused is included: a Pause request
+// halts the tracee and suspends it exactly like a breakpoint hit, just
+// asynchronously on demand rather than as a self-stop.
 var suspendingEvents = map[protocol.EventKind]bool{
 	protocol.EventBreakpointHit: true,
 	protocol.EventPanic:         true,
 	protocol.EventStepped:       true,
+	protocol.EventPaused:        true,
 }
 
-// resumingCommands unblock a suspended hub.
+// resumingCommands unblock a suspended hub. CmdPause is deliberately NOT here:
+// it is issued while the process is RUNNING (not suspended) and is routed via
+// cmdCh, so it must not be treated as a resume — see AGENTS.md → Pause.
 var resumingCommands = map[protocol.CommandKind]bool{
 	protocol.CmdContinue: true,
 	protocol.CmdStepOver: true,
@@ -218,7 +223,7 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 	h.broadcast(evt)
 
 	switch evt.Kind {
-	case protocol.EventBreakpointHit, protocol.EventPanic, protocol.EventStepped:
+	case protocol.EventBreakpointHit, protocol.EventPanic, protocol.EventStepped, protocol.EventPaused:
 		h.transitionState(protocol.StateSuspended)
 	case protocol.EventProcessExited:
 		h.transitionState(protocol.StateExited)

@@ -196,6 +196,39 @@ func declareChurnSpec() {
 	})
 }
 
+// declarePauseSpec adds the async-interrupt (Pause) acceptance spec. It is the
+// authoritative gate for Pause on the real backend: while the tracee runs, fire
+// Pause, assert EventPaused surfaces, then resume and repeat. Running the
+// Continue→Pause→Paused round-trip several times is the resume-after-pause
+// proof — if the first resume hung or corrupted the tracee (e.g. a SIGSTOP that
+// couldn't be cleanly discarded), the next Pause's signal would never surface
+// and waitFor would time out.
+func declarePauseSpec() {
+	It("interrupts a running process on demand and resumes, repeatedly", Label("pause"), func() {
+		bin := buildTarget("pause_target", basicTargetSrc)
+
+		h := newE2EHarness(bin)
+		h.waitFor(15*time.Second, protocol.EventStepped) // initial launch stop
+
+		iters := envInt("BINGO_E2E_PAUSE_ITERS", 3)
+		for i := 0; i < iters; i++ {
+			Expect(h.d.Continue()).To(Succeed(), "Continue #%d", i)
+
+			// Give the tracee a moment to actually be running before the async
+			// interrupt, so Pause exercises the running→suspended path rather
+			// than racing the resume.
+			time.Sleep(20 * time.Millisecond)
+
+			Expect(h.d.Pause()).To(Succeed(), "Pause #%d", i)
+			evt := h.waitFor(15*time.Second,
+				protocol.EventPaused, protocol.EventProcessExited, protocol.EventError)
+			Expect(evt.Kind).To(Equal(protocol.EventPaused),
+				"Pause #%d expected Paused, got %s: %s", i, evt.Kind, evt.Payload)
+		}
+		AddReportEntry("pause-iterations", iters)
+	})
+}
+
 // --- shared acceptance loop ---
 
 // stepDriver is the subset of debugger.Debugger and client.Client that the

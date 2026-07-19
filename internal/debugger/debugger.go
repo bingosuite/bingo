@@ -15,6 +15,7 @@ var (
 	ErrNotSuspended   = errors.New("debugger: process is not suspended")
 	ErrAlreadyRunning = errors.New("debugger: process already running")
 	ErrNoProcess      = errors.New("debugger: no process")
+	ErrNotRunning     = errors.New("debugger: process is not running")
 )
 
 // Debugger is the interface consumed by the hub. All methods are goroutine-safe.
@@ -38,6 +39,12 @@ type Debugger interface {
 	StepOver() error
 	StepInto() error
 	StepOut() error
+
+	// Pause asynchronously interrupts a running tracee, forcing it to suspend.
+	// It returns ErrNotRunning if the process is not currently running. The
+	// suspend itself is reported asynchronously via EventPaused, so a nil
+	// return only means the interrupt was requested (fire-and-forget).
+	Pause() error
 
 	// Locals: frame 0 is innermost.
 	Locals(frameIndex int) ([]protocol.Variable, error)

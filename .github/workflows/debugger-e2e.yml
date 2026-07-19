@@ -7,8 +7,9 @@ name: Debugger E2E
 # actual OS backend, so they need a real kernel and run on native GitHub-hosted
 # runners. Gated behind the `e2e` build tag; the Ginkgo suite lives in
 # ./test/integration and is split via Ginkgo labels into `basic` (correctness),
-# `churn` (multi-thread robustness), and `fullstack` (the same operations driven
-# through the whole client → WebSocket → hub → debugger stack).
+# `churn` (multi-thread robustness), `pause` (async interrupt / manual stop), and
+# `fullstack` (the same operations driven through the whole client → WebSocket →
+# hub → debugger stack).
 #
 # The linux jobs run fully on hosted runners. The darwin jobs compile and
 # codesign the E2E binary on hosted macOS runners (the only CI coverage that the
@@ -50,6 +51,9 @@ jobs:
 
       - name: E2E churn (multi-thread robustness)
         run: go test -tags e2e -race -count=1 -v -timeout 600s ./test/integration -ginkgo.label-filter=churn
+
+      - name: E2E pause (async interrupt)
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=pause
 
   darwin-arm64:
     name: Darwin arm64 (ptrace + Mach)

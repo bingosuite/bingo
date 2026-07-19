@@ -163,6 +163,11 @@ func main() {
 				printErr(err)
 			}
 
+		case "p", "pause":
+			if err := c.Pause(); err != nil {
+				printErr(err)
+			}
+
 		case "b", "break":
 			if len(args) < 2 {
 				fmt.Println("  usage: break <file>:<line>")
@@ -296,6 +301,13 @@ func eventPrinter(events <-chan protocol.Event) {
 					p.Location.File, p.Location.Line, p.Location.Function)
 			}
 
+		case protocol.EventPaused:
+			var p protocol.PausedPayload
+			if protocol.DecodeEventPayload(evt, &p) == nil {
+				fmt.Printf("\n  [paused] %s:%d in %s\nbingo> ",
+					p.Location.File, p.Location.Line, p.Location.Function)
+			}
+
 		case protocol.EventContinued:
 			fmt.Print("\n  [continued]\nbingo> ")
 
@@ -348,6 +360,7 @@ func printHelp() {
   n / next                   step over
   s / step                   step into
   out / finish               step out (run until function returns)
+  p / pause                  interrupt a running process and suspend it
 
   b / break <file>:<line>    set breakpoint  (e.g. break main.go:42)
   clear <id>                 remove breakpoint by ID
