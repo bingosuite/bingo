@@ -5,6 +5,12 @@ for agents — terse, link-heavy, biased toward "what you must know to not break
 things." Keep this file up to date when touching architecture; it's the index
 that replaces inline narrative comments.
 
+**This file is the single source of truth for agent guidance.** Tool-specific
+entry points ([CLAUDE.md](CLAUDE.md),
+[.github/copilot-instructions.md](.github/copilot-instructions.md)) are thin
+pointers back here — put new guidance in this file, not in them, so nothing
+drifts.
+
 ## What bingo is
 
 A standalone visual concurrency debugger for Go. Server (`cmd/bingo`) launches
@@ -19,6 +25,64 @@ Built and tested only on:
 - `linux/amd64`
 
 Other GOOS/GOARCH combos fail with `undefined: newBackend`.
+
+## Conventions for AI agents
+
+Rules for making changes. These encode decisions already litigated in the repo;
+follow them so reviews stay about substance, not style.
+
+### Comments
+
+- Explain **why**, not **what**. A comment must add context the code can't:
+  an invariant, a non-obvious constraint, a hazard, a reference. Never restate
+  what the next line literally does.
+- Do **not** add decorative or narrating one-liners (the
+  `// arbitrary instruction byte` / `// loop over items` style). They were
+  deliberately purged from this codebase; don't reintroduce them.
+- Prefer a short doc comment on the function/type over inline noise. If a block
+  genuinely needs explaining, one paragraph above it beats five scattered tags.
+- When you remove or move non-obvious logic, move its *why*-comment with it.
+
+### Code style
+
+- `gofmt` / `goimports` are mandatory — the lefthook pre-commit hook runs
+  `goimports -w` on staged `*.go` files. Match the surrounding style otherwise.
+- Make surgical, focused changes. Don't opportunistically reformat or refactor
+  unrelated code in the same commit.
+- Return errors; don't `panic` in server/hub/debugger control paths. Panics
+  crash the whole server (see issues #29, #60). `panic` is acceptable only in
+  clearly test-only or truly-unreachable-by-construction spots.
+
+### Commits
+
+- Conventional Commits are **enforced** by the commit-msg hook
+  ([cmd/githook](cmd/githook/), wired via [lefthook.yml](lefthook.yml)).
+  Format: `<type>(<scope>): <description>`.
+- Allowed types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`,
+  `chore`, `wip`. Non-conforming messages are rejected.
+
+### Build, test, verify
+
+- Always verify before declaring done: `go vet` + the relevant tests.
+- On macOS the darwin backend needs `-tags bingonative`; plain
+  `go test ./...` fails with `undefined: newBackend`. Use the justfile
+  (`just build`, `just test`) or pass the tag explicitly. Full command list is
+  in the build/test commands block near the end of this file.
+- Only run linters/builds/tests that already exist; don't introduce new
+  tooling for a change unless the task is specifically about that.
+
+### Platform scope
+
+- Supported platforms are **linux/amd64** and **darwin/arm64** only. Do not add
+  backends, build tags, or CI matrix entries for other GOOS/GOARCH (see #61).
+
+### Keep docs in sync
+
+- If you change an architectural invariant documented here, update AGENTS.md in
+  the **same commit** (see [When you change something](#when-you-change-something)).
+- Keep the tool pointer files ([CLAUDE.md](CLAUDE.md),
+  [.github/copilot-instructions.md](.github/copilot-instructions.md)) as thin
+  redirects — never fork guidance into them.
 
 ## Layout
 
