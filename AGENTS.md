@@ -367,6 +367,83 @@ confirmations like `BreakpointSet`). If clients saw both streams interleaved,
 they'd see two overlapping monotonic sequences and couldn't detect drops.
 **Always go through `h.seq.Add(1)` before broadcasting.**
 
+## Restart — hub-level, not engine-level
+
+`CmdRestart` (`internal/hub/hub.go` → `handleRestart`) kills the current
+process and relaunches it, reinstalling previously-set breakpoints. It is
+implemented entirely in the hub, **not** as a new `Debugger`/engine method,
+because of the engine's one-way shutdown invariant (see
+[Engine concurrency model](#engine-concurrency-model--non-obvious-invariants)):
+once `stateExited` is reached, `loop()` permanently closes `done` and
+`events`. Reviving a dead engine in place would need an epoch/generation
+counter on `stopResult` to stop a stale `waitLoop` result from the killed
+process being misread as belonging to the new one — too risky in the most
+fragile package in the repo. Instead, Restart calls `Kill()` on the old
+`Debugger`, discards it, and creates a fresh one via the hub's existing
+`newDebugger` factory (the same one `Launch`/`Attach` already use for managed
+sessions), then relaunches and re-sets breakpoints on the new instance. This
+mirrors Delve's `Debugger.Restart` (`service/debugger/debugger.go`): kill/
+detach, relaunch, reinstall logical breakpoints, collect `DiscardedBreakpoint`
+for ones that fail to resolve (bingo: `protocol.DiscardedBreakpoint`).
+
+Bookkeeping needed across the kill+relaunch, since the old engine's state is
+gone once killed:
+
+- `h.lastLaunch *protocol.LaunchPayload` — the program/args/env from the most
+  recent successful `Launch`. Restart refuses to run if this is nil (no prior
+  Launch, or the session was started via `Attach` — mirrors Delve's
+  `canRestart`: there's no "same binary" to relaunch for an attached process).
+  Set on `CmdLaunch` success, cleared on `CmdAttach` success.
+- `h.restartBreakpoints map[int]protocol.Location` — id → location for every
+  breakpoint currently believed installed. Updated on `CmdSetBreakpoint` /
+  `CmdClearBreakpoint` success, reset on `CmdLaunch`/`CmdAttach`. Restart
+  reinstalls these (sorted by id for determinism) via `SetBreakpoint` on the
+  new `Debugger`, which re-resolves each `file:line` through DWARF against the
+  new process image — addresses aren't reused directly since a relaunch can
+  shift the load address.
+
+**Routing quirk**: `CmdRestart` intentionally does **not** go through
+`resumeCh` like `CmdContinue`/`CmdKill`/etc. `resumeCh` is only ever drained
+inside `handleEvent`'s suspend-wait loop — Run's outer `select` never reads
+it — so a resuming command sent while the hub *isn't* currently suspended
+(the common case: restarting a running or idle session) would sit unread in
+the buffered channel indefinitely. This is a real pre-existing gap affecting
+`CmdKill` today too; it wasn't fixed for the general case, but Restart can't
+tolerate it because "restart while running" is the primary use case, not an
+edge case. Instead `CmdRestart` is routed through the ordinary `cmdCh` (like
+`SetBreakpoint`), which both Run's outer loop and the suspend-wait loop's
+`case cc := <-h.cmdCh:` branch drain. The one special case: that branch
+normally loops back to keep waiting for a resume after executing a
+non-resuming command, but for `CmdRestart` it `return`s instead — the
+suspended process it was waiting on no longer exists, so there's nothing left
+to resume, and returning lets Run's outer loop naturally pick up the new
+debugger's events channel (`h.dbg` is reassigned inside `handleRestart`
+before the confirmation event is broadcast).
+
+`EventRestarted` is a confirmation event (like `BreakpointSet`), not a
+suspending one — the new process's suspended state (if any, e.g. break-on-
+entry) is reported the normal way via `EventStepped`/`EventBreakpointHit` once
+the relaunched process actually reaches that point.
+
+## StopProcess — Pause groundwork only
+
+`Backend.StopProcess()` (both `backend_linux_amd64.go` and
+`backend_darwin_arm64.go`) sends a whole-process `SIGSTOP`, hardened as the
+one primitive a future `Pause` command would need — **no `Pause` command is
+wired up yet**, and this is not the whole story: Delve's actual manual-stop
+implementations are far more involved (Linux: `sys.Kill(pid, SIGTRAP)` plus a
+`trapWaitInternal` halt-flag state machine in
+`pkg/proc/native/proc_linux.go`; Darwin: Mach `thread_suspend` on every thread
+plus an atomic halt flag in `pkg/proc/native/proc_darwin.go`) to correctly
+distinguish a manual halt from a spontaneous trap and to safely land every
+thread at a consistent stop point. Implementing that state machine is out of
+scope until `Pause` is actually built. The hardening done now: direct
+`syscall.Kill(pid, SIGSTOP)` instead of `os.FindProcess(pid).Signal(...)`
+(the latter never actually distinguishes "no such process" on Unix — `
+os.FindProcess` can't fail there), a `pid == 0` guard, and treating `ESRCH`
+(process already gone) as an idempotent no-op success rather than an error,
+consistent with `engine.Kill()`'s idempotency elsewhere in this package.
+
 ## Error handling
 
 Conventions for wrapping, logging, and propagating errors live in

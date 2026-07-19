@@ -139,3 +139,24 @@ type ClearBreakpointPayload struct {
 type LocalsPayloadCmd struct {
 	FrameIndex int `json:"frameIndex"`
 }
+
+// RestartPayload optionally overrides the args/env used for the relaunch.
+// Leave both nil to reuse the values from the original Launch.
+type RestartPayload struct {
+	Args []string `json:"args,omitempty"`
+	Env  []string `json:"env,omitempty"`
+}
+
+// DiscardedBreakpoint reports a previously-set breakpoint that could not be
+// reinstalled after a Restart (e.g. the file:line no longer resolves).
+type DiscardedBreakpoint struct {
+	Location Location `json:"location"`
+	Reason   string   `json:"reason"`
+}
+
+// RestartedPayload confirms a completed Restart.
+type RestartedPayload struct {
+	Program     string                `json:"program"`
+	Breakpoints []Breakpoint          `json:"breakpoints,omitempty"`
+	Discarded   []DiscardedBreakpoint `json:"discarded,omitempty"`
+}

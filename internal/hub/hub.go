@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -68,6 +69,20 @@ type Hub struct {
 
 	shutdownCh chan struct{}
 	done       chan struct{}
+
+	// lastLaunch remembers the most recently successful Launch payload so
+	// Restart can relaunch the same binary with the same args/env. nil for
+	// Attach-based sessions and before any successful Launch — Restart
+	// refuses those, mirroring Delve's canRestart check (Restart only makes
+	// sense for a process bingo itself started).
+	lastLaunch *protocol.LaunchPayload
+
+	// restartBreakpoints mirrors the breakpoints installed on the current
+	// debugger (id -> location), purely so Restart can reinstall them on the
+	// relaunched process. The engine's breakpointTable remains the sole
+	// source of truth for the live process; this is bookkeeping the hub
+	// needs across a Kill+relaunch, when the old breakpointTable is gone.
+	restartBreakpoints map[int]protocol.Location
 }
 
 type clientCommand struct {
@@ -79,12 +94,13 @@ func newHub(log *slog.Logger) *Hub {
 		log = slog.Default()
 	}
 	return &Hub{
-		registry:   newRegistry(),
-		cmdCh:      make(chan clientCommand, 32),
-		resumeCh:   make(chan protocol.Command, 1),
-		shutdownCh: make(chan struct{}),
-		done:       make(chan struct{}),
-		log:        log,
+		registry:           newRegistry(),
+		cmdCh:              make(chan clientCommand, 32),
+		resumeCh:           make(chan protocol.Command, 1),
+		shutdownCh:         make(chan struct{}),
+		done:               make(chan struct{}),
+		log:                log,
+		restartBreakpoints: make(map[int]protocol.Location),
 	}
 }
 
@@ -252,7 +268,14 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 		case cc := <-h.cmdCh:
 			// Non-resuming command (SetBreakpoint, Locals, …) while suspended.
 			// Execute immediately — process is paused — and keep waiting.
+			// Restart is the one exception: it tears down and replaces the
+			// suspended process entirely, so there's nothing left to wait a
+			// resume on — return and let Run's outer loop pick up the new
+			// debugger's events channel (assigned inside handleRestart).
 			h.executeCommand(cc.cmd)
+			if cc.cmd.Kind == protocol.CmdRestart {
+				return
+			}
 
 		case <-timeout.C:
 			h.log.Warn("30-minute suspend timeout — auto-continuing")
@@ -278,6 +301,14 @@ func (h *Hub) handleDebuggerClosed() {
 }
 
 func (h *Hub) executeCommand(cmd protocol.Command) {
+	// Restart doesn't fit the generic dispatch(dbg, cmd) shape below: it
+	// tears down h.dbg and replaces it with a brand new instance, which only
+	// the hub (holder of newDebugger) can do. See handleRestart.
+	if cmd.Kind == protocol.CmdRestart {
+		h.handleRestart(cmd)
+		return
+	}
+
 	if h.sessionID != "" && (cmd.Kind == protocol.CmdLaunch || cmd.Kind == protocol.CmdAttach) {
 		if h.dbg != nil {
 			h.broadcastError(cmd.Kind, fmt.Errorf("debugger already active (state: %s)", h.State()))
@@ -306,10 +337,22 @@ func (h *Hub) executeCommand(cmd protocol.Command) {
 	}
 
 	switch cmd.Kind {
-	case protocol.CmdLaunch, protocol.CmdAttach:
+	case protocol.CmdLaunch:
 		h.transitionState(protocol.StateRunning)
+		h.rememberLaunch(cmd)
+		h.restartBreakpoints = make(map[int]protocol.Location)
+	case protocol.CmdAttach:
+		h.transitionState(protocol.StateRunning)
+		// Restart only makes sense for a process bingo itself launched —
+		// mirrors Delve's canRestart check.
+		h.lastLaunch = nil
+		h.restartBreakpoints = make(map[int]protocol.Location)
 	case protocol.CmdContinue, protocol.CmdStepOver, protocol.CmdStepInto, protocol.CmdStepOut:
 		h.transitionState(protocol.StateRunning)
+	case protocol.CmdSetBreakpoint:
+		h.rememberBreakpoint(result)
+	case protocol.CmdClearBreakpoint:
+		h.forgetBreakpoint(cmd)
 	}
 
 	if result.event != nil {
@@ -327,6 +370,141 @@ func (h *Hub) teardownFailedStart() {
 	if h.State() != protocol.StateIdle {
 		h.transitionState(protocol.StateIdle)
 	}
+}
+
+// rememberLaunch decodes cmd's LaunchPayload and stores a copy for a future
+// Restart. Decode failures are ignored — Launch has already succeeded by the
+// time this is called, so at worst Restart later reports "nothing to
+// restart" rather than corrupting an active session.
+func (h *Hub) rememberLaunch(cmd protocol.Command) {
+	var p protocol.LaunchPayload
+	if err := protocol.DecodeCommandPayload(cmd, &p); err != nil {
+		return
+	}
+	h.lastLaunch = &p
+}
+
+// rememberBreakpoint records a successfully-set breakpoint's id -> location
+// so Restart can reinstall it later.
+func (h *Hub) rememberBreakpoint(result dispatchResult) {
+	if result.event == nil {
+		return
+	}
+	var p protocol.BreakpointSetPayload
+	if err := protocol.DecodeEventPayload(*result.event, &p); err != nil {
+		return
+	}
+	h.restartBreakpoints[p.Breakpoint.ID] = p.Breakpoint.Location
+}
+
+// forgetBreakpoint removes a cleared breakpoint from the Restart bookkeeping.
+func (h *Hub) forgetBreakpoint(cmd protocol.Command) {
+	var p protocol.ClearBreakpointPayload
+	if err := protocol.DecodeCommandPayload(cmd, &p); err != nil {
+		return
+	}
+	delete(h.restartBreakpoints, p.ID)
+}
+
+// sortedRestartLocations returns the tracked breakpoint locations in
+// ascending ID order, so Restart reinstalls them in a deterministic sequence
+// (and thus assigns deterministic new IDs) across runs.
+func (h *Hub) sortedRestartLocations() []protocol.Location {
+	ids := make([]int, 0, len(h.restartBreakpoints))
+	for id := range h.restartBreakpoints {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+	locs := make([]protocol.Location, 0, len(ids))
+	for _, id := range ids {
+		locs = append(locs, h.restartBreakpoints[id])
+	}
+	return locs
+}
+
+// handleRestart kills the current process (if any), relaunches the last
+// Launch'd binary, and reinstalls previously-set breakpoints at their
+// original file:line locations — addresses are re-resolved via DWARF since a
+// relaunch can change the load address. Breakpoints that fail to resolve are
+// reported as discarded, mirroring Delve's Restart (pkg/proc/target_group.go).
+// Only supported for managed, Launch-based sessions: Attach-based sessions
+// have no "same binary" to relaunch, matching Delve's canRestart check.
+//
+// The old debugger's remaining events (e.g. a final ProcessExited from the
+// Kill below) are deliberately not forwarded to clients: from the client's
+// perspective Restart is one atomic operation, not a Kill followed by a
+// fresh Launch. Once Kill returns, the old debugger is abandoned — its
+// internal goroutines still tear down on their own (see AGENTS.md → shutdown
+// sequence), they're just no longer observed by the hub.
+func (h *Hub) handleRestart(cmd protocol.Command) {
+	if h.sessionID == "" || h.newDebugger == nil {
+		h.broadcastError(cmd.Kind, fmt.Errorf("restart requires a managed session"))
+		return
+	}
+	if h.lastLaunch == nil {
+		h.broadcastError(cmd.Kind, fmt.Errorf("no launched process to restart — use Launch first"))
+		return
+	}
+
+	var override protocol.RestartPayload
+	if len(cmd.Payload) > 0 {
+		if err := protocol.DecodeCommandPayload(cmd, &override); err != nil {
+			h.broadcastError(cmd.Kind, err)
+			return
+		}
+	}
+
+	program := h.lastLaunch.Program
+	args := h.lastLaunch.Args
+	if override.Args != nil {
+		args = override.Args
+	}
+	env := h.lastLaunch.Env
+	if override.Env != nil {
+		env = override.Env
+	}
+
+	saved := h.sortedRestartLocations()
+
+	if h.dbg != nil {
+		_ = h.dbg.Kill()
+		h.dbg = nil
+	}
+
+	newDbg := h.newDebugger()
+	if err := newDbg.Launch(program, args, env); err != nil {
+		h.broadcastError(cmd.Kind, fmt.Errorf("restart: relaunch failed: %w", err))
+		h.transitionState(protocol.StateIdle)
+		return
+	}
+	h.dbg = newDbg
+	h.lastLaunch = &protocol.LaunchPayload{Program: program, Args: args, Env: env}
+	h.transitionState(protocol.StateRunning)
+
+	installed := make([]protocol.Breakpoint, 0, len(saved))
+	discarded := make([]protocol.DiscardedBreakpoint, 0)
+	newBreakpoints := make(map[int]protocol.Location, len(saved))
+	for _, loc := range saved {
+		bp, err := newDbg.SetBreakpoint(loc.File, loc.Line)
+		if err != nil {
+			discarded = append(discarded, protocol.DiscardedBreakpoint{Location: loc, Reason: err.Error()})
+			continue
+		}
+		installed = append(installed, bp)
+		newBreakpoints[bp.ID] = bp.Location
+	}
+	h.restartBreakpoints = newBreakpoints
+
+	evt, err := protocol.NewEvent(protocol.EventRestarted, h.seq.Add(1), protocol.RestartedPayload{
+		Program:     program,
+		Breakpoints: installed,
+		Discarded:   discarded,
+	})
+	if err != nil {
+		h.log.Error("failed to create Restarted event", "err", err)
+		return
+	}
+	h.broadcast(evt)
 }
 
 // injectCommand is called by client read-pumps. Resuming commands go to

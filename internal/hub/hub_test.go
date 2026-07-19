@@ -656,4 +656,180 @@ var _ = Describe("Hub", func() {
 			}, "500ms", "10ms").Should(Equal(protocol.EventError))
 		})
 	})
+
+	Describe("Restart", func() {
+		It("rejects Restart on a raw (non-managed) hub", func() {
+			conn := newFakeWSConn()
+			h.AddClient(conn, nil)
+
+			conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+
+			e, ok := recvEvent(conn)
+			Expect(ok).To(BeTrue())
+			Expect(e.Kind).To(Equal(protocol.EventError))
+		})
+
+		It("rejects Restart before any successful Launch", func() {
+			managed := hub.NewSession("session", func() debugger.Debugger { return newFakeDebugger() }, nil)
+			cancelManaged := runHub(managed)
+			defer cancelManaged()
+
+			conn := newFakeWSConn()
+			managed.AddClient(conn, nil)
+			_, _ = recvEvent(conn) // welcome/state event
+
+			conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+
+			e, ok := recvEvent(conn)
+			Expect(ok).To(BeTrue())
+			Expect(e.Kind).To(Equal(protocol.EventError))
+		})
+
+		It("rejects Restart after Attach (no relaunchable binary)", func() {
+			managed := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
+			cancelManaged := runHub(managed)
+			defer cancelManaged()
+
+			conn := newFakeWSConn()
+			managed.AddClient(conn, nil)
+			_, _ = recvEvent(conn)
+
+			conn.inject(mustCommand(protocol.CmdAttach, protocol.AttachPayload{PID: 123}))
+			Eventually(fd.recordedCalls, "500ms", "10ms").Should(ContainElement("Attach"))
+
+			conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+
+			Eventually(func() protocol.EventKind {
+				e, ok := recvEvent(conn)
+				if !ok {
+					return ""
+				}
+				return e.Kind
+			}, "500ms", "10ms").Should(Equal(protocol.EventError))
+		})
+
+		It("kills the old debugger, relaunches, and reinstalls breakpoints", func() {
+			managed := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
+			cancelManaged := runHub(managed)
+			defer cancelManaged()
+
+			conn := newFakeWSConn()
+			managed.AddClient(conn, nil)
+			_, _ = recvEvent(conn)
+
+			conn.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: "myapp", Args: []string{"-x"}}))
+			Eventually(fd.recordedCalls, "500ms", "10ms").Should(ContainElement("Launch"))
+			_, _ = recvEvent(conn) // state -> running
+
+			fd.setBPResult = protocol.Breakpoint{ID: 1, Location: protocol.Location{File: "main.go", Line: 10}}
+			conn.inject(mustCommand(protocol.CmdSetBreakpoint, protocol.SetBreakpointPayload{File: "main.go", Line: 10}))
+			Eventually(func() protocol.EventKind {
+				e, ok := recvEvent(conn)
+				if !ok {
+					return ""
+				}
+				return e.Kind
+			}, "500ms", "10ms").Should(Equal(protocol.EventBreakpointSet))
+
+			conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+
+			var restarted protocol.RestartedPayload
+			Eventually(func() bool {
+				e, ok := recvEvent(conn)
+				if !ok || e.Kind != protocol.EventRestarted {
+					return false
+				}
+				Expect(protocol.DecodeEventPayload(e, &restarted)).To(Succeed())
+				return true
+			}, "500ms", "10ms").Should(BeTrue())
+
+			Expect(restarted.Program).To(Equal("myapp"))
+			Expect(restarted.Breakpoints).To(HaveLen(1))
+			Expect(restarted.Discarded).To(BeEmpty())
+
+			calls := fd.recordedCalls()
+			Expect(calls).To(ContainElement("Kill"))
+			launchCount := 0
+			bpCount := 0
+			for _, c := range calls {
+				if c == "Launch" {
+					launchCount++
+				}
+				if c == "SetBreakpoint" {
+					bpCount++
+				}
+			}
+			Expect(launchCount).To(Equal(2), "expected a Launch for the original start plus one for restart")
+			Expect(bpCount).To(Equal(2), "expected the original SetBreakpoint plus a reinstall on restart")
+		})
+
+		It("reports discarded breakpoints that fail to reinstall", func() {
+			managed := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
+			cancelManaged := runHub(managed)
+			defer cancelManaged()
+
+			conn := newFakeWSConn()
+			managed.AddClient(conn, nil)
+			_, _ = recvEvent(conn)
+
+			conn.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: "myapp"}))
+			Eventually(fd.recordedCalls, "500ms", "10ms").Should(ContainElement("Launch"))
+			_, _ = recvEvent(conn)
+
+			fd.setBPResult = protocol.Breakpoint{ID: 1, Location: protocol.Location{File: "main.go", Line: 10}}
+			conn.inject(mustCommand(protocol.CmdSetBreakpoint, protocol.SetBreakpointPayload{File: "main.go", Line: 10}))
+			Eventually(func() protocol.EventKind {
+				e, ok := recvEvent(conn)
+				if !ok {
+					return ""
+				}
+				return e.Kind
+			}, "500ms", "10ms").Should(Equal(protocol.EventBreakpointSet))
+
+			fd.setBPErr = fmt.Errorf("no such line")
+			conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+
+			var restarted protocol.RestartedPayload
+			Eventually(func() bool {
+				e, ok := recvEvent(conn)
+				if !ok || e.Kind != protocol.EventRestarted {
+					return false
+				}
+				Expect(protocol.DecodeEventPayload(e, &restarted)).To(Succeed())
+				return true
+			}, "500ms", "10ms").Should(BeTrue())
+
+			Expect(restarted.Breakpoints).To(BeEmpty())
+			Expect(restarted.Discarded).To(HaveLen(1))
+			Expect(restarted.Discarded[0].Reason).To(Equal("no such line"))
+		})
+
+		It("unblocks a suspended hub, same as Kill", func() {
+			managed := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
+			cancelManaged := runHub(managed)
+			defer cancelManaged()
+
+			conn := newFakeWSConn()
+			managed.AddClient(conn, nil)
+			_, _ = recvEvent(conn)
+
+			conn.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: "myapp"}))
+			Eventually(fd.recordedCalls, "500ms", "10ms").Should(ContainElement("Launch"))
+			_, _ = recvEvent(conn)
+
+			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+			_, _ = recvEvent(conn)
+
+			conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+
+			Eventually(func() protocol.EventKind {
+				e, ok := recvEvent(conn)
+				if !ok {
+					return ""
+				}
+				return e.Kind
+			}, "500ms", "10ms").Should(Equal(protocol.EventRestarted))
+		})
+	})
 })

@@ -46,6 +46,13 @@ const (
 	EventSessionState EventKind = "SessionState"
 
 	EventError EventKind = "Error"
+
+	// EventRestarted confirms a completed Restart: the process was
+	// relaunched and previously-set breakpoints were reinstalled where
+	// possible. It is a confirmation, not a suspending event — the process's
+	// own suspend state is reported separately via the Stepped event emitted
+	// at the new process's entry point (same as after Launch).
+	EventRestarted EventKind = "Restarted"
 )
 
 type CommandKind string
@@ -69,4 +76,10 @@ const (
 	CmdLocals     CommandKind = "Locals"
 	CmdFrames     CommandKind = "Frames"
 	CmdGoroutines CommandKind = "Goroutines"
+
+	// CmdRestart kills the current process (if any) and relaunches the last
+	// Launch'd binary, reinstalling previously-set breakpoints. Only
+	// supported for managed sessions started via Launch — see AGENTS.md →
+	// Restart.
+	CmdRestart CommandKind = "Restart"
 )

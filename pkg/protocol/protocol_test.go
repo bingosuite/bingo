@@ -291,6 +291,25 @@ var _ = Describe("Event", func() {
 					Expect(hasCmd).To(BeFalse(), "command field should be omitted for CmdNone")
 				},
 			),
+
+			Entry("Restarted",
+				protocol.EventRestarted,
+				protocol.RestartedPayload{
+					Program:     "/tmp/myapp",
+					Breakpoints: []protocol.Breakpoint{sampleBreakpoint},
+					Discarded: []protocol.DiscardedBreakpoint{
+						{Location: protocol.Location{File: "gone.go", Line: 5}, Reason: "no such file"},
+					},
+				},
+				func(e protocol.Event) {
+					var p protocol.RestartedPayload
+					Expect(protocol.DecodeEventPayload(e, &p)).To(Succeed())
+					Expect(p.Program).To(Equal("/tmp/myapp"))
+					Expect(p.Breakpoints).To(HaveLen(1))
+					Expect(p.Discarded).To(HaveLen(1))
+					Expect(p.Discarded[0].Reason).To(Equal("no such file"))
+				},
+			),
 		)
 	})
 
@@ -458,6 +477,16 @@ var _ = Describe("Command", func() {
 					Expect(c.Kind).To(Equal(protocol.CmdGoroutines))
 				},
 			),
+
+			Entry("Restart",
+				protocol.CmdRestart,
+				protocol.RestartPayload{Args: []string{"--verbose"}},
+				func(c protocol.Command) {
+					var p protocol.RestartPayload
+					Expect(protocol.DecodeCommandPayload(c, &p)).To(Succeed())
+					Expect(p.Args).To(ConsistOf("--verbose"))
+				},
+			),
 		)
 	})
 
@@ -501,6 +530,7 @@ var _ = Describe("Kind constants", func() {
 			protocol.EventFrames,
 			protocol.EventGoroutines,
 			protocol.EventError,
+			protocol.EventRestarted,
 		}
 		for _, k := range kinds {
 			Expect(string(k)).NotTo(BeEmpty(), "EventKind %q should not be empty", k)
@@ -521,6 +551,7 @@ var _ = Describe("Kind constants", func() {
 			protocol.CmdLocals,
 			protocol.CmdFrames,
 			protocol.CmdGoroutines,
+			protocol.CmdRestart,
 		}
 		for _, k := range kinds {
 			Expect(string(k)).NotTo(BeEmpty(), "CommandKind %q should not be empty", k)

@@ -568,12 +568,27 @@ func (b *darwinBackend) setSingleStep(tid int, on bool) error {
 	return nil
 }
 
+// StopProcess sends a whole-thread-group SIGSTOP as a stand-in halt
+// primitive, mirroring the intent (not the mechanism) of Delve's Darwin
+// requestManualStop, which suspends via Mach thread_suspend on every thread
+// plus an atomic halt flag (pkg/proc/native/proc_darwin.go). This is Pause
+// groundwork only: it does not implement that halt-flag state machine, so no
+// Pause command is wired to it yet — see AGENTS.md.
+//
+// syscall.Kill is used directly instead of os.FindProcess(pid).Signal:
+// os.FindProcess never fails to find a process on Unix (it just wraps the
+// pid), so the previous os.FindProcess/Signal pair was never distinguishing
+// "no such process" from any other error. ESRCH (process already gone) is
+// treated as an idempotent no-op, matching engine.Kill's idempotency
+// convention elsewhere in this package.
 func (b *darwinBackend) StopProcess() error {
-	p, err := os.FindProcess(b.pid)
-	if err != nil {
-		return err
+	if b.pid == 0 {
+		return fmt.Errorf("StopProcess: no process")
 	}
-	return p.Signal(syscall.SIGSTOP)
+	if err := syscall.Kill(b.pid, syscall.SIGSTOP); err != nil && err != syscall.ESRCH {
+		return fmt.Errorf("StopProcess: %w", err)
+	}
+	return nil
 }
 
 func (b *darwinBackend) GetRegisters(tid int) (Registers, error) {

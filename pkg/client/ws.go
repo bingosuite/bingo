@@ -256,6 +256,22 @@ func (c *wsClient) Kill() error {
 	return c.send(cmd)
 }
 
+func (c *wsClient) Restart(args, env []string) (protocol.RestartedPayload, error) {
+	cmd, err := newCommand(protocol.CmdRestart, protocol.RestartPayload{Args: args, Env: env})
+	if err != nil {
+		return protocol.RestartedPayload{}, err
+	}
+	evt, err := c.sendAndWait(cmd, protocol.EventRestarted)
+	if err != nil {
+		return protocol.RestartedPayload{}, err
+	}
+	var p protocol.RestartedPayload
+	if err := protocol.DecodeEventPayload(evt, &p); err != nil {
+		return protocol.RestartedPayload{}, fmt.Errorf("decode Restarted: %w", err)
+	}
+	return p, nil
+}
+
 func (c *wsClient) Continue() error {
 	cmd, err := newCommand(protocol.CmdContinue, struct{}{})
 	if err != nil {
