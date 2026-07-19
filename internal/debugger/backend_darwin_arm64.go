@@ -116,22 +116,31 @@ const (
 const darwinPauseSignal = syscall.SIGUSR2
 
 // The two darwin/arm64 step-over correctness fixes are independently toggleable
-// so an operator can run the behavior-preserving atomic step-over (#1) without
-// the async-preemption workaround (#2), which alters the tracee's goroutine
-// scheduling. See singleStepThread (#1) and withDarwinAsyncPreemptOff (#2).
+// so an operator can ablate either in isolation. See singleStepThread (#1) and
+// withDarwinAsyncPreemptOff (#2).
 //
 //	BINGO_DARWIN_ATOMIC_STEPOVER     default ON  — "0" disables (falls back to a
 //	                                 plain per-process single-step; reproduces
 //	                                 the original wrong-thread hang; ablation
 //	                                 only).
-//	BINGO_DARWIN_ASYNC_PREEMPT_OFF   default OFF — "1" injects
-//	                                 GODEBUG=asyncpreemptoff=1 into the tracee.
+//	BINGO_DARWIN_ASYNC_PREEMPT_OFF   default ON  — "0" disables (re-enables Go
+//	                                 async preemption in the tracee; reproduces
+//	                                 the SIGURG-misdirection lost-wakeup wedge;
+//	                                 ablation only).
 //
-// Fix #2 defaults OFF because bingo is a visual concurrency debugger: disabling
-// async preemption changes the very scheduling behavior a user may be trying to
-// observe. It is offered as an opt-in reliability knob for the residual
-// SIGURG-misdirection wedge under heavy step-over churn.
-const asyncPreemptOffDefault = false
+// Fix #2 defaults ON because the wait4/BSD-signal model cannot re-deliver a
+// thread-directed SIGURG to the M the Go runtime targeted (ptrace resume is
+// process-directed — XNU psignal), so under async-preemption churn a misdirected
+// SIGURG intermittently deadlocks the tracee in a pthread-condvar lost-wakeup
+// (~8% of step-overs at iters=40). Correctly re-delivering it needs the
+// Mach-exception model (PT_SIGEXC + exception port, as LLDB debugserver / Delve
+// macnative do), which is out of scope for the wait4 loop and tracked in #92.
+// Disabling async preemption removes the thread-directed SIGURG entirely; the
+// tracee falls back to cooperative preemption (function-prologue / loop-backedge
+// safepoints), so the only observable loss is async-preemption of pathological
+// safepoint-free tight loops. Linux is unaffected: ptrace signal delivery there
+// is per-thread. See withDarwinAsyncPreemptOff for the full mechanism.
+const asyncPreemptOffDefault = true
 
 func darwinAtomicStepOverEnabled() bool {
 	return os.Getenv("BINGO_DARWIN_ATOMIC_STEPOVER") != "0"
@@ -196,9 +205,9 @@ func startTracedProcess(_ Backend, binaryPath string, args []string, env []strin
 }
 
 // withDarwinAsyncPreemptOff merges GODEBUG=asyncpreemptoff=1 into the tracee's
-// environment. It is applied only when fix #2 is enabled
-// (darwinAsyncPreemptOffEnabled); see the toggle block above for why it is
-// opt-in. This is a darwin-specific correctness workaround, NOT a perf tweak.
+// environment. It is applied whenever fix #2 is enabled
+// (darwinAsyncPreemptOffEnabled, the darwin default; see the toggle block
+// above). This is a darwin-specific correctness measure, NOT a perf tweak.
 //
 // Go async preemption sends a THREAD-directed SIGURG (pthread_kill to a
 // specific M) at a runtime-chosen moment. In our wait4/BSD-stop model that
@@ -217,13 +226,14 @@ func startTracedProcess(_ Backend, binaryPath string, args []string, env []strin
 // PT_THUPDATE can set a per-thread siglist bit but cannot resume a wait4 stop
 // (no wakeup(&t->sigwait)), and the Mach-exception model real darwin debuggers
 // use (LLDB debugserver, Delve's macnative PT_SIGEXC path) is explicitly out of
-// scope here (AGENTS.md: PT_ATTACHEXC is incompatible with our wait4 loop).
-// Disabling async preemption in the tracee removes the thread-directed SIGURG
-// entirely (runtime.preemptone skips preemptM when asyncpreemptoff==1), so no
-// signal is ever misdirected and the runtime's preempt bookkeeping stays
-// consistent. The tracee falls back to cooperative preemption (function-
-// prologue and loop safepoints), which is sufficient for debugging; the only
-// loss is async-preemption of pathological safepoint-free tight loops.
+// scope here (AGENTS.md: PT_ATTACHEXC is incompatible with our wait4 loop;
+// tracked as the proper fix in #92). Disabling async preemption in the tracee
+// removes the thread-directed SIGURG entirely (runtime.preemptone skips preemptM
+// when asyncpreemptoff==1), so no signal is ever misdirected and the runtime's
+// preempt bookkeeping stays consistent. The tracee falls back to cooperative
+// preemption (function-prologue and loop safepoints), which is sufficient for
+// debugging; the only loss is async-preemption of pathological safepoint-free
+// tight loops.
 //
 // Linux does not need this: ptrace signal delivery there is per-thread, so the
 // SIGURG is re-delivered to the correct thread.
