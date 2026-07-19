@@ -499,6 +499,68 @@ var _ = Describe("Hub", func() {
 		})
 	})
 
+	Describe("Kill while running", func() {
+		It("terminates the process even with no breakpoint set (no suspend first)", func() {
+			conn := newFakeWSConn()
+			h.AddClient(conn, nil)
+
+			// A runaway target with no breakpoints never suspends. Kill must
+			// still reach the debugger: it rides cmdCh (main loop), not
+			// resumeCh (drained only while suspended).
+			conn.inject(mustCommand(protocol.CmdKill, struct{}{}))
+
+			Eventually(fd.recordedCalls, "500ms", "10ms").
+				Should(ContainElement("Kill"))
+		})
+
+		It("still terminates the process while suspended", func() {
+			conn := newFakeWSConn()
+			h.AddClient(conn, nil)
+
+			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+			_, _ = recvEvent(conn)
+
+			conn.inject(mustCommand(protocol.CmdKill, struct{}{}))
+			Eventually(fd.recordedCalls, "500ms", "10ms").
+				Should(ContainElement("Kill"))
+		})
+	})
+
+	Describe("stale resume handling", func() {
+		It("discards a resume buffered while running so it can't auto-continue a later suspend", func() {
+			conn := newFakeWSConn()
+			h.AddClient(conn, nil)
+			fd.setBPResult = protocol.Breakpoint{ID: 7}
+
+			// Erroneously send Continue while the process is still running: it
+			// lands in resumeCh. The SetBreakpoint that follows rides cmdCh from
+			// the SAME read-pump, so once its confirmation arrives the stale
+			// Continue is guaranteed to already be buffered in resumeCh.
+			conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
+			conn.inject(mustCommand(protocol.CmdSetBreakpoint,
+				protocol.SetBreakpointPayload{File: "main.go", Line: 3}))
+			waitForEventKind(conn, protocol.EventBreakpointSet, nil)
+
+			// Now the process suspends. The stale Continue must be dropped, not
+			// consumed to auto-resume.
+			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+			_, _ = recvEvent(conn) // BreakpointHit
+
+			time.Sleep(50 * time.Millisecond)
+			Expect(fd.recordedCalls()).NotTo(ContainElement("Continue"),
+				"stale resume must not auto-continue past the fresh suspend")
+
+			// A fresh Continue (sent after the suspend) resumes normally.
+			conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
+			Eventually(fd.recordedCalls, "500ms", "10ms").
+				Should(ContainElement("Continue"))
+			Expect(countCalls(fd.recordedCalls(), "Continue")).To(Equal(1),
+				"exactly one (fresh) Continue should have run")
+		})
+	})
+
 	Describe("Pause", func() {
 		It("routes CmdPause to the debugger while the process runs", func() {
 			conn := newFakeWSConn()
@@ -833,5 +895,30 @@ var _ = Describe("Restart", func() {
 
 		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
 		waitForEventKind(conn, protocol.EventRestarted, nil)
+	})
+})
+
+// This suite guards Finding 3 of #78: h.dbg is written on the Run goroutine
+// (Launch/Restart) but read by shutdown(), which runs on a separate goroutine
+// when the last client disconnects. Run under -race, the loop exercises that
+// write/read overlap; the dbgMu guard keeps it clean.
+var _ = Describe("dbg access during shutdown", func() {
+	It("has no data race between a mid-flight Launch and last-client shutdown", func() {
+		for i := 0; i < 100; i++ {
+			fd := newFakeDebugger()
+			managed := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
+			cancel := runHub(managed)
+
+			conn := newFakeWSConn()
+			managed.AddClient(conn, nil)
+
+			// Launch writes h.dbg on the Run goroutine; closing the only client
+			// spawns `go h.shutdown()`, which reads h.dbg concurrently.
+			conn.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: "x"}))
+			closeFakeWS(conn)
+
+			Eventually(managed.Done(), "1s", "10ms").Should(BeClosed())
+			cancel()
+		}
 	})
 })
