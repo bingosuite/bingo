@@ -52,29 +52,7 @@ func declareFullStackSpec() {
 		Expect(bp.Location.Line).To(Equal(line), "breakpoint resolved to the requested line")
 
 		iters := envInt("BINGO_E2E_FS_ITERS", 15)
-		for i := 0; i < iters; i++ {
-			// Continue is a resuming command: it must unblock the suspended hub
-			// and the resulting BreakpointHit must arrive re-stamped on Events().
-			Expect(h.c.Continue()).To(Succeed(), "Continue #%d", i)
-			evt := awaitEvent(h.c.Events(), 20*time.Second,
-				protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
-			Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit),
-				"Continue #%d expected BreakpointHit, got %s: %s", i, evt.Kind, evt.Payload)
-
-			var hit protocol.BreakpointHitPayload
-			Expect(json.Unmarshal(evt.Payload, &hit)).To(Succeed(), "decode BreakpointHit #%d", i)
-			Expect(hit.Breakpoint.Location.Line).To(Equal(line), "BreakpointHit #%d at BP line", i)
-
-			Expect(h.c.StepOver()).To(Succeed(), "StepOver #%d", i)
-			evt = awaitEvent(h.c.Events(), 20*time.Second,
-				protocol.EventStepped, protocol.EventProcessExited, protocol.EventError)
-			Expect(evt.Kind).To(Equal(protocol.EventStepped),
-				"StepOver #%d expected Stepped, got %s: %s", i, evt.Kind, evt.Payload)
-
-			var st protocol.SteppedPayload
-			Expect(json.Unmarshal(evt.Payload, &st)).To(Succeed(), "decode Stepped #%d", i)
-			Expect(st.Location.Line).NotTo(Equal(line), "StepOver #%d advanced past the BP line", i)
-		}
+		assertContinueStepOver(h.c, line, iters)
 		AddReportEntry("fullstack-iterations", iters)
 	})
 }
