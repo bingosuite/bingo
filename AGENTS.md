@@ -746,6 +746,12 @@ through the justfile.
   with the engine's Kill path which also calls `bps.clearAll`.
 - `CmdNone` is the empty string and gets `omitempty`'d off the wire. The
   protocol test pins this behaviour.
+- `RestartPayload.Args`/`Env` deliberately **omit** `omitempty` (unlike
+  `LaunchPayload`). The hub's `handleRestart` gates the override on nil-ness
+  (`if override.Args != nil`), so a non-nil empty slice must survive the wire
+  as `[]` to mean "clear", distinct from `null`/absent meaning "reuse the
+  original Launch value". `omitempty` would collapse both to `{}`. The protocol
+  test pins the nil-vs-empty round trip. See issue #102.
 - Hub `New(dbg, log)` (without a session ID) is for tests / single-session
   setups: the debugger is pre-attached, no state events are broadcast,
   managed-session machinery is bypassed. Real sessions go through
