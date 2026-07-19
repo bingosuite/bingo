@@ -371,6 +371,17 @@ func (e *engine) loop() {
 				e.drainCmds()
 				return
 			}
+			// Kill may have already moved us to stateExited while a real
+			// (non-exit) stop was buffered in stopCh — its synthetic StopExited
+			// is dropped when the channel is full. Do NOT let that stale stop
+			// reach handleStop: StopBreakpoint/StopSingleStep/StopSignal call
+			// setState(stateSuspended) unconditionally, which would resurrect
+			// the engine out of stateExited and wedge the loop (done/events
+			// never close, hub never sees the exit). Tear down cleanly instead.
+			if e.getState() == stateExited {
+				e.drainCmds()
+				return
+			}
 			e.handleStop(result.evt)
 			if e.getState() == stateExited {
 				e.drainCmds()
