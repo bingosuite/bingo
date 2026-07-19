@@ -561,6 +561,76 @@ var _ = Describe("Hub", func() {
 		})
 	})
 
+	Describe("failed resume keeps the hub suspended", func() {
+		// A resuming command can be rejected by the debugger while the process
+		// stays suspended (e.g. a transient backend error reinstalling a
+		// software breakpoint — see AGENTS.md → step-over flow). The hub must
+		// NOT abandon the suspend on that failure: a retry resume lands in
+		// resumeCh, which only the suspend-wait loop drains (Run's outer loop
+		// never selects on it), so leaving the loop would strand the client and
+		// wedge the session with no way to resume.
+		It("lets a retry Continue reach the debugger after the first fails", func() {
+			conn := newFakeWSConn()
+			h.AddClient(conn, nil)
+			fd.continueErr = errors.New("reinstall failed")
+
+			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+			waitForEventKind(conn, protocol.EventBreakpointHit, nil)
+
+			conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
+			// The rejected resume surfaces as an EventError; it also serves as a
+			// happens-before barrier before we clear the transient error below.
+			waitForEventKind(conn, protocol.EventError, nil)
+			Expect(countCalls(fd.recordedCalls(), "Continue")).To(Equal(1))
+
+			fd.continueErr = nil
+			conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
+			Eventually(func() int {
+				return countCalls(fd.recordedCalls(), "Continue")
+			}, "500ms", "10ms").Should(Equal(2),
+				"retry resume must reach the debugger after a failed resume")
+		})
+
+		It("still resumes via Continue after a failed StepOver", func() {
+			conn := newFakeWSConn()
+			h.AddClient(conn, nil)
+			fd.stepOverErr = errors.New("step failed")
+
+			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+			waitForEventKind(conn, protocol.EventBreakpointHit, nil)
+
+			conn.inject(mustCommand(protocol.CmdStepOver, struct{}{}))
+			waitForEventKind(conn, protocol.EventError, nil)
+			Expect(fd.recordedCalls()).NotTo(ContainElement("Continue"))
+
+			conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
+			Eventually(fd.recordedCalls, "500ms", "10ms").
+				Should(ContainElement("Continue"))
+		})
+
+		It("still services non-resuming commands after a failed resume", func() {
+			conn := newFakeWSConn()
+			h.AddClient(conn, nil)
+			fd.setBPResult = protocol.Breakpoint{ID: 9}
+			fd.continueErr = errors.New("boom")
+
+			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+			waitForEventKind(conn, protocol.EventBreakpointHit, nil)
+
+			conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
+			waitForEventKind(conn, protocol.EventError, nil)
+
+			// The hub is still parked in the suspend-wait loop, so a SetBreakpoint
+			// (non-resuming) is executed immediately while suspended.
+			conn.inject(mustCommand(protocol.CmdSetBreakpoint,
+				protocol.SetBreakpointPayload{File: "main.go", Line: 5}))
+			waitForEventKind(conn, protocol.EventBreakpointSet, nil)
+		})
+	})
+
 	Describe("Pause", func() {
 		It("routes CmdPause to the debugger while the process runs", func() {
 			conn := newFakeWSConn()
