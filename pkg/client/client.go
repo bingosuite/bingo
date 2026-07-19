@@ -29,7 +29,8 @@ type Client interface {
 
 	// Restart kills the current process (if any launched via Launch) and
 	// relaunches it, reinstalling previously-set breakpoints. Pass nil for
-	// args/env to reuse the values from the original Launch. Blocks until
+	// args/env to reuse the values from the original Launch; pass a non-nil
+	// slice (including an empty one, to clear them) to override. Blocks until
 	// the server confirms via EventRestarted.
 	Restart(args, env []string) (protocol.RestartedPayload, error)
 

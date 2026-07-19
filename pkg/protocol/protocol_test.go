@@ -525,6 +525,59 @@ var _ = Describe("Command", func() {
 		})
 	})
 
+	// Regression for issue #102. The hub's handleRestart distinguishes a nil
+	// slice ("reuse the original Launch args/env") from a non-nil empty slice
+	// ("clear them") via `if override.Args != nil`. RestartPayload therefore
+	// must NOT use omitempty on Args/Env: omitempty collapses both nil and a
+	// non-nil empty slice to {} on the wire, silently turning an explicit
+	// "clear" into a "reuse".
+	Describe("RestartPayload override semantics", func() {
+		roundTrip := func(in protocol.RestartPayload) protocol.RestartPayload {
+			cmd := protocol.Command{
+				Version: protocol.Version,
+				Kind:    protocol.CmdRestart,
+				Payload: mustRaw(in),
+			}
+			wire, err := json.Marshal(cmd)
+			Expect(err).NotTo(HaveOccurred())
+			decoded, err := protocol.UnmarshalCommand(wire)
+			Expect(err).NotTo(HaveOccurred())
+			var out protocol.RestartPayload
+			Expect(protocol.DecodeCommandPayload(decoded, &out)).To(Succeed())
+			return out
+		}
+
+		It("keeps a nil slice nil after the round trip (reuse original Launch)", func() {
+			out := roundTrip(protocol.RestartPayload{Args: nil, Env: nil})
+			Expect(out.Args).To(BeNil())
+			Expect(out.Env).To(BeNil())
+		})
+
+		It("keeps a non-nil empty slice non-nil after the round trip (clear)", func() {
+			out := roundTrip(protocol.RestartPayload{Args: []string{}, Env: []string{}})
+			Expect(out.Args).NotTo(BeNil(),
+				"empty Args override must survive the wire, not decode as nil")
+			Expect(out.Args).To(HaveLen(0))
+			Expect(out.Env).NotTo(BeNil(),
+				"empty Env override must survive the wire, not decode as nil")
+			Expect(out.Env).To(HaveLen(0))
+		})
+
+		It("serialises a non-nil empty slice distinctly from a nil one", func() {
+			empty := mustRaw(protocol.RestartPayload{Args: []string{}, Env: nil})
+			Expect(string(empty)).To(ContainSubstring(`"args":[]`),
+				"empty Args must encode as [] so the hub can tell clear from reuse")
+			nilArgs := mustRaw(protocol.RestartPayload{Args: nil, Env: nil})
+			Expect(string(nilArgs)).NotTo(ContainSubstring(`"args":[]`))
+		})
+
+		It("preserves explicit non-empty override values", func() {
+			out := roundTrip(protocol.RestartPayload{Args: []string{"--flag"}, Env: []string{"K=V"}})
+			Expect(out.Args).To(ConsistOf("--flag"))
+			Expect(out.Env).To(ConsistOf("K=V"))
+		})
+	})
+
 	Describe("UnmarshalCommand", func() {
 		It("returns an error for malformed JSON", func() {
 			_, err := protocol.UnmarshalCommand([]byte("not json"))
