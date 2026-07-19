@@ -165,6 +165,15 @@ delivered over the wire yet.
 When multiple clients race resume commands: **first writer wins**, the rest
 are dropped (`resumeCh` has capacity 1; see [hub.go injectCommand](internal/hub/hub.go)).
 
+Rejected resumes: a resuming command only ends the suspend if the debugger
+actually resumes the process. If the resume is **rejected** — e.g. a transient
+backend error while reinstalling a software breakpoint leaves the engine
+`stateSuspended` — the hub broadcasts the `EventError` but **stays in the wait
+loop** (it checks that the session left `suspended` before returning). Bailing
+out on a failed resume would strand the client: the process is still suspended,
+but a retry resume lands in `resumeCh`, which only the wait loop drains, so the
+session could never be resumed again.
+
 ### Session state machine
 
 `SessionState` ∈ {`idle`, `running`, `suspended`, `exited`}.

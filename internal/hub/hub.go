@@ -298,8 +298,20 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 
 		case cmd := <-h.resumeCh:
 			h.log.Info("resuming", "command", cmd.Kind)
+			// A resume ends the suspend only if it actually took effect. When
+			// the debugger rejects it — e.g. a transient backend error while
+			// reinstalling a software breakpoint (AGENTS.md → step-over flow),
+			// leaving the engine stateSuspended — executeCommand broadcasts an
+			// EventError but performs no → running transition. Returning here
+			// would strand the client: a retry resume lands in resumeCh, which
+			// only this wait loop drains (Run's outer loop never selects on it),
+			// so the process could never be resumed again. Keep waiting unless
+			// the resume advanced the session out of suspended (running on
+			// success, or exited if the process died mid-resume).
 			h.executeCommand(cmd)
-			return
+			if h.State() != protocol.StateSuspended {
+				return
+			}
 
 		case cc := <-h.cmdCh:
 			// Non-resuming command (SetBreakpoint, Locals, …) while suspended.
