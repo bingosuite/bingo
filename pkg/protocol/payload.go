@@ -150,10 +150,19 @@ type LocalsPayloadCmd struct {
 }
 
 // RestartPayload optionally overrides the args/env used for the relaunch.
-// Leave both nil to reuse the values from the original Launch.
+// Leave a field nil to reuse the value from the original Launch; pass a
+// non-nil slice (including an empty one) to override it — an empty slice
+// clears the args/env entirely.
+//
+// The fields deliberately omit `omitempty`: encoding/json treats a nil slice
+// and a non-nil empty slice identically under omitempty (both are dropped),
+// which would make an explicit "clear to empty" override indistinguishable
+// from "reuse" on the wire. The hub gates the override on nil-ness
+// (internal/hub handleRestart: `if override.Args != nil`), so that distinction
+// must survive the round trip. See issue #102.
 type RestartPayload struct {
-	Args []string `json:"args,omitempty"`
-	Env  []string `json:"env,omitempty"`
+	Args []string `json:"args"`
+	Env  []string `json:"env"`
 }
 
 // DiscardedBreakpoint reports a previously-set breakpoint that could not be
