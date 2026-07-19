@@ -73,8 +73,8 @@ type engine struct {
 	// user-visible suspend. Step primitives must target this thread, never
 	// threads[0]: darwin's task_threads returns creation order, so threads[0]
 	// is frequently an idle runtime M, and single-stepping the wrong thread
-	// (with a per-process PT_STEP that releases the whole task) misdirects Go's
-	// thread-directed SIGURG into a pthread-condvar lost-wakeup (see #92).
+	// leaves the intended thread parked while a sibling runs, corrupting the
+	// step-over state machine (see #92).
 	curTID int
 
 	bpResume  bpResumeAction
@@ -305,8 +305,9 @@ func (e *engine) StepInto() error {
 		}
 		// Step exactly one instruction on the user thread. On darwin this holds
 		// every other thread Mach-suspended and hardware-single-steps tid
-		// specifically, closing the per-process PT_STEP task-release window that
-		// misdirects Go's thread-directed SIGURG into a condvar lost-wakeup
+		// specifically: only the stepped thread runs during the step window, so
+		// the runtime's sysmon can't observe it and inject a preemption, and any
+		// Mach breakpoint exception seen mid-step is unambiguously this thread's
 		// (#92); elsewhere it degrades to a plain per-thread single-step.
 		if err := e.stepThreadOverBP(tid, regs.PC); err != nil {
 			return err

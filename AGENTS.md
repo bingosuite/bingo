@@ -14,9 +14,9 @@ drifts.
 ## What bingo is
 
 A standalone visual concurrency debugger for Go. Server (`cmd/bingo`) launches
-or attaches to a target Go binary, drives it via OS-level ptrace/Mach calls,
-and broadcasts events to one or more WebSocket clients. The reference CLI
-client lives in `cmd/cli`.
+or attaches to a target Go binary, drives it via OS-level primitives (ptrace on
+linux, Mach exception ports on darwin), and broadcasts events to one or more
+WebSocket clients. The reference CLI client lives in `cmd/cli`.
 
 Built and tested only on:
 
@@ -212,8 +212,9 @@ anything in [internal/debugger/](internal/debugger/).
    control op through `execPtrace`, because they must issue from the exact
    thread that forked/attached the tracee. `wait4` is the one exception — legal
    from any thread of the tracer process, so `Wait` runs it directly off the
-   tracer thread. On Darwin the ptrace/Mach calls run on the engine-loop thread
-   itself (Mach ports are task-wide). Mirrors Delve's `execPtraceFunc`.
+   tracer thread. On Darwin there is no ptrace: the Mach calls run on the
+   engine-loop thread itself (Mach ports are task-wide). Mirrors Delve's
+   `execPtraceFunc`.
 
 2. **`waitLoop` is a one-shot, locked goroutine.** Every time the process is
    resumed, a fresh `waitLoop` goroutine is started. It calls `Backend.Wait()`
@@ -294,35 +295,86 @@ engine advances PC by `len(archTrapInstruction())` and resumes. See the
 
 ### Darwin / arm64 ([backend_darwin_arm64.go](internal/debugger/backend_darwin_arm64.go))
 
-- Uses ptrace for control flow (`PT_CONTINUE`, `PT_STEP`, `PT_ATTACH`) and
-  Mach (`thread_get_state`, `mach_vm_read/write`, `task_threads`) for state.
-  `PT_ATTACHEXC` is NOT used — it routes signals through Mach exceptions,
-  incompatible with our `wait4`-based loop.
-- `task_for_pid` requires the `com.apple.security.cs.debugger` entitlement
-  (the build embeds [entitlements.plist](entitlements.plist) via codesign).
-- `task_threads` returns threads in **creation order**. `threads[0]` is
-  often an idle Go runtime M parked in `pthread_cond_wait`, **not** the
-  goroutine running user code. Darwin `Wait` returns raw SIGTRAP stops without
-  reading Mach thread/register state; the engine resolves the thread sitting at
-  a BRK on its serialized event loop. For SingleStep, save the thread port we
-  issued the step against (`b.stepTID`).
-- `PT_STEP` is per-PROCESS on Darwin (despite the API taking a tid). Always
-  pass `b.pid`, not the Mach thread port.
-- `SIGURG` (Go preemption) and `SIGWINCH` must be re-delivered transparently
-  during both step and continue, or scheduling breaks.
-- ASLR slide is computed in `TextSlide` by scanning the VM map for the first
+Pure Mach exception-port model (issue #92) — **no ptrace, no wait4 for stop
+detection**. Launch is `posix_spawn` with `POSIX_SPAWN_START_SUSPENDED`; stops
+are detected by a `mach_msg` receive loop.
+
+- **Exception port, not wait4.** `acquirePorts` registers a task-level Mach
+  exception port masking **only `EXC_MASK_BREAKPOINT`** and folds it, a dead-name
+  notification port, and a private control port into one port **set**. `Wait`
+  blocks in `bingo_mach_recv` on that set. A software `BRK` and a hardware
+  single-step both raise `EXC_BREAKPOINT` (msg id 2401, `exc=6`, `code0=1` —
+  indistinguishable by code, so step-vs-breakpoint is disambiguated by the
+  engine's `stepping`/step-over bookkeeping). Process exit arrives as the
+  dead-name notification (`BINGO_MSG_DEATH`) → `reap` via `wait4`.
+- **Native BSD signals + async preemption ON.** Because only breakpoints are
+  masked, Unix signals are left to native, thread-directed delivery. Go's
+  async-preemption `SIGURG` (a `pthread_kill` to a specific M) therefore reaches
+  the exact M the runtime targeted, so `GODEBUG=asyncpreemptoff` is **not** set
+  (`asyncPreemptOffDefault = false`) — this is the whole point of #92. Tradeoff:
+  the debugger no longer surfaces Unix signals as *stops* on darwin (a crash
+  becomes a process exit, not a signal stop). bingo's engine only needs
+  breakpoint/step/exit and no e2e asserts on signal reporting.
+- **Instruction-cache coherency is mandatory on every write.**
+  `bingo_write_memory` wraps `mach_vm_write` with `task_suspend`/`task_resume`
+  (quiesce + pipeline drain) **and** a `mach_vm_machine_attribute(MATTR_CACHE,
+  MATTR_VAL_CACHE_FLUSH)` on the patched range. The attribute call is NOT a no-op
+  on Apple Silicon (it returns `KERN_SUCCESS`; an earlier comment claimed
+  otherwise). Without it, a freshly-written trap (`<stepover-next>`,
+  `<stepout-return>`) that is re-executed within microseconds can hit a stale L1
+  I-cache line and be silently skipped — the root cause of the ~2.5% StepOut/
+  step-over wedge that #92 fixes. A trap re-hit a full loop-iteration later never
+  flaked (the line had been evicted), which is why the bug was intermittent.
+- **Deferred exception reply.** With only `EXC_MASK_BREAKPOINT` masked and BSD
+  signals native, replying `KERN_SUCCESS` to a breakpoint exception *immediately*
+  lets XNU build a `_sigtramp` frame for a pending signal before the engine reads
+  registers. So `Wait` receives with `do_reply=0`, stashes the reply header by
+  tid (`stashReply`), and keeps the faulting thread un-acked (frozen at its real
+  PC). The reply is flushed only immediately before that thread is resumed.
+  **Invariant: every resume path MUST flush its reply or `Wait` hangs forever** —
+  `ContinueProcess`/`killProcess` call `flushAllReplies`; `SingleStep` /
+  `singleStepThread` / the `advanceStepOver` re-arm call `flushReply(tid)`. At
+  most one pending reply per thread.
+- **Stop-the-world = individual thread suspends + drain.** On a real breakpoint,
+  `stopTheWorld` (`bingo_stop_the_world`) suspends every running thread and
+  **drains any already-queued exceptions** (reply to each). `thread_suspend` does
+  NOT flush a thread's already-queued Mach exception message, so a sibling
+  thread's breakpoint that was queued before it got suspended would otherwise
+  resurface mid-single-step and be misread as the step's completion. Draining
+  closes most of that race (Delve does the same).
+- **Single-step ignores traps that aren't the stepping thread's.** The drain
+  above is best-effort: a non-blocking receive cannot catch a sibling exception
+  the kernel has not finished *delivering* yet, so one can still surface during
+  the single-step window under heavy thread churn. `Wait` therefore only lets a
+  trap whose faulting thread == the stepping thread (`isStepThread` for the
+  atomic step-over, `consumeStep(tid)` for the ablation step) drive step
+  completion; a straggler sibling breakpoint stays parked (already suspended,
+  reply stashed) and re-faults on the next resume. Without this guard the
+  straggler is misread as a bogus `StopSingleStep`, leaving the real single-step
+  armed and wedging the next resume — the residual `churn` step-over hang. This
+  is the "loop until the trap belongs to the stepping thread" invariant (mirrors
+  Delve's `singleStep`); it is the definitive fix, with the drain as an
+  optimization that keeps the parked-straggler path rare.
+- **Resting-state invariant:** when the engine is `stateSuspended`, every live
+  thread has Mach `suspend_count >= 1`. `ContinueProcess` = normalizing
+  `thread_resume` of ALL threads to 0. `singleStepThread(tid)` = resume ONLY
+  `tid` (others stay held): with the world stopped, sysmon is frozen, so no NEW
+  `SIGURG` is generated in the step window. `task_threads` returns threads in
+  **creation order**, so `threads[0]` is frequently an idle runtime M, not the
+  user thread — step primitives target `curTID` (the thread that faulted), never
+  `threads[0]`.
+- **`task_for_pid` requires the `com.apple.security.cs.debugger` entitlement**
+  (the build embeds [entitlements.plist](entitlements.plist) via codesign). The
+  task port is acquired **once** past the launch race and cached (`taskPort`);
+  re-calling `task_for_pid` per op intermittently wedges in the kernel.
+- **Kill is wait4-based, no `cmd.Wait`.** `killProcess` flushes replies, resumes
+  every thread, `SIGKILL`s, and reaps via `wait4` — it does not block the engine
+  loop in `cmd.Wait`, so kill-while-running no longer deadlocks (the old
+  wait4/ptrace failure). `launched` distinguishes a spawned tracee (SIGKILL) from
+  an attached one (detach).
+- **ASLR slide** is computed in `TextSlide` by scanning the VM map for the first
   exec region with the 64-bit Mach-O magic. Do NOT use `TASK_DYLD_INFO` — its
-  image array is unpopulated at the very first ptrace stop.
-- The step-over suspend list (`b.suspended`) is **stepMu-guarded**, not
-  engine-loop-confined. `endThreadStep` → `resumeSuspended` runs on the engine
-  loop for a `Kill`, but the waitLoop also calls `endThreadStep` when an
-  in-flight `PT_STEP` fails, so the two can race. `suspendOthers`/
-  `resumeSuspended` therefore take `stepMu` around every read/write of
-  `b.suspended`; emptying the slice under the lock makes a second concurrent
-  teardown a no-op instead of a double `thread_resume`. `suspendOthers` calls
-  `Threads()` *before* taking `stepMu` to avoid nesting the thread/task locks
-  under it, and `stepMu` is non-reentrant so no locked path calls back into
-  these helpers.
+  image array is unpopulated at the very first stop.
 
 ### Linux / amd64 ([backend_linux_amd64.go](internal/debugger/backend_linux_amd64.go))
 
@@ -477,11 +529,17 @@ per-platform piece is *which* signal `StopProcess()` sends, abstracted behind
    returns immediately. It does **not** change state — the suspend happens when
    the stop surfaces. Fire-and-forget from the client's view; `EventPaused`
    arrives asynchronously.
-3. `StopProcess()` sends the backend's interrupt signal (`PauseSignal()`:
-   `SIGSTOP` on linux, `SIGUSR2` on darwin). A deliberate signal surfaces from
-   `Backend.Wait()` as `StopEvent{Reason: StopSignal, Signal: PauseSignal()}`
-   (a ptrace signal-delivery-stop) on **both** backends, so detection lives
-   entirely in the engine's `handleStop` `StopSignal` branch.
+3. `StopProcess()` triggers the backend's platform interrupt. On **linux** it
+   sends `PauseSignal()` = `SIGSTOP` (a real signal). On **darwin** it sends
+   nothing to the tracee — it posts an empty Mach message to a private control
+   port that is in `Wait`'s receive set (`bingo_send_ctrl`), because a
+   `task_suspend`/`thread_suspend` cannot wake a thread blocked in `mach_msg`.
+   Either way the interrupt surfaces from `Backend.Wait()` as
+   `StopEvent{Reason: StopSignal, Signal: PauseSignal()}`, so detection lives
+   entirely in the engine's `handleStop` `StopSignal` branch. `PauseSignal()`
+   returns `SIGSTOP` on linux and `SIGUSR2` on darwin, but on darwin that value
+   is only a **sentinel** the engine matches against — no `SIGUSR2` is ever
+   sent.
 4. `handleStop` `StopSignal` branch: if `manualStopPending` (and
    `stop.Signal == e.backend.PauseSignal()`), it clears the flag, defensively
    reinstalls any in-flight step-over BP (mirrors the existing StopSignal
@@ -513,44 +571,43 @@ deliberately **swallows** a non-main-thread SIGSTOP as a clone group-stop
 be lost. Targeting the main thread (`tid == pid`) makes it fall through to the
 `StopSignal` return every time. `PauseSignal()` returns `SIGSTOP`.
 
-**Darwin: a *catchable* signal (SIGUSR2), not SIGSTOP.** darwin `StopProcess()`
-([backend_darwin_arm64.go](internal/debugger/backend_darwin_arm64.go)) sends
-`kill(pid, SIGUSR2)` and `PauseSignal()` returns `SIGUSR2`. SIGSTOP does **not**
-work on darwin: XNU delivers a SIGSTOP to a ptraced tracee as a *job-control*
-stop that Go's `syscall.WaitStatus` classifies as neither `Stopped()` nor
-`Exited()` (`StopSignal() == -1`), so `Wait()`'s `if !ws.Stopped() { continue }`
-skips it and re-blocks in `wait4` forever — verified empirically on real Apple
-Silicon. A **catchable** signal instead produces an ordinary ptrace
-signal-delivery stop that `wait4` *does* report, so it falls through darwin
-`Wait()` to `StopEvent{StopSignal, sig}` (SIGTRAP is breakpoint/step and
-SIGURG/SIGWINCH are re-delivered, so those are special-cased; SIGUSR2 is not).
-SIGUSR2 is chosen because it is catchable, never terminal-generated, and unused
-by the Go runtime. Bingo never re-injects it (`Continue` resumes with signal 0),
-so the tracee never actually receives it — resume is a plain Continue, and the
-async-preempt SIGURG hazard doesn't apply (the darwin backend also forces
-`GODEBUG=asyncpreemptoff=1`, so the tracee has no SIGURG anyway). This mirrors
-Delve's *intent* (an on-demand halt surfaced to the wait loop) while fitting
-bingo's `wait4` architecture — it does **not** use Mach `thread_suspend` (Delve
-needs that only because it detects stops via a Mach exception port, not `wait4`).
+**Darwin: a control-port wake + `stopTheWorld`, no signal at all.** darwin
+`StopProcess()`
+([backend_darwin_arm64.go](internal/debugger/backend_darwin_arm64.go)) does
+`bingo_send_ctrl(ctrlPort)` — a non-blocking `mach_msg` send to a private port
+folded into `Wait`'s receive set. `Wait` sees the wake as `BINGO_MSG_PAUSE`,
+runs `stopTheWorld` (suspend every thread + drain queued exceptions), and
+returns `StopEvent{StopSignal, PauseSignal()}` with `PauseSignal()` = `SIGUSR2`
+as a pure engine sentinel — no signal is delivered to the tracee. A Mach send is
+used rather than `task_suspend`/`thread_suspend` directly because those cannot
+wake a thread blocked in `mach_msg`; the send both wakes `Wait` and lets it do
+the suspend on the serialized loop. Because no signal is injected and no whole-
+group stop is created, **resume-after-pause is a plain `ContinueProcess`** —
+identical to resuming from a breakpoint, no special handling. With async
+preemption RE-ENABLED (#92) the tracee does generate `SIGURG`, but those are
+delivered natively to the correct M and never intercepted, so they do not
+interfere with the pause round-trip. This mirrors Delve's *intent* (an on-demand
+halt surfaced to the receive loop); bingo's partial-stop model only needs the
+reporting path suspended, so it does not replicate Delve's per-thread
+`thread_suspend` + atomic halt-flag machinery.
 
-**Resume-after-pause is a plain Continue.** bingo never *injects* the interrupt
-signal (`Continue` does `PtraceCont(tid, 0)` / `PT_CONTINUE` with signal 0,
-which suppresses the pending signal), so only the reporting thread entered
-signal-delivery-stop and no whole-group stop was created. Resuming is therefore
-identical to resuming from a breakpoint — no special handling. The
-`pause`-labelled E2E spec (`declarePauseSpec`,
+**Resume-after-pause is a plain Continue.** On linux bingo never *injects* the
+interrupt signal (`Continue` does `PtraceCont(tid, 0)` with signal 0, which
+suppresses the pending SIGSTOP); on darwin no signal was ever sent. Either way
+resuming is identical to resuming from a breakpoint. The `pause`-labelled E2E
+spec (`declarePauseSpec`,
 [debugger_e2e_common_test.go](test/integration/debugger_e2e_common_test.go),
 wired into **both** the linux and darwin containers) runs the
 Continue→Pause→Paused round-trip several times; if the first resume hung, the
-second Pause's signal would never surface and the spec would time out.
+second Pause's wake would never surface and the spec would time out.
 
-`StopProcess()` itself is the hardened idempotent primitive from the Restart
-groundwork: a `pid == 0` guard and `ESRCH` (process already gone) treated as a
-no-op success. Delve's manual-stop is heavier (Linux: `sys.Kill(pid, SIGTRAP)` +
-a `trapWaitInternal` halt-flag state machine; Darwin: Mach `thread_suspend` on
-every thread + an atomic halt flag) because it lands *every* thread at a
-consistent stop point; bingo's partial-stop model only needs the one reporting
-thread suspended, so a single interrupt signal suffices on both platforms.
+`StopProcess()` is idempotent: linux guards `pid == 0` and treats `ESRCH`
+(process already gone) as a no-op success; darwin tolerates `MACH_SEND_TIMED_OUT`
+(the receive loop is momentarily not blocked) as success. Delve's manual-stop is
+heavier (Linux: `sys.Kill(pid, SIGTRAP)` + a `trapWaitInternal` halt-flag state
+machine; Darwin: Mach `thread_suspend` on every thread + an atomic halt flag)
+because it lands *every* thread at a consistent stop point; bingo's model stops
+the world in `Wait` and reports the pause, which is all the engine needs.
 
 ## Error handling
 
@@ -579,9 +636,10 @@ side `chan error` — every debugger outcome, failures included, rides the singl
 - `test/integration`: Ginkgo suite. A trivial placeholder spec runs by default;
   the real content is the **debugger E2E acceptance tests** — Ginkgo specs gated
   behind the `e2e` build tag that launch a real target and drive the ACTUAL
-  native backend (ptrace on linux/amd64, ptrace+Mach on darwin/arm64), NOT the
-  `fakeBackend`. These need a real kernel, so they only run on native runners
-  (they can't run under emulation or with fakes). Split into:
+  native backend (ptrace on linux/amd64, a pure-Mach exception-port model on
+  darwin/arm64), NOT the `fakeBackend`. These need a real kernel, so they only
+  run on native runners (they can't run under emulation or with fakes). Split
+  into:
   `debugger_e2e_common_test.go` (harness + target sources + shared spec bodies),
   `debugger_e2e_linux_amd64_test.go`, `debugger_e2e_darwin_arm64_test.go`, and
   `debugger_e2e_fullstack_test.go`. Ginkgo labels: `basic`
@@ -599,53 +657,39 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   of real events, the suspend/resume gate on a genuine BreakpointHit, synchronous
   SetBreakpoint confirmation routing). The `pause` spec (`declarePauseSpec`) is
   wired into **both** the linux and darwin containers — detection is
-  platform-agnostic in the engine and each backend's `PauseSignal()` surfaces
-  the interrupt through `wait4`.
+  platform-agnostic in the engine and each backend's `StopProcess()` surfaces the
+  interrupt to `Wait` (a real SIGSTOP on linux, a control-port wake on darwin).
 
-  **Platform scoping — the darwin container runs only plain-resume specs.**
-  The darwin container wires `pause`, `inspect`, `restart`, and `fullstack`;
-  `basic`, `stepping`, `breakpoints`, `churn`, and `kill` are LINUX-ONLY. The
-  dividing line is whether the tracee is ever single-stepped *off* an armed
-  software breakpoint (the restore→single-step-over-the-trap→reinstall dance in
-  `engine.resumeFromBreakpoint`). The darwin specs never do: they resume with a
-  plain continue INTO a trap (or from a launch/paused stop) and only ever kill a
-  *suspended* tracee, so they are deterministic. Turning `asyncpreemptoff` on by
-  default on darwin (`asyncPreemptOffDefault = true` in
-  [backend_darwin_arm64.go](internal/debugger/backend_darwin_arm64.go)) removed
-  the SIGURG-during-resume misdirection that was the #89 root cause and made the
-  plain-resume paths solid, but it did NOT make stepping-off-a-trap reliable.
-  What stays linux-only, and why (all are wait4-model gaps the Mach-exception
-  rearchitecture in **#92** closes — do NOT paper over them by bloating
-  timeouts):
+  **Platform scoping — both containers run the full set.** The darwin container
+  wires the same specs as linux: `basic`, `stepping`, `breakpoints`, `churn`,
+  `kill`, `pause`, `inspect`, `restart`, and `fullstack`. This was NOT always so:
+  under the old darwin wait4/ptrace model the step-off-an-armed-trap specs
+  (`basic`, `stepping`, `breakpoints`, `churn`) and `kill` (kill-while-running)
+  were LINUX-ONLY, because single-stepping off a software breakpoint could be
+  diverted by a mid-step BSD signal and killing a freely-running tracee
+  deadlocked the engine loop. The Mach-exception rearchitecture (**#92**) closed
+  all of those gaps, so they now run on darwin too. The three things that made it
+  reliable, with async preemption RE-ENABLED (`asyncPreemptOffDefault = false`):
 
-  1. **Single-step off an armed breakpoint (`basic`, `stepping`, `breakpoints`,
-     `churn`).** Whenever a resume steps off a software breakpoint, a BSD signal
-     delivered *during* the `PT_STEP` can divert PC into the Go runtime's signal
-     trampoline (`runtime.sigtramp`/libsystem). For a branch instruction the
-     step-retire logic (`PC != addr`) cannot tell "stepped past the trap" from
-     "diverted into the handler," so the resume hangs (the next `wait4` blocks and
-     the spec times out ~15-20s). It is a LOW rate per step — `basic` (25 step-
-     overs) and `breakpoints` (a handful of continues off a parked BP) each flake
-     ~1-3% per run — but nonzero, so both are linux-only rather than shipped as
-     flaky darwin canaries. `stepping` (StepInto/StepOut) and `churn` (hundreds of
-     step-overs under continuous thread creation) hit it far more often. This is
-     DISTINCT from issue #78 (a suspend-list data race in
-     `backend_darwin_arm64.go`) but lives in the same darwin single-step
-     subsystem.
-  2. **Kill-while-running deadlock (`kill`).** `killProcess` on darwin SIGKILLs
-     then does one `PT_CONTINUE` then `cmd.Wait()`. For a *freely-running*
-     (PT_CONTINUE'd) tracee, the SIGKILL enters a ptrace signal-delivery-stop
-     needing a follow-up `PT_CONTINUE` that never comes (the engine loop is
-     blocked in `cmd.Wait()`, which also double-waits the engine's own waitLoop
-     `wait4`), deadlocking. Linux `killProcess` reaps via `Wait4(-1, …, WALL)` so
-     `cmd.Wait()` returns `ECHILD` and it works. Killing a *suspended* tracee
-     (every spec's cleanup, and `restart`) is fine on darwin and stays covered.
-     So `kill` (kill-while-running) is linux-only.
+  1. **Per-thread exception delivery + native signals.** Masking only
+     `EXC_MASK_BREAKPOINT` and leaving BSD signals native means Go's
+     thread-directed `SIGURG` reaches the exact M, so a single-step is no longer
+     diverted into the runtime signal trampoline. (Under wait4 the only resume
+     was process-directed, which misdirected SIGURG — the #89 root cause that had
+     forced `asyncpreemptoff`.) During a single-step only the stepped thread is
+     resumed (others stay Mach-suspended), so sysmon is frozen and no new
+     preemption is injected in the step window.
+  2. **Target-side I-cache flush on every breakpoint write.**
+     `mach_vm_machine_attribute(MATTR_CACHE, MATTR_VAL_CACHE_FLUSH)` in
+     `bingo_write_memory` makes a freshly-installed trap (`<stepover-next>`,
+     `<stepout-return>`) visible the instant it is re-executed. Without it a
+     trap re-hit within microseconds could fetch a stale L1 I-cache line and be
+     skipped — the ~2.5% StepOut/step-over wedge (see Backend quirks → Darwin).
+  3. **wait4-based kill, no `cmd.Wait`.** darwin `killProcess` resumes every
+     thread, `SIGKILL`s, and reaps via `wait4` without blocking the engine loop,
+     so kill-while-running tears down cleanly instead of deadlocking.
 
-  #92 restores `basic`, `stepping`, `breakpoints`, `churn`, and `kill` onto
-  darwin once stops are detected through a Mach exception port (per-thread signal
-  fidelity, `thread_suspend` halting) instead of wait4. Each label is its own CI
-  job. CI:
+  Each label is its own CI job. CI:
   [.github/workflows/debugger-e2e.yml](.github/workflows/debugger-e2e.yml).
   The linux jobs run fully on hosted runners. The darwin jobs compile and
   codesign the E2E binary on hosted macOS runners (the only CI check that the
@@ -684,7 +728,7 @@ just test [PKG]                            # go test -v
 just coverage [PKG]                        # writes test/coverage.out
 just integration                           # ginkgo -r ./test/integration (no e2e tag)
 just e2e-linux                             # native linux/amd64 ptrace E2E (all labels)
-just e2e-darwin                            # native darwin/arm64 ptrace+Mach E2E (codesigned; darwin-wired labels)
+just e2e-darwin                            # native darwin/arm64 Mach-exception E2E (codesigned; all labels)
 # Filter to one label, e.g. only the correctness gate (package path must come
 # before the -ginkgo.* flag so `go test` doesn't mistake it for the package):
 go test -tags e2e -race ./test/integration -ginkgo.label-filter=basic
