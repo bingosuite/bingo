@@ -1,8 +1,41 @@
 // Exposes internal symbols to debugger_test. Compiled only during `go test`.
 package debugger
 
+import "fmt"
+
 func ExportedTrapInstruction() []byte {
 	return archTrapInstruction()
+}
+
+// ExportedLoadDWARF loads DWARF from binaryPath into the engine, bypassing a
+// real Launch/Attach so DWARF-dependent inspection paths (Locals, StackFrames,
+// Goroutines) can be exercised against the fakeBackend. Panics on failure.
+func ExportedLoadDWARF(d Debugger, binaryPath string) {
+	e := d.(*engine)
+	if err := e.dispatch(func() error {
+		e.loadDWARF(binaryPath)
+		if e.dw == nil {
+			return fmt.Errorf("no DWARF for %s", binaryPath)
+		}
+		return nil
+	}); err != nil {
+		panic("ExportedLoadDWARF: " + err.Error())
+	}
+}
+
+// ExportedPCForFileLine resolves file:line to a runtime PC via the loaded DWARF.
+func ExportedPCForFileLine(d Debugger, file string, line int) (uint64, error) {
+	e := d.(*engine)
+	var pc uint64
+	err := e.dispatch(func() error {
+		if e.dw == nil {
+			return fmt.Errorf("no DWARF loaded")
+		}
+		var lookupErr error
+		pc, lookupErr = e.dw.PCForFileLine(file, line)
+		return lookupErr
+	})
+	return pc, err
 }
 
 func ExportedFileMatches(candidate, target string) bool {

@@ -357,11 +357,15 @@ func (e *engine) Locals(frameIndex int) ([]protocol.Variable, error) {
 		if e.dw == nil {
 			return fmt.Errorf("Locals: no DWARF info")
 		}
-		threads, err := e.backend.Threads()
-		if err != nil || len(threads) == 0 {
-			return fmt.Errorf("Locals: no threads")
+		// Inspect the thread the user is stopped on (curTID via activeTID), not
+		// threads[0]: on Darwin threads[0] is frequently an idle runtime M, so a
+		// breakpoint that fires on another thread would otherwise report an
+		// unrelated frame's locals. See the activeTID/collectFrames invariant.
+		tid, err := e.activeTID()
+		if err != nil {
+			return fmt.Errorf("Locals: %w", err)
 		}
-		regs, err := e.backend.GetRegisters(threads[0])
+		regs, err := e.backend.GetRegisters(tid)
 		if err != nil {
 			return fmt.Errorf("Locals: get registers: %w", err)
 		}
@@ -396,7 +400,10 @@ func (e *engine) StackFrames() ([]protocol.Frame, error) {
 			return err
 		}
 		var err error
-		frames, err = e.collectFrames(e.lastBPTID)
+		// Walk the currently-stopped thread. lastBPTID is only valid immediately
+		// after a breakpoint hit and is cleared once we single-step off it, so it
+		// goes stale after a step; curTID always tracks the active stop.
+		frames, err = e.collectFrames(e.curTID)
 		return err
 	})
 	return frames, err
@@ -844,9 +851,8 @@ func (e *engine) sourceStepOver() error {
 		e.stepOverLine = 0
 
 		if file == "" || line == 0 {
-			threads, err := e.backend.Threads()
-			if err == nil && len(threads) > 0 {
-				if regs, err := e.backend.GetRegisters(threads[0]); err == nil {
+			if tid, err := e.activeTID(); err == nil {
+				if regs, err := e.backend.GetRegisters(tid); err == nil {
 					loc := e.dw.locationForPC(regs.PC)
 					file = loc.File
 					line = loc.Line
@@ -1020,11 +1026,13 @@ func (e *engine) walkStack(regs Registers) []uint64 {
 }
 
 func (e *engine) readGoroutines() ([]protocol.Goroutine, error) {
-	threads, err := e.backend.Threads()
-	if err != nil || len(threads) == 0 {
+	// Report the stopped thread's location (curTID via activeTID); threads[0] may
+	// be an idle runtime M and would misreport where execution is paused.
+	tid, err := e.activeTID()
+	if err != nil {
 		return nil, nil
 	}
-	regs, err := e.backend.GetRegisters(threads[0])
+	regs, err := e.backend.GetRegisters(tid)
 	if err != nil {
 		return nil, fmt.Errorf("Goroutines: %w", err)
 	}
