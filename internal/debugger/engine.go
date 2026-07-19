@@ -67,8 +67,18 @@ type engine struct {
 	lastBP         *breakpointEntry
 	lastBPTID      int // thread that hit lastBP (Mach port on Darwin)
 	steppingOverBP *breakpointEntry
-	bpResume       bpResumeAction
-	bpRetAddr      uint64 // bpResumeStepOut only
+
+	// curTID is the thread the user is currently stopped on — the one that hit
+	// the last breakpoint or completed the last step. Updated on every
+	// user-visible suspend. Step primitives must target this thread, never
+	// threads[0]: darwin's task_threads returns creation order, so threads[0]
+	// is frequently an idle runtime M, and single-stepping the wrong thread
+	// (with a per-process PT_STEP that releases the whole task) misdirects Go's
+	// thread-directed SIGURG into a pthread-condvar lost-wakeup (see #92).
+	curTID int
+
+	bpResume  bpResumeAction
+	bpRetAddr uint64 // bpResumeStepOut only
 
 	// Source-line target remembered from the previous step-over. More
 	// reliable than re-querying locationForPC, which can land on a DWARF
@@ -124,6 +134,22 @@ func (e *engine) endThreadStep() {
 	if ts, ok := e.backend.(threadStepper); ok {
 		ts.endThreadStep()
 	}
+}
+
+// activeTID resolves the thread the user is currently stopped on. It prefers
+// curTID (set on every user-visible suspend) and falls back to the first task
+// thread only before any stop has been recorded. Callers that single-step or
+// read registers must use this, not threads[0]: on darwin threads[0] is often
+// an idle runtime M, not the goroutine under inspection (see curTID).
+func (e *engine) activeTID() (int, error) {
+	if e.curTID != 0 {
+		return e.curTID, nil
+	}
+	threads, err := e.backend.Threads()
+	if err != nil || len(threads) == 0 {
+		return 0, fmt.Errorf("no current thread")
+	}
+	return threads[0], nil
 }
 
 type stopResult struct {
@@ -269,11 +295,20 @@ func (e *engine) StepInto() error {
 		if e.lastBP != nil {
 			return e.resumeFromBreakpoint(bpResumeStep, 0)
 		}
-		threads, err := e.backend.Threads()
-		if err != nil || len(threads) == 0 {
-			return fmt.Errorf("StepInto: no threads")
+		tid, err := e.activeTID()
+		if err != nil {
+			return fmt.Errorf("StepInto: %w", err)
 		}
-		if err := e.backend.SingleStep(threads[0]); err != nil {
+		regs, err := e.backend.GetRegisters(tid)
+		if err != nil {
+			return fmt.Errorf("StepInto: get registers: %w", err)
+		}
+		// Step exactly one instruction on the user thread. On darwin this holds
+		// every other thread Mach-suspended and hardware-single-steps tid
+		// specifically, closing the per-process PT_STEP task-release window that
+		// misdirects Go's thread-directed SIGURG into a condvar lost-wakeup
+		// (#92); elsewhere it degrades to a plain per-thread single-step.
+		if err := e.stepThreadOverBP(tid, regs.PC); err != nil {
 			return err
 		}
 		e.setState(stateRunning)
@@ -839,11 +874,18 @@ func (e *engine) sourceStepOver() error {
 			}
 		}
 	}
-	threads, err := e.backend.Threads()
-	if err != nil || len(threads) == 0 {
-		return fmt.Errorf("StepOver: no threads")
+	tid, err := e.activeTID()
+	if err != nil {
+		return fmt.Errorf("StepOver: %w", err)
 	}
-	if err := e.backend.SingleStep(threads[0]); err != nil {
+	regs, err := e.backend.GetRegisters(tid)
+	if err != nil {
+		return fmt.Errorf("StepOver: get registers: %w", err)
+	}
+	// No DWARF next-line target (e.g. stopped outside known source): fall back
+	// to a single machine-instruction step of the user thread via the atomic
+	// path, same rationale as StepInto (#92).
+	if err := e.stepThreadOverBP(tid, regs.PC); err != nil {
 		return err
 	}
 	e.setState(stateRunning)
@@ -852,16 +894,25 @@ func (e *engine) sourceStepOver() error {
 }
 
 func (e *engine) stepOut() error {
-	threads, err := e.backend.Threads()
-	if err != nil || len(threads) == 0 {
-		return fmt.Errorf("StepOut: no threads")
+	tid, err := e.activeTID()
+	if err != nil {
+		return fmt.Errorf("StepOut: %w", err)
 	}
-	regs, err := e.backend.GetRegisters(threads[0])
+	regs, err := e.backend.GetRegisters(tid)
 	if err != nil {
 		return fmt.Errorf("StepOut: get registers: %w", err)
 	}
+	// The return address lives at BP+8 — just above the caller's saved frame
+	// pointer at BP — the same frame-pointer chain walkStack follows. Reading
+	// *(SP) only yields the return address at a function's first instruction,
+	// before the prologue moves SP below the pushed return address; StepOut is
+	// normally invoked at a mid-function breakpoint, where *(SP) is a local slot.
+	// That mismatch was the "null return address" StepOut failure.
+	if regs.BP == 0 {
+		return fmt.Errorf("StepOut: null frame pointer — at outermost frame?")
+	}
 	var retBuf [8]byte
-	if err := e.backend.ReadMemory(regs.SP, retBuf[:]); err != nil {
+	if err := e.backend.ReadMemory(regs.BP+8, retBuf[:]); err != nil {
 		return fmt.Errorf("StepOut: read return address: %w", err)
 	}
 	retAddr := binary.LittleEndian.Uint64(retBuf[:])
@@ -1027,6 +1078,9 @@ func (e *engine) emit(kind protocol.EventKind, payload any) {
 }
 
 func (e *engine) emitBreakpointHit(bp *breakpointEntry, stop StopEvent) {
+	if stop.TID != 0 {
+		e.curTID = stop.TID
+	}
 	// Suspending for a self-stop cancels any pending Pause: a Pause interrupt
 	// signal that raced this stop and lost is now leftover in the kernel queue,
 	// to be suppressed (not reported as Paused) when it surfaces on the next
@@ -1060,6 +1114,9 @@ func (e *engine) emitStoppedAtCurrentPC() {
 }
 
 func (e *engine) emitStepped(stop StopEvent) {
+	if stop.TID != 0 {
+		e.curTID = stop.TID
+	}
 	// Completing a step suspends for a self-stop, which cancels any pending
 	// Pause the same way a breakpoint hit does (see emitBreakpointHit).
 	e.manualStopPending = false
@@ -1084,6 +1141,9 @@ func (e *engine) emitStepped(stop StopEvent) {
 // carries EventPaused/PausedPayload: the location is wherever execution was
 // interrupted, not a source-line boundary.
 func (e *engine) emitPaused(stop StopEvent) {
+	if stop.TID != 0 {
+		e.curTID = stop.TID
+	}
 	frames, _ := e.collectFrames(stop.TID)
 	goroutines, _ := e.readGoroutines()
 	var g protocol.Goroutine

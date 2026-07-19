@@ -500,12 +500,15 @@ var _ = Describe("Engine", func() {
 		const (
 			currentPC = uint64(0x8000)
 			currentSP = uint64(0x7fff0000)
+			currentBP = currentSP + 16
 			retAddr   = uint64(0x9000)
 		)
 
 		BeforeEach(func() {
-			fb.seedRegs(debugger.Registers{PC: currentPC, SP: currentSP, BP: currentSP + 16})
-			fb.seedMem(currentSP, le8(retAddr))
+			// The return address lives at BP+8 (above the caller's saved frame
+			// pointer at BP), matching StepOut's frame-pointer read.
+			fb.seedRegs(debugger.Registers{PC: currentPC, SP: currentSP, BP: currentBP})
+			fb.seedMem(currentBP+8, le8(retAddr))
 			fb.seedMem(retAddr, []byte{0x90})
 			debugger.ExportedForceSuspended(d)
 		})
@@ -541,8 +544,8 @@ var _ = Describe("Engine", func() {
 			Expect(fb.peekMem(retAddr, 1)[0]).To(Equal(byte(0x90)))
 		})
 
-		It("returns error when SP points to a null return address", func() {
-			fb.seedMem(currentSP, le8(0))
+		It("returns error when the return slot holds a null address", func() {
+			fb.seedMem(currentBP+8, le8(0))
 			Expect(d.StepOut()).To(HaveOccurred())
 		})
 	})
