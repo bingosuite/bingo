@@ -280,6 +280,21 @@ engine advances PC by `len(archTrapInstruction())` and resumes. See the
   Register-allocated variables come back as `<optimized out>`. Values are
   read as 8 bytes and returned hex; type-aware formatting is a TODO.
 
+## Logging — one injected logger per component
+
+`server`, `hub`, `client`, and the debugger `engine` each hold a `*slog.Logger`
+field (`s.log`, `h.log`, `c.log`, `e.log`), threaded down from
+[cmd/bingo/main.go](cmd/bingo/main.go) through `server.New` → `sessionStore` →
+`hub.NewSession` → `debugger.New`/`NewWithBackend`. `sessionStore.create` scopes
+it with `.With("session", id)` before handing it to both the hub and the
+debugger, so every log line for a session — regardless of which layer emitted
+it — is correlated by that field. **Never call the package-level `slog.Debug`
+/ `slog.Info` / `slog.Warn` / `slog.Error` from inside these components** —
+that bypasses the configured level/handler and the session correlation,
+producing duplicate-looking, uncorrelated log lines (this was the root cause
+of issue #32). Constructors accept a nil logger and fall back to
+`slog.Default()` (tests rely on this).
+
 ## Hub seq stream — why one counter
 
 The hub re-stamps every outbound event with its own atomic `seq` counter. The

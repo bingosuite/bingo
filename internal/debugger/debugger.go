@@ -5,6 +5,7 @@ package debugger
 
 import (
 	"errors"
+	"log/slog"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
@@ -47,12 +48,14 @@ type Debugger interface {
 	Events() <-chan protocol.Event
 }
 
-// New returns a Debugger backed by the platform-native OS backend.
-func New() Debugger {
-	return newEngine(newBackend())
+// New returns a Debugger backed by the platform-native OS backend. log is the
+// single sink for all debugger logging; pass nil to fall back to
+// slog.Default().
+func New(log *slog.Logger) Debugger {
+	return newEngine(newBackend(), log)
 }
 
 // NewWithBackend returns a Debugger using the supplied Backend. Tests only.
-func NewWithBackend(b Backend) Debugger {
-	return newEngine(b)
+func NewWithBackend(b Backend, log *slog.Logger) Debugger {
+	return newEngine(b, log)
 }

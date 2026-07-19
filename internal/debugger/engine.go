@@ -75,6 +75,12 @@ type engine struct {
 	// boundary with line==0. Zeroed on each sourceStepOver and on user-BP hits.
 	stepOverFile string
 	stepOverLine int
+
+	// log is the single sink for all engine logging. Never call the
+	// package-level slog functions directly — they bypass the per-session
+	// logger the hub/server configure, producing duplicate, uncorrelated
+	// log lines. See AGENTS.md.
+	log *slog.Logger
 }
 
 type engineCmd struct {
@@ -117,7 +123,10 @@ type stopResult struct {
 	err error
 }
 
-func newEngine(b Backend) *engine {
+func newEngine(b Backend, log *slog.Logger) *engine {
+	if log == nil {
+		log = slog.Default()
+	}
 	e := &engine{
 		backend: b,
 		bps:     newBreakpointTable(),
@@ -126,6 +135,7 @@ func newEngine(b Backend) *engine {
 		stopCh:  make(chan stopResult, 1),
 		done:    make(chan struct{}),
 		state:   stateNoProcess,
+		log:     log,
 	}
 	go e.loop()
 	return e
@@ -429,7 +439,7 @@ func (e *engine) handleStop(stop StopEvent) {
 			return
 		}
 		bp := e.bps.atAddr(stop.PC)
-		slog.Debug("StopBreakpoint", "pc", fmt.Sprintf("0x%x", stop.PC),
+		e.log.Debug("StopBreakpoint", "pc", fmt.Sprintf("0x%x", stop.PC),
 			"found", bp != nil,
 			"steppingOverBP", e.steppingOverBP != nil)
 		if bp == nil {
@@ -437,7 +447,7 @@ func (e *engine) handleStop(stop StopEvent) {
 			// internal trap or libc assertion). On ARM64 PC points AT the
 			// BRK; ContinueProcess with signal=0 leaves PC unchanged and
 			// re-executes the trap forever. Advance PC past the 4-byte BRK.
-			slog.Warn("spurious SIGTRAP — advancing PC past BRK and resuming",
+			e.log.Warn("spurious SIGTRAP — advancing PC past BRK and resuming",
 				"pc", fmt.Sprintf("0x%x", stop.PC))
 			if regs, err := e.backend.GetRegisters(stop.TID); err == nil {
 				regs.PC = stop.PC + uint64(len(archTrapInstruction()))
@@ -448,7 +458,7 @@ func (e *engine) handleStop(stop StopEvent) {
 			go e.waitLoop()
 			return
 		}
-		slog.Debug("StopBreakpoint matched", "file", bp.file, "line", bp.line,
+		e.log.Debug("StopBreakpoint matched", "file", bp.file, "line", bp.line,
 			"addr", fmt.Sprintf("0x%x", bp.addr))
 		e.rewindToBreakpoint(stop)
 		if bp.file == stepOverNextFile {
@@ -484,7 +494,7 @@ func (e *engine) handleStop(stop StopEvent) {
 			e.emitError(protocol.CmdNone, err)
 			return
 		}
-		slog.Debug("StopSingleStep", "pc", fmt.Sprintf("0x%x", stop.PC),
+		e.log.Debug("StopSingleStep", "pc", fmt.Sprintf("0x%x", stop.PC),
 			"steppingOverBP", e.steppingOverBP != nil)
 		if sob := e.steppingOverBP; sob != nil {
 			e.steppingOverBP = nil
@@ -492,7 +502,7 @@ func (e *engine) handleStop(stop StopEvent) {
 				// Reinstall failed. Suspend instead of resuming — running
 				// without the trap would let the process loose.
 				e.endThreadStep()
-				slog.Error("breakpoint reinstall failed — suspending to prevent runaway process",
+				e.log.Error("breakpoint reinstall failed — suspending to prevent runaway process",
 					"addr", fmt.Sprintf("0x%x", sob.addr), "err", rerr)
 				e.setState(stateSuspended)
 				e.emitError(protocol.CmdNone, fmt.Errorf("reinstall breakpoint 0x%x: %w", sob.addr, rerr))
@@ -501,7 +511,7 @@ func (e *engine) handleStop(stop StopEvent) {
 			// The trap byte is back in place; only now is it safe to release
 			// the threads we held for the atomic step-over.
 			e.endThreadStep()
-			slog.Debug("breakpoint reinstalled", "addr", fmt.Sprintf("0x%x", sob.addr))
+			e.log.Debug("breakpoint reinstalled", "addr", fmt.Sprintf("0x%x", sob.addr))
 			switch e.bpResume {
 			case bpResumeContinue:
 				_ = e.backend.ContinueProcess()
@@ -516,7 +526,7 @@ func (e *engine) handleStop(stop StopEvent) {
 				// the BP and can land on a DWARF entry with line==0.
 				if e.dw != nil && sob.file != "" && sob.line > 0 {
 					if nextPC, nextLine, ok := e.dw.NextLinePC(sob.file, sob.line); ok {
-						slog.Debug("sourceStepOver: setting "+stepOverNextFile,
+						e.log.Debug("sourceStepOver: setting "+stepOverNextFile,
 							"from", fmt.Sprintf("%s:%d", sob.file, sob.line),
 							"nextPC", fmt.Sprintf("0x%x", nextPC), "nextLine", nextLine)
 						entry, setErr := e.bps.set(e.backend, stepOverNextFile, 0, nextPC)
@@ -533,15 +543,15 @@ func (e *engine) handleStop(stop StopEvent) {
 								e.stepOverLine = 0
 							}
 						} else {
-							slog.Warn("sourceStepOver: set "+stepOverNextFile+" failed",
+							e.log.Warn("sourceStepOver: set "+stepOverNextFile+" failed",
 								"addr", fmt.Sprintf("0x%x", nextPC), "err", setErr)
 						}
 					} else {
-						slog.Warn("sourceStepOver: NextLinePC found no next line",
+						e.log.Warn("sourceStepOver: NextLinePC found no next line",
 							"file", sob.file, "line", sob.line)
 					}
 				}
-				slog.Debug("sourceStepOver fallback: emitting Stepped")
+				e.log.Debug("sourceStepOver fallback: emitting Stepped")
 				e.setState(stateSuspended)
 				e.emitStepped(stop)
 			case bpResumeStepOut:
@@ -622,7 +632,7 @@ func (e *engine) rewindToBreakpoint(stop StopEvent) {
 	}
 	regs, err := e.backend.GetRegisters(stop.TID)
 	if err != nil {
-		slog.Warn("rewindToBreakpoint: get registers failed",
+		e.log.Warn("rewindToBreakpoint: get registers failed",
 			"tid", stop.TID, "err", err)
 		return
 	}
@@ -631,7 +641,7 @@ func (e *engine) rewindToBreakpoint(stop StopEvent) {
 	}
 	regs.PC = stop.PC
 	if err := e.backend.SetRegisters(stop.TID, regs); err != nil {
-		slog.Warn("rewindToBreakpoint: set registers failed",
+		e.log.Warn("rewindToBreakpoint: set registers failed",
 			"tid", stop.TID, "pc", fmt.Sprintf("0x%x", stop.PC), "err", err)
 	}
 }
