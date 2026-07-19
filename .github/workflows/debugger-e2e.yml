@@ -1,0 +1,77 @@
+name: Debugger E2E
+
+# Real end-to-end acceptance tests that drive the native low-level debugger
+# backends against a freshly-built target: ptrace on linux/amd64, ptrace+Mach
+# on darwin/arm64. Unlike the default `go test ./...` (which exercises only the
+# in-process fakeBackend), these launch a real process and step it through the
+# actual OS backend, so they need a real kernel and run on native GitHub-hosted
+# runners. Gated behind the `e2e` build tag; the Ginkgo suite lives in
+# ./test/integration and is split into `basic` (correctness) and `churn`
+# (multi-thread robustness) via Ginkgo labels.
+
+on:
+  pull_request:
+  push:
+    branches: ["main", "dev"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-amd64:
+    name: Linux amd64 (ptrace)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Confirm native target
+        run: test "$(go env GOOS)/$(go env GOARCH)" = "linux/amd64"
+
+      - name: Show ptrace policy
+        run: cat /proc/sys/kernel/yama/ptrace_scope || true
+
+      - name: E2E basic (continue + step-over correctness)
+        run: go test -tags e2e -race -count=1 -v -timeout 300s -ginkgo.label-filter=basic ./test/integration
+
+      - name: E2E churn (multi-thread robustness)
+        run: go test -tags e2e -race -count=1 -v -timeout 600s -ginkgo.label-filter=churn ./test/integration
+
+  darwin-arm64:
+    name: Darwin arm64 (ptrace + Mach)
+    runs-on: macos-14
+    timeout-minutes: 25
+    # GitHub-hosted macOS runners can restrict task_for_pid even with the
+    # debugger entitlement; darwin is primarily verified locally. Don't fail the
+    # whole workflow if the runner blocks it.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Confirm native target
+        run: test "$(go env GOOS)/$(go env GOARCH)" = "darwin/arm64"
+
+      # task_for_pid needs the com.apple.security.cs.debugger entitlement, so the
+      # test binary must be codesigned before it runs. Compile first, sign, run.
+      - name: Build and codesign the E2E test binary
+        run: |
+          CGO_ENABLED=1 go test -tags 'e2e bingonative' -race -c -o e2e.test ./test/integration
+          codesign --sign - --entitlements entitlements.plist --force e2e.test
+          codesign -d --entitlements - e2e.test || true
+
+      - name: E2E basic (continue + step-over correctness)
+        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=basic
+
+      - name: E2E churn (single-step race under thread churn)
+        run: ./e2e.test -test.v -test.timeout 600s -ginkgo.label-filter=churn
