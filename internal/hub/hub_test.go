@@ -656,180 +656,146 @@ var _ = Describe("Hub", func() {
 			}, "500ms", "10ms").Should(Equal(protocol.EventError))
 		})
 	})
+})
 
-	Describe("Restart", func() {
-		It("rejects Restart on a raw (non-managed) hub", func() {
-			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+// newManagedRestartHub starts a managed session backed by fd, connects one
+// client, and drains the initial welcome/state event. The returned cancel
+// must be deferred by the caller.
+func newManagedRestartHub(fd *fakeDebugger) (*hub.Hub, *fakeWSConn, context.CancelFunc) {
+	managed := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
+	cancel := runHub(managed)
+	conn := newFakeWSConn()
+	managed.AddClient(conn, nil)
+	_, _ = recvEvent(conn) // welcome/state event
+	return managed, conn, cancel
+}
 
-			conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+// launchManaged injects a Launch and waits for it to reach the fake debugger
+// and the resulting running-state event to drain.
+func launchManaged(conn *fakeWSConn, fd *fakeDebugger, program string) {
+	conn.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: program}))
+	Eventually(fd.recordedCalls, "500ms", "10ms").Should(ContainElement("Launch"))
+	_, _ = recvEvent(conn) // state -> running
+}
 
-			e, ok := recvEvent(conn)
-			Expect(ok).To(BeTrue())
-			Expect(e.Kind).To(Equal(protocol.EventError))
-		})
+// waitForEventKind polls conn until an event of the given kind arrives,
+// decoding it into out (if non-nil) before returning.
+func waitForEventKind(conn *fakeWSConn, kind protocol.EventKind, out any) {
+	Eventually(func() bool {
+		e, ok := recvEvent(conn)
+		if !ok || e.Kind != kind {
+			return false
+		}
+		if out != nil {
+			ExpectWithOffset(1, protocol.DecodeEventPayload(e, out)).To(Succeed())
+		}
+		return true
+	}, "500ms", "10ms").Should(BeTrue())
+}
 
-		It("rejects Restart before any successful Launch", func() {
-			managed := hub.NewSession("session", func() debugger.Debugger { return newFakeDebugger() }, nil)
-			cancelManaged := runHub(managed)
-			defer cancelManaged()
+// countCalls returns how many times name appears in calls.
+func countCalls(calls []string, name string) int {
+	n := 0
+	for _, c := range calls {
+		if c == name {
+			n++
+		}
+	}
+	return n
+}
 
-			conn := newFakeWSConn()
-			managed.AddClient(conn, nil)
-			_, _ = recvEvent(conn) // welcome/state event
+var _ = Describe("Restart", func() {
+	var fd *fakeDebugger
 
-			conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+	BeforeEach(func() {
+		fd = newFakeDebugger()
+	})
 
-			e, ok := recvEvent(conn)
-			Expect(ok).To(BeTrue())
-			Expect(e.Kind).To(Equal(protocol.EventError))
-		})
+	It("rejects Restart on a raw (non-managed) hub", func() {
+		h := hub.New(fd, nil)
+		cancel := runHub(h)
+		defer cancel()
 
-		It("rejects Restart after Attach (no relaunchable binary)", func() {
-			managed := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
-			cancelManaged := runHub(managed)
-			defer cancelManaged()
+		conn := newFakeWSConn()
+		h.AddClient(conn, nil)
 
-			conn := newFakeWSConn()
-			managed.AddClient(conn, nil)
-			_, _ = recvEvent(conn)
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		waitForEventKind(conn, protocol.EventError, nil)
+	})
 
-			conn.inject(mustCommand(protocol.CmdAttach, protocol.AttachPayload{PID: 123}))
-			Eventually(fd.recordedCalls, "500ms", "10ms").Should(ContainElement("Attach"))
+	It("rejects Restart before any successful Launch", func() {
+		_, conn, cancel := newManagedRestartHub(fd)
+		defer cancel()
 
-			conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		waitForEventKind(conn, protocol.EventError, nil)
+	})
 
-			Eventually(func() protocol.EventKind {
-				e, ok := recvEvent(conn)
-				if !ok {
-					return ""
-				}
-				return e.Kind
-			}, "500ms", "10ms").Should(Equal(protocol.EventError))
-		})
+	It("rejects Restart after Attach (no relaunchable binary)", func() {
+		_, conn, cancel := newManagedRestartHub(fd)
+		defer cancel()
 
-		It("kills the old debugger, relaunches, and reinstalls breakpoints", func() {
-			managed := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
-			cancelManaged := runHub(managed)
-			defer cancelManaged()
+		conn.inject(mustCommand(protocol.CmdAttach, protocol.AttachPayload{PID: 123}))
+		Eventually(fd.recordedCalls, "500ms", "10ms").Should(ContainElement("Attach"))
 
-			conn := newFakeWSConn()
-			managed.AddClient(conn, nil)
-			_, _ = recvEvent(conn)
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		waitForEventKind(conn, protocol.EventError, nil)
+	})
 
-			conn.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: "myapp", Args: []string{"-x"}}))
-			Eventually(fd.recordedCalls, "500ms", "10ms").Should(ContainElement("Launch"))
-			_, _ = recvEvent(conn) // state -> running
+	It("kills the old debugger, relaunches, and reinstalls breakpoints", func() {
+		_, conn, cancel := newManagedRestartHub(fd)
+		defer cancel()
+		launchManaged(conn, fd, "myapp")
 
-			fd.setBPResult = protocol.Breakpoint{ID: 1, Location: protocol.Location{File: "main.go", Line: 10}}
-			conn.inject(mustCommand(protocol.CmdSetBreakpoint, protocol.SetBreakpointPayload{File: "main.go", Line: 10}))
-			Eventually(func() protocol.EventKind {
-				e, ok := recvEvent(conn)
-				if !ok {
-					return ""
-				}
-				return e.Kind
-			}, "500ms", "10ms").Should(Equal(protocol.EventBreakpointSet))
+		fd.setBPResult = protocol.Breakpoint{ID: 1, Location: protocol.Location{File: "main.go", Line: 10}}
+		conn.inject(mustCommand(protocol.CmdSetBreakpoint, protocol.SetBreakpointPayload{File: "main.go", Line: 10}))
+		waitForEventKind(conn, protocol.EventBreakpointSet, nil)
 
-			conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		var restarted protocol.RestartedPayload
+		waitForEventKind(conn, protocol.EventRestarted, &restarted)
 
-			var restarted protocol.RestartedPayload
-			Eventually(func() bool {
-				e, ok := recvEvent(conn)
-				if !ok || e.Kind != protocol.EventRestarted {
-					return false
-				}
-				Expect(protocol.DecodeEventPayload(e, &restarted)).To(Succeed())
-				return true
-			}, "500ms", "10ms").Should(BeTrue())
+		Expect(restarted.Program).To(Equal("myapp"))
+		Expect(restarted.Breakpoints).To(HaveLen(1))
+		Expect(restarted.Discarded).To(BeEmpty())
 
-			Expect(restarted.Program).To(Equal("myapp"))
-			Expect(restarted.Breakpoints).To(HaveLen(1))
-			Expect(restarted.Discarded).To(BeEmpty())
+		calls := fd.recordedCalls()
+		Expect(calls).To(ContainElement("Kill"))
+		Expect(countCalls(calls, "Launch")).To(Equal(2),
+			"expected a Launch for the original start plus one for restart")
+		Expect(countCalls(calls, "SetBreakpoint")).To(Equal(2),
+			"expected the original SetBreakpoint plus a reinstall on restart")
+	})
 
-			calls := fd.recordedCalls()
-			Expect(calls).To(ContainElement("Kill"))
-			launchCount := 0
-			bpCount := 0
-			for _, c := range calls {
-				if c == "Launch" {
-					launchCount++
-				}
-				if c == "SetBreakpoint" {
-					bpCount++
-				}
-			}
-			Expect(launchCount).To(Equal(2), "expected a Launch for the original start plus one for restart")
-			Expect(bpCount).To(Equal(2), "expected the original SetBreakpoint plus a reinstall on restart")
-		})
+	It("reports discarded breakpoints that fail to reinstall", func() {
+		_, conn, cancel := newManagedRestartHub(fd)
+		defer cancel()
+		launchManaged(conn, fd, "myapp")
 
-		It("reports discarded breakpoints that fail to reinstall", func() {
-			managed := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
-			cancelManaged := runHub(managed)
-			defer cancelManaged()
+		fd.setBPResult = protocol.Breakpoint{ID: 1, Location: protocol.Location{File: "main.go", Line: 10}}
+		conn.inject(mustCommand(protocol.CmdSetBreakpoint, protocol.SetBreakpointPayload{File: "main.go", Line: 10}))
+		waitForEventKind(conn, protocol.EventBreakpointSet, nil)
 
-			conn := newFakeWSConn()
-			managed.AddClient(conn, nil)
-			_, _ = recvEvent(conn)
+		fd.setBPErr = fmt.Errorf("no such line")
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		var restarted protocol.RestartedPayload
+		waitForEventKind(conn, protocol.EventRestarted, &restarted)
 
-			conn.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: "myapp"}))
-			Eventually(fd.recordedCalls, "500ms", "10ms").Should(ContainElement("Launch"))
-			_, _ = recvEvent(conn)
+		Expect(restarted.Breakpoints).To(BeEmpty())
+		Expect(restarted.Discarded).To(HaveLen(1))
+		Expect(restarted.Discarded[0].Reason).To(Equal("no such line"))
+	})
 
-			fd.setBPResult = protocol.Breakpoint{ID: 1, Location: protocol.Location{File: "main.go", Line: 10}}
-			conn.inject(mustCommand(protocol.CmdSetBreakpoint, protocol.SetBreakpointPayload{File: "main.go", Line: 10}))
-			Eventually(func() protocol.EventKind {
-				e, ok := recvEvent(conn)
-				if !ok {
-					return ""
-				}
-				return e.Kind
-			}, "500ms", "10ms").Should(Equal(protocol.EventBreakpointSet))
+	It("unblocks a suspended hub, same as Kill", func() {
+		_, conn, cancel := newManagedRestartHub(fd)
+		defer cancel()
+		launchManaged(conn, fd, "myapp")
 
-			fd.setBPErr = fmt.Errorf("no such line")
-			conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+			protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+		_, _ = recvEvent(conn)
 
-			var restarted protocol.RestartedPayload
-			Eventually(func() bool {
-				e, ok := recvEvent(conn)
-				if !ok || e.Kind != protocol.EventRestarted {
-					return false
-				}
-				Expect(protocol.DecodeEventPayload(e, &restarted)).To(Succeed())
-				return true
-			}, "500ms", "10ms").Should(BeTrue())
-
-			Expect(restarted.Breakpoints).To(BeEmpty())
-			Expect(restarted.Discarded).To(HaveLen(1))
-			Expect(restarted.Discarded[0].Reason).To(Equal("no such line"))
-		})
-
-		It("unblocks a suspended hub, same as Kill", func() {
-			managed := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
-			cancelManaged := runHub(managed)
-			defer cancelManaged()
-
-			conn := newFakeWSConn()
-			managed.AddClient(conn, nil)
-			_, _ = recvEvent(conn)
-
-			conn.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: "myapp"}))
-			Eventually(fd.recordedCalls, "500ms", "10ms").Should(ContainElement("Launch"))
-			_, _ = recvEvent(conn)
-
-			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
-				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
-			_, _ = recvEvent(conn)
-
-			conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
-
-			Eventually(func() protocol.EventKind {
-				e, ok := recvEvent(conn)
-				if !ok {
-					return ""
-				}
-				return e.Kind
-			}, "500ms", "10ms").Should(Equal(protocol.EventRestarted))
-		})
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		waitForEventKind(conn, protocol.EventRestarted, nil)
 	})
 })
