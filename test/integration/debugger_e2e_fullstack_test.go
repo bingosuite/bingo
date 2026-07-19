@@ -21,6 +21,7 @@ package integration
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -113,8 +114,16 @@ func newFullStackHarness(bin string) *fullStackHarness {
 	})
 
 	// Launch is fire-and-forget; the initial stop surfaces as Stepped on Events.
+	// A launch-time failure (e.g. task_for_pid denied on a locked-down host)
+	// comes back asynchronously as an EventError, so surface it clearly instead
+	// of masquerading as a Stepped timeout.
 	Expect(c.Launch(bin, nil, nil)).To(Succeed(), "client.Launch")
-	awaitEvent(c.Events(), 20*time.Second, protocol.EventStepped)
+	evt := awaitEvent(c.Events(), 20*time.Second, protocol.EventStepped, protocol.EventError)
+	if evt.Kind == protocol.EventError {
+		var ep protocol.ErrorPayload
+		_ = json.Unmarshal(evt.Payload, &ep)
+		Fail(fmt.Sprintf("launch failed over the wire: %s", ep.Message))
+	}
 
 	return &fullStackHarness{srv: srv, c: c}
 }
