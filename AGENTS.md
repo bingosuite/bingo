@@ -421,7 +421,13 @@ are detected by a `mach_msg` receive loop.
   away (the "parking the thread group" hazard).
 - `Wait` uses `Wait4(-1, …, WALL)` to receive events for any thread.
   `PTRACE_EVENT_*` stops are absorbed (resumed and looped) and never surface
-  to the engine.
+  to the engine — except the **main thread's** `PTRACE_EVENT_EXIT`, which is the
+  one exit the engine needs. Because `PTRACE_O_TRACEEXIT` stops the leader
+  *before* it dies and the engine tears down on the resulting `StopExited`, the
+  real status never resurfaces as a later `wait4` `Exited()`; so `Wait` reads it
+  at that stop via `PTRACE_GETEVENTMSG` (a `wait(2)`-encoded status) and reports
+  the true `ExitCode`, or `StopKilled` on signal death. Returning a hardcoded 0
+  here dropped every tracee's exit code (#94).
 - ptrace stops are per-thread. The backend records the last stopped TID and
   targets `ContinueProcess` / memory reads / memory writes at that TID, not
   blindly at the process PID. Non-main thread exits are absorbed inside `Wait`.
@@ -674,7 +680,8 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   (StepInto crosses into a callee, StepOut returns to the caller), `inspect`
   (StackFrames chain + Locals + Goroutines at a breakpoint), `breakpoints`
   (a cleared breakpoint stops firing), `kill` (Kill terminates a
-  freely-running tracee), and `restart` (hub-level kill+relaunch reinstalls
+  freely-running tracee), `exit` (EventProcessExited reports the tracee's real
+  exit code), and `restart` (hub-level kill+relaunch reinstalls
   breakpoints and reruns from the top), all driving `debugger.Debugger`
   in-process (except `restart`/`fullstack`, which go through the stack); plus
   `fullstack`, which drives operations through the ENTIRE stack (pkg/client →
@@ -692,8 +699,9 @@ side `chan error` — every debugger outcome, failures included, rides the singl
 
   **Platform scoping — both containers run the full set.** The darwin container
   wires the same specs as linux: `basic`, `stepping`, `breakpoints`, `churn`,
-  `kill`, `pause`, `inspect`, `restart`, and `fullstack`, plus the darwin-only
-  `hygiene` (Mach exception port-right leak regression). This was NOT always so:
+  `kill`, `exit`, `pause`, `inspect`, `restart`, and `fullstack`, plus the
+  darwin-only `hygiene` (Mach exception port-right leak regression). This was NOT
+  always so:
   under the old darwin wait4/ptrace model the step-off-an-armed-trap specs
   (`basic`, `stepping`, `breakpoints`, `churn`) and `kill` (kill-while-running)
   were LINUX-ONLY, because single-stepping off a software breakpoint could be
