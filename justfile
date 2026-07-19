@@ -45,3 +45,17 @@ coverage PKG="./...":
 # Run integration tests
 integration:
 	go run github.com/onsi/ginkgo/v2/ginkgo -r ./test/integration/.
+
+# Run the debugger E2E acceptance tests on linux/amd64 (native ptrace backend).
+# Runs both the `basic` correctness and `churn` robustness specs under -race.
+e2e-linux:
+	go test -tags e2e -race -count=1 -v -timeout 600s ./test/integration
+
+# Run the debugger E2E acceptance tests on darwin/arm64 (native ptrace+Mach
+# backend). task_for_pid needs the debugger entitlement, so the test binary is
+# codesigned before it runs.
+e2e-darwin:
+	mkdir -p ./build
+	env CGO_ENABLED=1 go test -tags 'e2e bingonative' -race -c -o ./build/bingo-e2e.test ./test/integration
+	codesign --sign - --entitlements entitlements.plist --force ./build/bingo-e2e.test
+	./build/bingo-e2e.test -test.v -test.timeout 600s
