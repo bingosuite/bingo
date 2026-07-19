@@ -139,6 +139,66 @@ func main() {
 }
 `
 
+// callTargetSrc is a small, quiet program with a known call chain
+// (main -> outer -> inner) and named locals in each frame, built with -N -l so
+// every local is stack-allocated (DWARF-readable) and every call is a real
+// call. It drives the stepping (StepInto/StepOut) and inspect
+// (StackFrames/Locals/Goroutines) specs. Markers: BPINNER sits on a line inside
+// inner (so a stop there has inner->outer->main on the stack with locals q/b);
+// CALLINNER sits on the call to inner (so a StepInto there crosses into it).
+const callTargetSrc = `package main
+
+import (
+	"os"
+	"time"
+)
+
+func inner(b int) int {
+	q := b * 2 // BPINNER
+	return q + 1
+}
+
+func outer(a int) int {
+	p := a + 100
+	r := inner(p) // CALLINNER
+	return r
+}
+
+func main() {
+	go func() { time.Sleep(180 * time.Second); os.Exit(0) }()
+	x := 0
+	for i := 0; i < 1000000; i++ {
+		x += outer(i % 5)
+		time.Sleep(time.Millisecond)
+		_ = x
+	}
+}
+`
+
+// twoBPTargetSrc has two distinct breakpoint-able lines in its hot loop (BP_A
+// then BP_B). The ClearBreakpoint spec sets both, then clears A while stopped at
+// B and asserts subsequent Continues only ever stop at B — proving the cleared
+// breakpoint really stops firing. Neither marked line contains a call, so the
+// spec exercises only Continue (never the darwin-fragile step-over path).
+const twoBPTargetSrc = `package main
+
+import (
+	"os"
+	"time"
+)
+
+func main() {
+	go func() { time.Sleep(180 * time.Second); os.Exit(0) }()
+	x := 0
+	for i := 0; i < 1000000; i++ {
+		x += i // BP_A
+		x *= 3 // BP_B
+		time.Sleep(time.Millisecond)
+		_ = x
+	}
+}
+`
+
 // declareBasicStepOverSpec adds the continue+step-over acceptance spec to the
 // enclosing Ginkgo container. It is the correctness gate: set a breakpoint on a
 // line that calls a function, repeatedly Continue to it and StepOver the call,
@@ -227,6 +287,269 @@ func declarePauseSpec() {
 		}
 		AddReportEntry("pause-iterations", iters)
 	})
+}
+
+// --- new operation specs (stepping / inspect / breakpoints / kill) ---
+//
+// LINUX vs DARWIN scoping: stepping (StepInto/StepOut), breakpoints
+// (ClearBreakpoint), and kill (kill-while-running) are wired only into the LINUX
+// container. StepInto/StepOut/ClearBreakpoint all RESUME FROM an armed software
+// breakpoint (the restore->single-step-over-trap->reinstall dance), which trips
+// a darwin backend lost-wakeup (~0.3-2% per resume, the #89 root cause);
+// kill-while-running deadlocks the darwin backend. inspect and restart never
+// resume from a breakpoint, so they run on both platforms. See the per-spec
+// comments, the darwin container, and AGENTS.md -> Test layering.
+
+// declareStepIntoSpec asserts StepInto crosses into a called function. It stops
+// at the call to inner (CALLINNER) and single-steps (machine-instruction
+// granularity) until the reported location is inside main.inner, proving the
+// step descended into the callee rather than over it. The step count is bounded
+// (a call site is only a couple of instructions from the CALL) so it stays
+// deterministic without assuming an exact number of instructions. LINUX-ONLY
+// (resumes from a breakpoint; see the scoping note above).
+func declareStepIntoSpec() {
+	It("steps into a called function", Label("stepping"), func() {
+		callLine := markerLine(callTargetSrc, "// CALLINNER")
+		bin := buildTarget("stepinto_target", callTargetSrc)
+
+		h := newE2EHarness(bin)
+		h.waitFor(15*time.Second, protocol.EventStepped) // initial launch stop
+
+		_, err := h.d.SetBreakpoint("stepinto_target.go", callLine)
+		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint at call site")
+
+		Expect(h.d.Continue()).To(Succeed(), "Continue to call site")
+		evt := h.waitFor(15*time.Second,
+			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit), "stopped at the call site")
+
+		const maxSteps = 20
+		reached := false
+		for s := 0; s < maxSteps && !reached; s++ {
+			Expect(h.d.StepInto()).To(Succeed(), "StepInto #%d", s)
+			evt = h.waitFor(15*time.Second,
+				protocol.EventStepped, protocol.EventProcessExited, protocol.EventError)
+			Expect(evt.Kind).To(Equal(protocol.EventStepped), "StepInto #%d emits Stepped", s)
+			var st protocol.SteppedPayload
+			Expect(json.Unmarshal(evt.Payload, &st)).To(Succeed(), "decode Stepped #%d", s)
+			if st.Location.Function == "main.inner" {
+				reached = true
+			}
+		}
+		Expect(reached).To(BeTrue(),
+			"StepInto reached main.inner within %d instruction steps", maxSteps)
+	})
+}
+
+// declareStepOutSpec asserts StepOut returns control to the caller. It stops
+// inside inner (BPINNER) and StepOut, then asserts the resulting location is
+// back in main.outer (the caller) — the return address the callee will unwind
+// to. StepOut over a software breakpoint runs the restore→single-step→reinstall
+// sequence once; a single StepOut keeps that off the flaky repeated-step path.
+// LINUX-ONLY (resumes from a breakpoint; see the scoping note above).
+func declareStepOutSpec() {
+	It("steps out of a callee back to its caller", Label("stepping"), func() {
+		innerLine := markerLine(callTargetSrc, "// BPINNER")
+		bin := buildTarget("stepout_target", callTargetSrc)
+
+		h := newE2EHarness(bin)
+		h.waitFor(15*time.Second, protocol.EventStepped) // initial launch stop
+
+		_, err := h.d.SetBreakpoint("stepout_target.go", innerLine)
+		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint inside callee")
+
+		Expect(h.d.Continue()).To(Succeed(), "Continue into callee")
+		evt := h.waitFor(15*time.Second,
+			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit), "stopped inside main.inner")
+
+		Expect(h.d.StepOut()).To(Succeed(), "StepOut of callee")
+		evt = h.waitFor(15*time.Second,
+			protocol.EventStepped, protocol.EventProcessExited, protocol.EventError)
+		Expect(evt.Kind).To(Equal(protocol.EventStepped), "StepOut emits Stepped")
+
+		var st protocol.SteppedPayload
+		Expect(json.Unmarshal(evt.Payload, &st)).To(Succeed(), "decode Stepped")
+		Expect(st.Location.Function).To(Equal("main.outer"),
+			"StepOut returned to the caller main.outer, got %q", st.Location.Function)
+	})
+}
+
+// declareInspectSpec asserts the state-inspection operations (StackFrames,
+// Locals, Goroutines) report a coherent snapshot at a breakpoint inside a known
+// call chain. It stops inside inner (main.inner <- main.outer <- main.main) and
+// checks: the innermost frames name those functions in order; Locals for the
+// innermost frame include the callee's declared local `q`; Goroutines returns a
+// plausible, non-empty list with a resolved current location. File/line in
+// resolved frames come back <autogenerated> under -N -l, so the assertions key
+// off the reliable Function name, not file:line.
+func declareInspectSpec() {
+	It("reports stack frames, locals, and goroutines at a breakpoint", Label("inspect"), func() {
+		innerLine := markerLine(callTargetSrc, "// BPINNER")
+		bin := buildTarget("inspect_target", callTargetSrc)
+
+		h := newE2EHarness(bin)
+		h.waitFor(15*time.Second, protocol.EventStepped) // initial launch stop
+
+		_, err := h.d.SetBreakpoint("inspect_target.go", innerLine)
+		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint inside callee")
+
+		Expect(h.d.Continue()).To(Succeed(), "Continue into callee")
+		evt := h.waitFor(15*time.Second,
+			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit), "stopped inside main.inner")
+
+		frames, err := h.d.StackFrames()
+		Expect(err).NotTo(HaveOccurred(), "StackFrames")
+		Expect(len(frames)).To(BeNumerically(">=", 3),
+			"expected at least inner<-outer<-main, got %d frames", len(frames))
+		Expect(frames[0].Location.Function).To(Equal("main.inner"), "innermost frame")
+		Expect(frames[1].Location.Function).To(Equal("main.outer"), "caller frame")
+		Expect(frames[2].Location.Function).To(Equal("main.main"), "outermost user frame")
+
+		locals, err := h.d.Locals(0)
+		Expect(err).NotTo(HaveOccurred(), "Locals(0)")
+		names := make([]string, 0, len(locals))
+		for _, v := range locals {
+			names = append(names, v.Name)
+		}
+		Expect(names).To(ContainElement("q"),
+			"innermost frame locals should include the declared local q, got %v", names)
+
+		grs, err := h.d.Goroutines()
+		Expect(err).NotTo(HaveOccurred(), "Goroutines")
+		Expect(len(grs)).To(BeNumerically(">=", 1), "at least one goroutine")
+		Expect(grs[0].CurrentLoc.Function).NotTo(BeEmpty(),
+			"goroutine current location should resolve to a function")
+	})
+}
+
+// declareClearBreakpointSpec asserts a cleared breakpoint stops firing. It sets
+// two breakpoints (A before B in the loop body), advances until it is stopped at
+// B, clears A (the non-current one — clearing the breakpoint the process is
+// currently parked on re-arms it through the step-off/reinstall path), then
+// Continues several times and asserts every subsequent stop is at B and never at
+// the cleared line A. LINUX-ONLY: the Continues here resume from an armed
+// breakpoint (see the scoping note above).
+func declareClearBreakpointSpec() {
+	It("stops stopping at a cleared breakpoint", Label("breakpoints"), func() {
+		lineA := markerLine(twoBPTargetSrc, "// BP_A")
+		lineB := markerLine(twoBPTargetSrc, "// BP_B")
+		bin := buildTarget("clearbp_target", twoBPTargetSrc)
+
+		h := newE2EHarness(bin)
+		h.waitFor(15*time.Second, protocol.EventStepped) // initial launch stop
+
+		bpA, err := h.d.SetBreakpoint("clearbp_target.go", lineA)
+		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint A")
+		_, err = h.d.SetBreakpoint("clearbp_target.go", lineB)
+		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint B")
+
+		// Advance to A, then to B, so we are parked on B (not A) when we clear A.
+		Expect(h.d.Continue()).To(Succeed(), "Continue to A")
+		evt := h.waitFor(15*time.Second,
+			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit), "first stop")
+		Expect(bpLine(evt)).To(Equal(lineA), "first stop is at A")
+
+		Expect(h.d.Continue()).To(Succeed(), "Continue to B")
+		evt = h.waitFor(15*time.Second,
+			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit), "second stop")
+		Expect(bpLine(evt)).To(Equal(lineB), "second stop is at B")
+
+		Expect(h.d.ClearBreakpoint(bpA.ID)).To(Succeed(), "ClearBreakpoint A")
+
+		// With A cleared, every remaining stop in the loop must be B.
+		const rounds = 4
+		for i := 0; i < rounds; i++ {
+			Expect(h.d.Continue()).To(Succeed(), "Continue #%d after clear", i)
+			evt = h.waitFor(15*time.Second,
+				protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+			Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit),
+				"post-clear stop #%d is a breakpoint", i)
+			Expect(bpLine(evt)).To(Equal(lineB),
+				"post-clear stop #%d must be at B (%d), not the cleared A (%d)", i, lineB, lineA)
+		}
+	})
+}
+
+// declareKillRunningSpec asserts Kill terminates a RUNNING tracee, not just a
+// suspended one. It Continues the process (so it is genuinely running, past the
+// launch stop), then Kills and asserts the engine tears down — proving Kill
+// reaps a process that is not sitting at a stop.
+//
+// LINUX-ONLY (wired only into the linux container). On darwin, killing a
+// freely-running (PT_CONTINUE'd) ptraced tracee deadlocks ~25% of the time: the
+// SIGKILL makes the traced process enter a ptrace signal-delivery-stop that
+// needs a follow-up PT_CONTINUE to push through, but darwin killProcess's
+// cmd.Wait() blocks the engine loop before it can issue one, so the process is
+// never reaped. That is a distinct darwin backend bug from the #78 suspend-list
+// race and is left to a dedicated follow-up rather than fixed here (it would be
+// fragile surgery in the same darwin subsystem #78 touches). Kill of a
+// *suspended* tracee works on darwin and is covered by every spec's cleanup and
+// by the Restart spec.
+func declareKillRunningSpec() {
+	It("kills a running process", Label("kill"), func() {
+		bin := buildTarget("kill_target", basicTargetSrc)
+
+		h := newE2EHarness(bin)
+		h.waitFor(15*time.Second, protocol.EventStepped) // initial launch stop
+
+		Expect(h.d.Continue()).To(Succeed(), "Continue so the tracee is running")
+		// Let it actually be running before we kill, so this exercises the
+		// running→exited path rather than racing the resume.
+		time.Sleep(30 * time.Millisecond)
+
+		Expect(h.d.Kill()).To(Succeed(), "Kill running process")
+		// Kill tears the engine down; which signal surfaces depends on which
+		// stop wins the race inside the loop. On linux the real wait4 exit
+		// typically arrives as ErrProcessExited and the loop emits
+		// EventProcessExited before closing; on darwin the synthetic StopExited
+		// injected by Kill wins and the loop returns straight to its deferred
+		// close(events) with no explicit exit event (see engine.loop's
+		// stateExited guard). Both outcomes prove the running tracee was reaped,
+		// so accept either. Only a timeout — neither event nor close — is a
+		// real failure (a wedged Kill that never reaped the process).
+		assertTerminated(h.d.Events(), 15*time.Second)
+	})
+}
+
+// assertTerminated drains ch until the engine signals the tracee is gone —
+// either an explicit EventProcessExited or the events channel closing (the
+// engine's clean-teardown path after Kill pre-sets stateExited). Fails on a
+// surfaced Error event or on timeout, the latter meaning Kill left the process
+// or engine wedged.
+func assertTerminated(ch <-chan protocol.Event, timeout time.Duration) {
+	GinkgoHelper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case evt, ok := <-ch:
+			if !ok {
+				return // channel closed: engine torn down, process reaped
+			}
+			if e2eDebug {
+				GinkgoWriter.Printf("event: kind=%v seq=%d payload=%s\n", evt.Kind, evt.Seq, evt.Payload)
+			}
+			switch evt.Kind {
+			case protocol.EventProcessExited:
+				return
+			case protocol.EventError:
+				Fail(fmt.Sprintf("Kill surfaced an error event: %s", evt.Payload))
+			}
+		case <-deadline:
+			Fail(fmt.Sprintf("TIMEOUT after %s: Kill did not terminate the running tracee", timeout))
+		}
+	}
+}
+
+// bpLine decodes a BreakpointHit event and returns its resolved line.
+func bpLine(evt protocol.Event) int {
+	GinkgoHelper()
+	var hit protocol.BreakpointHitPayload
+	Expect(json.Unmarshal(evt.Payload, &hit)).To(Succeed(), "decode BreakpointHit")
+	return hit.Breakpoint.Location.Line
 }
 
 // --- shared acceptance loop ---
