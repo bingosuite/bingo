@@ -61,19 +61,21 @@ type darwinBackend struct {
 
 	// Atomic step-over-breakpoint bookkeeping.
 	//
-	// suspended and the suspend/resume of held threads are touched ONLY from the
-	// engine loop goroutine (singleStepThread before waitLoop starts, and
-	// endThreadStep after the stopCh hand-back), so they need no lock.
-	//
-	// The remaining fields are shared: advanceStepOver drives the step on the
-	// waitLoop goroutine while endThreadStep may run concurrently on the engine
-	// loop goroutine if a Kill lands mid-step. They are guarded by stepMu.
+	// All of these are shared between two goroutines: advanceStepOver drives
+	// the step on the waitLoop goroutine, while endThreadStep may run
+	// concurrently on the engine loop goroutine if a Kill lands mid-step (and
+	// endThreadStep is itself also called from the waitLoop on a PT_STEP
+	// failure). They are guarded by stepMu. That includes `suspended`: it is
+	// truncated by resumeSuspended, which endThreadStep calls from EITHER
+	// goroutine, so an unguarded slice would race (and double-resume the same
+	// Mach ports) when a Kill races a waitLoop teardown.
 	// sobActive gates the step-over path in Wait; sobAddr is the disarmed
 	// breakpoint address the stepped thread must retire past; sobBranch records
 	// whether the instruction there alters control flow (so we can't assume it
 	// retires to sobAddr+4); sobSteps bounds the retry loop that steps through
 	// signal-handler excursions; stepThreadPort is the thread armed with
-	// hardware single-step that must be disarmed afterwards.
+	// hardware single-step that must be disarmed afterwards; suspended lists the
+	// exact Mach ports held so endThreadStep resumes precisely those.
 	suspended      []int
 	stepThreadPort int
 	sobActive      bool
@@ -527,8 +529,10 @@ func (b *darwinBackend) advanceStepOver() (StopEvent, bool) {
 // disarm hardware single-step on the stepped thread and resume every thread we
 // suspended. Idempotent and safe to call when no atomic step is in flight. May
 // run on the engine loop goroutine (Kill) while advanceStepOver runs on the
-// waitLoop goroutine, so the shared fields are touched under stepMu; the
-// suspend list itself is engine-loop-only.
+// waitLoop goroutine — and is itself also called from the waitLoop on a PT_STEP
+// failure — so every shared field it touches, `suspended` included, is accessed
+// under stepMu. Because resumeSuspended empties `suspended` under the lock, a
+// second concurrent teardown finds it empty and cannot double-resume a port.
 func (b *darwinBackend) endThreadStep() {
 	b.stepMu.Lock()
 	b.sobActive = false
@@ -544,12 +548,17 @@ func (b *darwinBackend) endThreadStep() {
 
 // suspendOthers Mach-suspends every task thread except keep, recording the
 // exact ports suspended so endThreadStep resumes precisely those (threads that
-// spawn during the window are left alone; threads that exit are ignored).
+// spawn during the window are left alone; threads that exit are ignored). The
+// `suspended` slice is written under stepMu since endThreadStep/resumeSuspended
+// may read and truncate it from another goroutine. Threads() is enumerated
+// before taking stepMu to avoid nesting the thread/task locks under it.
 func (b *darwinBackend) suspendOthers(keep int) error {
 	tids, err := b.Threads()
 	if err != nil {
 		return err
 	}
+	b.stepMu.Lock()
+	defer b.stepMu.Unlock()
 	b.suspended = b.suspended[:0]
 	for _, tid := range tids {
 		if tid == keep {
@@ -562,7 +571,13 @@ func (b *darwinBackend) suspendOthers(keep int) error {
 	return nil
 }
 
+// resumeSuspended resumes and clears every Mach port held by suspendOthers.
+// Guarded by stepMu because endThreadStep can call it from either the engine
+// loop (Kill) or the waitLoop (PT_STEP failure); emptying the slice under the
+// lock makes a racing second call a no-op instead of a double resume.
 func (b *darwinBackend) resumeSuspended() {
+	b.stepMu.Lock()
+	defer b.stepMu.Unlock()
 	for _, tid := range b.suspended {
 		C.bingo_thread_resume(C.mach_port_t(tid))
 	}
