@@ -335,6 +335,23 @@ are detected by a `mach_msg` receive loop.
   `ContinueProcess`/`killProcess` call `flushAllReplies`; `SingleStep` /
   `singleStepThread` / the `advanceStepOver` re-arm call `flushReply(tid)`. At
   most one pending reply per thread.
+- **Exception messages carry send rights that MUST be balanced.** Every
+  `exception_raise` (msgh_id 2401) the kernel delivers inserts a send right to
+  BOTH the faulting thread (`desc[0]`) and the task (`desc[1]`) into our IPC
+  space; Mach coalesces each onto our existing port name and bumps that name's
+  user-ref count. Left unbalanced this is a per-stop leak: the task is a single
+  cached name whose uref then grows without bound until `KERN_UREFS_OVERFLOW`,
+  after which the kernel can no longer copy out the exception and `Wait` wedges
+  (also one leaked dead name per exited thread under churn). So `bingo_mach_recv`
+  **deallocates the task right unconditionally** (we hold the cached `taskPort`,
+  so its uref stays ≥1) and hands the thread right back; the caller balances that:
+  the main `Wait` path folds it into the retained per-thread set
+  (`adoptExcThreadPort` — release if already tracked, else adopt, mirroring
+  `Threads()`), and the `bingo_stop_the_world` drain path deallocates each
+  absorbed straggler's thread right directly (it re-faults on the next resume).
+  Reconcile runs on EVERY received exception (including intermediate step-over
+  traps), not just returned stops, or the retire loop leaks. The regression gate
+  is the `hygiene`-labelled darwin E2E spec.
 - **Stop-the-world = individual thread suspends + drain.** On a real breakpoint,
   `stopTheWorld` (`bingo_stop_the_world`) suspends every running thread and
   **drains any already-queued exceptions** (reply to each). `thread_suspend` does
@@ -659,10 +676,15 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   wired into **both** the linux and darwin containers — detection is
   platform-agnostic in the engine and each backend's `StopProcess()` surfaces the
   interrupt to `Wait` (a real SIGSTOP on linux, a control-port wake on darwin).
+  The `hygiene` spec (`declarePortHygieneSpec`) is **darwin-only** — it asserts
+  the Mach exception path does not leak task/thread send rights across many
+  breakpoint stops (reads the `debugger.DarwinTaskPortSendRefs` hook), a check
+  meaningless on the ptrace backend.
 
   **Platform scoping — both containers run the full set.** The darwin container
   wires the same specs as linux: `basic`, `stepping`, `breakpoints`, `churn`,
-  `kill`, `pause`, `inspect`, `restart`, and `fullstack`. This was NOT always so:
+  `kill`, `pause`, `inspect`, `restart`, and `fullstack`, plus the darwin-only
+  `hygiene` (Mach exception port-right leak regression). This was NOT always so:
   under the old darwin wait4/ptrace model the step-off-an-armed-trap specs
   (`basic`, `stepping`, `breakpoints`, `churn`) and `kill` (kill-while-running)
   were LINUX-ONLY, because single-stepping off a software breakpoint could be
