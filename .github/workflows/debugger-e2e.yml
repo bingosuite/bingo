@@ -1,26 +1,24 @@
 name: Debugger E2E
 
 # Real end-to-end acceptance tests that drive the native low-level debugger
-# backends against a freshly-built target: ptrace on linux/amd64, ptrace+Mach
-# on darwin/arm64. Unlike the default `go test ./...` (which exercises only the
-# in-process fakeBackend), these launch a real process and step it through the
-# actual OS backend, so they need a real kernel and run on native GitHub-hosted
-# runners. Gated behind the `e2e` build tag; the Ginkgo suite lives in
-# ./test/integration and is split via Ginkgo labels into `basic` (correctness),
-# `churn` (multi-thread robustness), `pause` (async interrupt / manual stop),
-# `stepping` (StepInto/StepOut), `inspect` (StackFrames/Locals/Goroutines),
-# `breakpoints` (ClearBreakpoint), `kill` (kill-while-running), `restart`, and
-# `fullstack` (operations driven through the whole client → WebSocket → hub →
-# debugger stack).
+# backends against a freshly-built target: ptrace on linux/amd64, a pure-Mach
+# exception-port model on darwin/arm64. Unlike the default `go test ./...` (which
+# exercises only the in-process fakeBackend), these launch a real process and
+# step it through the actual OS backend, so they need a real kernel and run on
+# native GitHub-hosted runners. Gated behind the `e2e` build tag; the Ginkgo
+# suite lives in ./test/integration and is split via Ginkgo labels into `basic`
+# (correctness), `churn` (multi-thread robustness), `pause` (async interrupt /
+# manual stop), `stepping` (StepInto/StepOut), `inspect`
+# (StackFrames/Locals/Goroutines), `breakpoints` (ClearBreakpoint), `kill`
+# (kill-while-running), `restart`, and `fullstack` (operations driven through the
+# whole client → WebSocket → hub → debugger stack).
 #
-# basic, stepping, breakpoints, churn, and kill are LINUX-ONLY. The darwin
-# container runs only specs that resume with a plain continue INTO a trap and
-# never single-step *off* an armed breakpoint (pause, inspect, restart,
-# fullstack). Anything that steps off an armed trap (basic/stepping/breakpoints/
-# churn) hangs a low but nonzero fraction of the time on darwin, and
-# kill-while-running deadlocks it — all wait4-model gaps the Mach-exception
-# rearchitecture in #92 closes (it restores those specs to darwin). See
-# AGENTS.md → Test layering.
+# Both linux and darwin run the full set. The step-off-an-armed-trap specs
+# (basic, stepping, breakpoints, churn) and kill (kill-while-running) used to be
+# LINUX-ONLY because they were unreliable under the old darwin wait4/ptrace model;
+# the Mach-exception rearchitecture (#92) — per-thread exception delivery plus a
+# target-side I-cache flush on breakpoint writes plus a wait4-free kill — closed
+# those gaps, so they now run on darwin as well. See AGENTS.md → Test layering.
 #
 # The linux jobs run fully on hosted runners. The darwin jobs compile and
 # codesign the E2E binary on hosted macOS runners (the only CI coverage that the
@@ -79,7 +77,7 @@ jobs:
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=kill
 
   darwin-arm64:
-    name: Darwin arm64 (ptrace + Mach)
+    name: Darwin arm64 (Mach exceptions)
     runs-on: macos-14
     timeout-minutes: 25
     steps:
@@ -109,11 +107,36 @@ jobs:
       # in the kernel, so the Mach backend can never run here. Execution is gated
       # to self-hosted runners; hosted runners stop after the compile+codesign
       # above. Delve hits the identical wall. Run locally via `just e2e-darwin`.
-      - name: E2E pause + inspect (self-hosted runners only)
+      # Each label runs as its own step so a failure is attributable at a glance;
+      # this mirrors the linux backend job (minus fullstack/restart, which run in
+      # the fullstack-darwin-arm64 job).
+      - name: E2E basic (continue + step-over correctness)
         if: runner.environment == 'self-hosted'
-        run: |
-          ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=pause
-          ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=inspect
+        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=basic
+
+      - name: E2E stepping (StepInto / StepOut)
+        if: runner.environment == 'self-hosted'
+        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=stepping
+
+      - name: E2E breakpoints (ClearBreakpoint)
+        if: runner.environment == 'self-hosted'
+        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=breakpoints
+
+      - name: E2E churn (multi-thread robustness)
+        if: runner.environment == 'self-hosted'
+        run: ./e2e.test -test.v -test.timeout 600s -ginkgo.label-filter=churn
+
+      - name: E2E pause (async interrupt)
+        if: runner.environment == 'self-hosted'
+        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=pause
+
+      - name: E2E inspect (StackFrames / Locals / Goroutines)
+        if: runner.environment == 'self-hosted'
+        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=inspect
+
+      - name: E2E kill (kill-while-running)
+        if: runner.environment == 'self-hosted'
+        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=kill
 
       - name: Skip execution on hosted runners (task_for_pid unavailable)
         if: runner.environment != 'self-hosted'
@@ -148,7 +171,7 @@ jobs:
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter='fullstack || restart'
 
   fullstack-darwin-arm64:
-    name: Full-stack Darwin arm64 (client → WS → hub → ptrace+Mach)
+    name: Full-stack Darwin arm64 (client → WS → hub → Mach)
     runs-on: macos-14
     timeout-minutes: 25
     steps:

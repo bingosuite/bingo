@@ -62,14 +62,15 @@ integration:
 e2e-linux:
 	go test -tags e2e -race -count=1 -v -timeout 600s ./test/integration
 
-# Run the debugger E2E acceptance tests on darwin/arm64 (native ptrace+Mach
-# backend). Runs every darwin-wired label (no filter): `pause`, `inspect`,
-# `restart`, and `fullstack` — the specs that resume with a plain continue INTO a
-# trap and never single-step off an armed breakpoint, so they are deterministic
-# here. basic/stepping/breakpoints/churn (they single-step off an armed trap) and
-# kill (kill-while-running) are linux-only; they hit darwin wait4-model gaps that
-# #92 closes (see the darwin container and AGENTS.md). task_for_pid needs the
-# debugger entitlement, so the test binary is codesigned before it runs.
+# Run the debugger E2E acceptance tests on darwin/arm64 (native pure-Mach
+# exception-port backend). Runs every label (no filter): `basic`, `stepping`,
+# `breakpoints`, `churn`, `kill`, `pause`, `inspect`, `restart`, and `fullstack`,
+# matching linux. The step-off-an-armed-trap specs and kill-while-running, once
+# linux-only under the old wait4 model, are reliable on darwin under the
+# Mach-exception rearchitecture (#92) — per-thread exception delivery, a
+# target-side I-cache flush on breakpoint writes, and a wait4-free kill (see the
+# darwin container and AGENTS.md). task_for_pid needs the debugger entitlement, so
+# the test binary is codesigned before it runs.
 e2e-darwin:
 	mkdir -p ./build
 	env CGO_ENABLED=1 go test -tags 'e2e bingonative' -race -c -o ./build/bingo-e2e.test ./test/integration

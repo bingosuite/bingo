@@ -4,39 +4,43 @@ package integration
 
 import . "github.com/onsi/ginkgo/v2"
 
-// Darwin/arm64 debugger acceptance suite. Drives the real ptrace+Mach backend
-// (atomic single-thread step-over, asyncpreemptoff-by-default so a thread-
-// directed SIGURG can't be misdirected under wait4 — see backend_darwin_arm64.go
-// and #92). Needs the bingonative tag and a debugger-entitled (codesigned) test
-// binary; see .github/workflows/debugger-e2e.yml and the justfile e2e-darwin
-// recipe.
+// Darwin/arm64 debugger acceptance suite. Drives the real pure-Mach backend
+// (task-level EXC_MASK_BREAKPOINT exception port + mach_msg receive loop,
+// posix_spawn START_SUSPENDED launch, per-thread hardware single-step, Mach
+// stop-the-world), with Go async preemption ENABLED in the tracee — the #92
+// rearchitecture that replaced the wait4/ptrace model. Needs the bingonative tag
+// and a debugger-entitled (codesigned) test binary; see
+// .github/workflows/debugger-e2e.yml and the justfile e2e-darwin recipe.
 //
-// This container lists ONLY the specs that are DETERMINISTICALLY green on the
-// current darwin backend, so `just e2e-darwin` and the darwin CI job never flake.
-// The common denominator: every spec here resumes the tracee with a PLAIN
-// continue INTO a trap (or from a launch/paused stop) and only ever kills a
-// SUSPENDED tracee — it never single-steps *off* an armed software breakpoint.
+// The Mach exception model gives per-thread signal fidelity: a thread-directed
+// SIGURG is delivered natively to the exact M the runtime targeted (breakpoints
+// are masked as Mach exceptions; BSD signals are left native), so the old
+// wait4-era misdirection that forced asyncpreemptoff — and made single-stepping
+// off an armed breakpoint flaky — is gone by construction. Stop-the-world drains
+// any exception queued before a sibling thread was suspended, closing the
+// concurrent-fault race. Kill resumes every thread before SIGKILL and reaps via
+// wait4, so kill-while-running no longer deadlocks. That is why the whole suite
+// now runs on darwin, matching linux (minus linux-only backend mechanics):
+//   - basic: Continue into a breakpoint then repeated StepOver.
+//   - stepping: StepInto crosses into a callee; StepOut returns to the caller.
+//   - breakpoints: a cleared breakpoint stops firing.
+//   - churn: hundreds of step-overs under continuous thread creation.
+//   - kill: Kill terminates a freely-running tracee.
 //   - pause: Continue -> Pause -> Paused round-trips (async interrupt).
-//   - inspect: continue INTO a breakpoint, then StackFrames/Locals/Goroutines.
-//   - fullstack: the whole client -> WebSocket -> hub -> debugger transport on
-//     plain-resume paths plus one breakpoint hit entered from a Paused stop.
-//   - restart: hub kill + relaunch + reinstall, reaching the breakpoint again by
-//     a plain continue into the freshly-armed trap.
+//   - inspect: continue into a breakpoint, then StackFrames/Locals/Goroutines.
+//   - restart: hub kill + relaunch + reinstall, reaching the breakpoint again.
+//   - fullstack: the whole client -> WebSocket -> hub -> debugger transport.
 //
-// Everything that single-steps *off* an armed software breakpoint (basic's
-// StepOver, stepping's StepInto/StepOut, breakpoints' continue off a parked BP,
-// and churn's hundreds of step-overs) is deliberately LINUX-ONLY, as is kill
-// (kill-while-running). On darwin a BSD signal delivered *during* the
-// restore->single-step-over-the-trap->reinstall dance can divert PC into the Go
-// runtime signal trampoline, and the step-retire logic can't tell "stepped past
-// the trap" from "diverted into the handler", so those paths hang a low but
-// nonzero fraction of the time; kill-while-running deadlocks outright. All are
-// wait4-model gaps that the Mach-exception rearchitecture in #92 closes, which
-// restores basic, stepping, breakpoints, churn, and kill to this container. See
-// AGENTS.md -> Test layering.
-var _ = Describe("Darwin arm64 debugger backend (ptrace+Mach) E2E", Label("darwin"), func() {
+// See AGENTS.md -> Test layering and Backend quirks -> Darwin / arm64.
+var _ = Describe("Darwin arm64 debugger backend (Mach exceptions) E2E", Label("darwin"), func() {
+	declareBasicStepOverSpec()
+	declareChurnSpec()
 	declarePauseSpec()
+	declareStepIntoSpec()
+	declareStepOutSpec()
 	declareInspectSpec()
+	declareClearBreakpointSpec()
+	declareKillRunningSpec()
 	declareFullStackSpec()
 	declareRestartSpec()
 })

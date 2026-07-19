@@ -203,9 +203,9 @@ func main() {
 // enclosing Ginkgo container. It is the correctness gate: set a breakpoint on a
 // line that calls a function, repeatedly Continue to it and StepOver the call,
 // asserting the tracee reaches the breakpoint every time and the step advances
-// past the BP line (never hangs, errors, or exits early). LINUX-ONLY: each
-// StepOver single-steps *off* the armed breakpoint, which is darwin-flaky
-// pending #92 (see the scoping note above).
+// past the BP line (never hangs, errors, or exits early). Runs on both linux and
+// darwin: each StepOver single-steps *off* the armed breakpoint, a path made
+// reliable on darwin by the Mach-exception model (see the scoping note above).
 func declareBasicStepOverSpec() {
 	It("continues to a breakpoint and steps over a call, repeatedly", Label("basic"), func() {
 		line := markerLine(basicTargetSrc, "// BP")
@@ -229,10 +229,12 @@ func declareBasicStepOverSpec() {
 // different thread's BreakpointHit; what must NOT happen is a hang (waitFor
 // timeout), an error, or an unexpected process exit.
 //
-// LINUX-ONLY (wired only into the linux container). It hammers StepOver hundreds
-// of times while the target spawns threads continuously, so it compounds the
-// darwin per-step signal-misdirection flake (see the scoping note above) into a
-// reliable failure. #92 restores it to darwin.
+// Runs on both linux and darwin. It hammers StepOver hundreds of times while the
+// target spawns threads continuously — the heaviest step-off-an-armed-trap
+// stress in the suite. On darwin this was the worst of the old wait4-model
+// flakes; the Mach-exception model (per-thread signal fidelity + target-side
+// I-cache flush on breakpoint writes) makes it deterministic (see the scoping
+// note above).
 func declareChurnSpec() {
 	It("survives continue+step-over under continuous thread churn", Label("churn"), func() {
 		line := markerLine(churnTargetSrc, "// BP")
@@ -298,29 +300,30 @@ func declarePauseSpec() {
 
 // --- new operation specs (stepping / inspect / breakpoints / kill) ---
 //
-// LINUX vs DARWIN scoping: the darwin container runs only specs that resume with
-// a PLAIN continue INTO a trap and never single-step *off* an armed software
-// breakpoint — pause, inspect, restart, and fullstack. Every spec that steps off
-// an armed trap (basic's StepOver, stepping's StepInto/StepOut, breakpoints'
-// continue off a parked BP, churn's hundreds of step-overs) is LINUX-ONLY, as is
-// kill (kill-while-running). On darwin the restore->single-step-over-the-trap->
-// reinstall dance in engine.resumeFromBreakpoint can be diverted by a BSD signal
-// delivered mid-step (PC lands in the runtime signal trampoline and the retire
-// logic can't classify it), so those paths hang a low but nonzero fraction of
-// the time; kill-while-running deadlocks the darwin backend outright. All are
-// wait4-model gaps the Mach-exception rearchitecture in #92 closes, which
-// restores them to darwin. See the per-spec comments, the darwin container, and
-// AGENTS.md -> Test layering.
+// LINUX and DARWIN both run the full set. The darwin backend used to run only
+// specs that resume with a PLAIN continue INTO a trap, because single-stepping
+// *off* an armed software breakpoint and killing a freely-running tracee were
+// unreliable under the old wait4/ptrace model. The Mach-exception rearchitecture
+// (#92) closed those gaps: per-thread exception delivery means a BSD signal can
+// no longer divert a single-step into the runtime trampoline undetected, an
+// explicit target-side I-cache flush on every breakpoint write makes a
+// freshly-installed trap (e.g. <stepover-next>/<stepout-return>) visible the
+// instant it is re-executed, and Kill resumes every thread before SIGKILL and
+// reaps via wait4 without blocking the engine loop. So the step-off-an-armed-trap
+// specs (basic's StepOver, stepping's StepInto/StepOut, breakpoints' continue off
+// a parked BP, churn's hundreds of step-overs) and kill (kill-while-running) now
+// run on darwin as well as linux. See the per-spec comments, the darwin
+// container, and AGENTS.md -> Test layering.
 
 // declareStepIntoSpec asserts StepInto crosses into a called function. It stops
 // at the call to inner (CALLINNER) and single-steps (machine-instruction
 // granularity) until the reported location is inside main.inner, proving the
 // step descended into the callee rather than over it. The step count is bounded
 // (a call site is only a couple of instructions from the CALL) so it stays
-// deterministic without assuming an exact number of instructions. LINUX-ONLY:
-// StepInto does repeated single-steps, which are darwin-flaky pending #92 (a
-// mid-step BSD signal diverts PC into the runtime trampoline; see the scoping
-// note above).
+// deterministic without assuming an exact number of instructions. Runs on both
+// linux and darwin: the repeated single-steps are reliable on darwin under the
+// Mach-exception model (per-thread signal delivery keeps a mid-step BSD signal
+// from diverting the step; see the scoping note above).
 func declareStepIntoSpec() {
 	It("steps into a called function", Label("stepping"), func() {
 		callLine := markerLine(callTargetSrc, "// CALLINNER")
@@ -384,8 +387,10 @@ func stopInsideInner(targetName string) *e2eHarness {
 // to. The return address is read from the saved frame pointer (BP+8), the same
 // chain walkStack follows; reading *(SP) only works at a function's first
 // instruction, before the prologue, and was the old "null return address" bug.
-// LINUX-ONLY: StepOut single-steps off the armed breakpoint, which is
-// darwin-flaky pending #92 (see the scoping note above).
+// Runs on both linux and darwin: the step off the armed breakpoint plus the
+// <stepout-return> trap are reliable on darwin under the Mach-exception model
+// (the target-side I-cache flush makes the freshly-written return trap visible
+// the instant the callee returns; see the scoping note above).
 func declareStepOutSpec() {
 	It("steps out of a callee back to its caller", Label("stepping"), func() {
 		h := stopInsideInner("stepout_target")
@@ -444,10 +449,10 @@ func declareInspectSpec() {
 // B, clears A (the non-current one — clearing the breakpoint the process is
 // currently parked on re-arms it through the step-off/reinstall path), then
 // Continues several times and asserts every subsequent stop is at B and never at
-// the cleared line A. LINUX-ONLY: after clearing A the process is parked on B,
-// so each subsequent Continue single-steps *off* B's armed trap (the
-// restore->single-step->reinstall dance), which is darwin-flaky pending #92 (see
-// the scoping note above).
+// the cleared line A. Runs on both linux and darwin: after clearing A the process
+// is parked on B, so each subsequent Continue single-steps *off* B's armed trap
+// (the restore->single-step->reinstall dance), a path made reliable on darwin by
+// the Mach-exception model (see the scoping note above).
 func declareClearBreakpointSpec() {
 	It("stops stopping at a cleared breakpoint", Label("breakpoints"), func() {
 		lineA := markerLine(twoBPTargetSrc, "// BP_A")
@@ -496,16 +501,13 @@ func declareClearBreakpointSpec() {
 // launch stop), then Kills and asserts the engine tears down — proving Kill
 // reaps a process that is not sitting at a stop.
 //
-// LINUX-ONLY (wired only into the linux container). On darwin, killing a
-// freely-running (PT_CONTINUE'd) ptraced tracee frequently deadlocks: the
-// SIGKILL makes the traced process enter a ptrace signal-delivery-stop that
-// needs a follow-up PT_CONTINUE to push through, but darwin killProcess's
-// cmd.Wait() blocks the engine loop before it can issue one, so the process is
-// never reaped. This is one of the darwin wait4-model gaps the Mach-exception
-// rearchitecture in #92 closes (thread_suspend + exception-port teardown does
-// not depend on wait4 draining a signal-delivery stop); it is left to that
-// follow-up rather than patched here. Kill of a *suspended* tracee works on
-// darwin and is covered by every spec's cleanup and by the Restart spec.
+// Runs on both linux and darwin. Killing a freely-running tracee used to deadlock
+// the old darwin backend (the SIGKILL landed the ptraced process in a
+// signal-delivery stop that cmd.Wait() couldn't drain from the blocked engine
+// loop). Under the Mach-exception model darwin killProcess resumes every thread,
+// SIGKILLs, and reaps via wait4 without a cmd.Wait on the engine loop, so
+// kill-while-running tears down cleanly. Kill of a *suspended* tracee also works
+// and is covered by every spec's cleanup and by the Restart spec.
 func declareKillRunningSpec() {
 	It("kills a running process", Label("kill"), func() {
 		bin := buildTarget("kill_target", basicTargetSrc)
