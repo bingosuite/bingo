@@ -233,22 +233,11 @@ func (b *linuxBackend) SingleStep(tid int) error {
 // tracee still delivers signals to the group). This is Pause groundwork
 // only: it does not implement Delve's trapWaitInternal halt-flag state
 // machine that distinguishes a manual stop from a spontaneous trap, so no
-// Pause command is wired to it yet — see AGENTS.md.
-//
-// syscall.Kill is used directly instead of os.FindProcess(pid).Signal:
-// os.FindProcess never fails to find a process on Unix (it just wraps the
-// pid), so the previous os.FindProcess/Signal pair was never distinguishing
-// "no such process" from any other error. ESRCH (process already gone) is
-// treated as an idempotent no-op, matching engine.Kill's idempotency
-// convention elsewhere in this package.
+// Pause command is wired to it yet — see AGENTS.md. The signal mechanics
+// (syscall.Kill, ESRCH-as-idempotent) are shared with the darwin backend via
+// stopProcessSignal in process.go.
 func (b *linuxBackend) StopProcess() error {
-	if b.pid == 0 {
-		return fmt.Errorf("StopProcess: no process")
-	}
-	if err := syscall.Kill(b.pid, syscall.SIGSTOP); err != nil && err != syscall.ESRCH {
-		return fmt.Errorf("StopProcess: %w", err)
-	}
-	return nil
+	return stopProcessSignal(b.pid)
 }
 
 func (b *linuxBackend) ReadMemory(addr uint64, dst []byte) error {

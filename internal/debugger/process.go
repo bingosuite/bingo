@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"syscall"
 )
 
 // process tracks the OS handle for the tracee, with platform-specific hooks
@@ -60,6 +61,24 @@ func (p *process) kill(b Backend) error {
 	p.live = false
 	if err := killProcess(b, p.pid, p.cmd); err != nil {
 		return fmt.Errorf("kill: %w", err)
+	}
+	return nil
+}
+
+// stopProcessSignal sends a whole-thread-group SIGSTOP to pid, the shared
+// mechanism behind both backends' StopProcess(). syscall.Kill is used
+// directly instead of os.FindProcess(pid).Signal: os.FindProcess never fails
+// to find a process on Unix (it just wraps the pid), so that pairing never
+// actually distinguished "no such process" from any other error. ESRCH
+// (process already gone) is treated as an idempotent no-op, matching
+// process.kill's idempotency above. See AGENTS.md → StopProcess for why this
+// exists (Pause groundwork) and what it deliberately doesn't do.
+func stopProcessSignal(pid int) error {
+	if pid == 0 {
+		return fmt.Errorf("StopProcess: no process")
+	}
+	if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil && err != syscall.ESRCH {
+		return fmt.Errorf("StopProcess: %w", err)
 	}
 	return nil
 }
