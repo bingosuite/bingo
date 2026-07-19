@@ -313,6 +313,16 @@ engine advances PC by `len(archTrapInstruction())` and resumes. See the
 - ASLR slide is computed in `TextSlide` by scanning the VM map for the first
   exec region with the 64-bit Mach-O magic. Do NOT use `TASK_DYLD_INFO` — its
   image array is unpopulated at the very first ptrace stop.
+- The step-over suspend list (`b.suspended`) is **stepMu-guarded**, not
+  engine-loop-confined. `endThreadStep` → `resumeSuspended` runs on the engine
+  loop for a `Kill`, but the waitLoop also calls `endThreadStep` when an
+  in-flight `PT_STEP` fails, so the two can race. `suspendOthers`/
+  `resumeSuspended` therefore take `stepMu` around every read/write of
+  `b.suspended`; emptying the slice under the lock makes a second concurrent
+  teardown a no-op instead of a double `thread_resume`. `suspendOthers` calls
+  `Threads()` *before* taking `stepMu` to avoid nesting the thread/task locks
+  under it, and `stepMu` is non-reentrant so no locked path calls back into
+  these helpers.
 
 ### Linux / amd64 ([backend_linux_amd64.go](internal/debugger/backend_linux_amd64.go))
 
