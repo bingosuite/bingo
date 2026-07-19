@@ -355,6 +355,29 @@ func declareStepIntoSpec() {
 	})
 }
 
+// stopInsideInner builds the shared call-chain target (callTargetSrc), launches
+// it, sets a breakpoint inside main.inner (the BPINNER marker), and continues
+// until the tracee is stopped there. It returns the harness parked inside the
+// callee, ready for step-out or state inspection — the common preamble of the
+// StepOut and inspect specs.
+func stopInsideInner(targetName string) *e2eHarness {
+	GinkgoHelper()
+	innerLine := markerLine(callTargetSrc, "// BPINNER")
+	bin := buildTarget(targetName, callTargetSrc)
+
+	h := newE2EHarness(bin)
+	h.waitFor(15*time.Second, protocol.EventStepped) // initial launch stop
+
+	_, err := h.d.SetBreakpoint(targetName+".go", innerLine)
+	Expect(err).NotTo(HaveOccurred(), "SetBreakpoint inside callee")
+
+	Expect(h.d.Continue()).To(Succeed(), "Continue into callee")
+	evt := h.waitFor(15*time.Second,
+		protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+	Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit), "stopped inside main.inner")
+	return h
+}
+
 // declareStepOutSpec asserts StepOut returns control to the caller. It stops
 // inside inner (BPINNER) and StepOut, then asserts the resulting location is
 // back in main.outer (the caller) — the return address the callee will unwind
@@ -365,22 +388,10 @@ func declareStepIntoSpec() {
 // darwin-flaky pending #92 (see the scoping note above).
 func declareStepOutSpec() {
 	It("steps out of a callee back to its caller", Label("stepping"), func() {
-		innerLine := markerLine(callTargetSrc, "// BPINNER")
-		bin := buildTarget("stepout_target", callTargetSrc)
-
-		h := newE2EHarness(bin)
-		h.waitFor(15*time.Second, protocol.EventStepped) // initial launch stop
-
-		_, err := h.d.SetBreakpoint("stepout_target.go", innerLine)
-		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint inside callee")
-
-		Expect(h.d.Continue()).To(Succeed(), "Continue into callee")
-		evt := h.waitFor(15*time.Second,
-			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
-		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit), "stopped inside main.inner")
+		h := stopInsideInner("stepout_target")
 
 		Expect(h.d.StepOut()).To(Succeed(), "StepOut of callee")
-		evt = h.waitFor(15*time.Second,
+		evt := h.waitFor(15*time.Second,
 			protocol.EventStepped, protocol.EventProcessExited, protocol.EventError)
 		Expect(evt.Kind).To(Equal(protocol.EventStepped), "StepOut emits Stepped")
 
@@ -401,19 +412,7 @@ func declareStepOutSpec() {
 // off the reliable Function name, not file:line.
 func declareInspectSpec() {
 	It("reports stack frames, locals, and goroutines at a breakpoint", Label("inspect"), func() {
-		innerLine := markerLine(callTargetSrc, "// BPINNER")
-		bin := buildTarget("inspect_target", callTargetSrc)
-
-		h := newE2EHarness(bin)
-		h.waitFor(15*time.Second, protocol.EventStepped) // initial launch stop
-
-		_, err := h.d.SetBreakpoint("inspect_target.go", innerLine)
-		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint inside callee")
-
-		Expect(h.d.Continue()).To(Succeed(), "Continue into callee")
-		evt := h.waitFor(15*time.Second,
-			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
-		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit), "stopped inside main.inner")
+		h := stopInsideInner("inspect_target")
 
 		frames, err := h.d.StackFrames()
 		Expect(err).NotTo(HaveOccurred(), "StackFrames")
