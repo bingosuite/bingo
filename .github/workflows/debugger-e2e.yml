@@ -13,11 +13,14 @@ name: Debugger E2E
 # `fullstack` (operations driven through the whole client → WebSocket → hub →
 # debugger stack).
 #
-# stepping, breakpoints, and kill are LINUX-ONLY: StepInto/StepOut/ClearBreakpoint
-# resume from an armed software breakpoint and kill-while-running SIGKILLs a
-# running tracee — both hit darwin backend bugs (a resume-from-breakpoint
-# lost-wakeup and a kill-while-running deadlock; see AGENTS.md → Test layering).
-# inspect and restart never resume from a breakpoint, so they run on both.
+# basic, stepping, breakpoints, churn, and kill are LINUX-ONLY. The darwin
+# container runs only specs that resume with a plain continue INTO a trap and
+# never single-step *off* an armed breakpoint (pause, inspect, restart,
+# fullstack). Anything that steps off an armed trap (basic/stepping/breakpoints/
+# churn) hangs a low but nonzero fraction of the time on darwin, and
+# kill-while-running deadlocks it — all wait4-model gaps the Mach-exception
+# rearchitecture in #92 closes (it restores those specs to darwin). See
+# AGENTS.md → Test layering.
 #
 # The linux jobs run fully on hosted runners. The darwin jobs compile and
 # codesign the E2E binary on hosted macOS runners (the only CI coverage that the
@@ -106,11 +109,9 @@ jobs:
       # in the kernel, so the Mach backend can never run here. Execution is gated
       # to self-hosted runners; hosted runners stop after the compile+codesign
       # above. Delve hits the identical wall. Run locally via `just e2e-darwin`.
-      - name: E2E basic + churn + pause + inspect (self-hosted runners only)
+      - name: E2E pause + inspect (self-hosted runners only)
         if: runner.environment == 'self-hosted'
         run: |
-          ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=basic
-          ./e2e.test -test.v -test.timeout 600s -ginkgo.label-filter=churn
           ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=pause
           ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=inspect
 

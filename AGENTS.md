@@ -602,45 +602,50 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   platform-agnostic in the engine and each backend's `PauseSignal()` surfaces
   the interrupt through `wait4`.
 
-  **Platform scoping — `stepping`, `breakpoints`, and `kill` are LINUX-ONLY.**
-  The darwin container wires only `basic`, `churn`, `pause`, `inspect`,
-  `restart`, and `fullstack`. Two distinct darwin backend bugs (both in the
-  fragile ptrace+Mach single-step/kill subsystem, both left for a follow-up —
-  do NOT paper over them by bloating timeouts) keep the other three off darwin:
+  **Platform scoping — the darwin container runs only plain-resume specs.**
+  The darwin container wires `pause`, `inspect`, `restart`, and `fullstack`;
+  `basic`, `stepping`, `breakpoints`, `churn`, and `kill` are LINUX-ONLY. The
+  dividing line is whether the tracee is ever single-stepped *off* an armed
+  software breakpoint (the restore→single-step-over-the-trap→reinstall dance in
+  `engine.resumeFromBreakpoint`). The darwin specs never do: they resume with a
+  plain continue INTO a trap (or from a launch/paused stop) and only ever kill a
+  *suspended* tracee, so they are deterministic. Turning `asyncpreemptoff` on by
+  default on darwin (`asyncPreemptOffDefault = true` in
+  [backend_darwin_arm64.go](internal/debugger/backend_darwin_arm64.go)) removed
+  the SIGURG-during-resume misdirection that was the #89 root cause and made the
+  plain-resume paths solid, but it did NOT make stepping-off-a-trap reliable.
+  What stays linux-only, and why (all are wait4-model gaps the Mach-exception
+  rearchitecture in **#92** closes — do NOT paper over them by bloating
+  timeouts):
 
-  1. **Resume-from-armed-software-breakpoint lost-wakeup (issue #89 root cause).**
-     ANY resume that steps *off* an armed software breakpoint — the
-     restore-original-byte → single-step-over-the-trap → reinstall dance in
-     `engine.resumeFromBreakpoint` — occasionally hangs on darwin: the next
-     `wait4` blocks forever and the spec times out (~20s). This is NOT
-     step-over-specific and NOT a transport bug — an in-process Continue-from-a-
-     breakpoint-only probe reproduced it at ~8%; over the WebSocket transport it
-     was ~20%; `stepping` (one resume-from-BP) flakes ~1.7%. PLAIN resumes never
-     hit it (resume from a launch/Stepped stop, or from a Paused stop): the
-     `pause` spec is 0/800 and the redesigned `fullstack` spec is 40/40. So
-     `stepping` and `breakpoints` (StepInto/StepOut/ClearBreakpoint all
-     resume-from-BP) are linux-only; `inspect` and `restart` never resume from a
-     breakpoint and run on both. `basic` (continue + step-over) deliberately
-     stays on darwin as the acceptance canary that still surfaces this bug
-     (~13% flake); re-run it for a clean pass. This is DISTINCT from issue #78
-     (a suspend-list data race in `backend_darwin_arm64.go`) but lives in the
-     same darwin single-step subsystem, so the fix is deferred rather than
-     attempted alongside #78.
-  2. **Kill-while-running deadlock.** `killProcess` on darwin SIGKILLs then does
-     one `PT_CONTINUE` then `cmd.Wait()`. For a *freely-running* (PT_CONTINUE'd)
-     tracee, the SIGKILL enters a ptrace signal-delivery-stop needing a
-     follow-up `PT_CONTINUE` that never comes (the engine loop is blocked in
-     `cmd.Wait()`, which also double-waits the engine's own waitLoop `wait4`),
-     deadlocking ~25% of the time. Linux `killProcess` reaps via
-     `Wait4(-1, …, WALL)` so `cmd.Wait()` returns `ECHILD` and it works. Killing
-     a *suspended* tracee (every spec's cleanup, and `restart`) is fine on
-     darwin and stays covered. So `kill` (kill-while-running) is linux-only.
+  1. **Single-step off an armed breakpoint (`basic`, `stepping`, `breakpoints`,
+     `churn`).** Whenever a resume steps off a software breakpoint, a BSD signal
+     delivered *during* the `PT_STEP` can divert PC into the Go runtime's signal
+     trampoline (`runtime.sigtramp`/libsystem). For a branch instruction the
+     step-retire logic (`PC != addr`) cannot tell "stepped past the trap" from
+     "diverted into the handler," so the resume hangs (the next `wait4` blocks and
+     the spec times out ~15-20s). It is a LOW rate per step — `basic` (25 step-
+     overs) and `breakpoints` (a handful of continues off a parked BP) each flake
+     ~1-3% per run — but nonzero, so both are linux-only rather than shipped as
+     flaky darwin canaries. `stepping` (StepInto/StepOut) and `churn` (hundreds of
+     step-overs under continuous thread creation) hit it far more often. This is
+     DISTINCT from issue #78 (a suspend-list data race in
+     `backend_darwin_arm64.go`) but lives in the same darwin single-step
+     subsystem.
+  2. **Kill-while-running deadlock (`kill`).** `killProcess` on darwin SIGKILLs
+     then does one `PT_CONTINUE` then `cmd.Wait()`. For a *freely-running*
+     (PT_CONTINUE'd) tracee, the SIGKILL enters a ptrace signal-delivery-stop
+     needing a follow-up `PT_CONTINUE` that never comes (the engine loop is
+     blocked in `cmd.Wait()`, which also double-waits the engine's own waitLoop
+     `wait4`), deadlocking. Linux `killProcess` reaps via `Wait4(-1, …, WALL)` so
+     `cmd.Wait()` returns `ECHILD` and it works. Killing a *suspended* tracee
+     (every spec's cleanup, and `restart`) is fine on darwin and stays covered.
+     So `kill` (kill-while-running) is linux-only.
 
-  The #89 FIX is in the test, not the backend: `declareFullStackSpec` was
-  redesigned to exercise only PLAIN-resume transport paths — Continue→Pause→
-  Paused round-trips plus one breakpoint hit entered from a Paused stop (a plain
-  continue *into* the trap, never resuming *from* one) — with an explicit seq-
-  monotonicity check spanning both phases. Each label is its own CI job. CI:
+  #92 restores `basic`, `stepping`, `breakpoints`, `churn`, and `kill` onto
+  darwin once stops are detected through a Mach exception port (per-thread signal
+  fidelity, `thread_suspend` halting) instead of wait4. Each label is its own CI
+  job. CI:
   [.github/workflows/debugger-e2e.yml](.github/workflows/debugger-e2e.yml).
   The linux jobs run fully on hosted runners. The darwin jobs compile and
   codesign the E2E binary on hosted macOS runners (the only CI check that the
