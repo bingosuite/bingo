@@ -7,9 +7,17 @@ name: Debugger E2E
 # actual OS backend, so they need a real kernel and run on native GitHub-hosted
 # runners. Gated behind the `e2e` build tag; the Ginkgo suite lives in
 # ./test/integration and is split via Ginkgo labels into `basic` (correctness),
-# `churn` (multi-thread robustness), `pause` (async interrupt / manual stop), and
-# `fullstack` (the same operations driven through the whole client → WebSocket →
-# hub → debugger stack).
+# `churn` (multi-thread robustness), `pause` (async interrupt / manual stop),
+# `stepping` (StepInto/StepOut), `inspect` (StackFrames/Locals/Goroutines),
+# `breakpoints` (ClearBreakpoint), `kill` (kill-while-running), `restart`, and
+# `fullstack` (operations driven through the whole client → WebSocket → hub →
+# debugger stack).
+#
+# stepping, breakpoints, and kill are LINUX-ONLY: StepInto/StepOut/ClearBreakpoint
+# resume from an armed software breakpoint and kill-while-running SIGKILLs a
+# running tracee — both hit darwin backend bugs (a resume-from-breakpoint
+# lost-wakeup and a kill-while-running deadlock; see AGENTS.md → Test layering).
+# inspect and restart never resume from a breakpoint, so they run on both.
 #
 # The linux jobs run fully on hosted runners. The darwin jobs compile and
 # codesign the E2E binary on hosted macOS runners (the only CI coverage that the
@@ -55,6 +63,18 @@ jobs:
       - name: E2E pause (async interrupt)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=pause
 
+      - name: E2E stepping (StepInto / StepOut)
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=stepping
+
+      - name: E2E inspect (StackFrames / Locals / Goroutines)
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=inspect
+
+      - name: E2E breakpoints (ClearBreakpoint)
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=breakpoints
+
+      - name: E2E kill (kill-while-running)
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=kill
+
   darwin-arm64:
     name: Darwin arm64 (ptrace + Mach)
     runs-on: macos-14
@@ -86,12 +106,13 @@ jobs:
       # in the kernel, so the Mach backend can never run here. Execution is gated
       # to self-hosted runners; hosted runners stop after the compile+codesign
       # above. Delve hits the identical wall. Run locally via `just e2e-darwin`.
-      - name: E2E basic + churn + pause (self-hosted runners only)
+      - name: E2E basic + churn + pause + inspect (self-hosted runners only)
         if: runner.environment == 'self-hosted'
         run: |
           ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=basic
           ./e2e.test -test.v -test.timeout 600s -ginkgo.label-filter=churn
           ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=pause
+          ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=inspect
 
       - name: Skip execution on hosted runners (task_for_pid unavailable)
         if: runner.environment != 'self-hosted'
@@ -119,10 +140,11 @@ jobs:
         run: cat /proc/sys/kernel/yama/ptrace_scope || true
 
       # Boots a real server on an ephemeral port, connects the real pkg/client
-      # over a real WebSocket, and drives continue/setBreakpoint/step-over
-      # through the whole stack down to the real ptrace backend.
-      - name: E2E full-stack (transport wiring over the real backend)
-        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=fullstack
+      # over a real WebSocket, and drives continue/pause/setBreakpoint through
+      # the whole stack down to the real ptrace backend. `restart` exercises the
+      # hub-level kill+relaunch+breakpoint-reinstall path through the same stack.
+      - name: E2E full-stack + restart (transport wiring over the real backend)
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter='fullstack || restart'
 
   fullstack-darwin-arm64:
     name: Full-stack Darwin arm64 (client → WS → hub → ptrace+Mach)
@@ -151,9 +173,9 @@ jobs:
       # Same Sonoma task_for_pid restriction as the backend darwin job: the Mach
       # backend can't attach on hosted runners, so execution is gated to
       # self-hosted runners. Hosted runners stop after the compile+codesign above.
-      - name: E2E full-stack (self-hosted runners only)
+      - name: E2E full-stack + restart (self-hosted runners only)
         if: runner.environment == 'self-hosted'
-        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=fullstack
+        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter='fullstack || restart'
 
       - name: Skip execution on hosted runners (task_for_pid unavailable)
         if: runner.environment != 'self-hosted'
