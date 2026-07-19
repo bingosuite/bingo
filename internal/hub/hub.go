@@ -426,6 +426,7 @@ func (h *Hub) broadcastError(kind protocol.CommandKind, err error) {
 		Message: err.Error(),
 	})
 	if e != nil {
+		h.log.Error("failed to marshal error event", "err", e, "cause", err)
 		return
 	}
 	h.broadcast(evt)
