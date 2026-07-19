@@ -742,6 +742,41 @@ func (b *darwinBackend) Threads() ([]int, error) {
 	return tids, nil
 }
 
+// adoptExcThreadPort reconciles the send right the kernel inserted for the
+// faulting thread of an exception message into the retained per-thread set,
+// keeping exactly one right per thread name. If we already track the thread the
+// message's extra right is released; otherwise it is adopted as the retained
+// one. This runs on the waitLoop goroutine and shares threadPorts with Threads()
+// (engine goroutine), so it takes threadMu. The name always ends with uref >= 1,
+// so the tid stays valid for the subsequent GetRegisters/suspend/step this stop
+// performs. Mirrors the adopt/dedup accounting in Threads().
+func (b *darwinBackend) adoptExcThreadPort(thread C.mach_port_t) {
+	b.threadMu.Lock()
+	defer b.threadMu.Unlock()
+	if b.threadPorts == nil {
+		b.threadPorts = make(map[C.mach_port_t]struct{})
+	}
+	if _, ok := b.threadPorts[thread]; ok {
+		C.bingo_port_deallocate(thread)
+	} else {
+		b.threadPorts[thread] = struct{}{}
+	}
+}
+
+// TaskPortSendRefs reports the Mach send-right user-reference count on the cached
+// tracee task port and whether the task port has been acquired yet. It exists
+// for the darwin port-hygiene regression test: the exception path must not leak
+// a task send right per stop (which would grow this count unboundedly toward
+// KERN_UREFS_OVERFLOW and wedge Wait). Returns (0, false) before launch/attach.
+func (b *darwinBackend) TaskPortSendRefs() (int, bool) {
+	b.taskMu.Lock()
+	defer b.taskMu.Unlock()
+	if !b.taskOK {
+		return 0, false
+	}
+	return int(C.bingo_port_send_refs(b.taskPort)), true
+}
+
 // Wait blocks on the Mach port set and turns each message into a StopEvent. It
 // is the pure-Mach replacement for the old wait4 loop: EXC_BREAKPOINT messages
 // (software BRK and hardware single-step) drive breakpoint/step detection, the
@@ -802,6 +837,13 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 
 		case C.BINGO_MSG_EXC:
 			tid := int(thread)
+			// The exception message carried a fresh send right to the faulting
+			// thread (see bingo_mach_recv). Fold it into the retained per-thread
+			// set: release the redundant right if we already track this thread,
+			// otherwise adopt it. Skipping this leaks one thread send right per
+			// stop (unbounded on a long-lived thread hitting a hot breakpoint,
+			// and one leaked dead name per exited thread under churn).
+			b.adoptExcThreadPort(thread)
 			// Defer the reply until this thread is resumed; see pendingReplies.
 			b.stashReply(tid, replyInfo{port: replyPort, bits: replyBits, id: replyID})
 			// Step-over in flight: ONLY the stepped thread's own single-step trap
