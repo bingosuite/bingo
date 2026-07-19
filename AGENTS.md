@@ -327,6 +327,18 @@ they'd see two overlapping monotonic sequences and couldn't detect drops.
   (the call hangs in the kernel), so the Mach backend can't attach there; hosted
   runners print a SKIPPED note and go green. Run darwin E2E locally via
   `just e2e-darwin`.
+- **Darwin verification gate**
+  ([.github/workflows/darwin-verification-gate.yml](.github/workflows/darwin-verification-gate.yml)):
+  because the darwin backend can't be executed in CI, this human-in-the-loop
+  check requires a maintainer to run `just e2e-darwin` locally and add the
+  `darwin-e2e-verified` PR label whenever a PR touches darwin-native code whose
+  runtime behaviour only runs on real Apple Silicon — matched by regex over
+  `internal/debugger/*_darwin_*`, `internal/debugger/trap_arm64.go`,
+  `test/integration/*_darwin_*_test.go`, and `entitlements.plist`. The "Darwin
+  E2E verified" check fails until the label is present; it re-runs on
+  `labeled`/`unlabeled` so adding the label flips it green without a new push,
+  and is a green no-op for PRs that don't touch those paths. Mark it a required
+  status check in branch protection to actually block merges.
 
 Build/test commands:
 
