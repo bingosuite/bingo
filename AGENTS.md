@@ -321,8 +321,9 @@ just coverage [PKG]                        # writes test/coverage.out
 just integration                           # ginkgo -r ./test/integration (no e2e tag)
 just e2e-linux                             # native linux/amd64 ptrace E2E (basic + churn)
 just e2e-darwin                            # native darwin/arm64 ptrace+Mach E2E (codesigned)
-# Filter to one label, e.g. only the correctness gate:
-go test -tags e2e -race -ginkgo.label-filter=basic ./test/integration
+# Filter to one label, e.g. only the correctness gate (package path must come
+# before the -ginkgo.* flag so `go test` doesn't mistake it for the package):
+go test -tags e2e -race ./test/integration -ginkgo.label-filter=basic
 ```
 
 On macOS, `go test ./...` without `-tags bingonative` will fail with

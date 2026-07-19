@@ -38,10 +38,10 @@ jobs:
         run: cat /proc/sys/kernel/yama/ptrace_scope || true
 
       - name: E2E basic (continue + step-over correctness)
-        run: go test -tags e2e -race -count=1 -v -timeout 300s -ginkgo.label-filter=basic ./test/integration
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=basic
 
       - name: E2E churn (multi-thread robustness)
-        run: go test -tags e2e -race -count=1 -v -timeout 600s -ginkgo.label-filter=churn ./test/integration
+        run: go test -tags e2e -race -count=1 -v -timeout 600s ./test/integration -ginkgo.label-filter=churn
 
   darwin-arm64:
     name: Darwin arm64 (ptrace + Mach)
