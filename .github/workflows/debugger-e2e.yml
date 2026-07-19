@@ -9,6 +9,13 @@ name: Debugger E2E
 # ./test/integration and is split via Ginkgo labels into `basic` (correctness),
 # `churn` (multi-thread robustness), and `fullstack` (the same operations driven
 # through the whole client → WebSocket → hub → debugger stack).
+#
+# The linux jobs run fully on hosted runners. The darwin jobs compile and
+# codesign the E2E binary on hosted macOS runners (the only CI coverage that the
+# darwin backend even builds), but *execution* is gated to self-hosted runners:
+# Apple's Sonoma (macOS 14) security model blocks task_for_pid on GitHub-hosted
+# runners even with the debugger entitlement, so the Mach backend can't attach
+# there. Run the darwin E2E locally on real hardware via `just e2e-darwin`.
 
 on:
   pull_request:
@@ -48,10 +55,6 @@ jobs:
     name: Darwin arm64 (ptrace + Mach)
     runs-on: macos-14
     timeout-minutes: 25
-    # GitHub-hosted macOS runners can restrict task_for_pid even with the
-    # debugger entitlement; darwin is primarily verified locally. Don't fail the
-    # whole workflow if the runner blocks it.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -65,17 +68,32 @@ jobs:
 
       # task_for_pid needs the com.apple.security.cs.debugger entitlement, so the
       # test binary must be codesigned before it runs. Compile first, sign, run.
+      # This compile+codesign is the only CI coverage that the darwin backend and
+      # E2E suite even build — the unit-test job on ubuntu compiles only the
+      # linux backend.
       - name: Build and codesign the E2E test binary
         run: |
           CGO_ENABLED=1 go test -tags 'e2e bingonative' -race -c -o e2e.test ./test/integration
           codesign --sign - --entitlements entitlements.plist --force e2e.test
           codesign -d --entitlements - e2e.test || true
 
-      - name: E2E basic (continue + step-over correctness)
-        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=basic
+      # Apple's Sonoma (macOS 14) security model blocks task_for_pid on
+      # GitHub-hosted runners even with the debugger entitlement — the call hangs
+      # in the kernel, so the Mach backend can never run here. Execution is gated
+      # to self-hosted runners; hosted runners stop after the compile+codesign
+      # above. Delve hits the identical wall. Run locally via `just e2e-darwin`.
+      - name: E2E basic + churn (self-hosted runners only)
+        if: runner.environment == 'self-hosted'
+        run: |
+          ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=basic
+          ./e2e.test -test.v -test.timeout 600s -ginkgo.label-filter=churn
 
-      - name: E2E churn (single-step race under thread churn)
-        run: ./e2e.test -test.v -test.timeout 600s -ginkgo.label-filter=churn
+      - name: Skip execution on hosted runners (task_for_pid unavailable)
+        if: runner.environment != 'self-hosted'
+        run: |
+          echo "SKIPPED: task_for_pid is blocked on GitHub-hosted macOS runners (Apple Sonoma restriction)."
+          echo "The darwin backend + E2E binary compiled and codesigned successfully above."
+          echo "Run the full darwin backend E2E locally on real hardware: just e2e-darwin"
 
   fullstack-linux-amd64:
     name: Full-stack Linux amd64 (client → WS → hub → ptrace)
@@ -105,9 +123,6 @@ jobs:
     name: Full-stack Darwin arm64 (client → WS → hub → ptrace+Mach)
     runs-on: macos-14
     timeout-minutes: 25
-    # Same task_for_pid caveat as the backend darwin job: don't fail the whole
-    # workflow if the hosted runner restricts it. Primarily verified locally.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -128,5 +143,16 @@ jobs:
           codesign --sign - --entitlements entitlements.plist --force e2e.test
           codesign -d --entitlements - e2e.test || true
 
-      - name: E2E full-stack (transport wiring over the real backend)
+      # Same Sonoma task_for_pid restriction as the backend darwin job: the Mach
+      # backend can't attach on hosted runners, so execution is gated to
+      # self-hosted runners. Hosted runners stop after the compile+codesign above.
+      - name: E2E full-stack (self-hosted runners only)
+        if: runner.environment == 'self-hosted'
         run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=fullstack
+
+      - name: Skip execution on hosted runners (task_for_pid unavailable)
+        if: runner.environment != 'self-hosted'
+        run: |
+          echo "SKIPPED: task_for_pid is blocked on GitHub-hosted macOS runners (Apple Sonoma restriction)."
+          echo "The darwin backend + E2E binary compiled and codesigned successfully above."
+          echo "Run the full-stack darwin E2E locally on real hardware: just e2e-darwin"

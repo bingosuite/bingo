@@ -318,6 +318,15 @@ they'd see two overlapping monotonic sequences and couldn't detect drops.
   events, the suspend/resume gate on a genuine BreakpointHit, synchronous
   SetBreakpoint confirmation routing). Each label is its own CI job. CI:
   [.github/workflows/debugger-e2e.yml](.github/workflows/debugger-e2e.yml).
+  The linux jobs run fully on hosted runners. The darwin jobs compile and
+  codesign the E2E binary on hosted macOS runners (the only CI check that the
+  darwin backend even builds — the unit-test job on ubuntu compiles only the
+  linux backend), but EXECUTION is gated to self-hosted runners via
+  `if: runner.environment == 'self-hosted'`. macOS 14 (Sonoma) blocks
+  `task_for_pid` on GitHub-hosted runners even with the debugger entitlement
+  (the call hangs in the kernel), so the Mach backend can't attach there; hosted
+  runners print a SKIPPED note and go green. Run darwin E2E locally via
+  `just e2e-darwin`.
 
 Build/test commands:
 
