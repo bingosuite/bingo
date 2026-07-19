@@ -239,7 +239,7 @@ func (b *linuxBackend) SingleStep(tid int) error {
 // EventPaused. The engine never injects this SIGSTOP back (Continue resumes
 // with signal 0), so it triggers no group-stop and resume is a plain
 // ContinueProcess. ESRCH (thread already gone) is an idempotent no-op,
-// matching stopProcessSignal / process.kill. tgkill is a plain signal syscall,
+// matching process.kill. tgkill is a plain signal syscall,
 // not a ptrace op, so it need not run on the tracer thread.
 func (b *linuxBackend) StopProcess() error {
 	if b.pid == 0 {

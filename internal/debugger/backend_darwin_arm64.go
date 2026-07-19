@@ -2,8 +2,22 @@
 
 package debugger
 
-// Darwin/arm64 (Apple Silicon) Backend. Self-contained: process lifecycle via
-// ptrace, registers via Mach thread_get_state, memory via mach_vm_read/write.
+// Darwin/arm64 (Apple Silicon) Backend. Pure Mach: process lifecycle via
+// posix_spawn + a task-level Mach exception port, registers via
+// thread_get_state, memory via mach_vm_read/write. Stops are detected by a
+// mach_msg receive loop on a port set (issue #92), NOT wait4/ptrace.
+//
+// Why no ptrace/PT_SIGEXC: bingo masks ONLY EXC_MASK_BREAKPOINT and leaves BSD
+// signals to native, thread-directed delivery. Go's async-preemption SIGURG is
+// thread-directed (pthread_kill to a specific M); under the old ptrace/wait4
+// model the only resume primitive was process-directed (XNU psignal), which
+// misdirected SIGURG to the wrong M and deadlocked the runtime — which is why
+// that model had to disable async preemption (asyncpreemptoff). Leaving signals
+// native re-delivers SIGURG to exactly the M the runtime targeted, so async
+// preemption can stay ON. The tradeoff: the debugger no longer surfaces Unix
+// signals as stops on darwin (a crash becomes a process exit, not a signal
+// stop); bingo's engine only needs breakpoint/step/exit, and no e2e asserts on
+// signal reporting. See AGENTS.md → Backend quirks / Pause.
 //
 // Requires com.apple.security.cs.debugger entitlement (or SIP disabled).
 // Cannot be cross-compiled from non-macOS — cgo needs the macOS SDK.
@@ -11,6 +25,8 @@ package debugger
 /*
 #cgo LDFLAGS: -framework CoreFoundation
 
+#include <stdlib.h>
+#include <string.h>
 #include "mach_darwin_arm64.h"
 */
 import "C"
@@ -34,113 +50,108 @@ func newBackend() Backend {
 }
 
 type darwinBackend struct {
-	pid      int
-	stepMu   sync.Mutex
-	stepping bool
-	stepTID  int // Mach thread port saved by SingleStep, reused on the step trap
+	pid int
+
+	// launched distinguishes a process we spawned (we own it → SIGKILL on Kill)
+	// from one we attached to (we don't own it → detach, don't kill). posix_spawn
+	// yields no *exec.Cmd, so this flag replaces the old cmd!=nil check.
+	launched bool
+
+	// Mach exception-port machinery (issue #92). portSet is the receive set Wait
+	// blocks on; excPort receives EXC_BREAKPOINT (software BRK and hardware
+	// single-step both raise it); notePort receives the dead-name notification
+	// when the tracee exits; ctrlPort is a private port Pause posts to so it can
+	// wake a blocked mach_msg (task/thread_suspend cannot wake a receive).
+	portSet  C.mach_port_t
+	excPort  C.mach_port_t
+	notePort C.mach_port_t
+	ctrlPort C.mach_port_t
+	portsOK  bool
 
 	// taskPort caches the Mach task port obtained from task_for_pid. It is
-	// acquired lazily on first use (after exec, so past the fork/exec race) and
-	// reused for the process's lifetime. Re-calling task_for_pid on every memory
-	// read/write/thread enumeration — as the code originally did — intermittently
-	// wedges IN THE KERNEL on a busy tracer: the send right is never released and
-	// the repeated port insertions eventually block task_for_pid indefinitely,
-	// hanging the debugger even though the tracee is healthy. Delve and LLDB both
-	// acquire the task port exactly once and cache it for this reason.
+	// acquired once at launch/attach (past the fork/exec race) and reused for the
+	// process's lifetime. Re-calling task_for_pid on every memory/thread op — as
+	// the code originally did — intermittently wedges IN THE KERNEL on a busy
+	// tracer: the send right is never released and repeated port insertions
+	// eventually block task_for_pid indefinitely. Delve and LLDB both acquire the
+	// task port exactly once for this reason.
 	taskMu   sync.Mutex
 	taskPort C.mach_port_t
 	taskOK   bool
 
 	// One retained send-right per live tracee thread, keyed by Mach port name.
-	// task_threads hands out a fresh send-right per thread on every call; we
-	// keep exactly one and deallocate the rest (and the rights of threads that
-	// have exited) so the debugger doesn't leak ports under thread churn and so
-	// a given thread keeps a stable port name across enumerations.
+	// task_threads hands out a fresh send-right per thread on every call; we keep
+	// exactly one and deallocate the rest (and the rights of threads that have
+	// exited) so the debugger doesn't leak ports under thread churn and so a
+	// given thread keeps a stable port name across enumerations.
 	threadMu    sync.Mutex
 	threadPorts map[C.mach_port_t]struct{}
 
-	// Atomic step-over-breakpoint bookkeeping.
-	//
-	// All of these are shared between two goroutines: advanceStepOver drives
-	// the step on the waitLoop goroutine, while endThreadStep may run
-	// concurrently on the engine loop goroutine if a Kill lands mid-step (and
-	// endThreadStep is itself also called from the waitLoop on a PT_STEP
-	// failure). They are guarded by stepMu. That includes `suspended`: it is
-	// truncated by resumeSuspended, which endThreadStep calls from EITHER
-	// goroutine, so an unguarded slice would race (and double-resume the same
-	// Mach ports) when a Kill races a waitLoop teardown.
-	// sobActive gates the step-over path in Wait; sobAddr is the disarmed
-	// breakpoint address the stepped thread must retire past; sobBranch records
-	// whether the instruction there alters control flow (so we can't assume it
-	// retires to sobAddr+4); sobSteps bounds the retry loop that steps through
-	// signal-handler excursions; stepThreadPort is the thread armed with
-	// hardware single-step that must be disarmed afterwards; suspended lists the
-	// exact Mach ports held so endThreadStep resumes precisely those.
-	suspended      []int
+	// Step bookkeeping. stepping/stepTID drive the ablation-only plain
+	// SingleStep; the sob* fields drive the atomic step-over-breakpoint retire
+	// loop. advanceStepOver runs on the waitLoop goroutine while endThreadStep
+	// may run on the engine loop goroutine (Kill mid-step), so the shared fields
+	// are guarded by stepMu. sobActive gates the step-over path in Wait; sobAddr
+	// is the disarmed breakpoint address the stepped thread must retire past;
+	// sobBranch records whether the instruction there alters control flow (so we
+	// can't assume it retires to sobAddr+4); sobSteps bounds the retry loop that
+	// steps through signal-handler excursions; stepThreadPort is the thread armed
+	// with hardware single-step that must be disarmed afterwards.
+	stepMu         sync.Mutex
+	stepping       bool
+	stepTID        int
 	stepThreadPort int
 	sobActive      bool
 	sobAddr        uint64
 	sobBranch      bool
 	sobSteps       int
 
+	// Deferred exception replies. bingo leaves BSD signals native (only
+	// EXC_MASK_BREAKPOINT is masked), so replying KERN_SUCCESS to a breakpoint
+	// exception the instant it arrives lets the kernel build a pending signal's
+	// handler frame on the still-suspended faulting thread — diverting its PC into
+	// _sigtramp before the engine reads it (observed with Go async-preemption
+	// SIGURG). Instead the reply header captured at receive time is stashed here,
+	// keyed by faulting thread port, and sent by bingo_reply_exception only when
+	// that thread is about to be resumed. An un-acknowledged Mach exception keeps
+	// the thread frozen at the faulting instruction with a stable PC. At most one
+	// reply is pending per thread (a suspended thread cannot fault again).
+	replyMu        sync.Mutex
+	pendingReplies map[int]replyInfo
+
 	// Diagnostic-only (BINGO_DARWIN_SUSPEND_PROBE): waitStartNanos records when
-	// Wait() blocked in wait4 (0 = not blocked). A watchdog goroutine, started
+	// Wait() blocked in mach_msg (0 = not blocked). A watchdog goroutine, started
 	// once, reads it to detect a wedge and dump the task/thread suspend state.
-	// suspendProbeOn caches the env gate so a disabled probe adds no per-wait
-	// work beyond one bool check.
+	// suspendProbeOn caches the env gate so a disabled probe adds no per-wait work
+	// beyond one bool check.
 	waitStartNanos int64
 	probeOnce      sync.Once
 	suspendProbeOn bool
 }
 
-// Darwin ptrace request codes from <sys/ptrace.h>. PT_ATTACH (10) makes the
-// stop wait4-able by PID. Do NOT use PT_ATTACHEXC (14) — Mach exceptions are
-// incompatible with our wait4-based Wait loop.
-const (
-	ptDarwinContinue = uintptr(7)
-	ptDarwinStep     = uintptr(9)
-	ptDarwinAttach   = uintptr(10)
-	ptDarwinDetach   = uintptr(11)
-)
-
-// darwinPauseSignal is the signal StopProcess sends to interrupt a running
-// tracee for Pause. It must be a CATCHABLE signal (so it surfaces through the
-// wait4 loop as a signal-delivery stop; SIGSTOP does not — see StopProcess) and
-// one Wait does not special-case (SIGTRAP is breakpoint/step; SIGURG/SIGWINCH
-// are re-delivered), leaving the StopSignal fall-through. SIGUSR2 fits: it is
-// never terminal-generated (unlike SIGINT/SIGTSTP), the Go runtime does not use
-// it for itself, and the engine suppresses it on resume so the tracee never
-// actually receives it. A genuine SIGUSR2 sent to the tracee while no Pause is
-// pending is silently discarded (like a stray SIGSTOP on linux); the tradeoff
-// is documented in AGENTS.md → Pause.
+// darwinPauseSignal is the sentinel PauseSignal the engine matches a manual-stop
+// StopSignal against. Under the Mach model no real signal is sent for Pause —
+// StopProcess posts to ctrlPort and Wait synthesises StopSignal{darwinPauseSignal}
+// after stopping the world — but the engine still needs a stable "which signal
+// means Pause" value to key emitPaused off (see handleStop's StopSignal branch).
+// SIGUSR2 is kept for continuity; the tracee never actually receives it.
 const darwinPauseSignal = syscall.SIGUSR2
 
-// The two darwin/arm64 step-over correctness fixes are independently toggleable
-// so an operator can ablate either in isolation. See singleStepThread (#1) and
-// withDarwinAsyncPreemptOff (#2).
+// The two darwin/arm64 step-over correctness knobs are independently toggleable
+// so an operator can ablate either in isolation.
 //
-//	BINGO_DARWIN_ATOMIC_STEPOVER     default ON  — "0" disables (falls back to a
-//	                                 plain per-process single-step; reproduces
-//	                                 the original wrong-thread hang; ablation
-//	                                 only).
-//	BINGO_DARWIN_ASYNC_PREEMPT_OFF   default ON  — "0" disables (re-enables Go
-//	                                 async preemption in the tracee; reproduces
-//	                                 the SIGURG-misdirection lost-wakeup wedge;
-//	                                 ablation only).
+//	BINGO_DARWIN_ATOMIC_STEPOVER     default ON  — "0" disables the retire loop
+//	                                 (falls back to a single naive per-thread
+//	                                 step; ablation only).
+//	BINGO_DARWIN_ASYNC_PREEMPT_OFF   default OFF — "1" forces
+//	                                 GODEBUG=asyncpreemptoff=1 in the tracee.
 //
-// Fix #2 defaults ON because the wait4/BSD-signal model cannot re-deliver a
-// thread-directed SIGURG to the M the Go runtime targeted (ptrace resume is
-// process-directed — XNU psignal), so under async-preemption churn a misdirected
-// SIGURG intermittently deadlocks the tracee in a pthread-condvar lost-wakeup
-// (~8% of step-overs at iters=40). Correctly re-delivering it needs the
-// Mach-exception model (PT_SIGEXC + exception port, as LLDB debugserver / Delve
-// macnative do), which is out of scope for the wait4 loop and tracked in #92.
-// Disabling async preemption removes the thread-directed SIGURG entirely; the
-// tracee falls back to cooperative preemption (function-prologue / loop-backedge
-// safepoints), so the only observable loss is async-preemption of pathological
-// safepoint-free tight loops. Linux is unaffected: ptrace signal delivery there
-// is per-thread. See withDarwinAsyncPreemptOff for the full mechanism.
-const asyncPreemptOffDefault = true
+// asyncpreemptoff defaults OFF under the Mach exception model: BSD signals are
+// delivered natively and thread-directed, so Go's async-preemption SIGURG
+// reaches the M the runtime targeted (the #92 fix). The old wait4/ptrace model
+// had to force it ON to dodge SIGURG misdirection; that stopgap is gone. The
+// toggle remains as an ablation lever.
+const asyncPreemptOffDefault = false
 
 func darwinAtomicStepOverEnabled() bool {
 	return os.Getenv("BINGO_DARWIN_ATOMIC_STEPOVER") != "0"
@@ -159,98 +170,123 @@ func darwinAsyncPreemptOffEnabled() bool {
 
 // darwinSuspendProbeEnabled gates a diagnostic-only watchdog that, on a wedge,
 // reads and logs the tracee's TASK-level Mach suspend_count plus per-thread
-// run_state/suspend/PC. It never changes control flow and only does work after
-// a multi-second wait4 stall, so it does not perturb the pre-wedge timing that
-// the race depends on.
+// run_state/suspend/PC. It never changes control flow and only does work after a
+// multi-second Wait stall, so it does not perturb the pre-wedge timing.
 func darwinSuspendProbeEnabled() bool {
 	return os.Getenv("BINGO_DARWIN_SUSPEND_PROBE") == "1"
 }
 
-func ptrace(request, pid, addr, data uintptr) error {
-	_, _, errno := syscall.Syscall6(
-		syscall.SYS_PTRACE,
-		request, pid, addr, data,
-		0, 0,
-	)
-	if errno != 0 {
-		return errno
+// startTracedProcess launches binaryPath suspended at its entry point via
+// posix_spawn(POSIX_SPAWN_START_SUSPENDED), acquires the Mach task port and
+// exception ports (racing the spawn), then freezes the process into bingo's
+// resting state (every thread individually Mach-suspended, task resumed). It
+// returns no *exec.Cmd — posix_spawn owns no exec.Cmd — so the caller relies on
+// the pid and the backend's launched flag.
+func startTracedProcess(b Backend, binaryPath string, args []string, env []string) (int, *exec.Cmd, error) {
+	db, _ := b.(*darwinBackend)
+	if db == nil {
+		return 0, nil, fmt.Errorf("darwin startTracedProcess: nil backend")
 	}
+
+	cpath := C.CString(binaryPath)
+	defer C.free(unsafe.Pointer(cpath))
+
+	argv := make([]*C.char, 0, len(args)+2)
+	argv = append(argv, cpath)
+	for _, a := range args {
+		ca := C.CString(a)
+		defer C.free(unsafe.Pointer(ca))
+		argv = append(argv, ca)
+	}
+	argv = append(argv, nil)
+
+	fullEnv := append(os.Environ(), env...)
+	if darwinAsyncPreemptOffEnabled() {
+		fullEnv = withDarwinAsyncPreemptOff(fullEnv)
+	}
+	envp := make([]*C.char, 0, len(fullEnv)+1)
+	for _, e := range fullEnv {
+		ce := C.CString(e)
+		defer C.free(unsafe.Pointer(ce))
+		envp = append(envp, ce)
+	}
+	envp = append(envp, nil)
+
+	var cpid C.int
+	rc := C.bingo_posix_spawn(cpath, &argv[0], &envp[0], &cpid)
+	if rc != 0 {
+		return 0, nil, fmt.Errorf("posix_spawn %q: %s", binaryPath, C.GoString(C.strerror(rc)))
+	}
+	pid := int(cpid)
+	db.launched = true
+
+	if err := db.acquirePorts(pid); err != nil {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		return 0, nil, err
+	}
+
+	task, err := db.task()
+	if err != nil {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		return 0, nil, err
+	}
+	if kr := C.bingo_freeze_at_launch(task); kr != C.KERN_SUCCESS {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		return 0, nil, fmt.Errorf("freeze at launch: %s", machErrString(kr))
+	}
+	return pid, nil, nil
+}
+
+// acquirePorts records the pid, obtains the Mach task port (retrying the brief
+// spawn/task race) and installs the exception/notification/control port set.
+func (b *darwinBackend) acquirePorts(pid int) error {
+	b.pid = pid
+
+	var task C.mach_port_t
+	var kr C.kern_return_t
+	// posix_spawn returns after the child task exists, so task_for_pid normally
+	// succeeds on the first try; a short bounded retry covers the rare race where
+	// the task port is not yet resolvable.
+	for i := 0; i < 200; i++ {
+		kr = C.bingo_task_for_pid(C.int(pid), &task)
+		if kr == C.KERN_SUCCESS {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
+	if kr != C.KERN_SUCCESS {
+		return fmt.Errorf("task_for_pid(%d): %s — debugger entitlement required",
+			pid, machErrString(kr))
+	}
+	b.taskMu.Lock()
+	b.taskPort = task
+	b.taskOK = true
+	b.taskMu.Unlock()
+
+	if kr := C.bingo_setup_exception_ports(task, &b.portSet, &b.excPort, &b.notePort, &b.ctrlPort); kr != C.KERN_SUCCESS {
+		return fmt.Errorf("setup exception ports: %s", machErrString(kr))
+	}
+	b.portsOK = true
 	return nil
 }
 
-func startTracedProcess(_ Backend, binaryPath string, args []string, env []string) (int, *exec.Cmd, error) {
-	cmd := exec.Command(binaryPath, args...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true}
-	cmd.Env = append(os.Environ(), env...)
-	if darwinAsyncPreemptOffEnabled() {
-		cmd.Env = withDarwinAsyncPreemptOff(cmd.Env)
-	}
-	if err := cmd.Start(); err != nil {
-		return 0, nil, fmt.Errorf("exec %q: %w", binaryPath, err)
-	}
-	pid := cmd.Process.Pid
-	var ws syscall.WaitStatus
-	if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
-		_ = cmd.Process.Kill()
-		return 0, nil, fmt.Errorf("wait for initial stop: %w", err)
-	}
-	if !ws.Stopped() {
-		_ = cmd.Process.Kill()
-		return 0, nil, fmt.Errorf("expected initial SIGTRAP, got: %v", ws)
-	}
-	return pid, cmd, nil
-}
-
 // withDarwinAsyncPreemptOff merges GODEBUG=asyncpreemptoff=1 into the tracee's
-// environment. It is applied whenever fix #2 is enabled
-// (darwinAsyncPreemptOffEnabled, the darwin default; see the toggle block
-// above). This is a darwin-specific correctness measure, NOT a perf tweak.
-//
-// Go async preemption sends a THREAD-directed SIGURG (pthread_kill to a
-// specific M) at a runtime-chosen moment. In our wait4/BSD-stop model that
-// SIGURG surfaces as a ptrace stop and we must re-inject it to keep the runtime
-// scheduling — but the only tool wait4 gives us is ptrace(PT_CONTINUE/PT_STEP,
-// pid, …, SIGURG), which XNU implements as psignal(): a PROCESS-directed signal
-// delivered to the first unblocked thread of the task (mach_process.c). That is
-// almost never the M the runtime intended. The misdirected SIGURG (a) spuriously
-// interrupts an unrelated M parked in __psynch_cvwait, racing the pthread
-// condvar's __psynch_cvsignal into a rare lost-wakeup deadlock, and (b) leaves
-// the intended M's runtime signalPending=1 forever (doSigPreempt clears the
-// counter on the wrong M), desyncing the process-global pendingPreemptSignals.
-// The result is an intermittent hang (~1 in 30 step-overs at iters=100).
-//
-// The wait4 model fundamentally cannot re-deliver a thread-directed signal:
-// PT_THUPDATE can set a per-thread siglist bit but cannot resume a wait4 stop
-// (no wakeup(&t->sigwait)), and the Mach-exception model real darwin debuggers
-// use (LLDB debugserver, Delve's macnative PT_SIGEXC path) is explicitly out of
-// scope here (AGENTS.md: PT_ATTACHEXC is incompatible with our wait4 loop;
-// tracked as the proper fix in #92). Disabling async preemption in the tracee
-// removes the thread-directed SIGURG entirely (runtime.preemptone skips preemptM
-// when asyncpreemptoff==1), so no signal is ever misdirected and the runtime's
-// preempt bookkeeping stays consistent. The tracee falls back to cooperative
-// preemption (function-prologue and loop safepoints), which is sufficient for
-// debugging; the only loss is async-preemption of pathological safepoint-free
-// tight loops.
-//
-// Linux does not need this: ptrace signal delivery there is per-thread, so the
-// SIGURG is re-delivered to the correct thread.
+// environment. Under the Mach exception model this is applied ONLY when the
+// BINGO_DARWIN_ASYNC_PREEMPT_OFF=1 ablation toggle is set (default OFF): native
+// thread-directed signal delivery re-delivers SIGURG correctly, so async
+// preemption no longer needs disabling. It respects an explicit asyncpreemptoff
+// the caller already set.
 func withDarwinAsyncPreemptOff(env []string) []string {
 	const key = "asyncpreemptoff"
 	out := make([]string, 0, len(env)+1)
 	godebug := ""
 	for _, kv := range env {
 		if strings.HasPrefix(kv, "GODEBUG=") {
-			// Last GODEBUG wins; collapse to a single merged entry below.
 			godebug = strings.TrimPrefix(kv, "GODEBUG=")
 			continue
 		}
 		out = append(out, kv)
 	}
-	// Respect an explicit asyncpreemptoff the caller already set (either value);
-	// otherwise force it on.
 	if !godebugHasKey(godebug, key) {
 		if godebug == "" {
 			godebug = key + "=1"
@@ -271,112 +307,123 @@ func godebugHasKey(godebug, key string) bool {
 	return false
 }
 
-func attachToProcess(_ Backend, pid int) error {
-	if err := ptrace(ptDarwinAttach, uintptr(pid), 0, 0); err != nil {
-		return fmt.Errorf("PT_ATTACH pid %d: %w", pid, err)
+func attachToProcess(b Backend, pid int) error {
+	db, _ := b.(*darwinBackend)
+	if db == nil {
+		return fmt.Errorf("darwin attach: nil backend")
 	}
-	var ws syscall.WaitStatus
-	if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
-		return fmt.Errorf("wait after PT_ATTACH: %w", err)
+	db.launched = false
+	if err := db.acquirePorts(pid); err != nil {
+		return err
+	}
+	// The attached process is running; bring it to resting state (all threads
+	// Mach-suspended) so the engine can inspect and set breakpoints.
+	task, err := db.task()
+	if err != nil {
+		return err
+	}
+	if cls := C.bingo_stop_the_world(task, db.portSet); cls == C.BINGO_MSG_ERROR {
+		return fmt.Errorf("attach: stop the world failed")
 	}
 	return nil
 }
 
-func killProcess(_ Backend, pid int, cmd *exec.Cmd) error {
-	if cmd != nil {
-		if err := cmd.Process.Kill(); err != nil && !isAlreadyExited(err) {
-			return err
+func killProcess(b Backend, pid int, _ *exec.Cmd) error {
+	db, _ := b.(*darwinBackend)
+
+	// Attached (not launched): we don't own the process. Resume its threads so it
+	// keeps running after we stop intercepting, but never kill it.
+	if db != nil && !db.launched {
+		db.flushAllReplies()
+		if task, err := db.task(); err == nil {
+			C.bingo_resume_all_threads(task)
 		}
-		// The tracee is ptrace-stopped, so the pending SIGKILL is not delivered
-		// until it is resumed. Without this PT_CONTINUE, cmd.Wait blocks until
-		// this process itself exits (the "Kill did not reap" wedge). Resuming
-		// lets the tracee run straight into the fatal signal; ignore the error
-		// since the process may already be gone. Breakpoints were restored by
-		// the engine's bps.clearAll before this call, so the text is clean.
-		_ = ptrace(ptDarwinContinue, uintptr(pid), 1, 0)
-		_ = cmd.Wait()
 		return nil
 	}
-	// Attached (not launched): detach, don't kill — we don't own the process.
-	_ = ptrace(ptDarwinDetach, uintptr(pid), 1, 0)
-	return nil
-}
 
-func isAlreadyExited(err error) bool {
-	return err != nil && err.Error() == "os: process already finished"
+	// Launched: a Mach-suspended thread never runs the SIGKILL AST, so resume
+	// every thread first, then SIGKILL, then reap. By the time the engine calls
+	// this it has already cleared breakpoints and torn down any in-flight
+	// single-step (Kill → endThreadStep → bps.clearAll → proc.kill), so resuming
+	// runs clean code straight into the fatal signal.
+	if db != nil {
+		db.flushAllReplies()
+		if task, err := db.task(); err == nil {
+			C.bingo_resume_all_threads(task)
+		}
+	}
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("kill: SIGKILL: %w", err)
+	}
+	for {
+		var ws syscall.WaitStatus
+		_, err := syscall.Wait4(pid, &ws, 0, nil)
+		if err == nil || isNoChildProcess(err) {
+			return nil
+		}
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		return fmt.Errorf("kill: reap: %w", err)
+	}
 }
 
 func (b *darwinBackend) ContinueProcess() error {
 	b.clearStep()
-	if err := ptrace(ptDarwinContinue, uintptr(b.pid), 1, 0); err != nil {
-		return fmt.Errorf("PT_CONTINUE: %w", err)
+	b.flushAllReplies()
+	task, err := b.task()
+	if err != nil {
+		return err
+	}
+	if kr := C.bingo_resume_all_threads(task); kr != C.KERN_SUCCESS {
+		return fmt.Errorf("resume all threads: %s", machErrString(kr))
 	}
 	return nil
 }
 
+// SingleStep is the ablation-only naive step (BINGO_DARWIN_ATOMIC_STEPOVER=0):
+// arm hardware single-step on tid and resume just that thread, with no retire
+// loop. singleStepThread is the production path.
 func (b *darwinBackend) SingleStep(tid int) error {
-	b.setStep(tid)
-	// Darwin PT_STEP is per-process (by PID), not per-thread. The tid argument
-	// is a Mach thread port, not a valid ptrace identifier — use b.pid.
-	if err := ptrace(ptDarwinStep, uintptr(b.pid), 1, 0); err != nil {
+	b.stepMu.Lock()
+	b.stepping = true
+	b.stepTID = tid
+	b.stepThreadPort = tid
+	b.stepMu.Unlock()
+	if err := b.setSingleStep(tid, true); err != nil {
 		b.clearStep()
-		return fmt.Errorf("PT_STEP: %w", err)
+		return fmt.Errorf("SingleStep arm tid %d: %w", tid, err)
+	}
+	b.flushReply(tid)
+	if kr := C.bingo_resume_one_thread(C.mach_port_t(tid)); kr != C.KERN_SUCCESS {
+		_ = b.setSingleStep(tid, false)
+		b.clearStep()
+		return fmt.Errorf("SingleStep resume tid %d: %s", tid, machErrString(kr))
 	}
 	return nil
 }
 
 // singleStepThread single-steps exactly one thread over a disarmed software
-// breakpoint, atomically with respect to every other thread in the task, and
-// guarantees the disarmed instruction actually retires even if the kernel tries
-// to divert the thread into a signal handler.
+// breakpoint (or, for a plain StepInto, over one instruction from addr) and
+// guarantees the instruction retires even if the kernel diverts the thread into
+// a signal handler.
 //
-// Two Darwin-specific hazards make the naive "PT_STEP once" wrong:
-//
-//  1. PT_STEP is per-process: it applies the hardware single-step to the
-//     kernel's first task thread and task_release's the WHOLE task. If the
-//     thread that hit the breakpoint is not that first thread, a plain PT_STEP
-//     lets the breakpoint thread run FREELY past the (temporarily removed) trap
-//     byte while a different thread absorbs the single-step.
-//
-//  2. ptrace resume delivers pending BSD signals. Go's scheduler preempts
-//     goroutines with SIGURG (~100 Hz); a SIGURG left pending on the breakpoint
-//     thread is delivered by PT_STEP, so the kernel enters the Go signal
-//     trampoline INSTEAD of executing the instruction at bp.addr. On sigreturn
-//     the thread lands back on bp.addr, the engine has meanwhile re-armed the
-//     trap, and the target re-hits the breakpoint — the step is silently lost
-//     and the client's StepOver never completes. Delve dodges this by
-//     Mach-thread_resume'ing a single thread (which does not deliver BSD
-//     signals), but under our wait4/BSD-stop model the breakpoint thread has
-//     Mach suspend count 0, so only a ptrace resume can run it.
-//
-// To make the disarm→step→rearm section atomic AND land past bp.addr, we:
-//  1. Mach-suspend every other thread (so only tid can run and no other thread
-//     can generate a fresh SIGURG while the trap byte is absent),
-//  2. arm ARMv8 hardware single-step on tid specifically (MDSCR_EL1.SS +
-//     PSTATE.SS), so PT_STEP steps precisely tid,
-//  3. issue the first PT_STEP with signal 0 (never re-injecting a signal), then
-//  4. let Wait/advanceStepOver keep stepping tid — with every signal suppressed
-//     — until PC has genuinely retired past bp.addr, transparently stepping
-//     through any signal-handler excursion.
-//
-// endThreadStep MUST be called once the step trap is reported (after the engine
-// re-arms the breakpoint) to disarm single-step on tid and resume the suspended
-// threads. On any error here we roll back fully so no thread is left suspended.
+// Under the Mach model the resting state already has every thread
+// Mach-suspended, so this does NOT suspend others: it arms ARMv8 hardware
+// single-step (MDSCR_EL1.SS + PSTATE.SS) on tid, resumes ONLY tid, and records
+// the sob* state so Wait's advanceStepOver drives it to completion. With only
+// tid runnable and Go's sysmon (another thread) frozen, no fresh preemption
+// SIGURG can be generated in the window; a SIGURG already pending on tid is
+// stepped through by the retire loop. endThreadStep disarms single-step once the
+// step trap is reported.
 func (b *darwinBackend) singleStepThread(tid int, addr uint64) error {
 	if !darwinAtomicStepOverEnabled() {
-		// Ablation path (BINGO_DARWIN_ATOMIC_STEPOVER=0): fall back to the plain
-		// per-process single-step. This reproduces the original wrong-thread
-		// hang and is intended only for measuring fix #1 in isolation.
 		return b.SingleStep(tid)
 	}
-	if err := b.suspendOthers(tid); err != nil {
-		return fmt.Errorf("single step thread: suspend others: %w", err)
-	}
+	branch := b.instrAltersPC(addr)
 	if err := b.setSingleStep(tid, true); err != nil {
-		b.resumeSuspended()
 		return fmt.Errorf("single step thread: arm single-step tid %d: %w", tid, err)
 	}
-	branch := b.instrAltersPC(addr)
 	b.stepMu.Lock()
 	b.stepThreadPort = tid
 	b.sobActive = true
@@ -384,14 +431,14 @@ func (b *darwinBackend) singleStepThread(tid int, addr uint64) error {
 	b.sobBranch = branch
 	b.sobSteps = 0
 	b.stepMu.Unlock()
-	if err := ptrace(ptDarwinStep, uintptr(b.pid), 1, 0); err != nil {
+	b.flushReply(tid)
+	if kr := C.bingo_resume_one_thread(C.mach_port_t(tid)); kr != C.KERN_SUCCESS {
 		_ = b.setSingleStep(tid, false)
 		b.stepMu.Lock()
 		b.stepThreadPort = 0
 		b.sobActive = false
 		b.stepMu.Unlock()
-		b.resumeSuspended()
-		return fmt.Errorf("single step thread: PT_STEP: %w", err)
+		return fmt.Errorf("single step thread: resume tid %d: %s", tid, machErrString(kr))
 	}
 	return nil
 }
@@ -403,11 +450,10 @@ const sobStepCap = 200000
 
 // instrAltersPC reports whether the 4-byte AArch64 instruction at addr can set
 // PC to something other than addr+4 (any branch, branch-register, compare/test
-// branch, conditional branch, or exception-generating instruction). When it
-// can, we cannot assume the instruction retires to sobAddr+4 and fall back to
-// trusting a single step. ADR/ADRP are deliberately excluded: they only compute
-// an address into a register and fall through. On any read error we
-// conservatively report true (trust one step).
+// branch, conditional branch, or exception-generating instruction). When it can,
+// we cannot assume the instruction retires to sobAddr+4 and fall back to trusting
+// a single step. ADR/ADRP are excluded: they only compute an address and fall
+// through. On any read error we conservatively report true (trust one step).
 func (b *darwinBackend) instrAltersPC(addr uint64) bool {
 	var buf [4]byte
 	if err := b.ReadMemory(addr, buf[:]); err != nil {
@@ -440,7 +486,7 @@ func (b *darwinBackend) stepOverActive() bool {
 }
 
 // clearStepOver marks any in-flight step-over as finished (used on process
-// exit/kill). It does not resume suspended threads: on exit they are gone, and
+// exit/kill). It does not disarm single-step: on exit the thread is gone, and
 // endThreadStep handles the live-teardown case.
 func (b *darwinBackend) clearStepOver() {
 	b.stepMu.Lock()
@@ -448,32 +494,16 @@ func (b *darwinBackend) clearStepOver() {
 	b.stepMu.Unlock()
 }
 
-// stepOverBumpCapped increments the step-over retry counter, clearing the
-// step-over if the cap is exceeded, and reports the stepped thread port plus
-// whether the loop must terminate now (cap hit or already torn down).
-func (b *darwinBackend) stepOverBumpCapped() (tid int, done bool) {
-	b.stepMu.Lock()
-	defer b.stepMu.Unlock()
-	tid = b.stepThreadPort
-	if !b.sobActive {
-		return tid, true
-	}
-	b.sobSteps++
-	if b.sobSteps > sobStepCap {
-		b.sobActive = false
-		return tid, true
-	}
-	return tid, false
-}
-
-// advanceStepOver is called from Wait for every SIGTRAP seen while a software-BP
-// step-over is in flight. It returns (event, true) once the disarmed instruction
-// has retired past bp.addr — handing a single StopSingleStep back to the engine —
-// or (zero, false) after issuing another suppressed single-step to work through a
-// signal-handler excursion. All other threads remain Mach-suspended throughout,
-// so only the stepped thread runs and no fresh preemption signals are generated.
-// sobActive may be cleared concurrently by endThreadStep (Kill); we re-check it
-// under stepMu after reading registers and treat teardown as completion.
+// advanceStepOver is called from Wait for every EXC_BREAKPOINT seen while a
+// software-BP step-over is in flight. The stepped thread has just re-suspended
+// on its single-step trap (mach_recv suspended it). advanceStepOver returns
+// (event, true) once the disarmed instruction has retired past sobAddr — handing
+// one StopSingleStep back to the engine — or (zero, false) after re-arming
+// single-step and resuming the stepped thread again to work through a
+// signal-handler excursion. Only the stepped thread ever runs, so no fresh
+// preemption signals are generated. sobActive may be cleared concurrently by
+// endThreadStep (Kill); we re-check it under stepMu and treat teardown as
+// completion.
 func (b *darwinBackend) advanceStepOver() (StopEvent, bool) {
 	b.stepMu.Lock()
 	active := b.sobActive
@@ -492,17 +522,13 @@ func (b *darwinBackend) advanceStepOver() (StopEvent, bool) {
 		retired = true
 	} else if branch {
 		// Control-flow instruction: its successor isn't statically sobAddr+4.
-		// PC != sobAddr means it left the breakpoint (either retired or was
-		// diverted). We can't cheaply tell these apart for a branch, so trust
-		// the step once it moves — same best effort as before, but now atomic
-		// w.r.t. other threads. PC == sobAddr means a handler just returned
-		// without executing it yet; step again.
+		// PC != sobAddr means it left the breakpoint. PC == sobAddr means a
+		// handler just returned without executing it yet; step again.
 		retired = regs.PC != addr
 	} else {
-		// Straight-line instruction: it has retired iff PC advanced to the next
+		// Straight-line instruction: retired iff PC advanced to the next
 		// instruction. A signal diversion lands PC in the runtime trampoline
-		// (never sobAddr+4), so this cleanly distinguishes "instruction
-		// executed" from "diverted into a handler".
+		// (never sobAddr+4), cleanly distinguishing "executed" from "diverted".
 		retired = regs.PC == addr+4
 	}
 
@@ -524,9 +550,16 @@ func (b *darwinBackend) advanceStepOver() (StopEvent, bool) {
 	}
 	b.stepMu.Unlock()
 
-	// Not yet past bp.addr: keep stepping the same (only-runnable) thread with
-	// the signal suppressed so the disarmed instruction eventually executes.
-	if err := ptrace(ptDarwinStep, uintptr(b.pid), 1, 0); err != nil {
+	// Not yet past sobAddr: re-arm single-step (PSTATE.SS self-clears after each
+	// trap) and resume the same (only-runnable) thread for another step.
+	if err := b.setSingleStep(tid, true); err != nil {
+		b.stepMu.Lock()
+		b.sobActive = false
+		b.stepMu.Unlock()
+		return StopEvent{Reason: StopSingleStep, TID: tid}, true
+	}
+	b.flushReply(tid)
+	if kr := C.bingo_resume_one_thread(C.mach_port_t(tid)); kr != C.KERN_SUCCESS {
 		b.stepMu.Lock()
 		b.sobActive = false
 		b.stepMu.Unlock()
@@ -536,13 +569,11 @@ func (b *darwinBackend) advanceStepOver() (StopEvent, bool) {
 }
 
 // endThreadStep tears down the critical section opened by singleStepThread:
-// disarm hardware single-step on the stepped thread and resume every thread we
-// suspended. Idempotent and safe to call when no atomic step is in flight. May
-// run on the engine loop goroutine (Kill) while advanceStepOver runs on the
-// waitLoop goroutine — and is itself also called from the waitLoop on a PT_STEP
-// failure — so every shared field it touches, `suspended` included, is accessed
-// under stepMu. Because resumeSuspended empties `suspended` under the lock, a
-// second concurrent teardown finds it empty and cannot double-resume a port.
+// disarm hardware single-step on the stepped thread. It does NOT resume other
+// threads — the resting state keeps every thread Mach-suspended until the engine
+// issues ContinueProcess. Idempotent and safe to call when no step is in flight.
+// May run on the engine loop goroutine (Kill) while advanceStepOver runs on the
+// waitLoop goroutine, so the shared fields are touched under stepMu.
 func (b *darwinBackend) endThreadStep() {
 	b.stepMu.Lock()
 	b.sobActive = false
@@ -550,48 +581,8 @@ func (b *darwinBackend) endThreadStep() {
 	b.stepThreadPort = 0
 	b.stepMu.Unlock()
 	if port != 0 {
-		// Best-effort: clear the hardware single-step bit on the stepped thread.
 		_ = b.setSingleStep(port, false)
 	}
-	b.resumeSuspended()
-}
-
-// suspendOthers Mach-suspends every task thread except keep, recording the
-// exact ports suspended so endThreadStep resumes precisely those (threads that
-// spawn during the window are left alone; threads that exit are ignored). The
-// `suspended` slice is written under stepMu since endThreadStep/resumeSuspended
-// may read and truncate it from another goroutine. Threads() is enumerated
-// before taking stepMu to avoid nesting the thread/task locks under it.
-func (b *darwinBackend) suspendOthers(keep int) error {
-	tids, err := b.Threads()
-	if err != nil {
-		return err
-	}
-	b.stepMu.Lock()
-	defer b.stepMu.Unlock()
-	b.suspended = b.suspended[:0]
-	for _, tid := range tids {
-		if tid == keep {
-			continue
-		}
-		if kr := C.bingo_thread_suspend(C.mach_port_t(tid)); kr == C.KERN_SUCCESS {
-			b.suspended = append(b.suspended, tid)
-		}
-	}
-	return nil
-}
-
-// resumeSuspended resumes and clears every Mach port held by suspendOthers.
-// Guarded by stepMu because endThreadStep can call it from either the engine
-// loop (Kill) or the waitLoop (PT_STEP failure); emptying the slice under the
-// lock makes a racing second call a no-op instead of a double resume.
-func (b *darwinBackend) resumeSuspended() {
-	b.stepMu.Lock()
-	defer b.stepMu.Unlock()
-	for _, tid := range b.suspended {
-		C.bingo_thread_resume(C.mach_port_t(tid))
-	}
-	b.suspended = b.suspended[:0]
 }
 
 func (b *darwinBackend) setSingleStep(tid int, on bool) error {
@@ -605,26 +596,28 @@ func (b *darwinBackend) setSingleStep(tid int, on bool) error {
 	return nil
 }
 
-// StopProcess asynchronously interrupts the running tracee for Pause by sending
-// it darwinPauseSignal. Unlike Delve's Darwin backend — which halts via Mach
-// thread_suspend on every thread because it detects stops through a Mach
-// exception port — bingo detects stops through wait4, so Pause must produce a
-// wait4-visible stop. SIGSTOP cannot: XNU delivers it to a ptraced tracee as a
-// job-control stop that Go's syscall.WaitStatus reports as neither Stopped nor
-// Exited (StopSignal()==-1), so Wait's `if !ws.Stopped()` skips it and re-blocks
-// forever. A catchable signal instead surfaces as an ordinary ptrace
-// signal-delivery stop — Wait returns it as StopEvent{StopSignal, sig} and the
-// engine's manual-stop detection turns it into EventPaused. The engine never
-// re-injects it (Continue resumes with signal 0), so the tracee never actually
-// receives the signal and resume is a plain ContinueProcess. ESRCH (process
-// already gone) is an idempotent no-op, matching process.kill.
+// StopProcess asynchronously interrupts the running tracee for Pause by posting
+// a sentinel message to ctrlPort. Wait, blocked in mach_msg on the port set,
+// wakes, stops the world and synthesises StopSignal{PauseSignal()} which the
+// engine turns into EventPaused. Unlike the old model this sends no real signal:
+// task/thread_suspend cannot wake a blocked receive, and Delve's alternative
+// (a synchronous exception_raise RPC) can block the caller if the receiver is
+// mid-handling, whereas a one-way port send never blocks. MACH_SEND_TIMED_OUT
+// means a prior wake is still queued — one pending Pause is enough, so that is a
+// no-op success.
 func (b *darwinBackend) StopProcess() error {
-	return stopProcessSignal(b.pid, darwinPauseSignal)
+	if !b.portsOK {
+		return fmt.Errorf("StopProcess: no exception ports")
+	}
+	kr := C.bingo_send_ctrl(b.ctrlPort)
+	if kr != C.KERN_SUCCESS && kr != C.MACH_SEND_TIMED_OUT {
+		return fmt.Errorf("StopProcess: send ctrl: %s", machErrString(kr))
+	}
+	return nil
 }
 
-// PauseSignal is the catchable signal StopProcess delivers and that the engine
-// turns into EventPaused. See Backend.PauseSignal and StopProcess for why a
-// catchable signal (not SIGSTOP) is required on darwin.
+// PauseSignal is the sentinel the engine matches a manual-stop StopSignal
+// against. See darwinPauseSignal and StopProcess.
 func (b *darwinBackend) PauseSignal() int { return int(darwinPauseSignal) }
 
 func (b *darwinBackend) GetRegisters(tid int) (Registers, error) {
@@ -749,7 +742,15 @@ func (b *darwinBackend) Threads() ([]int, error) {
 	return tids, nil
 }
 
-//nolint:gocognit // The wait loop is one serialized ptrace state machine.
+// Wait blocks on the Mach port set and turns each message into a StopEvent. It
+// is the pure-Mach replacement for the old wait4 loop: EXC_BREAKPOINT messages
+// (software BRK and hardware single-step) drive breakpoint/step detection, the
+// dead-name notification signals process exit, and the control port carries
+// Pause. The faulting thread is suspended and the exception acknowledged inside
+// bingo_mach_recv before this returns, so a returned stop already holds that
+// thread; a real breakpoint additionally stops the rest of the world here.
+//
+//nolint:gocognit // The receive loop is one serialized Mach stop state machine.
 func (b *darwinBackend) Wait() (StopEvent, error) {
 	b.probeOnce.Do(func() {
 		if darwinSuspendProbeEnabled() {
@@ -758,130 +759,138 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 		}
 	})
 	for {
-		var ws syscall.WaitStatus
+		var thread C.mach_port_t
+		var exc C.int
+		var code0 C.int64_t
+		var id C.int
+		var replyPort C.mach_port_t
+		var replyBits C.uint
+		var replyID C.int
 		if b.suspendProbeOn {
 			atomic.StoreInt64(&b.waitStartNanos, time.Now().UnixNano())
 		}
-		tid, err := syscall.Wait4(b.pid, &ws, 0, nil)
+		cls := C.bingo_mach_recv(b.portSet, -1, &thread, &exc, &code0, &id, 1, 0,
+			&replyPort, &replyBits, &replyID)
 		if b.suspendProbeOn {
 			atomic.StoreInt64(&b.waitStartNanos, 0)
 		}
-		if err != nil {
-			if isNoChildProcess(err) {
-				return StopEvent{Reason: StopExited, TID: b.pid}, nil
-			}
-			return StopEvent{}, fmt.Errorf("wait4: %w", err)
-		}
-		if ws.Exited() {
-			b.clearStepOver()
-			return StopEvent{Reason: StopExited, TID: tid, ExitCode: ws.ExitStatus()}, nil
-		}
-		if ws.Signaled() {
-			b.clearStepOver()
-			return StopEvent{Reason: StopKilled, TID: tid}, nil
-		}
-		if !ws.Stopped() {
+
+		switch cls {
+		case C.BINGO_MSG_NONE:
 			continue
-		}
 
-		sig := ws.StopSignal()
+		case C.BINGO_MSG_ERROR:
+			return StopEvent{}, fmt.Errorf("mach_msg recv failed")
 
-		// Software-BP step-over in flight: every other thread is Mach-suspended
-		// and only the stepped thread runs. Drive it to completion here (the
-		// sole wait4 owner), suppressing any signal so it can never be injected
-		// into the atomic disarm→step→rearm window (a delivered SIGURG would
-		// divert the thread into the Go signal trampoline instead of executing
-		// the disarmed instruction). advanceStepOver returns done=true with a
-		// single StopSingleStep once the instruction has retired past bp.addr.
-		if b.stepOverActive() {
-			if sig == syscall.SIGTRAP {
-				if ev, done := b.advanceStepOver(); done {
-					return ev, nil
+		case C.BINGO_MSG_DEATH:
+			b.clearStepOver()
+			return b.reap()
+
+		case C.BINGO_MSG_PAUSE:
+			// A step-over never overlaps a running-state Pause; a control wake
+			// seen mid-step is a stale leftover — ignore and keep receiving.
+			if b.stepOverActive() {
+				continue
+			}
+			if died, err := b.stopTheWorld(); err != nil {
+				return StopEvent{}, err
+			} else if died {
+				b.clearStepOver()
+				return b.reap()
+			}
+			return StopEvent{Reason: StopSignal, Signal: b.PauseSignal()}, nil
+
+		case C.BINGO_MSG_EXC:
+			tid := int(thread)
+			// Defer the reply until this thread is resumed; see pendingReplies.
+			b.stashReply(tid, replyInfo{port: replyPort, bits: replyBits, id: replyID})
+			// Step-over in flight: ONLY the stepped thread's own single-step trap
+			// advances it. A sibling/newly-created thread whose real-breakpoint
+			// exception was still in flight when stop-the-world ran can surface
+			// here mid-step — the non-blocking drain in bingo_stop_the_world
+			// cannot catch an exception the kernel has not finished delivering
+			// yet. Misreading such a straggler as the step's completion returns a
+			// bogus StopSingleStep and leaves the real single-step armed, which
+			// wedges the next resume (the residual churn hang). So only the
+			// stepping thread's trap drives advanceStepOver; a straggler stays
+			// parked (already suspended, reply stashed) and re-faults on the next
+			// resume. Mirrors Delve's "loop until the trap belongs to the stepping
+			// thread" guard in singleStep.
+			if b.stepOverActive() {
+				if b.isStepThread(tid) {
+					if ev, done := b.advanceStepOver(); done {
+						return ev, nil
+					}
 				}
 				continue
 			}
-			stepTID, done := b.stepOverBumpCapped()
-			if done {
-				return StopEvent{Reason: StopSingleStep, TID: stepTID}, nil
+			// Ablation single-step (BINGO_DARWIN_ATOMIC_STEPOVER=0). Same guard:
+			// only the thread the step was issued against completes it; a straggler
+			// sibling breakpoint stays parked for the next resume.
+			if b.consumeStep(tid) {
+				return StopEvent{Reason: StopSingleStep, TID: tid}, nil
 			}
-			if err := ptrace(ptDarwinStep, uintptr(b.pid), 1, 0); err != nil {
-				b.endThreadStep()
-				if isNoSuchProcess(err) {
-					return StopEvent{Reason: StopKilled, TID: tid}, nil
-				}
+			// Real breakpoint hit: stop the rest of the world into resting state,
+			// then report the faulting thread.
+			if died, err := b.stopTheWorld(); err != nil {
 				return StopEvent{}, err
+			} else if died {
+				b.clearStepOver()
+				return b.reap()
 			}
-			continue
-		}
+			return StopEvent{Reason: StopBreakpoint, TID: tid}, nil
 
-		if sig == syscall.SIGTRAP {
-			if stepping, thread := b.consumeStep(); stepping {
-				return StopEvent{Reason: StopSingleStep, TID: thread}, nil
-			}
-			return StopEvent{Reason: StopBreakpoint}, nil
+		default:
+			return StopEvent{}, fmt.Errorf("mach_msg recv: unknown class %d", int(cls))
 		}
-
-		// SIGURG is Go's goroutine-preemption signal. Re-deliver transparently.
-		if sig == syscall.SIGURG {
-			if err := b.resumeAfterSignal(sig); err != nil {
-				if isNoSuchProcess(err) {
-					return StopEvent{Reason: StopKilled, TID: tid}, nil
-				}
-				return StopEvent{}, err
-			}
-			continue
-		}
-
-		// SIGWINCH (terminal resize): handled by the Go runtime, re-deliver.
-		if sig == syscall.SIGWINCH {
-			if err := b.resumeAfterSignal(sig); err != nil {
-				if isNoSuchProcess(err) {
-					return StopEvent{Reason: StopKilled, TID: tid}, nil
-				}
-				return StopEvent{}, err
-			}
-			continue
-		}
-
-		// Other signals during a plain machine single-step (StepInto): re-deliver
-		// via PT_STEP so the step completes. If PT_STEP fails, fall through to
-		// StopSignal so the engine can recover. Don't fall back to
-		// PT_CONTINUE+continue: that loops on SIGURG every ~10ms forever.
-		if b.isStepping() {
-			if err := ptrace(ptDarwinStep, uintptr(b.pid), 1, uintptr(sig)); err == nil {
-				continue
-			} else if isNoSuchProcess(err) {
-				return StopEvent{Reason: StopKilled, TID: tid}, nil
-			}
-			b.clearStep()
-		}
-		return StopEvent{Reason: StopSignal, Signal: int(sig)}, nil
 	}
 }
 
+// stopTheWorld suspends every running thread and drains any queued breakpoint
+// exceptions so the process reaches bingo's resting state with nothing pending.
+// Returns died=true if the tracee exited during the stop.
+func (b *darwinBackend) stopTheWorld() (died bool, err error) {
+	task, err := b.task()
+	if err != nil {
+		return false, err
+	}
+	switch C.bingo_stop_the_world(task, b.portSet) {
+	case C.BINGO_MSG_NONE:
+		return false, nil
+	case C.BINGO_MSG_DEATH:
+		return true, nil
+	default:
+		return false, fmt.Errorf("stop the world failed")
+	}
+}
+
+// reap collects the tracee's exit status after a dead-name notification. A
+// concurrent kill path may have already reaped it (ECHILD), which is treated as
+// a normal exit.
+func (b *darwinBackend) reap() (StopEvent, error) {
+	var ws syscall.WaitStatus
+	for {
+		_, err := syscall.Wait4(b.pid, &ws, 0, nil)
+		if err == nil {
+			break
+		}
+		if isNoChildProcess(err) {
+			return StopEvent{Reason: StopExited, TID: b.pid}, nil
+		}
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		return StopEvent{}, fmt.Errorf("wait4 reap: %w", err)
+	}
+	if ws.Signaled() {
+		return StopEvent{Reason: StopKilled, TID: b.pid}, nil
+	}
+	return StopEvent{Reason: StopExited, TID: b.pid, ExitCode: ws.ExitStatus()}, nil
+}
+
 // suspendProbeWatchdog (diagnostic only) polls waitStartNanos and, when Wait()
-// has been blocked in wait4 for longer than probeWedgeThreshold, dumps the
-// tracee's TASK-level suspend_count and per-thread state once per stall episode.
-//
-// Interpreting the numbers (validated by a task_suspend positive control):
-//   - A ptrace-STOPPED darwin task already reads task suspend_count == 1 (BSD
-//     SSTOP shares the single Mach task suspend_count). So suspend_count == 1
-//     is the ORDINARY stop baseline, NOT evidence of a leak on its own.
-//   - task_suspend/task_resume increment/decrement that SAME counter, so a
-//     LEAKED task_suspend (e.g. an unbalanced bingo_write_memory) stacked on a
-//     ptrace stop would read suspend_count >= 2.
-//   - A resumed/running task reads 0.
-//
-// Therefore the discriminators for the residual wedge are:
-//
-//	(a) suspend_count >= 2                         -> a held/leaked task suspend
-//	(b) threads run_state==STOPPED at user PCs      -> task-suspend freeze
-//	(c) a thread run_state==RUNNING, task not        -> a non-preemptible run the
-//	    suspended                                       runtime can't stop (STW
-//	                                                    stall; e.g. asyncpreemptoff
-//	                                                    disabling async preemption)
-//	(d) threads run_state==WAITING, static kernel PCs (__psynch_cvwait, …),
-//	    suspend ∈ {0,1}                             -> pthread-condvar lost-wakeup
+// has been blocked for longer than probeWedgeThreshold, dumps the tracee's
+// TASK-level suspend_count and per-thread state once per stall episode.
 func (b *darwinBackend) suspendProbeWatchdog() {
 	const probeWedgeThreshold = 9 * time.Second
 	var lastDumped int64
@@ -912,14 +921,7 @@ func (b *darwinBackend) dumpSuspendState(waitStart int64) {
 			b.pid, waited, machErrString(kr))
 		return
 	}
-	scStr := "0 (task resumed/running)"
-	switch {
-	case int(sc) == 1:
-		scStr = "1 (== ordinary ptrace-stop baseline; NOT a leak by itself)"
-	case int(sc) >= 2:
-		scStr = fmt.Sprintf("%d (>=2: hold BEYOND ptrace baseline -> candidate task-suspend LEAK)", int(sc))
-	}
-	fmt.Fprintf(os.Stderr, "[suspendprobe] pid=%d waited=%s TASK_SUSPEND_COUNT=%s\n", b.pid, waited, scStr)
+	fmt.Fprintf(os.Stderr, "[suspendprobe] pid=%d waited=%s TASK_SUSPEND_COUNT=%d\n", b.pid, waited, int(sc))
 
 	pcs0, _, stopped0, _ := b.dumpThreads(task, "s0")
 	time.Sleep(300 * time.Millisecond)
@@ -934,14 +936,12 @@ func (b *darwinBackend) dumpSuspendState(waitStart int64) {
 	}
 	verdict := "INCONCLUSIVE"
 	switch {
-	case int(sc) >= 2:
-		verdict = "task-suspend LEAK (suspend_count exceeds ptrace baseline)"
 	case stopped0 > 0 || stopped1 > 0:
-		verdict = "task-suspend FREEZE (threads STOPPED, not voluntarily waiting)"
+		verdict = "threads STOPPED (task-suspend freeze)"
 	case running1 > 0:
-		verdict = "non-preemptible RUN (a thread is RUNNING and cannot be stopped -> STW stall, e.g. asyncpreemptoff); NOT a suspend leak"
+		verdict = "a thread is RUNNING and cannot be stopped (STW stall)"
 	case waiting1 > 0 && static:
-		verdict = "pthread-condvar LOST-WAKEUP (threads WAITING in kernel, PCs static, suspend<=1)"
+		verdict = "threads WAITING in kernel, PCs static (possible lost-wakeup)"
 	}
 	fmt.Fprintf(os.Stderr, "[suspendprobe]   VERDICT: %s (waiting=%d running=%d stopped=%d staticPCs=%v)\n",
 		verdict, waiting1, running1, stopped1, static)
@@ -988,14 +988,61 @@ func (b *darwinBackend) dumpThreads(task C.mach_port_t, label string) (map[int]u
 	return pcs, waiting, stopped, running
 }
 
-func (b *darwinBackend) setPID(pid int) { b.pid = pid }
-
-func (b *darwinBackend) setStep(tid int) {
-	b.stepMu.Lock()
-	b.stepping = true
-	b.stepTID = tid
-	b.stepMu.Unlock()
+// replyInfo captures the fields bingo_reply_exception needs to acknowledge a
+// deferred exception: the kernel's reply port, the remote bits, and the original
+// request id. See the pendingReplies field and bingo_reply_exception.
+type replyInfo struct {
+	port C.mach_port_t
+	bits C.uint
+	id   C.int
 }
+
+// stashReply records the deferred reply for a faulting thread. If one is somehow
+// already pending for that thread (should be impossible — a suspended thread
+// can't fault again), the stale reply is flushed first so its exception isn't
+// left un-acknowledged forever.
+func (b *darwinBackend) stashReply(tid int, r replyInfo) {
+	b.replyMu.Lock()
+	if b.pendingReplies == nil {
+		b.pendingReplies = make(map[int]replyInfo)
+	}
+	old, ok := b.pendingReplies[tid]
+	b.pendingReplies[tid] = r
+	b.replyMu.Unlock()
+	if ok {
+		C.bingo_reply_exception(old.port, old.bits, old.id)
+	}
+}
+
+// flushReply acknowledges and clears any deferred exception for tid. It MUST be
+// called before resuming tid: until the exception is replied the thread stays
+// blocked on it and thread_resume alone will not run it.
+func (b *darwinBackend) flushReply(tid int) {
+	b.replyMu.Lock()
+	r, ok := b.pendingReplies[tid]
+	if ok {
+		delete(b.pendingReplies, tid)
+	}
+	b.replyMu.Unlock()
+	if ok {
+		C.bingo_reply_exception(r.port, r.bits, r.id)
+	}
+}
+
+// flushAllReplies acknowledges and clears every deferred exception. Called
+// before a resume-all (ContinueProcess / kill) so no thread is left blocked on
+// an un-acknowledged exception.
+func (b *darwinBackend) flushAllReplies() {
+	b.replyMu.Lock()
+	pending := b.pendingReplies
+	b.pendingReplies = nil
+	b.replyMu.Unlock()
+	for _, r := range pending {
+		C.bingo_reply_exception(r.port, r.bits, r.id)
+	}
+}
+
+func (b *darwinBackend) setPID(pid int) { b.pid = pid }
 
 func (b *darwinBackend) clearStep() {
 	b.stepMu.Lock()
@@ -1004,49 +1051,37 @@ func (b *darwinBackend) clearStep() {
 	b.stepMu.Unlock()
 }
 
-func (b *darwinBackend) isStepping() bool {
+func (b *darwinBackend) consumeStep(tid int) bool {
 	b.stepMu.Lock()
 	defer b.stepMu.Unlock()
-	return b.stepping
-}
-
-func (b *darwinBackend) consumeStep() (bool, int) {
-	b.stepMu.Lock()
-	defer b.stepMu.Unlock()
-	if !b.stepping {
-		return false, 0
+	// Only the thread the ablation step was issued against retires it; a trap on
+	// any other thread is a concurrent breakpoint, not this step.
+	if !b.stepping || b.stepTID != tid {
+		return false
 	}
-	tid := b.stepTID
 	b.stepping = false
 	b.stepTID = 0
-	return true, tid
+	return true
 }
 
-func (b *darwinBackend) resumeAfterSignal(sig syscall.Signal) error {
-	request := ptDarwinContinue
-	if b.isStepping() {
-		request = ptDarwinStep
-	}
-	if err := ptrace(request, uintptr(b.pid), 1, uintptr(sig)); err != nil {
-		return fmt.Errorf("ptrace resume after %s: %w", sig, err)
-	}
-	return nil
-}
-
-func isNoSuchProcess(err error) bool {
-	return errors.Is(err, syscall.ESRCH)
+// isStepThread reports whether an in-flight atomic step-over belongs to tid, so
+// Wait only lets the stepping thread's own trap drive advanceStepOver.
+func (b *darwinBackend) isStepThread(tid int) bool {
+	b.stepMu.Lock()
+	defer b.stepMu.Unlock()
+	return b.sobActive && b.stepThreadPort == tid
 }
 
 func isNoChildProcess(err error) bool {
 	return errors.Is(err, syscall.ECHILD)
 }
 
-// TextSlide returns the ASLR slide for the main executable: actual load
-// address minus preferred __TEXT vmaddr. Returns 0 on any error.
+// TextSlide returns the ASLR slide for the main executable: actual load address
+// minus preferred __TEXT vmaddr. Returns 0 on any error.
 //
-// Scans the task's VM map for the first executable region with the 64-bit
-// Mach-O magic. Works even at the very first ptrace stop (before dyld runs),
-// unlike TASK_DYLD_INFO whose image array is unpopulated at that point.
+// Scans the task's VM map for the first executable region with the 64-bit Mach-O
+// magic. Works even at the very first suspended stop (before dyld runs), unlike
+// TASK_DYLD_INFO whose image array is unpopulated at that point.
 func (b *darwinBackend) TextSlide(binaryPath string) int64 {
 	task, err := b.task()
 	if err != nil {
@@ -1081,11 +1116,9 @@ func machoTextVmaddr(binaryPath string) (uint64, error) {
 
 var _ Backend = (*darwinBackend)(nil)
 
-// task returns the Mach task port for the tracee. Requires the
-// com.apple.security.cs.debugger entitlement or disabled SIP.
-// task returns the tracee's Mach task port, acquiring it once via task_for_pid
-// and caching it thereafter. See the taskPort field comment for why re-acquiring
-// per call is unsafe (it intermittently hangs task_for_pid in the kernel).
+// task returns the tracee's Mach task port, acquired once via task_for_pid and
+// cached thereafter. See the taskPort field comment for why re-acquiring per
+// call is unsafe (it intermittently hangs task_for_pid in the kernel).
 func (b *darwinBackend) task() (C.mach_port_t, error) {
 	b.taskMu.Lock()
 	defer b.taskMu.Unlock()
