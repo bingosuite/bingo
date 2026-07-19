@@ -251,6 +251,10 @@ func (b *linuxBackend) StopProcess() error {
 	return nil
 }
 
+// PauseSignal is SIGSTOP: the signal StopProcess directs at the main thread and
+// that the engine turns into EventPaused. See Backend.PauseSignal.
+func (b *linuxBackend) PauseSignal() int { return int(syscall.SIGSTOP) }
+
 func (b *linuxBackend) ReadMemory(addr uint64, dst []byte) error {
 	tid := b.traceTID()
 	var n int

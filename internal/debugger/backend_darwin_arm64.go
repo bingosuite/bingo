@@ -101,6 +101,18 @@ const (
 	ptDarwinDetach   = uintptr(11)
 )
 
+// darwinPauseSignal is the signal StopProcess sends to interrupt a running
+// tracee for Pause. It must be a CATCHABLE signal (so it surfaces through the
+// wait4 loop as a signal-delivery stop; SIGSTOP does not — see StopProcess) and
+// one Wait does not special-case (SIGTRAP is breakpoint/step; SIGURG/SIGWINCH
+// are re-delivered), leaving the StopSignal fall-through. SIGUSR2 fits: it is
+// never terminal-generated (unlike SIGINT/SIGTSTP), the Go runtime does not use
+// it for itself, and the engine suppresses it on resume so the tracee never
+// actually receives it. A genuine SIGUSR2 sent to the tracee while no Pause is
+// pending is silently discarded (like a stray SIGSTOP on linux); the tradeoff
+// is documented in AGENTS.md → Pause.
+const darwinPauseSignal = syscall.SIGUSR2
+
 // The two darwin/arm64 step-over correctness fixes are independently toggleable
 // so an operator can run the behavior-preserving atomic step-over (#1) without
 // the async-preemption workaround (#2), which alters the tracee's goroutine
@@ -568,17 +580,27 @@ func (b *darwinBackend) setSingleStep(tid int, on bool) error {
 	return nil
 }
 
-// StopProcess sends a whole-thread-group SIGSTOP as a stand-in halt
-// primitive, mirroring the intent (not the mechanism) of Delve's Darwin
-// requestManualStop, which suspends via Mach thread_suspend on every thread
-// plus an atomic halt flag (pkg/proc/native/proc_darwin.go). This is Pause
-// groundwork only: it does not implement that halt-flag state machine, so no
-// Pause command is wired to it yet — see AGENTS.md. The signal mechanics
-// (syscall.Kill, ESRCH-as-idempotent) are shared with the linux backend via
-// stopProcessSignal in process.go.
+// StopProcess asynchronously interrupts the running tracee for Pause by sending
+// it darwinPauseSignal. Unlike Delve's Darwin backend — which halts via Mach
+// thread_suspend on every thread because it detects stops through a Mach
+// exception port — bingo detects stops through wait4, so Pause must produce a
+// wait4-visible stop. SIGSTOP cannot: XNU delivers it to a ptraced tracee as a
+// job-control stop that Go's syscall.WaitStatus reports as neither Stopped nor
+// Exited (StopSignal()==-1), so Wait's `if !ws.Stopped()` skips it and re-blocks
+// forever. A catchable signal instead surfaces as an ordinary ptrace
+// signal-delivery stop — Wait returns it as StopEvent{StopSignal, sig} and the
+// engine's manual-stop detection turns it into EventPaused. The engine never
+// re-injects it (Continue resumes with signal 0), so the tracee never actually
+// receives the signal and resume is a plain ContinueProcess. ESRCH (process
+// already gone) is an idempotent no-op, matching process.kill.
 func (b *darwinBackend) StopProcess() error {
-	return stopProcessSignal(b.pid)
+	return stopProcessSignal(b.pid, darwinPauseSignal)
 }
+
+// PauseSignal is the catchable signal StopProcess delivers and that the engine
+// turns into EventPaused. See Backend.PauseSignal and StopProcess for why a
+// catchable signal (not SIGSTOP) is required on darwin.
+func (b *darwinBackend) PauseSignal() int { return int(darwinPauseSignal) }
 
 func (b *darwinBackend) GetRegisters(tid int) (Registers, error) {
 	thread := C.mach_port_t(tid)
