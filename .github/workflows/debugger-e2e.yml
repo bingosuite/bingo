@@ -138,6 +138,10 @@ jobs:
         if: runner.environment == 'self-hosted'
         run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=kill
 
+      - name: E2E hygiene (Mach port-right leak regression)
+        if: runner.environment == 'self-hosted'
+        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=hygiene
+
       - name: Skip execution on hosted runners (task_for_pid unavailable)
         if: runner.environment != 'self-hosted'
         run: |

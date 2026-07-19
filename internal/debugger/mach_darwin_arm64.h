@@ -492,6 +492,16 @@ static inline int bingo_mach_recv(
         if (thread_out) *thread_out = thread;
         if (exc_out) *exc_out = (int)data[0];
         if (code0_out) *code0_out = (int64_t)data[2];
+        // The kernel inserts a send right to BOTH the faulting thread and the
+        // task into our IPC space for every exception message; Mach coalesces
+        // them to our existing names and bumps each name's user-ref count. We
+        // never use the task descriptor (we hold a cached task port), so release
+        // it here — otherwise a single name's uref grows by one per stop and
+        // eventually hits KERN_UREFS_OVERFLOW, after which the kernel can no
+        // longer copy out the exception and Wait wedges. The thread right IS
+        // handed back via thread_out; its accounting (adopt-or-release into the
+        // retained per-thread set) is the caller's responsibility.
+        mach_port_deallocate(mach_task_self(), desc[1].name);
         if (do_suspend) thread_suspend(thread);
         if (do_reply) {
             if (bingo__send_reply(&msg.hdr) != MACH_MSG_SUCCESS) return BINGO_MSG_ERROR;
@@ -537,7 +547,15 @@ static inline int bingo_stop_the_world(task_t task, mach_port_t port_set) {
             mach_port_t th = 0; int exc = 0, id = 0; int64_t c0 = 0;
             int cls = bingo_mach_recv(port_set, 0, &th, &exc, &c0, &id, 1, 1, 0, 0, 0);
             if (cls == BINGO_MSG_DEATH) return BINGO_MSG_DEATH;
-            if (cls == BINGO_MSG_EXC) continue; // absorbed a queued fault
+            if (cls == BINGO_MSG_EXC) {
+                // Absorbed a queued fault: it was replied immediately (do_reply=1)
+                // and its thread right is not handed to Go, so release it here.
+                // The thread stays suspended and re-faults on the next resume; the
+                // task right was already released inside bingo_mach_recv. Without
+                // this each drained straggler leaks one per-thread send right.
+                mach_port_deallocate(mach_task_self(), th);
+                continue;
+            }
             break; // none / pause / error
         }
         int running = bingo_num_running_threads(task);
@@ -604,4 +622,17 @@ static inline kern_return_t bingo_thread_probe(
         thread, ARM_THREAD_STATE64, (thread_state_t)&st, &tcount);
     *pc = (kr == KERN_SUCCESS) ? (uint64_t)st.__pc : 0;
     return KERN_SUCCESS;
+}
+// bingo_port_send_refs returns the number of send-right user references held on
+// a port NAME in our own IPC space, or -1 on error. Pure read (mach_port_get_refs
+// on mach_task_self). Used by the darwin port-hygiene regression test to assert
+// the exception-receive path does not leak a task/thread send right per stop — a
+// per-stop leak grows one name's uref unboundedly toward KERN_UREFS_OVERFLOW, at
+// which point the kernel can no longer copy out the exception message and Wait
+// wedges.
+static inline int bingo_port_send_refs(mach_port_t name) {
+    mach_port_urefs_t refs = 0;
+    if (mach_port_get_refs(mach_task_self(), name, MACH_PORT_RIGHT_SEND, &refs) != KERN_SUCCESS)
+        return -1;
+    return (int)refs;
 }
