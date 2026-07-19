@@ -55,14 +55,18 @@ integration:
 	go run github.com/onsi/ginkgo/v2/ginkgo -r ./test/integration/.
 
 # Run the debugger E2E acceptance tests on linux/amd64 (native ptrace backend).
-# Runs the `basic` correctness, `churn` robustness, `pause` async-interrupt, and
-# `fullstack` transport specs under -race.
+# Runs every label (no filter): `basic` correctness, `churn` robustness, `pause`
+# async-interrupt, `stepping` (StepInto/StepOut), `inspect` (StackFrames/Locals/
+# Goroutines), `breakpoints` (ClearBreakpoint), `kill` (kill-while-running),
+# `restart`, and `fullstack` transport, all under -race.
 e2e-linux:
 	go test -tags e2e -race -count=1 -v -timeout 600s ./test/integration
 
 # Run the debugger E2E acceptance tests on darwin/arm64 (native ptrace+Mach
-# backend). Runs the `basic` correctness, `churn` robustness, `pause`
-# async-interrupt, and `fullstack` transport specs. task_for_pid needs the
+# backend). Runs every darwin-wired label (no filter): `basic`, `churn`,
+# `pause`, `inspect`, `restart`, and `fullstack`. stepping/breakpoints/kill are
+# linux-only (they resume-from-breakpoint / kill-while-running, which hit darwin
+# backend bugs — see the darwin container and AGENTS.md). task_for_pid needs the
 # debugger entitlement, so the test binary is codesigned before it runs.
 e2e-darwin:
 	mkdir -p ./build
