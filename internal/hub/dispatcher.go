@@ -80,6 +80,11 @@ func dispatch(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, erro
 	case protocol.CmdStepOut:
 		return dispatchResult{}, dbg.StepOut()
 
+	// Pause is fire-and-forget: it arms an async interrupt and returns. The
+	// debugger emits EventPaused once the SIGSTOP lands (no immediate event).
+	case protocol.CmdPause:
+		return dispatchResult{}, dbg.Pause()
+
 	case protocol.CmdLocals:
 		var p protocol.LocalsPayloadCmd
 		if err := protocol.DecodeCommandPayload(cmd, &p); err != nil {

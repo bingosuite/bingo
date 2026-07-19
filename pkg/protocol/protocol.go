@@ -29,6 +29,12 @@ const (
 	EventBreakpointHit EventKind = "BreakpointHit"
 	EventPanic         EventKind = "Panic"
 	EventStepped       EventKind = "Stepped"
+
+	// EventPaused reports that a Pause request forcibly halted the running
+	// tracee. Like BreakpointHit it is a suspending event — the process is
+	// stopped and the hub waits for a resuming command — but it is delivered
+	// asynchronously in response to CmdPause rather than a self-stop.
+	EventPaused EventKind = "Paused"
 )
 
 const (
@@ -72,6 +78,12 @@ const (
 	CmdStepOver CommandKind = "StepOver"
 	CmdStepInto CommandKind = "StepInto"
 	CmdStepOut  CommandKind = "StepOut"
+
+	// CmdPause asynchronously interrupts a running tracee, forcing it to
+	// suspend (reported via EventPaused). Unlike the resuming commands it is
+	// issued while the process is RUNNING, so it is not a member of the hub's
+	// resuming-commands set — see AGENTS.md → Pause.
+	CmdPause CommandKind = "Pause"
 
 	CmdLocals     CommandKind = "Locals"
 	CmdFrames     CommandKind = "Frames"

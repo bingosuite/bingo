@@ -222,6 +222,21 @@ var _ = Describe("Event", func() {
 				},
 			),
 
+			Entry("Paused",
+				protocol.EventPaused,
+				protocol.PausedPayload{
+					Goroutine: sampleGoroutine,
+					Location:  sampleLocation,
+					Frames:    sampleFrames,
+				},
+				func(e protocol.Event) {
+					var p protocol.PausedPayload
+					Expect(protocol.DecodeEventPayload(e, &p)).To(Succeed())
+					Expect(p.Location.Line).To(Equal(42))
+					Expect(p.Frames).To(HaveLen(2))
+				},
+			),
+
 			Entry("Continued",
 				protocol.EventContinued,
 				protocol.ContinuedPayload{},
@@ -452,6 +467,14 @@ var _ = Describe("Command", func() {
 				},
 			),
 
+			Entry("Pause",
+				protocol.CmdPause,
+				json.RawMessage(`{}`),
+				func(c protocol.Command) {
+					Expect(c.Kind).To(Equal(protocol.CmdPause))
+				},
+			),
+
 			Entry("Locals",
 				protocol.CmdLocals,
 				protocol.LocalsPayloadCmd{FrameIndex: 2},
@@ -531,6 +554,7 @@ var _ = Describe("Kind constants", func() {
 			protocol.EventGoroutines,
 			protocol.EventError,
 			protocol.EventRestarted,
+			protocol.EventPaused,
 		}
 		for _, k := range kinds {
 			Expect(string(k)).NotTo(BeEmpty(), "EventKind %q should not be empty", k)
@@ -552,6 +576,7 @@ var _ = Describe("Kind constants", func() {
 			protocol.CmdFrames,
 			protocol.CmdGoroutines,
 			protocol.CmdRestart,
+			protocol.CmdPause,
 		}
 		for _, k := range kinds {
 			Expect(string(k)).NotTo(BeEmpty(), "CommandKind %q should not be empty", k)

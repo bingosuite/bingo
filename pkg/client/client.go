@@ -38,6 +38,11 @@ type Client interface {
 	StepInto() error
 	StepOut() error
 
+	// Pause asynchronously interrupts a running process, forcing it to
+	// suspend. Fire-and-forget like Continue: it returns as soon as the
+	// command is sent; the halt is reported later via EventPaused on Events().
+	Pause() error
+
 	// SetBreakpoint blocks until the server confirms the resolved Breakpoint.
 	SetBreakpoint(file string, line int) (protocol.Breakpoint, error)
 	ClearBreakpoint(id int) error

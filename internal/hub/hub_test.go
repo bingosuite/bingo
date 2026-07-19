@@ -36,6 +36,7 @@ type fakeDebugger struct {
 	stepOverErr      error
 	stepIntoErr      error
 	stepOutErr       error
+	pauseErr         error
 	localsResult     []protocol.Variable
 	framesResult     []protocol.Frame
 	goroutinesResult []protocol.Goroutine
@@ -77,6 +78,7 @@ func (f *fakeDebugger) Continue() error { f.record("Continue"); return f.continu
 func (f *fakeDebugger) StepOver() error { f.record("StepOver"); return f.stepOverErr }
 func (f *fakeDebugger) StepInto() error { f.record("StepInto"); return f.stepIntoErr }
 func (f *fakeDebugger) StepOut() error  { f.record("StepOut"); return f.stepOutErr }
+func (f *fakeDebugger) Pause() error    { f.record("Pause"); return f.pauseErr }
 func (f *fakeDebugger) ClearBreakpoint(id int) error {
 	f.record("ClearBreakpoint")
 	return f.clearBPErr
@@ -494,6 +496,40 @@ var _ = Describe("Hub", func() {
 				}
 			}
 			Expect(count).To(Equal(1), "Continue must be called exactly once")
+		})
+	})
+
+	Describe("Pause", func() {
+		It("routes CmdPause to the debugger while the process runs", func() {
+			conn := newFakeWSConn()
+			h.AddClient(conn, nil)
+
+			// CmdPause is not a resuming command: it reaches the debugger via
+			// the main-loop cmdCh path, without any suspending event first.
+			conn.inject(mustCommand(protocol.CmdPause, struct{}{}))
+
+			Eventually(fd.recordedCalls, "500ms", "10ms").
+				Should(ContainElement("Pause"))
+		})
+
+		It("suspends the hub on EventPaused, then resumes on Continue", func() {
+			conn := newFakeWSConn()
+			h.AddClient(conn, nil)
+
+			fd.push(protocol.MustEvent(protocol.EventPaused, 1,
+				protocol.PausedPayload{Location: protocol.Location{File: "main.go", Line: 7}}))
+
+			e, ok := recvEvent(conn)
+			Expect(ok).To(BeTrue())
+			Expect(e.Kind).To(Equal(protocol.EventPaused))
+
+			// Suspending: no auto-resume until a resuming command arrives.
+			time.Sleep(20 * time.Millisecond)
+			Expect(fd.recordedCalls()).NotTo(ContainElement("Continue"))
+
+			conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
+			Eventually(fd.recordedCalls, "500ms", "10ms").
+				Should(ContainElement("Continue"))
 		})
 	})
 
