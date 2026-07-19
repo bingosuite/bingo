@@ -74,6 +74,7 @@ func (f *fakeBackend) peekMem(addr uint64, n int) []byte {
 
 func (f *fakeBackend) ContinueProcess() error  { f.continueCalls++; return nil }
 func (f *fakeBackend) StopProcess() error      { f.stopProcessCalls++; return nil }
+func (f *fakeBackend) PauseSignal() int        { return int(syscall.SIGSTOP) }
 func (f *fakeBackend) Threads() ([]int, error) { return f.tids, nil }
 
 func (f *fakeBackend) SingleStep(tid int) error {

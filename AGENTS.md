@@ -440,9 +440,9 @@ breakpoint. It's the one suspend that is *asynchronous*: breakpoints and steps
 are self-stops (the tracee runs into a trap it was set up to hit), whereas Pause
 interrupts from the outside at an arbitrary instruction.
 
-Flow (detection is platform-agnostic, in the shared engine — no backend changes
-were needed for it on the platform where it works, linux; see the darwin caveat
-at the end):
+Flow (detection is platform-agnostic, in the shared engine — the only
+per-platform piece is *which* signal `StopProcess()` sends, abstracted behind
+`Backend.PauseSignal()`):
 
 1. Client sends `CmdPause` while running. The hub routes it via `cmdCh`
    (**not** `resumeCh` — Pause is not a resuming command; see
@@ -453,17 +453,17 @@ at the end):
    returns immediately. It does **not** change state — the suspend happens when
    the stop surfaces. Fire-and-forget from the client's view; `EventPaused`
    arrives asynchronously.
-3. `StopProcess()` sends `SIGSTOP`. On **linux**, a deliberate SIGSTOP surfaces
-   from `Backend.Wait()` as `StopEvent{Reason: StopSignal, Signal: SIGSTOP}`
-   (a ptrace signal-delivery-stop), so detection lives entirely in the engine's
-   `handleStop` `StopSignal` branch. (Darwin does **not** surface it — see the
-   caveat below.)
+3. `StopProcess()` sends the backend's interrupt signal (`PauseSignal()`:
+   `SIGSTOP` on linux, `SIGUSR2` on darwin). A deliberate signal surfaces from
+   `Backend.Wait()` as `StopEvent{Reason: StopSignal, Signal: PauseSignal()}`
+   (a ptrace signal-delivery-stop) on **both** backends, so detection lives
+   entirely in the engine's `handleStop` `StopSignal` branch.
 4. `handleStop` `StopSignal` branch: if `manualStopPending` (and
-   `stop.Signal == SIGSTOP`), it clears the flag, defensively reinstalls any
-   in-flight step-over BP (mirrors the existing StopSignal reinstall),
-   `populateStopPC`s, `setState(stateSuspended)`, and `emitPaused(stop)` —
-   returning **without** continuing. Genuine other signals keep the original
-   emit-output-then-auto-resume behavior.
+   `stop.Signal == e.backend.PauseSignal()`), it clears the flag, defensively
+   reinstalls any in-flight step-over BP (mirrors the existing StopSignal
+   reinstall), `populateStopPC`s, `setState(stateSuspended)`, and
+   `emitPaused(stop)` — returning **without** continuing. Genuine other signals
+   keep the original emit-output-then-auto-resume behavior.
 
 **Loop-thread-only flag, no sync.** `manualStopPending` is a plain `bool` with
 no mutex because both writers/readers — `Pause()`'s dispatched closure and
@@ -471,60 +471,62 @@ no mutex because both writers/readers — `Pause()`'s dispatched closure and
 [Engine concurrency model](#engine-concurrency-model--non-obvious-invariants)).
 Don't add locking; don't touch it from another goroutine.
 
-**Pending-SIGSTOP race.** If a real breakpoint/step stop wins the race after
-`Pause()` set the flag but before the SIGSTOP is dequeued, the process suspends
-for *that* self-stop and the SIGSTOP stays queued in the tracee. To stop it
-being misread as a bogus Pause on the next resume, `manualStopPending` is
+**Pending-interrupt race.** If a real breakpoint/step stop wins the race after
+`Pause()` set the flag but before the interrupt signal is dequeued, the process
+suspends for *that* self-stop and the signal stays queued in the tracee. To stop
+it being misread as a bogus Pause on the next resume, `manualStopPending` is
 cleared on **every** self-stop suspend (`emitBreakpointHit` / `emitStepped`).
-Then when the leftover SIGSTOP later surfaces with the flag clear, the
+Then when the leftover signal later surfaces with the flag clear, the
 `StopSignal` branch silently suppresses it (continue, no `EventPaused`, no
-spurious "signal 19" output). A focused engine unit test pins this ordering.
+spurious signal output). A focused engine unit test pins this ordering.
 
 **Linux: SIGSTOP is directed at the main thread.** `StopProcess()` on
 [backend_linux_amd64.go](internal/debugger/backend_linux_amd64.go) uses
-`tgkill(pid, pid, SIGSTOP)` rather than the process-directed
-`stopProcessSignal` (`kill`) the darwin backend shares. A process-directed
-SIGSTOP can be dequeued by any thread, and linux `Wait()` deliberately
-**swallows** a non-main-thread SIGSTOP as a clone group-stop
+`tgkill(pid, pid, SIGSTOP)` rather than a process-directed `kill`. A
+process-directed SIGSTOP can be dequeued by any thread, and linux `Wait()`
+deliberately **swallows** a non-main-thread SIGSTOP as a clone group-stop
 (`sig == SIGSTOP && tid != b.pid` → continue), so a multithreaded Pause could
 be lost. Targeting the main thread (`tid == pid`) makes it fall through to the
-`StopSignal` return every time.
+`StopSignal` return every time. `PauseSignal()` returns `SIGSTOP`.
 
-**Resume-after-pause is a plain Continue.** bingo never *injects* the SIGSTOP
-(`Continue` does `PtraceCont(tid, 0)`, which suppresses the pending signal), so
-only the reporting thread entered signal-delivery-stop and no whole-group stop
-was created. Resuming is therefore identical to resuming from a breakpoint —
-no special handling. The linux `pause`-labelled E2E spec
-(`declarePauseSpec`, [debugger_e2e_common_test.go](test/integration/debugger_e2e_common_test.go),
-wired into the linux container only) runs the Continue→Pause→Paused round-trip
-several times; if the first resume hung, the second Pause's signal would never
-surface and the spec would time out.
+**Darwin: a *catchable* signal (SIGUSR2), not SIGSTOP.** darwin `StopProcess()`
+([backend_darwin_arm64.go](internal/debugger/backend_darwin_arm64.go)) sends
+`kill(pid, SIGUSR2)` and `PauseSignal()` returns `SIGUSR2`. SIGSTOP does **not**
+work on darwin: XNU delivers a SIGSTOP to a ptraced tracee as a *job-control*
+stop that Go's `syscall.WaitStatus` classifies as neither `Stopped()` nor
+`Exited()` (`StopSignal() == -1`), so `Wait()`'s `if !ws.Stopped() { continue }`
+skips it and re-blocks in `wait4` forever — verified empirically on real Apple
+Silicon. A **catchable** signal instead produces an ordinary ptrace
+signal-delivery stop that `wait4` *does* report, so it falls through darwin
+`Wait()` to `StopEvent{StopSignal, sig}` (SIGTRAP is breakpoint/step and
+SIGURG/SIGWINCH are re-delivered, so those are special-cased; SIGUSR2 is not).
+SIGUSR2 is chosen because it is catchable, never terminal-generated, and unused
+by the Go runtime. Bingo never re-injects it (`Continue` resumes with signal 0),
+so the tracee never actually receives it — resume is a plain Continue, and the
+async-preempt SIGURG hazard doesn't apply (the darwin backend also forces
+`GODEBUG=asyncpreemptoff=1`, so the tracee has no SIGURG anyway). This mirrors
+Delve's *intent* (an on-demand halt surfaced to the wait loop) while fitting
+bingo's `wait4` architecture — it does **not** use Mach `thread_suspend` (Delve
+needs that only because it detects stops via a Mach exception port, not `wait4`).
 
-**Darwin caveat — Pause is not functional on darwin yet (linux-only).** The
-platform-agnostic detection above works on linux but **not** on darwin/arm64.
-macOS applies a `kill(pid, SIGSTOP)` to a ptraced tracee as a *job-control*
-stop, which is **not** reported through our ptrace `wait4` loop as a
-signal-delivery-stop — so `Backend.Wait()` never returns, no `StopSignal`
-surfaces, and no `EventPaused` is emitted (a Pause on darwin currently hangs the
-suspend). This was verified empirically on real Apple Silicon. The darwin
-`StopProcess()` groundwork comment already flags this: a correct darwin Pause
-needs Mach `thread_suspend` on every thread plus an atomic halt flag, exactly
-like Delve's `requestManualStop` (`pkg/proc/native/proc_darwin.go`) — **not**
-SIGSTOP. That is a darwin-native change to
-[backend_darwin_arm64.go](internal/debugger/backend_darwin_arm64.go), which is
-deliberately **out of scope** here to stay clear of the
-[darwin verification gate](#test-layering); it is left as a follow-up. Nothing
-in the shared engine, hub, protocol, client, or CLI is darwin-specific — the
-moment darwin's backend surfaces the stop, `EventPaused` will flow with no
-further engine changes.
+**Resume-after-pause is a plain Continue.** bingo never *injects* the interrupt
+signal (`Continue` does `PtraceCont(tid, 0)` / `PT_CONTINUE` with signal 0,
+which suppresses the pending signal), so only the reporting thread entered
+signal-delivery-stop and no whole-group stop was created. Resuming is therefore
+identical to resuming from a breakpoint — no special handling. The
+`pause`-labelled E2E spec (`declarePauseSpec`,
+[debugger_e2e_common_test.go](test/integration/debugger_e2e_common_test.go),
+wired into **both** the linux and darwin containers) runs the
+Continue→Pause→Paused round-trip several times; if the first resume hung, the
+second Pause's signal would never surface and the spec would time out.
 
-`StopProcess()` itself is still the hardened idempotent primitive from the
-Restart groundwork: a `pid == 0` guard and `ESRCH` (process already gone)
-treated as a no-op success. Delve's manual-stop is heavier (Linux:
-`sys.Kill(pid, SIGTRAP)` + a `trapWaitInternal` halt-flag state machine; Darwin:
-Mach `thread_suspend` on every thread + an atomic halt flag) because it lands
-*every* thread at a consistent stop point; bingo's partial-stop model only needs
-the one reporting thread suspended, so on linux the SIGSTOP approach suffices.
+`StopProcess()` itself is the hardened idempotent primitive from the Restart
+groundwork: a `pid == 0` guard and `ESRCH` (process already gone) treated as a
+no-op success. Delve's manual-stop is heavier (Linux: `sys.Kill(pid, SIGTRAP)` +
+a `trapWaitInternal` halt-flag state machine; Darwin: Mach `thread_suspend` on
+every thread + an atomic halt flag) because it lands *every* thread at a
+consistent stop point; bingo's partial-stop model only needs the one reporting
+thread suspended, so a single interrupt signal suffices on both platforms.
 
 ## Error handling
 
@@ -566,10 +568,10 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   internal/server → internal/hub → debugger → tracee) to catch transport/hub
   wiring regressions the backend-only specs can't (seq re-stamping of real
   events, the suspend/resume gate on a genuine BreakpointHit, synchronous
-  SetBreakpoint confirmation routing). The `pause` spec is wired into the linux
-  container only (`declarePauseSpec` — detection is platform-agnostic in the
-  engine, and darwin-native files must stay out of the verification gate). Each
-  label is its own CI job. CI:
+  SetBreakpoint confirmation routing). The `pause` spec (`declarePauseSpec`) is
+  wired into **both** the linux and darwin containers — detection is
+  platform-agnostic in the engine and each backend's `PauseSignal()` surfaces
+  the interrupt through `wait4`. Each label is its own CI job. CI:
   [.github/workflows/debugger-e2e.yml](.github/workflows/debugger-e2e.yml).
   The linux jobs run fully on hosted runners. The darwin jobs compile and
   codesign the E2E binary on hosted macOS runners (the only CI check that the

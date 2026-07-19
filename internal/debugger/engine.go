@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"runtime"
 	"sync"
-	"syscall"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
@@ -77,7 +76,8 @@ type engine struct {
 	stepOverFile string
 	stepOverLine int
 
-	// manualStopPending records that a Pause request has fired a SIGSTOP at
+	// manualStopPending records that a Pause request has fired the backend's
+	// interrupt signal (PauseSignal — SIGSTOP on linux, SIGUSR2 on darwin) at
 	// the tracee and we are awaiting the resulting signal-delivery stop, which
 	// should be turned into EventPaused rather than auto-resumed. It needs no
 	// synchronization: both Pause()'s dispatched closure and handleStop run on
@@ -293,10 +293,11 @@ func (e *engine) StepOut() error {
 
 // Pause asynchronously interrupts a running tracee. It is the only resume-side
 // operation issued while the process is RUNNING rather than suspended: it fires
-// a SIGSTOP at the tracee (via the backend) and records manualStopPending so
-// the resulting signal-delivery stop is turned into EventPaused instead of
-// being auto-resumed (see handleStop's StopSignal branch). The suspend is
-// reported asynchronously, so this returns as soon as the interrupt is armed.
+// the backend's interrupt signal (PauseSignal) at the tracee via
+// StopProcess and records manualStopPending so the resulting signal-delivery
+// stop is turned into EventPaused instead of being auto-resumed (see
+// handleStop's StopSignal branch). The suspend is reported asynchronously, so
+// this returns as soon as the interrupt is armed.
 func (e *engine) Pause() error {
 	return e.dispatch(func() error {
 		if e.getState() != stateRunning {
@@ -610,11 +611,11 @@ func (e *engine) handleStop(stop StopEvent) {
 			}
 			e.endThreadStep()
 		}
-		if stop.Signal == int(syscall.SIGSTOP) {
+		if stop.Signal == e.backend.PauseSignal() {
 			if e.manualStopPending {
-				// A Pause request's SIGSTOP has arrived. Suspend and report
-				// EventPaused instead of auto-resuming — this is the one signal
-				// stop we deliberately turn into a suspending event.
+				// A Pause request's interrupt signal has arrived. Suspend and
+				// report EventPaused instead of auto-resuming — this is the one
+				// signal stop we deliberately turn into a suspending event.
 				e.manualStopPending = false
 				var err error
 				if stop, err = e.populateStopPC(stop, false); err != nil {
@@ -626,11 +627,11 @@ func (e *engine) handleStop(stop StopEvent) {
 				e.emitPaused(stop)
 				return
 			}
-			// A SIGSTOP with no pending Pause is a leftover: a Pause raced a
-			// self-stop (breakpoint/step won and cleared manualStopPending),
-			// leaving its SIGSTOP queued. Suppress it silently — surfacing it
-			// as output or EventPaused would be bogus. Continue discards it
-			// (ContinueProcess resumes with signal 0).
+			// The interrupt signal with no pending Pause is a leftover: a Pause
+			// raced a self-stop (breakpoint/step won and cleared
+			// manualStopPending), leaving the signal queued. Suppress it
+			// silently — surfacing it as output or EventPaused would be bogus.
+			// Continue discards it (ContinueProcess resumes with signal 0).
 			_ = e.backend.ContinueProcess()
 			e.setState(stateRunning)
 			go e.waitLoop()
@@ -1026,9 +1027,10 @@ func (e *engine) emit(kind protocol.EventKind, payload any) {
 }
 
 func (e *engine) emitBreakpointHit(bp *breakpointEntry, stop StopEvent) {
-	// Suspending for a self-stop cancels any pending Pause: a Pause SIGSTOP that
-	// raced this stop and lost is now leftover in the kernel queue, to be
-	// suppressed (not reported as Paused) when it surfaces on the next resume.
+	// Suspending for a self-stop cancels any pending Pause: a Pause interrupt
+	// signal that raced this stop and lost is now leftover in the kernel queue,
+	// to be suppressed (not reported as Paused) when it surfaces on the next
+	// resume.
 	e.manualStopPending = false
 	frames, _ := e.collectFrames(stop.TID)
 	goroutines, _ := e.readGoroutines()

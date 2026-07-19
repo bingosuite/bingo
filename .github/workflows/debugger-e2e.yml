@@ -86,11 +86,12 @@ jobs:
       # in the kernel, so the Mach backend can never run here. Execution is gated
       # to self-hosted runners; hosted runners stop after the compile+codesign
       # above. Delve hits the identical wall. Run locally via `just e2e-darwin`.
-      - name: E2E basic + churn (self-hosted runners only)
+      - name: E2E basic + churn + pause (self-hosted runners only)
         if: runner.environment == 'self-hosted'
         run: |
           ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=basic
           ./e2e.test -test.v -test.timeout 600s -ginkgo.label-filter=churn
+          ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=pause
 
       - name: Skip execution on hosted runners (task_for_pid unavailable)
         if: runner.environment != 'self-hosted'

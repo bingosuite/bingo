@@ -11,6 +11,13 @@ type Backend interface {
 	SingleStep(tid int) error
 	StopProcess() error
 
+	// PauseSignal reports the signal number StopProcess delivers to interrupt a
+	// running tracee. The engine matches a StopSignal stop against it to tell an
+	// operator Pause apart from a genuine program signal (linux: SIGSTOP via
+	// tgkill; darwin: a catchable signal that surfaces through its wait4 loop —
+	// SIGSTOP cannot, see backend_darwin_arm64.go).
+	PauseSignal() int
+
 	ReadMemory(addr uint64, dst []byte) error
 	WriteMemory(addr uint64, src []byte) error
 
