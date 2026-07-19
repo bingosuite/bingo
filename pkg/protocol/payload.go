@@ -85,6 +85,15 @@ type SteppedPayload struct {
 	Frames    []Frame   `json:"frames"`
 }
 
+// PausedPayload reports where the tracee was halted by a Pause request. It
+// mirrors SteppedPayload: the location is wherever execution happened to be
+// interrupted (an async stop), not a source-line boundary.
+type PausedPayload struct {
+	Goroutine Goroutine `json:"goroutine"`
+	Location  Location  `json:"location"`
+	Frames    []Frame   `json:"frames"`
+}
+
 type ContinuedPayload struct{}
 
 type LocalsPayload struct {

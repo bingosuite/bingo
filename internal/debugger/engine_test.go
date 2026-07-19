@@ -3,6 +3,7 @@ package debugger_test
 import (
 	"encoding/binary"
 	"errors"
+	"syscall"
 	"testing"
 	"time"
 
@@ -28,9 +29,10 @@ type fakeBackend struct {
 	stopCh  chan debugger.StopEvent
 	stopped bool
 
-	continueCalls   int
-	singleStepCalls []int
-	writtenAt       map[uint64][]byte
+	continueCalls    int
+	singleStepCalls  []int
+	stopProcessCalls int
+	writtenAt        map[uint64][]byte
 }
 
 func newFakeBackend() *fakeBackend {
@@ -71,7 +73,7 @@ func (f *fakeBackend) peekMem(addr uint64, n int) []byte {
 }
 
 func (f *fakeBackend) ContinueProcess() error  { f.continueCalls++; return nil }
-func (f *fakeBackend) StopProcess() error      { return nil }
+func (f *fakeBackend) StopProcess() error      { f.stopProcessCalls++; return nil }
 func (f *fakeBackend) Threads() ([]int, error) { return f.tids, nil }
 
 func (f *fakeBackend) SingleStep(tid int) error {
@@ -558,6 +560,102 @@ var _ = Describe("Engine", func() {
 		It("rejects a second Continue without an intervening stop", func() {
 			Expect(d.Continue()).To(Succeed())
 			Expect(d.Continue()).To(MatchError(debugger.ErrNotSuspended))
+		})
+	})
+
+	Describe("Pause", func() {
+		const sigstop = int(syscall.SIGSTOP)
+
+		// pushSIGSTOP simulates the signal-delivery stop a Pause SIGSTOP
+		// surfaces as from Backend.Wait() on both backends.
+		pushSIGSTOP := func() {
+			fb.pushStop(debugger.StopEvent{
+				Reason: debugger.StopSignal,
+				TID:    1,
+				Signal: sigstop,
+			})
+		}
+
+		It("is rejected with ErrNotRunning when there is no process", func() {
+			Expect(d.Pause()).To(MatchError(debugger.ErrNotRunning))
+		})
+
+		It("is rejected with ErrNotRunning while suspended", func() {
+			debugger.ExportedForceSuspended(d)
+			Expect(d.Pause()).To(MatchError(debugger.ErrNotRunning))
+		})
+
+		It("fires StopProcess and emits EventPaused for the resulting SIGSTOP", func() {
+			debugger.ExportedForceSuspended(d)
+			Expect(d.Continue()).To(Succeed())
+
+			before := fb.stopProcessCalls
+			Expect(d.Pause()).To(Succeed())
+			Expect(fb.stopProcessCalls).To(Equal(before + 1))
+
+			pushSIGSTOP()
+
+			evt := mustNextEvent(d)
+			Expect(evt.Kind).To(Equal(protocol.EventPaused))
+
+			var p protocol.PausedPayload
+			Expect(protocol.DecodeEventPayload(evt, &p)).To(Succeed())
+
+			// The engine is now suspended: Continue must be accepted again.
+			Expect(d.Continue()).To(Succeed())
+		})
+
+		It("does not emit EventPaused for a SIGSTOP when no Pause is pending", func() {
+			debugger.ExportedForceSuspended(d)
+			Expect(d.Continue()).To(Succeed())
+
+			// A SIGSTOP with no armed Pause is a leftover: suppress and resume
+			// silently rather than reporting a bogus Paused.
+			pushSIGSTOP()
+			_, ok := nextEvent(d)
+			Expect(ok).To(BeFalse(), "leftover SIGSTOP must not surface any event")
+
+			// Prove the engine actually resumed (didn't stall) after swallowing
+			// the leftover: arm a real Pause and confirm its SIGSTOP now surfaces
+			// as EventPaused. Reading through the events channel gives the
+			// happens-before edge a raw counter read would race on, since the
+			// suppressing ContinueProcess runs on the loop goroutine.
+			Expect(d.Pause()).To(Succeed())
+			pushSIGSTOP()
+			Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventPaused))
+		})
+
+		Context("pending-SIGSTOP race: a self-stop wins before the SIGSTOP lands", func() {
+			const bpAddr = uint64(0x3000)
+
+			BeforeEach(func() {
+				fb.seedMem(bpAddr, []byte{0x90})
+				debugger.ExportedForceSuspended(d)
+				debugger.ExportedSetBreakpointAt(d, bpAddr)
+			})
+
+			It("suspends for the breakpoint, then suppresses the leftover SIGSTOP", func() {
+				Expect(d.Continue()).To(Succeed())
+				Expect(d.Pause()).To(Succeed())
+
+				// The real breakpoint stop arrives before the SIGSTOP does.
+				fb.pushStop(debugger.StopEvent{
+					Reason: debugger.StopBreakpoint,
+					TID:    1,
+					PC:     bpAddr,
+				})
+				evt := mustNextEvent(d)
+				Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit))
+
+				// Resume; the queued SIGSTOP now surfaces but the Pause flag was
+				// cleared by the breakpoint suspend, so it must be swallowed —
+				// no spurious EventPaused.
+				Expect(d.Continue()).To(Succeed())
+				pushSIGSTOP()
+
+				_, ok := nextEvent(d)
+				Expect(ok).To(BeFalse(), "leftover SIGSTOP after a breakpoint must not surface EventPaused")
+			})
 		})
 	})
 

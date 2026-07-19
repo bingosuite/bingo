@@ -227,17 +227,28 @@ func (b *linuxBackend) SingleStep(tid int) error {
 	return nil
 }
 
-// StopProcess sends a whole-thread-group SIGSTOP, mirroring Delve's
-// requestManualStop-adjacent halt primitive (pkg/proc/native/proc_linux.go
-// sends a process-wide signal rather than per-thread, since a ptrace-stopped
-// tracee still delivers signals to the group). This is Pause groundwork
-// only: it does not implement Delve's trapWaitInternal halt-flag state
-// machine that distinguishes a manual stop from a spontaneous trap, so no
-// Pause command is wired to it yet — see AGENTS.md. The signal mechanics
-// (syscall.Kill, ESRCH-as-idempotent) are shared with the darwin backend via
-// stopProcessSignal in process.go.
+// StopProcess asynchronously interrupts the running tracee for Pause. It
+// directs SIGSTOP at the MAIN thread specifically (tgkill(pid, pid, SIGSTOP))
+// rather than the whole thread group (kill(pid, ...)). A process-directed
+// SIGSTOP may be dequeued by any thread, and Wait() deliberately swallows a
+// non-main thread's SIGSTOP as a clone group-stop (the sig==SIGSTOP &&
+// tid!=b.pid branch), so on a multithreaded target a group-directed Pause
+// could be lost. Targeting the main thread (whose TID equals the tgid) makes
+// the signal surface from Wait() as StopEvent{StopSignal, SIGSTOP} with
+// TID==b.pid, where the engine's manual-stop detection turns it into
+// EventPaused. The engine never injects this SIGSTOP back (Continue resumes
+// with signal 0), so it triggers no group-stop and resume is a plain
+// ContinueProcess. ESRCH (thread already gone) is an idempotent no-op,
+// matching stopProcessSignal / process.kill. tgkill is a plain signal syscall,
+// not a ptrace op, so it need not run on the tracer thread.
 func (b *linuxBackend) StopProcess() error {
-	return stopProcessSignal(b.pid)
+	if b.pid == 0 {
+		return fmt.Errorf("StopProcess: no process")
+	}
+	if err := syscall.Tgkill(b.pid, b.pid, syscall.SIGSTOP); err != nil && err != syscall.ESRCH {
+		return fmt.Errorf("StopProcess: %w", err)
+	}
+	return nil
 }
 
 func (b *linuxBackend) ReadMemory(addr uint64, dst []byte) error {

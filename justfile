@@ -55,8 +55,8 @@ integration:
 	go run github.com/onsi/ginkgo/v2/ginkgo -r ./test/integration/.
 
 # Run the debugger E2E acceptance tests on linux/amd64 (native ptrace backend).
-# Runs the `basic` correctness, `churn` robustness, and `fullstack` transport
-# specs under -race.
+# Runs the `basic` correctness, `churn` robustness, `pause` async-interrupt, and
+# `fullstack` transport specs under -race.
 e2e-linux:
 	go test -tags e2e -race -count=1 -v -timeout 600s ./test/integration
 

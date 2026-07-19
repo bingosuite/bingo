@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"runtime"
 	"sync"
+	"syscall"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
@@ -75,6 +76,13 @@ type engine struct {
 	// boundary with line==0. Zeroed on each sourceStepOver and on user-BP hits.
 	stepOverFile string
 	stepOverLine int
+
+	// manualStopPending records that a Pause request has fired a SIGSTOP at
+	// the tracee and we are awaiting the resulting signal-delivery stop, which
+	// should be turned into EventPaused rather than auto-resumed. It needs no
+	// synchronization: both Pause()'s dispatched closure and handleStop run on
+	// the single engine loop thread. See AGENTS.md → Pause.
+	manualStopPending bool
 
 	// log is the single sink for all engine logging. Never call the
 	// package-level slog functions directly — they bypass the per-session
@@ -280,6 +288,26 @@ func (e *engine) StepOut() error {
 			return err
 		}
 		return e.stepOut()
+	})
+}
+
+// Pause asynchronously interrupts a running tracee. It is the only resume-side
+// operation issued while the process is RUNNING rather than suspended: it fires
+// a SIGSTOP at the tracee (via the backend) and records manualStopPending so
+// the resulting signal-delivery stop is turned into EventPaused instead of
+// being auto-resumed (see handleStop's StopSignal branch). The suspend is
+// reported asynchronously, so this returns as soon as the interrupt is armed.
+func (e *engine) Pause() error {
+	return e.dispatch(func() error {
+		if e.getState() != stateRunning {
+			return ErrNotRunning
+		}
+		e.manualStopPending = true
+		if err := e.backend.StopProcess(); err != nil {
+			e.manualStopPending = false
+			return fmt.Errorf("Pause: %w", err)
+		}
+		return nil
 	})
 }
 
@@ -571,7 +599,7 @@ func (e *engine) handleStop(stop StopEvent) {
 		e.emitStepped(stop)
 
 	case StopSignal:
-		// Reinstall any in-flight step-over BP before resuming.
+		// Reinstall any in-flight step-over BP before resuming or suspending.
 		if sob := e.steppingOverBP; sob != nil {
 			e.steppingOverBP = nil
 			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
@@ -581,6 +609,32 @@ func (e *engine) handleStop(stop StopEvent) {
 				return
 			}
 			e.endThreadStep()
+		}
+		if stop.Signal == int(syscall.SIGSTOP) {
+			if e.manualStopPending {
+				// A Pause request's SIGSTOP has arrived. Suspend and report
+				// EventPaused instead of auto-resuming — this is the one signal
+				// stop we deliberately turn into a suspending event.
+				e.manualStopPending = false
+				var err error
+				if stop, err = e.populateStopPC(stop, false); err != nil {
+					e.setState(stateSuspended)
+					e.emitError(protocol.CmdNone, err)
+					return
+				}
+				e.setState(stateSuspended)
+				e.emitPaused(stop)
+				return
+			}
+			// A SIGSTOP with no pending Pause is a leftover: a Pause raced a
+			// self-stop (breakpoint/step won and cleared manualStopPending),
+			// leaving its SIGSTOP queued. Suppress it silently — surfacing it
+			// as output or EventPaused would be bogus. Continue discards it
+			// (ContinueProcess resumes with signal 0).
+			_ = e.backend.ContinueProcess()
+			e.setState(stateRunning)
+			go e.waitLoop()
+			return
 		}
 		e.emitOutput("stderr", fmt.Sprintf("signal %d", stop.Signal))
 		_ = e.backend.ContinueProcess()
@@ -972,6 +1026,10 @@ func (e *engine) emit(kind protocol.EventKind, payload any) {
 }
 
 func (e *engine) emitBreakpointHit(bp *breakpointEntry, stop StopEvent) {
+	// Suspending for a self-stop cancels any pending Pause: a Pause SIGSTOP that
+	// raced this stop and lost is now leftover in the kernel queue, to be
+	// suppressed (not reported as Paused) when it surfaces on the next resume.
+	e.manualStopPending = false
 	frames, _ := e.collectFrames(stop.TID)
 	goroutines, _ := e.readGoroutines()
 	var g protocol.Goroutine
@@ -1000,6 +1058,9 @@ func (e *engine) emitStoppedAtCurrentPC() {
 }
 
 func (e *engine) emitStepped(stop StopEvent) {
+	// Completing a step suspends for a self-stop, which cancels any pending
+	// Pause the same way a breakpoint hit does (see emitBreakpointHit).
+	e.manualStopPending = false
 	frames, _ := e.collectFrames(stop.TID)
 	goroutines, _ := e.readGoroutines()
 	var g protocol.Goroutine
@@ -1011,6 +1072,27 @@ func (e *engine) emitStepped(stop StopEvent) {
 		loc = e.dw.locationForPC(stop.PC)
 	}
 	e.emit(protocol.EventStepped, protocol.SteppedPayload{
+		Goroutine: g,
+		Location:  loc,
+		Frames:    frames,
+	})
+}
+
+// emitPaused reports an asynchronous Pause halt. It mirrors emitStepped but
+// carries EventPaused/PausedPayload: the location is wherever execution was
+// interrupted, not a source-line boundary.
+func (e *engine) emitPaused(stop StopEvent) {
+	frames, _ := e.collectFrames(stop.TID)
+	goroutines, _ := e.readGoroutines()
+	var g protocol.Goroutine
+	if len(goroutines) > 0 {
+		g = goroutines[0]
+	}
+	loc := protocol.Location{}
+	if e.dw != nil {
+		loc = e.dw.locationForPC(stop.PC)
+	}
+	e.emit(protocol.EventPaused, protocol.PausedPayload{
 		Goroutine: g,
 		Location:  loc,
 		Frames:    frames,
