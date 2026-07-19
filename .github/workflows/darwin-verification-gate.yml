@@ -1,0 +1,70 @@
+name: Darwin verification gate
+
+# The darwin/arm64 low-level backend (ptrace + Mach) cannot be *executed* on
+# GitHub-hosted macOS runners: Apple's Sonoma (macOS 14) security model blocks
+# task_for_pid there even with the debugger entitlement, so the real backend
+# never runs in CI (see .github/workflows/debugger-e2e.yml — the darwin E2E jobs
+# only compile + codesign on hosted runners).
+#
+# This gate closes that hole with a human-in-the-loop check: when a PR modifies
+# darwin-native code whose runtime behaviour can only be validated on real Apple
+# Silicon, it requires a maintainer to run `just e2e-darwin` locally, confirm it
+# passes, and add the `darwin-e2e-verified` label to the PR. The gate is a
+# no-op (green) for PRs that don't touch that code.
+#
+# It re-runs on `labeled`/`unlabeled` so adding the label flips the check to
+# green without needing a new push. To actually block merges, mark
+# "Darwin E2E verified" as a required status check in branch protection.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  darwin-e2e-verified:
+    name: Darwin E2E verified
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERIFIED_LABEL: darwin-e2e-verified
+      HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'darwin-e2e-verified') }}
+      # Paths whose runtime behaviour only runs on real darwin/arm64 hardware and
+      # therefore can't be exercised by any CI job. Keep in sync with the darwin
+      # files under internal/debugger, the darwin E2E spec, and entitlements.
+      DARWIN_NATIVE_REGEX: '^(internal/debugger/.*_darwin_.*|internal/debugger/trap_arm64\.go|test/integration/.*_darwin_.*_test\.go|entitlements\.plist)$'
+    steps:
+      - name: Require local darwin E2E verification when darwin-native code changes
+        run: |
+          set -euo pipefail
+          pr='${{ github.event.pull_request.number }}'
+          gh pr diff "$pr" --repo "${{ github.repository }}" --name-only > changed.txt
+          echo "Changed files in this PR:"
+          sed 's/^/  /' changed.txt
+
+          if grep -Eq "$DARWIN_NATIVE_REGEX" changed.txt; then
+            echo
+            echo "Darwin-native (CI-unexecutable) files changed:"
+            grep -E "$DARWIN_NATIVE_REGEX" changed.txt | sed 's/^/  /'
+            darwin_changed=true
+          else
+            darwin_changed=false
+          fi
+
+          echo
+          if [ "$darwin_changed" != "true" ]; then
+            echo "No darwin-native code changed — gate not required. ✅"
+            exit 0
+          fi
+
+          if [ "$HAS_LABEL" = "true" ]; then
+            echo "'$VERIFIED_LABEL' label present — darwin backend verified locally. ✅"
+            exit 0
+          fi
+
+          echo "::error title=Darwin E2E verification required::This PR changes darwin-native debugger code that cannot be executed on GitHub-hosted runners. Run 'just e2e-darwin' locally on Apple Silicon, confirm it passes, then add the '${VERIFIED_LABEL}' label to this PR."
+          exit 1
