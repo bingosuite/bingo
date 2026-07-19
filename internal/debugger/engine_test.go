@@ -170,7 +170,7 @@ var _ = Describe("Engine", func() {
 
 	BeforeEach(func() {
 		fb = newFakeBackend()
-		d = debugger.NewWithBackend(fb)
+		d = debugger.NewWithBackend(fb, nil)
 	})
 
 	AfterEach(func() {
@@ -390,7 +390,7 @@ var _ = Describe("Engine", func() {
 	Describe("process exit", func() {
 		It("emits EventProcessExited with exit code when StopExited arrives", func() {
 			fb2 := newFakeBackend()
-			d2 := debugger.NewWithBackend(fb2)
+			d2 := debugger.NewWithBackend(fb2, nil)
 			defer func() {
 				if !fb2.stopped {
 					close(fb2.stopCh)
@@ -418,7 +418,7 @@ var _ = Describe("Engine", func() {
 
 		It("closes the Events channel after process exits", func() {
 			fb2 := newFakeBackend()
-			d2 := debugger.NewWithBackend(fb2)
+			d2 := debugger.NewWithBackend(fb2, nil)
 			defer func() { _ = d2.Kill() }()
 
 			debugger.ExportedForceSuspended(d2)

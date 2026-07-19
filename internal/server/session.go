@@ -55,12 +55,15 @@ func newSessionStore(log *slog.Logger) *sessionStore {
 func (ss *sessionStore) create(ctx context.Context) *session {
 	id := uuid.New().String()
 
-	// Each launch/re-launch gets a fresh debugger.
+	log := ss.log.With("session", id)
+
+	// Each launch/re-launch gets a fresh debugger, sharing the session's
+	// scoped logger so debugger logs are correlated with the rest of the
+	// session's log lines instead of going to the package-level default.
 	factory := func() debugger.Debugger {
-		return debugger.New()
+		return debugger.New(log)
 	}
 
-	log := ss.log.With("session", id)
 	h := hub.NewSession(id, factory, log)
 
 	s := &session{

@@ -249,7 +249,7 @@ type e2eHarness struct {
 // failure mode instead of wedging the whole suite.
 func newE2EHarness(bin string) *e2eHarness {
 	GinkgoHelper()
-	d := debugger.New()
+	d := debugger.New(nil)
 	Expect(d.Launch(bin, nil, nil)).To(Succeed(), "Launch target")
 	DeferCleanup(func() {
 		done := make(chan struct{})
