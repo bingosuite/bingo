@@ -288,6 +288,17 @@ confirmations like `BreakpointSet`). If clients saw both streams interleaved,
 they'd see two overlapping monotonic sequences and couldn't detect drops.
 **Always go through `h.seq.Add(1)` before broadcasting.**
 
+## Error handling
+
+Conventions for wrapping, logging, and propagating errors live in
+[docs/ErrorHandling.md](docs/ErrorHandling.md). The short version: return
+wrapped errors (`fmt.Errorf("context: %w", err)`), never panic outside
+programmer-bug territory, and log **once** at the owning top level (engine loop
+/ hub / HTTP handler / `main`) via `slog`. Cross-goroutine errors do not use a
+side `chan error` — every debugger outcome, failures included, rides the single
+`Debugger.Events()` channel as a typed `protocol.Event` (`EventError` /
+`EventProcessExited`) and is broadcast to clients as an `EventError`.
+
 ## Test layering
 
 - `pkg/protocol`: pure wire round-trip tests, no fakes needed.
@@ -387,3 +398,7 @@ through the justfile.
   [justfile](justfile).
 - **AGENTS.md drift**: if you introduce a new invariant or change one of the
   ones documented above, update this file in the same commit.
+- **Error handling**: follow [docs/ErrorHandling.md](docs/ErrorHandling.md).
+  New cross-goroutine failure paths surface as a typed event on
+  `Debugger.Events()`, not a side channel; update that doc if you change a
+  convention.
