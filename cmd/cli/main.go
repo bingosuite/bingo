@@ -261,72 +261,76 @@ func main() {
 
 func eventPrinter(events <-chan protocol.Event) {
 	for evt := range events {
-		switch evt.Kind {
+		printEvent(evt)
+	}
+}
 
-		case protocol.EventSessionState:
-			var p protocol.SessionStatePayload
-			if protocol.DecodeEventPayload(evt, &p) == nil {
-				fmt.Printf("\n  [state] %s (clients: %d)\nbingo> ", p.State, p.Clients)
-			}
+func printEvent(evt protocol.Event) {
+	switch evt.Kind {
 
-		case protocol.EventBreakpointHit:
-			var p protocol.BreakpointHitPayload
-			if protocol.DecodeEventPayload(evt, &p) == nil {
-				fmt.Printf("\n  [hit] breakpoint %d at %s:%d\nbingo> ",
-					p.Breakpoint.ID, p.Breakpoint.Location.File, p.Breakpoint.Location.Line)
-			}
-
-		case protocol.EventPanic:
-			var p protocol.PanicPayload
-			if protocol.DecodeEventPayload(evt, &p) == nil {
-				fmt.Printf("\n  [panic] %s\nbingo> ", p.Message)
-			}
-
-		case protocol.EventOutput:
-			var p protocol.OutputPayload
-			if protocol.DecodeEventPayload(evt, &p) == nil {
-				fmt.Printf("\n  [%s] %s\nbingo> ", p.Stream, p.Content)
-			}
-
-		case protocol.EventProcessExited:
-			var p protocol.ProcessExitedPayload
-			if protocol.DecodeEventPayload(evt, &p) == nil {
-				fmt.Printf("\n  [exited] code=%d reason=%s\nbingo> ", p.ExitCode, p.Reason)
-			}
-
-		case protocol.EventStepped:
-			var p protocol.SteppedPayload
-			if protocol.DecodeEventPayload(evt, &p) == nil {
-				fmt.Printf("\n  [stepped] %s:%d in %s\nbingo> ",
-					p.Location.File, p.Location.Line, p.Location.Function)
-			}
-
-		case protocol.EventPaused:
-			var p protocol.PausedPayload
-			if protocol.DecodeEventPayload(evt, &p) == nil {
-				fmt.Printf("\n  [paused] %s:%d in %s\nbingo> ",
-					p.Location.File, p.Location.Line, p.Location.Function)
-			}
-
-		case protocol.EventContinued:
-			fmt.Print("\n  [continued]\nbingo> ")
-
-		case protocol.EventError:
-			var p protocol.ErrorPayload
-			if protocol.DecodeEventPayload(evt, &p) == nil {
-				fmt.Printf("\n  [error] %s: %s\nbingo> ", p.Command, p.Message)
-			}
-
-		case protocol.EventRestarted:
-			var p protocol.RestartedPayload
-			if protocol.DecodeEventPayload(evt, &p) == nil {
-				fmt.Printf("\n  [restarted] %s (%d breakpoint(s), %d discarded)\nbingo> ",
-					p.Program, len(p.Breakpoints), len(p.Discarded))
-			}
-
-		default:
-			fmt.Printf("\n  [%s] seq=%d\nbingo> ", evt.Kind, evt.Seq)
+	case protocol.EventSessionState:
+		var p protocol.SessionStatePayload
+		if protocol.DecodeEventPayload(evt, &p) == nil {
+			fmt.Printf("\n  [state] %s (clients: %d)\nbingo> ", p.State, p.Clients)
 		}
+
+	case protocol.EventBreakpointHit:
+		var p protocol.BreakpointHitPayload
+		if protocol.DecodeEventPayload(evt, &p) == nil {
+			fmt.Printf("\n  [hit] breakpoint %d at %s:%d\nbingo> ",
+				p.Breakpoint.ID, p.Breakpoint.Location.File, p.Breakpoint.Location.Line)
+		}
+
+	case protocol.EventPanic:
+		var p protocol.PanicPayload
+		if protocol.DecodeEventPayload(evt, &p) == nil {
+			fmt.Printf("\n  [panic] %s\nbingo> ", p.Message)
+		}
+
+	case protocol.EventOutput:
+		var p protocol.OutputPayload
+		if protocol.DecodeEventPayload(evt, &p) == nil {
+			fmt.Printf("\n  [%s] %s\nbingo> ", p.Stream, p.Content)
+		}
+
+	case protocol.EventProcessExited:
+		var p protocol.ProcessExitedPayload
+		if protocol.DecodeEventPayload(evt, &p) == nil {
+			fmt.Printf("\n  [exited] code=%d reason=%s\nbingo> ", p.ExitCode, p.Reason)
+		}
+
+	case protocol.EventStepped:
+		var p protocol.SteppedPayload
+		if protocol.DecodeEventPayload(evt, &p) == nil {
+			fmt.Printf("\n  [stepped] %s:%d in %s\nbingo> ",
+				p.Location.File, p.Location.Line, p.Location.Function)
+		}
+
+	case protocol.EventPaused:
+		var p protocol.PausedPayload
+		if protocol.DecodeEventPayload(evt, &p) == nil {
+			fmt.Printf("\n  [paused] %s:%d in %s\nbingo> ",
+				p.Location.File, p.Location.Line, p.Location.Function)
+		}
+
+	case protocol.EventContinued:
+		fmt.Print("\n  [continued]\nbingo> ")
+
+	case protocol.EventError:
+		var p protocol.ErrorPayload
+		if protocol.DecodeEventPayload(evt, &p) == nil {
+			fmt.Printf("\n  [error] %s: %s\nbingo> ", p.Command, p.Message)
+		}
+
+	case protocol.EventRestarted:
+		var p protocol.RestartedPayload
+		if protocol.DecodeEventPayload(evt, &p) == nil {
+			fmt.Printf("\n  [restarted] %s (%d breakpoint(s), %d discarded)\nbingo> ",
+				p.Program, len(p.Breakpoints), len(p.Discarded))
+		}
+
+	default:
+		fmt.Printf("\n  [%s] seq=%d\nbingo> ", evt.Kind, evt.Seq)
 	}
 }
 
