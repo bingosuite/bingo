@@ -61,8 +61,9 @@ e2e-linux:
 	go test -tags e2e -race -count=1 -v -timeout 600s ./test/integration
 
 # Run the debugger E2E acceptance tests on darwin/arm64 (native ptrace+Mach
-# backend). task_for_pid needs the debugger entitlement, so the test binary is
-# codesigned before it runs.
+# backend). Runs the `basic` correctness, `churn` robustness, `pause`
+# async-interrupt, and `fullstack` transport specs. task_for_pid needs the
+# debugger entitlement, so the test binary is codesigned before it runs.
 e2e-darwin:
 	mkdir -p ./build
 	env CGO_ENABLED=1 go test -tags 'e2e bingonative' -race -c -o ./build/bingo-e2e.test ./test/integration
