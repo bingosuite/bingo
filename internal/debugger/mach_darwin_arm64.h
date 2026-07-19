@@ -72,25 +72,36 @@ static inline kern_return_t bingo_read_memory(
 // patch read-only text segments (e.g. to install breakpoints), then restores
 // execute permission.
 //
-// Icache coherency on Apple Silicon (ARM64):
-// mach_vm_machine_attribute(MATTR_CACHE, MATTR_VAL_ICACHE_FLUSH) is a no-op
-// on Apple Silicon — the kernel returns KERN_NOT_SUPPORTED. The correct
-// approach is to wrap the write with task_suspend + task_resume: the resume
-// call drains the instruction pipeline for all threads in the task, ensuring
-// the CPU sees the new bytes.
+// Icache coherency on Apple Silicon (ARM64) — THE fix for the step-over/step-out
+// wedge (issue #92):
+// mach_vm_write updates the target's data view of the page, and the
+// task_suspend/task_resume pair below drains the in-flight instruction pipeline.
+// Neither, however, INVALIDATES the target CPU's L1 instruction cache. When a
+// freshly-patched breakpoint address is re-executed within microseconds of the
+// write (e.g. a <stepout-return> trap that fires the instant a callee returns,
+// or a <stepover-next> trap on a hot loop line), the core can still fetch the
+// STALE cached original instruction and run straight past the trap — the stop is
+// silently missed and the debugger wedges waiting for an event that never comes.
+// It is intermittent (~2.5% on step-out) precisely because it only bites when
+// the line is still resident in the I-cache at re-execution; a trap re-hit a
+// full loop iteration later never flakes because the line has since been
+// evicted. An artificial delay before the resume masked it, which is the
+// classic self-modifying-code cache-coherency signature.
+//
+// mach_vm_machine_attribute(MATTR_CACHE, MATTR_VAL_CACHE_FLUSH) DOES work on
+// Apple Silicon (returns KERN_SUCCESS — an earlier comment here claimed
+// KERN_NOT_SUPPORTED; that was wrong, verified empirically on M-series). It
+// cleans the data cache and invalidates the instruction cache for the patched
+// range in the TARGET task, which is exactly the cross-task SMC synchronization
+// the CPU needs. We issue it on every write; a failure is non-fatal (best
+// effort) but must not mask the underlying write's own error.
 //
 // Suspend-count accounting: Mach maintains a SINGLE task-level suspend_count
-// per task, and ptrace's own task hold shares it — task_suspend/task_resume
-// are NOT an independent counter (an earlier version of this comment claimed
-// they were; that was wrong). This is safe anyway because the suspend/resume
-// here are strictly balanced (every exit path below calls task_resume) and
-// this function only ever runs on the engine's single locked OS thread (see
-// AGENTS.md — all ptrace/Mach calls are serialized there), so the pair can
-// never interleave with itself and the count returns to its ptrace baseline
-// before we return. A leaked task suspend (count stuck >= 1) is therefore not
-// possible from this path; the residual step-over wedge was measured with
-// task suspend_count == 0 at the hang, confirming it is a pthread-condvar
-// lost-wakeup, not a suspend-count imbalance.
+// per task. The suspend/resume here are strictly balanced (every exit path
+// below calls task_resume) and this function only ever runs on the engine's
+// single locked OS thread (see AGENTS.md — all ptrace/Mach calls are serialized
+// there), so the pair can never interleave with itself and the count returns to
+// its baseline before we return.
 static inline kern_return_t bingo_write_memory(
     mach_port_t task, mach_vm_address_t addr,
     const void *src, mach_vm_size_t n)
@@ -113,6 +124,13 @@ static inline kern_return_t bingo_write_memory(
     }
     kr = mach_vm_protect(task, addr, n, FALSE,
         VM_PROT_READ | VM_PROT_EXECUTE);
+
+    // Invalidate the target's instruction cache for the patched range so a
+    // near-immediate re-execution of the address sees the new bytes rather than
+    // a stale I-cache line (see the SMC coherency note above). Best effort: the
+    // write itself already succeeded, so a flush failure must not clobber kr.
+    int flush = MATTR_VAL_CACHE_FLUSH;
+    mach_vm_machine_attribute(task, addr, n, MATTR_CACHE, &flush);
 
     // Resume lifts the task suspension and flushes the instruction pipeline
     // for all threads, ensuring the CPU fetches the new bytes on next execute.
@@ -227,6 +245,322 @@ static inline kern_return_t bingo_set_single_step(mach_port_t thread, int on) {
     else    st.__cpsr &= ~(1U << 21);
     return thread_set_state(
         thread, ARM_THREAD_STATE64, (thread_state_t)&st, ARM_THREAD_STATE64_COUNT);
+}
+
+// --- Exception-port launch + mach_msg receive loop (issue #92) ---------------
+// Design: pure Mach, no ptrace/PT_SIGEXC. Launch suspended via posix_spawn, then
+// register a TASK-level EXC_MASK_BREAKPOINT exception port and detect every stop
+// (software BRK #0 and ARMv8 hardware single-step both raise EXC_BREAKPOINT) by
+// receiving on a port set. Only EXC_MASK_BREAKPOINT is masked: BSD signals are
+// deliberately left to native, thread-directed delivery so the Go runtime's
+// thread-directed SIGURG reaches the exact M it targeted — this is what lets us
+// re-enable async preemption in the tracee (the #92 fix). See AGENTS.md.
+
+#include <spawn.h>
+#include <mach/notify.h>
+#include <mach/mig_errors.h>
+
+extern char **environ;
+
+// bingo_posix_spawn launches path with POSIX_SPAWN_START_SUSPENDED: the child is
+// created and its image mapped, but left Mach-suspended at its entry point
+// (before dyld runs any user code) so we win the race to attach the exception
+// port. fds and cwd are inherited from the parent (matching the previous
+// exec.Command default). Returns 0 on success (pid in *pid_out) or the errno
+// posix_spawn reports.
+static inline int bingo_posix_spawn(
+    const char *path, char *const argv[], char *const envp[], int *pid_out)
+{
+    posix_spawnattr_t attr;
+    if (posix_spawnattr_init(&attr) != 0) return -1;
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_START_SUSPENDED);
+    pid_t pid = 0;
+    int rc = posix_spawn(&pid, path, NULL, &attr, argv,
+                         envp ? envp : environ);
+    posix_spawnattr_destroy(&attr);
+    if (rc != 0) return rc;
+    *pid_out = (int)pid;
+    return 0;
+}
+
+// bingo_setup_exception_ports registers a task-level EXC_MASK_BREAKPOINT
+// exception port, a dead-name notification port (fires when the tracee exits),
+// and a control port used to wake a blocked receive for Pause — all moved into
+// one port set the receive loop waits on. THREAD_STATE_NONE keeps the exception
+// message small (no register state inline); the engine reads registers via
+// thread_get_state when it needs them.
+static inline kern_return_t bingo_setup_exception_ports(
+    task_t task, mach_port_t *port_set, mach_port_t *exc_port,
+    mach_port_t *note_port, mach_port_t *ctrl_port)
+{
+    kern_return_t kr;
+    mach_port_t self = mach_task_self();
+    mach_port_t prev_not;
+
+    kr = mach_port_allocate(self, MACH_PORT_RIGHT_RECEIVE, exc_port);
+    if (kr != KERN_SUCCESS) return kr;
+    kr = mach_port_insert_right(self, *exc_port, *exc_port, MACH_MSG_TYPE_MAKE_SEND);
+    if (kr != KERN_SUCCESS) return kr;
+    kr = task_set_exception_ports(task, EXC_MASK_BREAKPOINT, *exc_port,
+            EXCEPTION_DEFAULT, THREAD_STATE_NONE);
+    if (kr != KERN_SUCCESS) return kr;
+
+    kr = mach_port_allocate(self, MACH_PORT_RIGHT_RECEIVE, note_port);
+    if (kr != KERN_SUCCESS) return kr;
+    kr = mach_port_insert_right(self, *note_port, *note_port, MACH_MSG_TYPE_MAKE_SEND);
+    if (kr != KERN_SUCCESS) return kr;
+    kr = mach_port_request_notification(self, task, MACH_NOTIFY_DEAD_NAME, 0,
+            *note_port, MACH_MSG_TYPE_MAKE_SEND_ONCE, &prev_not);
+    if (kr != KERN_SUCCESS) return kr;
+
+    kr = mach_port_allocate(self, MACH_PORT_RIGHT_RECEIVE, ctrl_port);
+    if (kr != KERN_SUCCESS) return kr;
+    kr = mach_port_insert_right(self, *ctrl_port, *ctrl_port, MACH_MSG_TYPE_MAKE_SEND);
+    if (kr != KERN_SUCCESS) return kr;
+
+    kr = mach_port_allocate(self, MACH_PORT_RIGHT_PORT_SET, port_set);
+    if (kr != KERN_SUCCESS) return kr;
+    kr = mach_port_move_member(self, *exc_port, *port_set);
+    if (kr != KERN_SUCCESS) return kr;
+    kr = mach_port_move_member(self, *note_port, *port_set);
+    if (kr != KERN_SUCCESS) return kr;
+    return mach_port_move_member(self, *ctrl_port, *port_set);
+}
+
+// bingo_freeze_at_launch converts the POSIX_SPAWN_START_SUSPENDED task-level
+// suspension into bingo's resting state: every thread individually Mach-suspended
+// (suspend_count 1) with the task itself resumed. After this nothing runs but the
+// process is ready for per-thread single-step / continue.
+static inline kern_return_t bingo_freeze_at_launch(task_t task) {
+    thread_act_array_t list;
+    mach_msg_type_number_t n, i;
+    kern_return_t kr = task_threads(task, &list, &n);
+    if (kr != KERN_SUCCESS) return kr;
+    for (i = 0; i < n; i++) {
+        thread_suspend(list[i]);
+        mach_port_deallocate(mach_task_self(), list[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(list[0]));
+    return task_resume(task);
+}
+
+// bingo_num_running_threads returns how many threads have suspend_count == 0.
+static inline int bingo_num_running_threads(task_t task) {
+    thread_act_array_t list;
+    mach_msg_type_number_t n, i;
+    int running = 0;
+    if (task_threads(task, &list, &n) != KERN_SUCCESS) return -1;
+    for (i = 0; i < n; i++) {
+        struct thread_basic_info info;
+        mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
+        if (thread_info(list[i], THREAD_BASIC_INFO, (thread_info_t)&info, &c) == KERN_SUCCESS) {
+            if (info.suspend_count == 0) running++;
+        }
+        mach_port_deallocate(mach_task_self(), list[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(list[0]));
+    return running;
+}
+
+// bingo_resume_all_threads normalizing-resumes every thread to suspend_count 0
+// (the "continue the world" primitive). thread_resume is issued suspend_count
+// times so a thread suspended more than once (faulted, then stop-the-world'd) is
+// fully released. Mirrors Delve's resume_thread applied across the task.
+static inline kern_return_t bingo_resume_all_threads(task_t task) {
+    thread_act_array_t list;
+    mach_msg_type_number_t n, i;
+    kern_return_t kr = task_threads(task, &list, &n);
+    if (kr != KERN_SUCCESS) return kr;
+    for (i = 0; i < n; i++) {
+        struct thread_basic_info info;
+        mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
+        if (thread_info(list[i], THREAD_BASIC_INFO, (thread_info_t)&info, &c) == KERN_SUCCESS) {
+            for (int k = 0; k < info.suspend_count; k++) thread_resume(list[i]);
+        }
+        mach_port_deallocate(mach_task_self(), list[i]);
+    }
+    vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(list[0]));
+    return KERN_SUCCESS;
+}
+
+// bingo_resume_one_thread normalizing-resumes a single thread to suspend_count 0
+// (used to run exactly one thread for a single-step while the rest stay held).
+static inline kern_return_t bingo_resume_one_thread(mach_port_t thread) {
+    struct thread_basic_info info;
+    mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
+    kern_return_t kr = thread_info(thread, THREAD_BASIC_INFO, (thread_info_t)&info, &c);
+    if (kr != KERN_SUCCESS) return kr;
+    for (int k = 0; k < info.suspend_count; k++) {
+        kr = thread_resume(thread);
+        if (kr != KERN_SUCCESS) return kr;
+    }
+    return KERN_SUCCESS;
+}
+
+// bingo__send_reply acknowledges an exception message with KERN_SUCCESS so the
+// kernel considers it handled. The faulting thread is thread_suspend'd BEFORE the
+// reply (by the caller), so "handled" does not actually resume it — that is how a
+// stop is held. Reply id is request id + 100 (MIG convention).
+static inline kern_return_t bingo__send_reply(mach_msg_header_t *hdr) {
+    mig_reply_error_t reply;
+    mach_msg_header_t *rh = &reply.Head;
+    rh->msgh_bits = MACH_MSGH_BITS(MACH_MSGH_BITS_REMOTE(hdr->msgh_bits), 0);
+    rh->msgh_remote_port = hdr->msgh_remote_port;
+    rh->msgh_size = (mach_msg_size_t)sizeof(mig_reply_error_t);
+    rh->msgh_local_port = MACH_PORT_NULL;
+    rh->msgh_id = hdr->msgh_id + 100;
+    reply.NDR = NDR_record;
+    reply.RetCode = KERN_SUCCESS;
+    return mach_msg(&reply.Head, MACH_SEND_MSG | MACH_SEND_INTERRUPT,
+        rh->msgh_size, 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+}
+
+// Message classes returned by bingo_mach_recv / bingo_stop_the_world.
+#define BINGO_MSG_NONE   0  // timeout or interrupted; caller retries
+#define BINGO_MSG_EXC    1  // exception (thread halted at BRK / single-step trap)
+#define BINGO_MSG_DEATH  2  // dead-name notification: the tracee exited
+#define BINGO_MSG_PAUSE  3  // control-port wake (Pause requested)
+#define BINGO_MSG_ERROR  (-1)
+
+// Sentinel msgh_id for the Pause wake sent to the control port. Chosen well clear
+// of the exception (2401) and dead-name (72) ids.
+#define BINGO_CTRL_MSG_ID 0x42420
+
+// bingo_reply_exception acknowledges a previously-received exception with
+// KERN_SUCCESS, using the reply header fields captured by bingo_mach_recv. It is
+// the DEFERRED counterpart to the inline reply: bingo replies to the faulting
+// thread's exception only when it is about to resume that thread, NOT when the
+// exception is received. This matters because bingo leaves BSD signals native
+// (only EXC_MASK_BREAKPOINT is masked): if we reply immediately, the kernel
+// returns the still-suspended thread toward user space and, seeing a pending
+// signal (e.g. Go async-preemption SIGURG), builds a signal-handler frame —
+// moving the thread's PC into _sigtramp before the engine can read it, so the
+// stop is misread. An UN-acknowledged Mach exception keeps the thread frozen at
+// the faulting instruction with a stable PC; replying at resume time delivers
+// the pending signal correctly, on the exact thread the kernel targeted. remote
+// carries MACH_MSGH_BITS_REMOTE(msgh_bits); id is the original request id.
+static inline kern_return_t bingo_reply_exception(
+    mach_port_t remote_port, unsigned int remote_bits, int id)
+{
+    mig_reply_error_t reply;
+    mach_msg_header_t *rh = &reply.Head;
+    rh->msgh_bits = MACH_MSGH_BITS(remote_bits, 0);
+    rh->msgh_remote_port = remote_port;
+    rh->msgh_size = (mach_msg_size_t)sizeof(mig_reply_error_t);
+    rh->msgh_local_port = MACH_PORT_NULL;
+    rh->msgh_id = id + 100;
+    reply.NDR = NDR_record;
+    reply.RetCode = KERN_SUCCESS;
+    return mach_msg(&reply.Head, MACH_SEND_MSG | MACH_SEND_INTERRUPT,
+        rh->msgh_size, 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+}
+
+// bingo_mach_recv receives one message from the port set. timeout_ms < 0 blocks
+// indefinitely; >= 0 waits that long. On an exception it extracts the faulting
+// thread port (thread_out) and the exception type / first code, thread_suspend's
+// the faulting thread when do_suspend is set, and either replies immediately
+// (do_reply != 0) or hands the reply header back via reply_* out-params for a
+// deferred bingo_reply_exception (do_reply == 0 — the default for the main
+// receive loop; see bingo_reply_exception for why deferral is required).
+// Returns one of the BINGO_MSG_* classes.
+static inline int bingo_mach_recv(
+    mach_port_t port_set, int timeout_ms,
+    mach_port_t *thread_out, int *exc_out, int64_t *code0_out, int *id_out,
+    int do_suspend, int do_reply,
+    mach_port_t *reply_port_out, unsigned int *reply_bits_out, int *reply_id_out)
+{
+    union { mach_msg_header_t hdr; char buf[512]; } msg;
+    mach_msg_option_t opts = MACH_RCV_MSG | MACH_RCV_INTERRUPT;
+    mach_msg_timeout_t to = MACH_MSG_TIMEOUT_NONE;
+    if (timeout_ms >= 0) { opts |= MACH_RCV_TIMEOUT; to = (mach_msg_timeout_t)timeout_ms; }
+
+    kern_return_t kr = mach_msg(&msg.hdr, opts, 0, sizeof(msg.buf),
+                                port_set, to, MACH_PORT_NULL);
+    if (kr == MACH_RCV_TIMED_OUT || kr == MACH_RCV_INTERRUPTED) return BINGO_MSG_NONE;
+    if (kr != MACH_MSG_SUCCESS) return BINGO_MSG_ERROR;
+
+    if (id_out) *id_out = (int)msg.hdr.msgh_id;
+
+    switch (msg.hdr.msgh_id) {
+    case 2401: { // exception_raise (see xnu osfmk/mach/exc.defs)
+        mach_msg_body_t *bod = (mach_msg_body_t *)(&msg.hdr + 1);
+        mach_msg_port_descriptor_t *desc = (mach_msg_port_descriptor_t *)(bod + 1);
+        mach_port_t thread = desc[0].name; // desc[1].name == task
+        NDR_record_t *ndr = (NDR_record_t *)(desc + 2);
+        integer_t *data = (integer_t *)(ndr + 1);
+        // data[0]=exception, data[1]=codeCnt, data[2]=code[0], data[3]=code[1].
+        if (thread_out) *thread_out = thread;
+        if (exc_out) *exc_out = (int)data[0];
+        if (code0_out) *code0_out = (int64_t)data[2];
+        if (do_suspend) thread_suspend(thread);
+        if (do_reply) {
+            if (bingo__send_reply(&msg.hdr) != MACH_MSG_SUCCESS) return BINGO_MSG_ERROR;
+        } else {
+            if (reply_port_out) *reply_port_out = msg.hdr.msgh_remote_port;
+            if (reply_bits_out) *reply_bits_out = MACH_MSGH_BITS_REMOTE(msg.hdr.msgh_bits);
+            if (reply_id_out) *reply_id_out = (int)msg.hdr.msgh_id;
+        }
+        return BINGO_MSG_EXC;
+    }
+    case 72: // MACH_NOTIFY_DEAD_NAME
+        return BINGO_MSG_DEATH;
+    case BINGO_CTRL_MSG_ID:
+        return BINGO_MSG_PAUSE;
+    default:
+        return BINGO_MSG_NONE;
+    }
+}
+
+// bingo_stop_the_world brings the task to bingo's resting state: every thread
+// Mach-suspended with NO exception left queued. It suspends each running thread,
+// then DRAINS any breakpoint exceptions that were already in flight (suspending +
+// replying each), because thread_suspend does not flush a thread's already-queued
+// Mach exception — leaving one queued lets it resurface mid-single-step and be
+// misread as the step's completion (the concurrent-fault hang). Loops until no
+// thread is running. Returns BINGO_MSG_NONE when stopped, BINGO_MSG_DEATH if the
+// tracee exited during the stop, or BINGO_MSG_ERROR.
+static inline int bingo_stop_the_world(task_t task, mach_port_t port_set) {
+    for (int iter = 0; iter < 128; iter++) {
+        thread_act_array_t list;
+        mach_msg_type_number_t n, i;
+        if (task_threads(task, &list, &n) != KERN_SUCCESS) return BINGO_MSG_ERROR;
+        for (i = 0; i < n; i++) {
+            struct thread_basic_info info;
+            mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
+            if (thread_info(list[i], THREAD_BASIC_INFO, (thread_info_t)&info, &c) == KERN_SUCCESS) {
+                if (info.suspend_count == 0) thread_suspend(list[i]);
+            }
+            mach_port_deallocate(mach_task_self(), list[i]);
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(list[0]));
+        for (;;) {
+            mach_port_t th = 0; int exc = 0, id = 0; int64_t c0 = 0;
+            int cls = bingo_mach_recv(port_set, 0, &th, &exc, &c0, &id, 1, 1, 0, 0, 0);
+            if (cls == BINGO_MSG_DEATH) return BINGO_MSG_DEATH;
+            if (cls == BINGO_MSG_EXC) continue; // absorbed a queued fault
+            break; // none / pause / error
+        }
+        int running = bingo_num_running_threads(task);
+        if (running == 0) return BINGO_MSG_NONE;
+        if (running < 0) return BINGO_MSG_ERROR;
+    }
+    return BINGO_MSG_ERROR;
+}
+
+// bingo_send_ctrl wakes a blocked bingo_mach_recv for Pause by sending an empty
+// sentinel message to the control port. Non-blocking (MACH_SEND_TIMEOUT 0): if a
+// prior wake is still queued the send is dropped, which is fine — one pending
+// Pause is enough.
+static inline kern_return_t bingo_send_ctrl(mach_port_t ctrl_port) {
+    mach_msg_header_t h;
+    h.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
+    h.msgh_size = sizeof(h);
+    h.msgh_remote_port = ctrl_port;
+    h.msgh_local_port = MACH_PORT_NULL;
+    h.msgh_voucher_port = MACH_PORT_NULL;
+    h.msgh_id = BINGO_CTRL_MSG_ID;
+    return mach_msg(&h, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(h), 0,
+                    MACH_PORT_NULL, 0, MACH_PORT_NULL);
 }
 
 // --- Diagnostic-only helpers (gated behind BINGO_DARWIN_SUSPEND_PROBE) --------
