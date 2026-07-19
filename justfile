@@ -1,26 +1,34 @@
+# Auto-detected host OS/ARCH, normalized to Go's GOOS/GOARCH naming
+# (just's os()/arch() report "macos"/"aarch64"/"x86_64"; Go wants
+# "darwin"/"arm64"/"amd64"). Used as the default for build/run/server so
+# `just build` (no args) targets the machine it's running on; explicit
+# positional args still override.
+os_name := if os() == "macos" { "darwin" } else { os() }
+arch_name := if arch() == "aarch64" { "arm64" } else if arch() == "x86_64" { "amd64" } else { arch() }
+
 # Build the Target, build BinGo and run the Target
 default: build-target build run
 
-# Usage: just build 				-> 	bingo_linux_amd64 (Default)
+# Usage: just build 				-> 	bingo_<host os>_<host arch> (auto-detected)
 #		 just build darwin arm64    -> 	bingo_darwin_arm64 (MacOs specified, ARM64 specified)
 # Build the BinGo binary. Takes positional arguments for the target OS and architecture (Must be valid `go build` targets).
-build OS="linux" ARCH="amd64":
+build OS=os_name ARCH=arch_name:
 	go clean
 	mkdir -p ./build/bingo
 	{{ if OS == "darwin" { "env CGO_ENABLED=1 GOOS=" + OS + " GOARCH=" + ARCH + " go build -tags bingonative -o ./build/bingo/bingo_" + OS + "_" + ARCH + " ./cmd/bingo && codesign --sign - --entitlements entitlements.plist --force ./build/bingo/bingo_" + OS + "_" + ARCH } else { "env GOOS=" + OS + " GOARCH=" + ARCH + " go build -o ./build/bingo/bingo_" + OS + "_" + ARCH + " ./cmd/bingo" } }}
 
-# Usage: just run 										->	runs ./build/bingo/bingo_linux_amd64 (Default)
+# Usage: just run 										->	runs ./build/bingo/bingo_<host os>_<host arch> (auto-detected)
 #		 just run darwin arm64 							-> 	runs ./build/bingo/bingo_darwin_arm64 (MacOs specified, ARM64 specified)
 #		 just run linux amd64 -addr 127.0.0.1:6061 -v 	->  runs ./build/bingo/bingo_linux_amd64 -addr 127.0.0.1:6061 -v
 
 # ARGS:  -addr string    listen address (default ":6060")
 #		 -v              verbose logging (debug level)
 # Run the BinGo binary. Takes positional arguments for the target OS and architecture (Must be existing binaries).
-run OS="linux" ARCH="amd64" *ARGS="":
+run OS=os_name ARCH=arch_name *ARGS="":
 	./build/bingo/bingo_{{OS}}_{{ARCH}} {{ARGS}}
 
 # Builds then runs the bingo binary for the target OS and architecture (Must be valid `go build` targets).
-server OS="linux" ARCH="amd64" *ARGS="": build-target (build OS ARCH) (run OS ARCH ARGS)
+server OS=os_name ARCH=arch_name *ARGS="": build-target (build OS ARCH) (run OS ARCH ARGS)
 
 # Build the Target with maximum debugging information
 build-target:
