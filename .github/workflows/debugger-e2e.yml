@@ -6,8 +6,9 @@ name: Debugger E2E
 # in-process fakeBackend), these launch a real process and step it through the
 # actual OS backend, so they need a real kernel and run on native GitHub-hosted
 # runners. Gated behind the `e2e` build tag; the Ginkgo suite lives in
-# ./test/integration and is split into `basic` (correctness) and `churn`
-# (multi-thread robustness) via Ginkgo labels.
+# ./test/integration and is split via Ginkgo labels into `basic` (correctness),
+# `churn` (multi-thread robustness), and `fullstack` (the same operations driven
+# through the whole client → WebSocket → hub → debugger stack).
 
 on:
   pull_request:
@@ -75,3 +76,57 @@ jobs:
 
       - name: E2E churn (single-step race under thread churn)
         run: ./e2e.test -test.v -test.timeout 600s -ginkgo.label-filter=churn
+
+  fullstack-linux-amd64:
+    name: Full-stack Linux amd64 (client → WS → hub → ptrace)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Confirm native target
+        run: test "$(go env GOOS)/$(go env GOARCH)" = "linux/amd64"
+
+      - name: Show ptrace policy
+        run: cat /proc/sys/kernel/yama/ptrace_scope || true
+
+      # Boots a real server on an ephemeral port, connects the real pkg/client
+      # over a real WebSocket, and drives continue/setBreakpoint/step-over
+      # through the whole stack down to the real ptrace backend.
+      - name: E2E full-stack (transport wiring over the real backend)
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=fullstack
+
+  fullstack-darwin-arm64:
+    name: Full-stack Darwin arm64 (client → WS → hub → ptrace+Mach)
+    runs-on: macos-14
+    timeout-minutes: 25
+    # Same task_for_pid caveat as the backend darwin job: don't fail the whole
+    # workflow if the hosted runner restricts it. Primarily verified locally.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Confirm native target
+        run: test "$(go env GOOS)/$(go env GOARCH)" = "darwin/arm64"
+
+      # The tracee is spawned by the server's debugger, which still needs the
+      # com.apple.security.cs.debugger entitlement — so the test binary must be
+      # codesigned before it runs. Compile first, sign, run.
+      - name: Build and codesign the E2E test binary
+        run: |
+          CGO_ENABLED=1 go test -tags 'e2e bingonative' -race -c -o e2e.test ./test/integration
+          codesign --sign - --entitlements entitlements.plist --force e2e.test
+          codesign -d --entitlements - e2e.test || true
+
+      - name: E2E full-stack (transport wiring over the real backend)
+        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=fullstack

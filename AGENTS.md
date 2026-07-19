@@ -308,9 +308,16 @@ they'd see two overlapping monotonic sequences and couldn't detect drops.
   `fakeBackend`. These need a real kernel, so they only run on native runners
   (they can't run under emulation or with fakes). Split into:
   `debugger_e2e_common_test.go` (harness + target sources + shared spec bodies),
-  `debugger_e2e_linux_amd64_test.go`, `debugger_e2e_darwin_arm64_test.go`. Two
-  Ginkgo labels: `basic` (continue+step-over correctness) and `churn`
-  (multi-thread robustness). CI: [.github/workflows/debugger-e2e.yml](.github/workflows/debugger-e2e.yml).
+  `debugger_e2e_linux_amd64_test.go`, `debugger_e2e_darwin_arm64_test.go`, and
+  `debugger_e2e_fullstack_test.go`. Three Ginkgo labels: `basic`
+  (continue+step-over correctness) and `churn` (multi-thread robustness), both
+  driving `debugger.Debugger` in-process; plus `fullstack`, which drives the
+  same operations through the ENTIRE stack (pkg/client → WebSocket →
+  internal/server → internal/hub → debugger → tracee) to catch transport/hub
+  wiring regressions the backend-only specs can't (seq re-stamping of real
+  events, the suspend/resume gate on a genuine BreakpointHit, synchronous
+  SetBreakpoint confirmation routing). Each label is its own CI job. CI:
+  [.github/workflows/debugger-e2e.yml](.github/workflows/debugger-e2e.yml).
 
 Build/test commands:
 
@@ -319,11 +326,13 @@ just build [linux amd64 | darwin arm64]   # produces ./build/bingo/...
 just test [PKG]                            # go test -v
 just coverage [PKG]                        # writes test/coverage.out
 just integration                           # ginkgo -r ./test/integration (no e2e tag)
-just e2e-linux                             # native linux/amd64 ptrace E2E (basic + churn)
+just e2e-linux                             # native linux/amd64 ptrace E2E (basic + churn + fullstack)
 just e2e-darwin                            # native darwin/arm64 ptrace+Mach E2E (codesigned)
 # Filter to one label, e.g. only the correctness gate (package path must come
 # before the -ginkgo.* flag so `go test` doesn't mistake it for the package):
 go test -tags e2e -race ./test/integration -ginkgo.label-filter=basic
+# The full-stack spec exercises client → WebSocket → hub → debugger → tracee:
+go test -tags e2e -race ./test/integration -ginkgo.label-filter=fullstack
 ```
 
 On macOS, `go test ./...` without `-tags bingonative` will fail with

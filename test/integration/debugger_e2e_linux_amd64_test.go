@@ -10,4 +10,5 @@ import . "github.com/onsi/ginkgo/v2"
 var _ = Describe("Linux amd64 debugger backend (ptrace) E2E", Label("linux"), func() {
 	declareBasicStepOverSpec()
 	declareChurnSpec()
+	declareFullStackSpec()
 })

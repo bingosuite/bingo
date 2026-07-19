@@ -247,10 +247,18 @@ func newE2EHarness(bin string) *e2eHarness {
 // on timeout (a hang) or a closed channel.
 func (h *e2eHarness) waitFor(timeout time.Duration, kinds ...protocol.EventKind) protocol.Event {
 	GinkgoHelper()
+	return awaitEvent(h.d.Events(), timeout, kinds...)
+}
+
+// awaitEvent drains ch until one of kinds arrives, failing the spec on timeout
+// (a hang) or a closed channel. Shared by the direct-debugger harness and the
+// full-stack (client-over-WebSocket) harness, which drain different channels.
+func awaitEvent(ch <-chan protocol.Event, timeout time.Duration, kinds ...protocol.EventKind) protocol.Event {
+	GinkgoHelper()
 	deadline := time.After(timeout)
 	for {
 		select {
-		case evt, ok := <-h.d.Events():
+		case evt, ok := <-ch:
 			if !ok {
 				Fail(fmt.Sprintf("events channel closed while waiting for %v", kinds))
 			}
@@ -262,7 +270,8 @@ func (h *e2eHarness) waitFor(timeout time.Duration, kinds ...protocol.EventKind)
 					return evt
 				}
 			}
-			// Ignore unrelated events (Continued, BreakpointSet, Output, ...).
+			// Ignore unrelated events (Continued, BreakpointSet, Output,
+			// SessionState transitions, ...).
 		case <-deadline:
 			Fail(fmt.Sprintf("TIMEOUT after %s waiting for %v (possible hang)", timeout, kinds))
 		}
