@@ -407,11 +407,31 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 					}
 					continue
 				}
-				// Main thread is about to call exit_group — let it actually exit.
+				// Main thread is about to exit. PTRACE_O_TRACEEXIT stops it here
+				// BEFORE it dies, and the engine tears down on this StopExited, so
+				// the real status never resurfaces as a later wait4 Exited()/
+				// Signaled(). Read it now via PTRACE_GETEVENTMSG (a wait(2)-encoded
+				// status) so a non-zero exit or a fatal signal isn't misreported as
+				// a clean exit 0. GETEVENTMSG must run before we resume the thread —
+				// once continued it is gone and the message is unreadable.
+				var msg uint
+				var msgErr error
+				b.execPtrace(func() { msg, msgErr = syscall.PtraceGetEventMsg(tid) })
 				if err := b.continueIfTraceeExists(tid, 0); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT exiting process tid %d: %w", tid, err)
 				}
 				b.recordStop(tid)
+				if msgErr == nil {
+					status := syscall.WaitStatus(msg)
+					switch {
+					case status.Signaled():
+						return StopEvent{Reason: StopKilled, TID: tid}, nil
+					case status.Exited():
+						return StopEvent{Reason: StopExited, TID: tid, ExitCode: status.ExitStatus()}, nil
+					}
+				}
+				// Status unreadable (e.g. ESRCH racing a Kill) or unexpected shape:
+				// fall back to a clean exit rather than inventing a code.
 				return StopEvent{Reason: StopExited, TID: tid, ExitCode: 0}, nil
 
 			case syscall.PTRACE_EVENT_EXEC:

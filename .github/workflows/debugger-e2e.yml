@@ -10,8 +10,8 @@ name: Debugger E2E
 # (correctness), `churn` (multi-thread robustness), `pause` (async interrupt /
 # manual stop), `stepping` (StepInto/StepOut), `inspect`
 # (StackFrames/Locals/Goroutines), `breakpoints` (ClearBreakpoint), `kill`
-# (kill-while-running), `restart`, and `fullstack` (operations driven through the
-# whole client → WebSocket → hub → debugger stack).
+# (kill-while-running), `exit` (process exit status), `restart`, and `fullstack`
+# (operations driven through the whole client → WebSocket → hub → debugger stack).
 #
 # Both linux and darwin run the full set. The step-off-an-armed-trap specs
 # (basic, stepping, breakpoints, churn) and kill (kill-while-running) used to be
@@ -76,6 +76,9 @@ jobs:
       - name: E2E kill (kill-while-running)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=kill
 
+      - name: E2E exit (process exit status)
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=exit
+
   darwin-arm64:
     name: Darwin arm64 (Mach exceptions)
     runs-on: macos-14
@@ -137,6 +140,10 @@ jobs:
       - name: E2E kill (kill-while-running)
         if: runner.environment == 'self-hosted'
         run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=kill
+
+      - name: E2E exit (process exit status)
+        if: runner.environment == 'self-hosted'
+        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=exit
 
       - name: E2E hygiene (Mach port-right leak regression)
         if: runner.environment == 'self-hosted'

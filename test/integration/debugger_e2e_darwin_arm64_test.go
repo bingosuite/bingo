@@ -34,6 +34,7 @@ import (
 //   - breakpoints: a cleared breakpoint stops firing.
 //   - churn: hundreds of step-overs under continuous thread creation.
 //   - kill: Kill terminates a freely-running tracee.
+//   - exit: EventProcessExited reports the tracee's real exit code.
 //   - pause: Continue -> Pause -> Paused round-trips (async interrupt).
 //   - inspect: continue into a breakpoint, then StackFrames/Locals/Goroutines.
 //   - restart: hub kill + relaunch + reinstall, reaching the breakpoint again.
@@ -49,6 +50,7 @@ var _ = Describe("Darwin arm64 debugger backend (Mach exceptions) E2E", Label("d
 	declareInspectSpec()
 	declareClearBreakpointSpec()
 	declareKillRunningSpec()
+	declareExitCodeSpec()
 	declareFullStackSpec()
 	declareRestartSpec()
 	declarePortHygieneSpec()
