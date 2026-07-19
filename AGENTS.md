@@ -135,18 +135,32 @@ The hub blocks after broadcasting any of these "suspending" events until a
 "resuming" command arrives (or the 30-min safety timeout fires):
 
 - Suspending events: `BreakpointHit`, `Panic`, `Stepped`, `Paused`
-- Resuming commands: `Continue`, `StepOver`, `StepInto`, `StepOut`, `Kill`
+- Resuming commands: `Continue`, `StepOver`, `StepInto`, `StepOut`
 
 While suspended, **non-resuming** commands (`SetBreakpoint`, `Locals`, …) are
 still executed immediately — the process is paused, so it's safe.
 
-`Pause` is the odd one out: it is a suspending *request* issued **while the
-process is running**, not while suspended, and is deliberately **not** a
-resuming command. It rides the ordinary `cmdCh` (like `SetBreakpoint`), so
-Run's main loop dispatches it promptly to `dbg.Pause()`; it is never routed
-through `resumeCh`. The suspend it triggers is reported asynchronously via the
-`Paused` suspending event once the SIGSTOP surfaces — see
-[Pause — async interrupt](#pause--async-interrupt).
+`Pause` and `Kill` are the odd ones out: both must act **while the process is
+running**, not only while suspended, so neither is a resuming command. They ride
+the ordinary `cmdCh` (like `SetBreakpoint`), which both Run's main loop and the
+suspended wait loop drain. `Pause` is a suspending *request* whose suspend is
+reported asynchronously via the `Paused` event once the interrupt surfaces (see
+[Pause — async interrupt](#pause--async-interrupt)). `Kill` was previously
+misrouted through `resumeCh`, which is only drained while suspended — so a `Kill`
+against a runaway target (tight loop, no breakpoints) could never terminate it
+through the protocol. Routing `Kill` via `cmdCh` fixes that; the suspended wait
+loop `return`s after executing a `Kill` (like `Restart`), since the process it
+was waiting to resume no longer exists. `Kill` with no active debugger is a
+benign no-op success (nothing to terminate).
+
+Stale resumes: a resuming command sent **while the process is still running**
+(an erroneous or racing client) lands in `resumeCh` but is not drained by Run's
+main loop. To stop it from satisfying a *future* suspend — auto-continuing past
+a fresh `BreakpointHit`/`Stepped` before the client can inspect — the wait loop
+**drains `resumeCh` on entry**, immediately after broadcasting the suspending
+event. Any resume buffered at that instant is necessarily stale: a legitimate
+resume can only follow the client observing the suspend, which hasn't been
+delivered over the wire yet.
 
 When multiple clients race resume commands: **first writer wins**, the rest
 are dropped (`resumeCh` has capacity 1; see [hub.go injectCommand](internal/hub/hub.go)).
@@ -411,22 +425,22 @@ gone once killed:
   shift the load address.
 
 **Routing quirk**: `CmdRestart` intentionally does **not** go through
-`resumeCh` like `CmdContinue`/`CmdKill`/etc. `resumeCh` is only ever drained
+`resumeCh` like `CmdContinue`/`CmdStep*`. `resumeCh` is only ever drained
 inside `handleEvent`'s suspend-wait loop — Run's outer `select` never reads
 it — so a resuming command sent while the hub *isn't* currently suspended
 (the common case: restarting a running or idle session) would sit unread in
-the buffered channel indefinitely. This is a real pre-existing gap affecting
-`CmdKill` today too; it wasn't fixed for the general case, but Restart can't
-tolerate it because "restart while running" is the primary use case, not an
-edge case. Instead `CmdRestart` is routed through the ordinary `cmdCh` (like
-`SetBreakpoint`), which both Run's outer loop and the suspend-wait loop's
-`case cc := <-h.cmdCh:` branch drain. The one special case: that branch
-normally loops back to keep waiting for a resume after executing a
-non-resuming command, but for `CmdRestart` it `return`s instead — the
-suspended process it was waiting on no longer exists, so there's nothing left
-to resume, and returning lets Run's outer loop naturally pick up the new
-debugger's events channel (`h.dbg` is reassigned inside `handleRestart`
-before the confirmation event is broadcast).
+the buffered channel indefinitely. `CmdKill` used to share this hazard (it was
+a resuming command); it is now routed via `cmdCh` for exactly this reason — see
+[Suspend/resume protocol](#suspendresume-protocol). `CmdRestart` is likewise
+routed through the ordinary `cmdCh` (like `SetBreakpoint`), which both Run's
+outer loop and the suspend-wait loop's `case cc := <-h.cmdCh:` branch drain.
+The one special case: that branch normally loops back to keep waiting for a
+resume after executing a non-resuming command, but for `CmdRestart` **and**
+`CmdKill` it `return`s instead — the suspended process it was waiting on no
+longer exists (replaced or terminated), so there's nothing left to resume, and
+returning lets Run's outer loop naturally pick up the new/closed debugger's
+events channel (`h.dbg` is reassigned inside `handleRestart` before the
+confirmation event is broadcast).
 
 `EventRestarted` is a confirmation event (like `BreakpointSet`), not a
 suspending one — the new process's suspended state (if any, e.g. break-on-

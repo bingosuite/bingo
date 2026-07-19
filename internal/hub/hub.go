@@ -27,15 +27,19 @@ var suspendingEvents = map[protocol.EventKind]bool{
 	protocol.EventPaused:        true,
 }
 
-// resumingCommands unblock a suspended hub. CmdPause is deliberately NOT here:
-// it is issued while the process is RUNNING (not suspended) and is routed via
-// cmdCh, so it must not be treated as a resume — see AGENTS.md → Pause.
+// resumingCommands unblock a suspended hub via resumeCh (first-writer-wins).
+// They are only meaningful while the process is suspended.
+//
+// CmdKill and CmdPause are deliberately NOT here: both must act while the
+// process is RUNNING, not only while suspended, so they ride the ordinary
+// cmdCh that Run's main loop drains. Kill routed through resumeCh could not
+// terminate a runaway target (tight loop, no breakpoints) because resumeCh is
+// only drained inside the suspended wait — see AGENTS.md → Suspend/resume.
 var resumingCommands = map[protocol.CommandKind]bool{
 	protocol.CmdContinue: true,
 	protocol.CmdStepOver: true,
 	protocol.CmdStepInto: true,
 	protocol.CmdStepOut:  true,
-	protocol.CmdKill:     true,
 }
 
 // Hub owns one debug session. It bridges the Debugger with all connected
@@ -48,6 +52,16 @@ type Hub struct {
 	newDebugger func() debugger.Debugger
 
 	// dbg is the active debugger. nil while idle (no process launched).
+	//
+	// All writes happen on the Run goroutine (executeCommand, handleRestart,
+	// handleDebuggerClosed, teardownFailedStart). shutdown() may read it from a
+	// DIFFERENT goroutine (removeClient spawns `go h.shutdown()` when the last
+	// client leaves), so writes go through setDbg and shutdown's read takes
+	// dbgMu — otherwise a mid-flight Launch/Restart racing the last disconnect
+	// is an unsynchronized interface read. Run-goroutine reads need no lock:
+	// they only ever contend with same-goroutine writes (sequential) or with
+	// shutdown's read (read-read).
+	dbgMu    sync.Mutex
 	dbg      debugger.Debugger
 	registry *registry
 	log      *slog.Logger
@@ -184,6 +198,15 @@ func (h *Hub) eventsCh() <-chan protocol.Event {
 	return h.dbg.Events()
 }
 
+// setDbg replaces the active debugger. Called only on the Run goroutine, but
+// takes dbgMu so a concurrent shutdown() on another goroutine reads a
+// consistent value (see the dbg field comment).
+func (h *Hub) setDbg(d debugger.Debugger) {
+	h.dbgMu.Lock()
+	h.dbg = d
+	h.dbgMu.Unlock()
+}
+
 // AddClient registers conn as a new client. Safe from any goroutine.
 func (h *Hub) AddClient(conn WSConn, log *slog.Logger) *Client {
 	c := newClient(conn, h, log)
@@ -235,6 +258,14 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 
 	h.log.Info("suspended — waiting for resuming command", "event", evt.Kind)
 
+	// Discard any resuming command that was buffered while the process was
+	// still running. Such a command is necessarily stale: a legitimate resume
+	// can only be sent after the client observes this suspending event, which
+	// hasn't been delivered over the network yet. Without this drain, that
+	// stale resume would be consumed immediately below and auto-continue past
+	// the suspend, robbing the client of its chance to inspect.
+	h.drainResumeCh()
+
 	timeout := time.NewTimer(30 * time.Minute)
 	defer timeout.Stop()
 
@@ -273,12 +304,13 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 		case cc := <-h.cmdCh:
 			// Non-resuming command (SetBreakpoint, Locals, …) while suspended.
 			// Execute immediately — process is paused — and keep waiting.
-			// Restart is the one exception: it tears down and replaces the
-			// suspended process entirely, so there's nothing left to wait a
-			// resume on — return and let Run's outer loop pick up the new
-			// debugger's events channel (assigned inside handleRestart).
+			// Restart and Kill are the exceptions: Restart tears down and
+			// replaces the suspended process, and Kill terminates it, so in
+			// both cases the process we were waiting to resume no longer
+			// exists — return and let Run's outer loop pick up the new or
+			// closed debugger's events channel.
 			h.executeCommand(cc.cmd)
-			if cc.cmd.Kind == protocol.CmdRestart {
+			if cc.cmd.Kind == protocol.CmdRestart || cc.cmd.Kind == protocol.CmdKill {
 				return
 			}
 
@@ -300,7 +332,7 @@ func (h *Hub) handleDebuggerClosed() {
 	if h.State() != protocol.StateExited {
 		h.transitionState(protocol.StateExited)
 	}
-	h.dbg = nil
+	h.setDbg(nil)
 	h.transitionState(protocol.StateIdle)
 	h.log.Info("debugger closed — session idle, ready for re-launch")
 }
@@ -323,10 +355,17 @@ func (h *Hub) executeCommand(cmd protocol.Command) {
 			h.broadcastError(cmd.Kind, fmt.Errorf("no debugger factory configured"))
 			return
 		}
-		h.dbg = h.newDebugger()
+		h.setDbg(h.newDebugger())
 	}
 
 	if h.dbg == nil {
+		// Kill with no active debugger is a benign no-op: there is nothing to
+		// terminate, so report success rather than an error. This keeps Kill
+		// idempotent across the running/idle/exited states now that it is
+		// routed through cmdCh and can reach an already-torn-down session.
+		if cmd.Kind == protocol.CmdKill {
+			return
+		}
 		h.broadcastError(cmd.Kind, fmt.Errorf("no active debugger — send Launch or Attach first"))
 		return
 	}
@@ -368,7 +407,7 @@ func (h *Hub) executeCommand(cmd protocol.Command) {
 
 func (h *Hub) teardownFailedStart() {
 	dbg := h.dbg
-	h.dbg = nil
+	h.setDbg(nil)
 	if dbg != nil {
 		_ = dbg.Kill()
 	}
@@ -473,7 +512,7 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 
 	if h.dbg != nil {
 		_ = h.dbg.Kill()
-		h.dbg = nil
+		h.setDbg(nil)
 	}
 
 	newDbg := h.newDebugger()
@@ -482,7 +521,7 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 		h.transitionState(protocol.StateIdle)
 		return
 	}
-	h.dbg = newDbg
+	h.setDbg(newDbg)
 	h.lastLaunch = &protocol.LaunchPayload{Program: program, Args: args, Env: env}
 	h.transitionState(protocol.StateRunning)
 
@@ -512,8 +551,10 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 	h.broadcast(evt)
 }
 
-// injectCommand is called by client read-pumps. Resuming commands go to
-// resumeCh to directly unblock a suspended hub; everything else to cmdCh.
+// injectCommand is called by client read-pumps. Resuming commands (Continue,
+// Step*) go to resumeCh to directly unblock a suspended hub; everything else —
+// including Kill and Pause, which must act while the process is running — goes
+// to cmdCh, drained by Run's main loop and the suspended wait loop alike.
 func (h *Hub) injectCommand(_ *Client, cmd protocol.Command) {
 	if resumingCommands[cmd.Kind] {
 		select {
@@ -527,6 +568,15 @@ func (h *Hub) injectCommand(_ *Client, cmd protocol.Command) {
 	case h.cmdCh <- clientCommand{cmd: cmd}:
 	default:
 		h.log.Warn("command queue full — dropping", "kind", cmd.Kind)
+	}
+}
+
+// drainResumeCh removes any single buffered resuming command without blocking.
+// resumeCh has capacity 1, so one non-blocking receive empties it.
+func (h *Hub) drainResumeCh() {
+	select {
+	case <-h.resumeCh:
+	default:
 	}
 }
 
@@ -622,8 +672,14 @@ func (h *Hub) shutdown() {
 		h.log.Info("hub shutting down")
 		close(h.shutdownCh)
 		h.registry.closeAll()
-		if h.dbg != nil {
-			_ = h.dbg.Kill()
+		// shutdown may run on a non-Run goroutine (go h.shutdown() from
+		// removeClient), so snapshot dbg under dbgMu to avoid racing a
+		// mid-flight Launch/Restart on the Run goroutine.
+		h.dbgMu.Lock()
+		dbg := h.dbg
+		h.dbgMu.Unlock()
+		if dbg != nil {
+			_ = dbg.Kill()
 		}
 	})
 }
