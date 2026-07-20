@@ -10,8 +10,10 @@ name: Debugger E2E
 # (correctness), `churn` (multi-thread robustness), `pause` (async interrupt /
 # manual stop), `stepping` (StepInto/StepOut), `inspect`
 # (StackFrames/Locals/Goroutines), `breakpoints` (ClearBreakpoint), `kill`
-# (kill-while-running), `exit` (process exit status), `restart`, and `fullstack`
-# (operations driven through the whole client → WebSocket → hub → debugger stack).
+# (kill-while-running), `exit` (process exit status), `restart`, `fullstack`
+# (operations driven through the whole client → WebSocket → hub → debugger stack),
+# and `dap` (a real Debug Adapter Protocol client driving a session over TCP,
+# with WebSocket observers sharing it).
 #
 # Both linux and darwin run the full set. The step-off-an-armed-trap specs
 # (basic, stepping, breakpoints, churn) and kill (kill-while-running) used to be
@@ -188,6 +190,12 @@ jobs:
       - name: E2E full-stack + restart (transport wiring over the real backend)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter='fullstack || restart'
 
+      # DAP is a second transport into the same stack: a real go-dap client over
+      # TCP drives the session, and N WebSocket observers share it. Same category
+      # as fullstack (whole client → transport → hub → debugger → tracee slice).
+      - name: E2E dap (Debug Adapter Protocol driver + WebSocket observers)
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=dap
+
   fullstack-darwin-arm64:
     name: Full-stack Darwin arm64 (client → WS → hub → Mach)
     runs-on: macos-14
@@ -218,6 +226,10 @@ jobs:
       - name: E2E full-stack + restart (self-hosted runners only)
         if: runner.environment == 'self-hosted'
         run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter='fullstack || restart'
+
+      - name: E2E dap (Debug Adapter Protocol driver + WebSocket observers, self-hosted only)
+        if: runner.environment == 'self-hosted'
+        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=dap
 
       - name: Skip execution on hosted runners (task_for_pid unavailable)
         if: runner.environment != 'self-hosted'

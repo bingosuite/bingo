@@ -96,6 +96,7 @@ follow them so reviews stay about substance, not style.
 | [pkg/client](pkg/client/) | Reference Go client. WebSocket-backed. Public surface: `Client` interface + `Create` / `Join` / `ListSessions`. |
 | [internal/server](internal/server/) | HTTP/WebSocket entry. `Server`, `sessionStore`, `/api/sessions` and `/ws` handlers. |
 | [internal/hub](internal/hub/) | Per-session bridge between connected clients and one `Debugger`. |
+| [internal/dap](internal/dap/) | Debug Adapter Protocol translator. A `Handler` implements `hub.WSConn`, so a DAP/IDE client plugs into a hub session as just another client (ZERO hub changes). |
 | [internal/debugger](internal/debugger/) | The actual debugger. Engine + per-platform Backend. |
 | [test/integration](test/integration/) | Ginkgo suite. Placeholder specs + the platform-split debugger E2E acceptance tests (`e2e` build tag). |
 
@@ -671,6 +672,163 @@ machine; Darwin: Mach `thread_suspend` on every thread + an atomic halt flag)
 because it lands *every* thread at a consistent stop point; bingo's model stops
 the world in `Wait` and reports the pause, which is all the engine needs.
 
+## DAP — Debug Adapter Protocol alongside WebSocket
+
+Source: [internal/dap/](internal/dap/). Wired via
+[internal/server/dap.go](internal/server/dap.go) + the `-dap-addr` flag in
+[cmd/bingo/main.go](cmd/bingo/main.go).
+
+**What it is / why.** DAP is the IDE-facing debugger wire protocol (VS Code,
+neovim). bingo speaks it *alongside* the native WebSocket protocol so a standard
+editor can DRIVE a session (breakpoints, stepping, stack/vars, continue/pause)
+while any number of WebSocket clients OBSERVE — and can also drive — the SAME
+session in parallel. DAP is the least-common-denominator debug loop; bingo's
+richer concurrency visualizations stay on the WebSocket side. The two coexist on
+one hub session (this is the whole point — an IDE gets a working debugger, the
+bingo UI gets its bonus features, both against the same tracee).
+
+**Architecture — a translator at the `hub.WSConn` seam, ZERO hub changes.**
+`dap.Handler` implements `hub.WSConn` and is registered via
+`Session.AddClient(handler, log)`, so from the hub's perspective the DAP client
+is just another client: it reuses ALL hub fan-out / broadcast / seq-restamping /
+slow-client eviction. There is deliberately no DAP-awareness anywhere in
+`internal/hub` or `internal/debugger`.
+
+- `WriteMessage(mt, data)` (called on the hub write-pump goroutine): the hub
+  hands it a marshalled bingo `Event`; the Handler `UnmarshalEvent`s and
+  translates to DAP. Always returns nil so the hub never treats a slow/broken
+  DAP socket as a failed writer — the socket lifecycle is owned by `Serve`/`Close`.
+- `ReadMessage()` (called on the hub read-pump goroutine): blocks on an internal
+  `cmdOut chan []byte` of marshalled bingo `Command`s produced by the DAP read
+  loop; returns `io.EOF` on Close. **cmdOut-priority:** a non-blocking check of
+  `cmdOut` precedes the `{cmdOut | done}` select, so a `Kill` enqueued right
+  before `Close` (disconnect-terminate) is still handed off before EOF.
+- `Serve()` (its own goroutine, one per connection): the DAP read loop —
+  `godap.ReadProtocolMessage` → `dispatchRequest`. Runs the handshake state
+  machine, enqueues bingo commands, and answers non-hub requests directly.
+
+**Three goroutines touch a Handler** — `Serve` (socket reads), the hub read pump
+(`ReadMessage`), the hub write pump (`WriteMessage`→`translateEvent`). `mu`
+guards coordination state; `writeMu` serialises socket writes + the DAP `seq`.
+**Rule: never hold `mu` across a socket write or a `cmdOut` enqueue** (release
+`mu`, then take `writeMu`). go-dap's `WriteProtocolMessage` does not set `Seq`,
+so `send` stamps it via reflection (`setSeqField` walks anonymous-embedded
+structs for the int `Seq`).
+
+### Handshake (Delve-style, VS Code-compatible)
+
+1. `initialize` → `Capabilities` (ConfigurationDone/Terminate/Restart +
+   TerminateDebuggee). NO `initialized` event yet.
+2. `launch`/`attach` → `startSession` (`CreateSession` + `AddClient(self)`)
+   **then** enqueue `CmdLaunch`/`CmdAttach`; set `launching=true`. Registering as
+   a client BEFORE enqueuing the launch is what guarantees we receive the entry
+   stop. An `EventError(Launch/Attach)` during `launching` → error the start
+   request + `terminated` (`failStart`).
+3. The entry stop is an **`EventStepped`** (engine's `Launch`/`Attach` both call
+   `emitStoppedAtCurrentPC`). While `launching`, `onStop` fires the `initialized`
+   event (breakpoints can now resolve against the loaded image), flips
+   `launching→false`, `suspended=true`, and withholds the launch response and any
+   `stopped`.
+4. `setBreakpoints` (suspended at entry) → diff/FIFO (below).
+5. `configurationDone` → respond, send the DELAYED launch/attach response, then
+   if `stopOnEntry` send `stopped reason=entry`, else enqueue `CmdContinue`
+   (`pendingContinues++`). Restart reuses a `restarting` flag so the post-restart
+   entry `EventStepped` is treated as a fresh entry.
+
+### Event → DAP mapping
+
+`EventStepped`(entry)=handshake signal; `EventStepped`(step)→`stopped`
+reason=step; `EventBreakpointHit`→`stopped` reason=breakpoint;
+`EventPanic`→reason=exception; `EventPaused`→reason=pause;
+`EventProcessExited`→`exited`(code)+`terminated`; `EventOutput`→`output`;
+`EventRestarted`→delayed `restart` response; `EventSessionState`→ignored
+(no DAP equivalent).
+
+`EventContinued` → DAP `continued` **only for out-of-band resumes**. The Handler
+increments `pendingContinues` before enqueuing its OWN continue and decrements it
+on the matching `EventContinued` (suppressing it — the IDE already implied
+continuation via the continue/step response). A continue driven by a *different*
+client on the session arrives with the counter at 0 and IS surfaced as
+`continued`, so the IDE learns the tracee is running again. This is exactly why
+the prerequisite PR made the engine emit `EventContinued` on resume.
+
+### Request → command + the FIFO-correlation limitation
+
+`continue`→Continue; `next/stepIn/stepOut`→StepOver/Into/Out; `pause`→Pause;
+`threads`→Goroutines; `stackTrace`→Frames; `scopes`→synthetic single "Locals"
+scope whose `variablesReference` IS the frame id; `variables`→Locals(frameIndex);
+`disconnect`/`terminate`→Kill; `restart`→Restart. Data requests
+(threads/stackTrace/variables) are only enqueued while the Handler believes it is
+`suspended`; otherwise they return an empty (best-effort) result rather than
+blocking.
+
+`variablesReference = frameIndex+1`, `frameID = frameIndex+1` (both reversible
+via `frameIndexFromRef`, both non-zero since DAP reserves 0). threads =
+goroutines with id `max(id,1)`; empty list → synthetic `{1,"main"}`.
+
+**FIFO correlation — the key limitation.** bingo's confirmation events
+(`EventBreakpointSet/Cleared`, `EventFrames`, `EventGoroutines`, `EventLocals`)
+carry **no request/correlation id**. The Handler correlates each incoming
+confirmation to the oldest outstanding DAP request of that kind via per-kind FIFO
+queues (`setQ`/`clearQ`/`threadsQ`/`framesQ`/`localsQ`), relying on the hub's
+in-order event stream. **This is valid only while the DAP client is the sole
+driver of breakpoints/data-requests on the session.** A WebSocket client
+concurrently setting breakpoints or requesting frames on the same session could
+misalign the FIFOs. Observers (read-only) are always safe; concurrent *drivers*
+of those specific request kinds are the documented caveat. Fixing it properly
+needs correlation ids in the bingo protocol — deferred. Resume/step/breakpoint-
+hit events are broadcast to all clients and need no correlation, so multi-driver
+continue/step is fine; only the id-less confirmation requests are affected.
+
+**setBreakpoints is replace-all** (`breakpoints.go`): diff the requested lines
+for a source against `bpByFile` — clear removed, set new, keep unchanged — and
+respond once every slot in the request resolves, in request order. Clearing the
+breakpoint the process is currently parked on re-arms it through the engine's
+step-off path (see the clearbp spec), so the e2e continue-to-exit uses a
+no-breakpoint target, not a clear-then-continue.
+
+### Server wiring + multi-client discovery
+
+`internal/server` implements `dap.Provider` (`dapProvider`): `CreateSession` →
+`sessions.create` (an ordinary managed hub, identical to `/ws?create`), so a
+DAP-created session auto-cleans on disconnect and is joinable by WebSocket
+observers. `Server.StartDAP(addr)` opens the DAP TCP accept loop; `Shutdown`
+closes it. The DAP client emits a `console` output naming the session id;
+observers join `/ws?session=<id>` (also discoverable via `/api/sessions`).
+
+**One-driver vs many-driver.** DAP assumes a single driver; bingo does not
+enforce it. WebSocket clients CAN also drive (the hub's `resumeCh` is
+first-writer-wins). The recommended posture is DAP-drives + WebSocket-observes,
+but multi-driver resume/step works because those events fan out to everyone; the
+only fragility is the id-less confirmation FIFO above.
+
+**Option Y (rejected).** The alternative was teaching the hub about DAP directly
+(a second protocol path through `internal/hub`). Rejected: it would fork the most
+fragile fan-out/suspend-gate code for a second protocol. The `hub.WSConn`
+translator keeps DAP entirely outside the hub — a strictly additive package.
+
+### Tests
+
+- Unit: [internal/dap/translate_test.go](internal/dap/translate_test.go) (pure
+  translators) and [internal/dap/handler_test.go](internal/dap/handler_test.go)
+  (full handshake over loopback TCP + a fake `Session`/`Provider` + a command
+  recorder: handshake→breakpoint, own-continue-suppressed, out-of-band-continue-
+  surfaced, setBreakpoints diff/FIFO, stackTrace/variables correlation,
+  step→stopped=step, disconnect-terminates). Run with the normal
+  `go test -tags bingonative ./internal/dap/...`.
+- E2E: label `dap` in [test/integration](test/integration/) — a real go-dap
+  client over TCP through the WHOLE stack (client → TCP →
+  `internal/dap.Handler` → hub → debugger → tracee), see
+  [debugger_e2e_dap_test.go](test/integration/debugger_e2e_dap_test.go).
+  `declareDAPSpec` (single driver: launch→bp→inspect threads/stack/vars→resume
+  re-hits bp), `declareDAPExitSpec` (clean exit → `exited`+`terminated`), and
+  `declareDAPMultiClientSpec` (**1 DAP driver + N WebSocket observers on one
+  session all witness the same breakpoint hit** — the coexistence proof;
+  `BINGO_E2E_DAP_OBSERVERS`, default 3). All three run in BOTH the linux and
+  darwin containers (the translator is platform-agnostic; only the backend
+  differs). CI: the `dap` label runs in the `fullstack-*` jobs of
+  [debugger-e2e.yml](.github/workflows/debugger-e2e.yml).
+
 ## Error handling
 
 Conventions for wrapping, logging, and propagating errors live in
@@ -704,7 +862,8 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   into:
   `debugger_e2e_common_test.go` (harness + target sources + shared spec bodies),
   `debugger_e2e_linux_amd64_test.go`, `debugger_e2e_darwin_arm64_test.go`, and
-  `debugger_e2e_fullstack_test.go`. Ginkgo labels: `basic`
+  `debugger_e2e_fullstack_test.go` (plus `debugger_e2e_dap_test.go`). Ginkgo
+  labels: `basic`
   (continue+step-over correctness), `churn` (multi-thread robustness),
   `pause` (async-interrupt / manual-stop round-trip), `stepping`
   (StepInto crosses into a callee, StepOut returns to the caller), `inspect`
@@ -715,12 +874,17 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   debugger did not launch — then breakpoint it), and `restart` (hub-level
   kill+relaunch reinstalls
   breakpoints and reruns from the top), all driving `debugger.Debugger`
-  in-process (except `restart`/`fullstack`, which go through the stack); plus
+  in-process (except `restart`/`fullstack`/`dap`, which go through the stack); plus
   `fullstack`, which drives operations through the ENTIRE stack (pkg/client →
   WebSocket → internal/server → internal/hub → debugger → tracee) to catch
   transport/hub wiring regressions the backend-only specs can't (seq re-stamping
   of real events, the suspend/resume gate on a genuine BreakpointHit, synchronous
-  SetBreakpoint confirmation routing). The `pause` spec (`declarePauseSpec`) is
+  SetBreakpoint confirmation routing); plus `dap`, which drives a real Debug
+  Adapter Protocol client over TCP through the SAME whole stack (go-dap client →
+  TCP → internal/dap.Handler → hub → debugger → tracee) and, in the multi-client
+  spec, attaches N WebSocket observers to the DAP-driven session to prove DAP +
+  WebSocket coexist (see the DAP section above). The `pause` spec
+  (`declarePauseSpec`) is
   wired into **both** the linux and darwin containers — detection is
   platform-agnostic in the engine and each backend's `StopProcess()` surfaces the
   interrupt to `Wait` (a real SIGSTOP on linux, a control-port wake on darwin).
@@ -731,7 +895,8 @@ side `chan error` — every debugger outcome, failures included, rides the singl
 
   **Platform scoping — both containers run the full set.** The darwin container
   wires the same specs as linux: `basic`, `stepping`, `breakpoints`, `churn`,
-  `kill`, `exit`, `attach`, `pause`, `inspect`, `restart`, and `fullstack`, plus the
+  `kill`, `exit`, `attach`, `pause`, `inspect`, `restart`, `fullstack`, and `dap`,
+  plus the
   darwin-only `hygiene` (Mach exception port-right leak regression). This was NOT
   always so:
   under the old darwin wait4/ptrace model the step-off-an-armed-trap specs
@@ -838,6 +1003,12 @@ through the justfile.
 - **Suspend/resume sets**: update both `suspendingEvents` and
   `resumingCommands` in [hub.go](internal/hub/hub.go), and the matching
   hub_test cases.
+- **New `EventKind`/`CommandKind`**: if it should reach an IDE, add its
+  translation to [internal/dap](internal/dap/) (`translateEvent`/event handlers
+  for events, `dispatchRequest` for the reverse). Events with no DAP equivalent
+  are safely ignored in `translateEvent`, but decide deliberately — a new
+  *suspending* event especially must map to a `stopped` reason or the IDE won't
+  realise the tracee halted.
 - **New OS or arch**: add a new `backend_<goos>_<goarch>.go` and a matching
   `trap_<goarch>.go` if the trap differs. Update [README.md](README.md) and
   the build matrix in [.github/workflows/](.github/workflows/) and
