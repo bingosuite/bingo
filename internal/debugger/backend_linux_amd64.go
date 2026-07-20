@@ -180,14 +180,31 @@ func attachToProcess(b Backend, pid int) error {
 	return attachErr
 }
 
-func killProcess(b Backend, pid int, cmd *exec.Cmd) error {
+// killProcess terminates a launched tracee (SIGKILL) or detaches from an
+// attached one. running reports whether the engine's waitLoop is in flight —
+// true for a running tracee, false for one suspended at a stop.
+func killProcess(b Backend, pid int, cmd *exec.Cmd, running bool) error {
 	if cmd != nil {
 		// SIGKILL via the OS handle is not a ptrace op, so it is safe from any
 		// thread and keeps Kill responsive even if the tracer thread is busy.
 		if err := cmd.Process.Kill(); err != nil && !isAlreadyExited(err) {
 			return err
 		}
-		_ = cmd.Wait()
+		// Reaping the zombie belongs to the waitLoop whenever one is in flight
+		// (a running tracee). It is blocked in Wait4(-1, WALL) and will absorb
+		// every thread's SIGKILL death and surface StopKilled. A second reaper
+		// here would both (a) race that waitLoop for the same stops and (b) —
+		// since a Go tracee is always multi-threaded — never make progress:
+		// Wait4(pid) targets only the thread-group leader, whose zombie is not
+		// reapable until all siblings are, and killProcess cannot reach the
+		// siblings. Either way Kill wedges (the deadlock reported in #111). So
+		// only reap here when there is NO waitLoop — the tracee was suspended at
+		// a stop, making killProcess the sole reaper.
+		if !running {
+			if lb, ok := b.(*linuxBackend); ok {
+				lb.reapAfterKill()
+			}
+		}
 		return nil
 	}
 	// Attached (not launched): detach, don't kill — we don't own the process.
@@ -198,6 +215,39 @@ func killProcess(b Backend, pid int, cmd *exec.Cmd) error {
 		_ = syscall.PtraceDetach(pid)
 	}
 	return nil
+}
+
+// reapAfterKill drains a SIGKILL'd tracee that has no waitLoop to reap it (it
+// was suspended at a ptrace stop when killed). It waits on Wait4(-1) — any
+// thread — never Wait4(pid): a Go tracee is always multi-threaded and the
+// thread-group leader's zombie stays unreapable until every sibling thread is
+// reaped, so waiting on the leader's pid alone blocks forever. A thread frozen
+// at a ptrace stop (e.g. the breakpoint we were suspended at) will not proceed
+// to death until resumed, so continue any stopped thread before waiting again;
+// the process-wide SIGKILL then kills it. Returns once ECHILD reports the whole
+// thread group gone.
+//
+// It must never run concurrently with the engine's waitLoop: two Wait4(-1)
+// callers would steal each other's stops. killProcess guarantees that by only
+// invoking it when the tracee was not running (no waitLoop in flight).
+func (b *linuxBackend) reapAfterKill() {
+	for {
+		var ws syscall.WaitStatus
+		wpid, err := syscall.Wait4(-1, &ws, syscall.WALL, nil)
+		switch {
+		case err == nil:
+			if ws.Stopped() {
+				_ = b.continueIfTraceeExists(wpid, 0)
+			}
+			// Exited/Signaled: that thread is reaped; loop for the rest.
+		case isNoChildProcess(err):
+			return // whole thread group reaped
+		case errors.Is(err, syscall.EINTR):
+			// interrupted by a signal; retry
+		default:
+			return // unexpected wait4 error: nothing left to reap
+		}
+	}
 }
 
 func isAlreadyExited(err error) bool {

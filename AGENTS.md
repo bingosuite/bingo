@@ -444,6 +444,22 @@ are detected by a `mach_msg` receive loop.
   breakpoint (or SIGURG) while a step is in flight — keying off `stepping`
   alone would misclassify it and corrupt the engine's step-over state machine.
 - `g` pointer for goroutine inspection lives at `FS_BASE` on amd64.
+- `killProcess` never reaps the zombie itself while the engine's `waitLoop` is
+  in flight (a *running* tracee). That waitLoop is blocked in `Wait4(-1, WALL)`
+  and is the **sole** legitimate reaper: it absorbs every thread's SIGKILL death
+  and surfaces `StopKilled`. A second reaper in `killProcess` deadlocks Kill two
+  ways (#111): it races the waitLoop for the same stops, and — because a Go
+  tracee is always multi-threaded — `Wait4(pid)` targets only the thread-group
+  leader, whose zombie stays unreapable until every sibling is reaped, which
+  `killProcess` cannot do. So `killProcess` only reaps when the tracee was
+  **suspended** at a stop (no waitLoop), via `reapAfterKill`, which loops
+  `Wait4(-1, WALL)` (any thread, never the leader's pid), resuming any
+  ptrace-stopped thread so the pending process-wide SIGKILL kills it, until
+  `ECHILD`. The engine passes `running` (state == running) down through
+  `process.kill` to drive this. (Darwin has no such race — its `waitLoop` blocks
+  on a Mach port, not `wait4`, so its `killProcess` `Wait4(pid)` is always the
+  sole reaper and ignores `running`.) Regression guard: the `kill` e2e loops the
+  launch→run→Kill cycle (`BINGO_E2E_KILL_ITERS`).
 - `SIGURG` re-delivery is mandatory here too — but only the `stepTID` thread is
   re-single-stepped on SIGURG; a SIGURG on any other thread is re-delivered and
   that thread continued.

@@ -218,11 +218,16 @@ func (e *engine) Kill() error {
 		if e.getState() == stateExited {
 			return nil
 		}
+		// A running tracee has an in-flight waitLoop blocked in Wait4(-1); on
+		// linux that waitLoop — not killProcess — must reap the SIGKILL death,
+		// since two concurrent wait4 callers race and wedge Kill (#111). Capture
+		// whether we're running before endThreadStep/clearAll touch anything.
+		running := e.getState() == stateRunning
 		// Release any threads held for an in-flight atomic step-over first, so
 		// a detach (attached-process Kill) never leaves them Mach-suspended.
 		e.endThreadStep()
 		e.bps.clearAll(e.backend)
-		if killErr := e.proc.kill(e.backend); killErr != nil {
+		if killErr := e.proc.kill(e.backend, running); killErr != nil {
 			return killErr
 		}
 		e.setState(stateExited)
