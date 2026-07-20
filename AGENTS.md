@@ -156,11 +156,16 @@ benign no-op success (nothing to terminate).
 Stale resumes: a resuming command sent **while the process is still running**
 (an erroneous or racing client) lands in `resumeCh` but is not drained by Run's
 main loop. To stop it from satisfying a *future* suspend — auto-continuing past
-a fresh `BreakpointHit`/`Stepped` before the client can inspect — the wait loop
-**drains `resumeCh` on entry**, immediately after broadcasting the suspending
-event. Any resume buffered at that instant is necessarily stale: a legitimate
-resume can only follow the client observing the suspend, which hasn't been
-delivered over the wire yet.
+a fresh `BreakpointHit`/`Stepped` before the client can inspect — `handleEvent`
+**drains `resumeCh` before broadcasting the suspending event**. Draining *before*
+(not after) the broadcast is load-bearing: the broadcast is the starting gun, so
+any *legitimate* resume the client sends in response necessarily lands in
+`resumeCh` after the drain and is caught by the wait loop, while any resume
+already buffered when the drain runs is necessarily stale (a legitimate resume
+can only follow the client observing the suspend). Draining *after* the broadcast
+raced a zero-latency in-process client, which could put its legitimate resume in
+`resumeCh` before the drain ran and have it silently eaten — wedging the session
+(and flaking the hub tests under randomized load).
 
 When multiple clients race resume commands: **first writer wins**, the rest
 are dropped (`resumeCh` has capacity 1; see [hub.go injectCommand](internal/hub/hub.go)).
