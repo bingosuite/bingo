@@ -50,6 +50,22 @@ coverage PKG="./...":
 	go test -coverprofile=test/coverage.out {{PKG}}
 	go tool cover -func=test/coverage.out
 
+# Generate the Markdown API reference for the public packages (pkg/protocol and
+# pkg/client) from their Go doc comments into docs/api/. Re-run after changing
+# those packages' exported surface or doc comments and commit the result;
+# `just docs-check` fails when the committed output drifts from the code.
+docs:
+	mkdir -p docs/api
+	go tool gomarkdoc --output docs/api/protocol.md ./pkg/protocol
+	go tool gomarkdoc --output docs/api/client.md ./pkg/client
+
+# Fail if the committed API reference is stale. Uses gomarkdoc's native --check
+# (regenerates in memory and diffs) so drift blocks CI until `just docs` is run
+# and the result committed. Wire this into the lint/test workflow.
+docs-check:
+	go tool gomarkdoc --check --output docs/api/protocol.md ./pkg/protocol
+	go tool gomarkdoc --check --output docs/api/client.md ./pkg/client
+
 # Run integration tests
 integration:
 	go run github.com/onsi/ginkgo/v2/ginkgo -r ./test/integration/.

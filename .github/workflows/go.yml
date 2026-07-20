@@ -55,3 +55,24 @@ jobs:
 
       - name: Test
         run: go test -v ./...
+
+  docs:
+    name: API docs
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      # Mirrors `just docs-check`: fails if the committed Markdown API reference
+      # under docs/api/ has drifted from the packages' doc comments. Regenerate
+      # with `just docs` and commit the result.
+      - name: Check generated API reference is in sync
+        run: |
+          go tool gomarkdoc --check --output docs/api/protocol.md ./pkg/protocol
+          go tool gomarkdoc --check --output docs/api/client.md ./pkg/client

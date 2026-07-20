@@ -772,6 +772,8 @@ Build/test commands:
 just build [linux amd64 | darwin arm64]   # produces ./build/bingo/...
 just test [PKG]                            # go test -v
 just coverage [PKG]                        # writes test/coverage.out
+just docs                                  # regenerate docs/api/*.md from doc comments (gomarkdoc)
+just docs-check                            # fail if docs/api/*.md is stale (CI gate)
 just integration                           # ginkgo -r ./test/integration (no e2e tag)
 just e2e-linux                             # native linux/amd64 ptrace E2E (all labels)
 just e2e-darwin                            # native darwin/arm64 Mach-exception E2E (codesigned; all labels)
@@ -785,6 +787,24 @@ go test -tags e2e -race ./test/integration -ginkgo.label-filter=fullstack
 On macOS, `go test ./...` without `-tags bingonative` will fail with
 `undefined: newBackend`. Always use `go test -tags bingonative ./...` or run
 through the justfile.
+
+## Generated API reference
+
+The Markdown API reference for the **public** packages ([pkg/protocol](pkg/protocol/),
+[pkg/client](pkg/client/)) is generated from their Go **doc comments** by
+[gomarkdoc](https://github.com/princjef/gomarkdoc) (tracked via the go.mod
+`tool` directive, like lefthook) into [docs/api/](docs/api/). It is a
+reference layer only — the "why"/architecture narrative stays hand-written in
+this file, never generated.
+
+- Regenerate with `just docs` and **commit** the result whenever you change an
+  exported symbol or its doc comment in those two packages.
+- The `docs` job in [go.yml](.github/workflows/go.yml) runs `gomarkdoc --check`
+  (same as `just docs-check`) and fails the build when the committed output
+  drifts from the code, so the reference can never silently go stale.
+- Only `pkg/protocol` and `pkg/client` are documented — they're the public
+  surface. To document another package, add it to the `docs`/`docs-check`
+  recipes in the [justfile](justfile) and the CI job.
 
 ## Things that look weird but are intentional
 
