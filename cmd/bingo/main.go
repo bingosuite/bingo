@@ -1,6 +1,6 @@
 // Command bingo starts the bingo debug server.
 //
-//	bingo [-addr host:port] [-v]
+//	bingo [-addr host:port] [-dap-addr host:port] [-v]
 package main
 
 import (
@@ -16,6 +16,7 @@ import (
 
 func main() {
 	addr := flag.String("addr", ":6060", "listen address (host:port)")
+	dapAddr := flag.String("dap-addr", "", "DAP listen address (host:port); empty disables the DAP server")
 	verbose := flag.Bool("v", false, "enable verbose (debug) logging")
 	flag.Parse()
 
@@ -28,6 +29,13 @@ func main() {
 	}))
 
 	srv := server.New(*addr, log)
+
+	if *dapAddr != "" {
+		if err := srv.StartDAP(*dapAddr); err != nil {
+			log.Error("dap server error", "err", err)
+			os.Exit(1)
+		}
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

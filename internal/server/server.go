@@ -9,12 +9,15 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/bingosuite/bingo/internal/dap"
 )
 
 // Server owns the HTTP listener, the session store, and the lifecycle of all
 // debug sessions.
 type Server struct {
 	httpServer *http.Server
+	dapServer  *dap.Server
 	sessions   *sessionStore
 	log        *slog.Logger
 	ctx        context.Context
@@ -69,6 +72,12 @@ func (s *Server) Start() error {
 func (s *Server) Shutdown(timeout time.Duration) {
 	s.log.Info("shutting down server")
 	s.cancel()
+
+	if s.dapServer != nil {
+		if err := s.dapServer.Close(); err != nil {
+			s.log.Error("dap shutdown error", "err", err)
+		}
+	}
 
 	ctx, done := context.WithTimeout(context.Background(), timeout)
 	defer done()
