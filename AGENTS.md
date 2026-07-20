@@ -797,14 +797,18 @@ The Markdown API reference for the **public** packages ([pkg/protocol](pkg/proto
 reference layer only — the "why"/architecture narrative stays hand-written in
 this file, never generated.
 
-- Regenerate with `just docs` and **commit** the result whenever you change an
-  exported symbol or its doc comment in those two packages.
+- The pre-commit hook ([lefthook.yml](lefthook.yml) → `api-docs`) regenerates
+  `docs/api/*.md` and stages them **automatically** whenever a commit touches
+  `pkg/protocol` or `pkg/client`, so you normally don't run anything by hand.
+  Run `just docs` manually only if you bypass the hook (`--no-verify`) or
+  haven't run `lefthook install`.
 - The `docs` job in [go.yml](.github/workflows/go.yml) runs `gomarkdoc --check`
   (same as `just docs-check`) and fails the build when the committed output
-  drifts from the code, so the reference can never silently go stale.
+  drifts from the code — the backstop for hook-bypassed commits.
 - Only `pkg/protocol` and `pkg/client` are documented — they're the public
   surface. To document another package, add it to the `docs`/`docs-check`
-  recipes in the [justfile](justfile) and the CI job.
+  recipes in the [justfile](justfile), the `api-docs` hook glob + commands in
+  [lefthook.yml](lefthook.yml), and the CI job.
 
 ## Things that look weird but are intentional
 

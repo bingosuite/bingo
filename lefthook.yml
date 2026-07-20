@@ -7,6 +7,17 @@ pre-commit:
     imports:
       glob: "*.go"
       run: goimports -w {staged_files} && git add {staged_files}
+    # Keep the generated API reference in sync automatically: whenever a staged
+    # change touches the public packages, regenerate docs/api/*.md from their
+    # doc comments and stage the result. Mirrors the `docs` justfile recipe; the
+    # go.yml "API docs" job (gomarkdoc --check) is the backstop for commits that
+    # bypass the hook (--no-verify) or an uninstalled lefthook.
+    api-docs:
+      glob: "pkg/{protocol,client}/*.go"
+      run: |
+        go tool gomarkdoc --output docs/api/protocol.md ./pkg/protocol
+        go tool gomarkdoc --output docs/api/client.md ./pkg/client
+        git add docs/api/protocol.md docs/api/client.md
 
 commit-msg:
   commands:
