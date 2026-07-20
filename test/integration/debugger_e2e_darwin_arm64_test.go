@@ -40,6 +40,8 @@ import (
 //   - inspect: continue into a breakpoint, then StackFrames/Locals/Goroutines.
 //   - restart: hub kill + relaunch + reinstall, reaching the breakpoint again.
 //   - fullstack: the whole client -> WebSocket -> hub -> debugger transport.
+//   - dap: a real Debug Adapter Protocol client drives a session over TCP, and
+//     N WebSocket observers share it (DAP + WebSocket coexisting on one session).
 //
 // See AGENTS.md -> Test layering and Backend quirks -> Darwin / arm64.
 var _ = Describe("Darwin arm64 debugger backend (Mach exceptions) E2E", Label("darwin"), func() {
@@ -55,6 +57,9 @@ var _ = Describe("Darwin arm64 debugger backend (Mach exceptions) E2E", Label("d
 	declareAttachSpec()
 	declareFullStackSpec()
 	declareRestartSpec()
+	declareDAPSpec()
+	declareDAPExitSpec()
+	declareDAPMultiClientSpec()
 	declarePortHygieneSpec()
 })
 

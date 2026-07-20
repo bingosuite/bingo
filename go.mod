@@ -11,7 +11,10 @@ require (
 	github.com/onsi/gomega v1.39.0
 )
 
-require gopkg.in/yaml.v3 v3.0.1 // indirect
+require (
+	github.com/google/go-dap v0.12.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
+)
 
 require (
 	github.com/MakeNowJust/heredoc v1.0.0 // indirect
