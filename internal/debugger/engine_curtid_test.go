@@ -132,7 +132,7 @@ var _ = Describe("current-thread inspection", func() {
 	stopOnThread2 := func() {
 		debugger.ExportedForceSuspended(d)
 		debugger.ExportedSetBreakpointAt(d, pcBeta)
-		Expect(d.Continue()).To(Succeed())
+		continueAndConsumeContinued(d)
 		fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: 2, PC: pcBeta})
 		Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventBreakpointHit))
 	}
