@@ -328,7 +328,10 @@ func attachToProcess(b Backend, pid int) error {
 	return nil
 }
 
-func killProcess(b Backend, pid int, _ *exec.Cmd) error {
+// running is unused on Darwin: the waitLoop blocks on a Mach exception port,
+// not wait4, so this Wait4(pid) reap is always the sole reaper — no race with
+// the waitLoop the way the linux backend has (see backend_linux_amd64.go).
+func killProcess(b Backend, pid int, _ *exec.Cmd, _ bool) error {
 	db, _ := b.(*darwinBackend)
 
 	// Attached (not launched): we don't own the process. Resume its threads so it

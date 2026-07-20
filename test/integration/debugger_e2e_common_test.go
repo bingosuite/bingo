@@ -568,25 +568,34 @@ func declareKillRunningSpec() {
 	It("kills a running process", Label("kill"), func() {
 		bin := buildTarget("kill_target", basicTargetSrc)
 
-		h := newE2EHarness(bin)
-		h.waitFor(15*time.Second, protocol.EventStepped) // initial launch stop
+		// Repeat the launch→run→Kill cycle. Killing a running tracee reaps it
+		// from the engine loop while a waitLoop concurrently reaps via
+		// Wait4(-1); the losing reaper must return promptly (ECHILD) rather than
+		// wedge Kill. That is a timing race, so a single kill only catches a
+		// regression intermittently — loop to make the reap path deterministic.
+		iters := envInt("BINGO_E2E_KILL_ITERS", 20)
+		for i := 0; i < iters; i++ {
+			h := newE2EHarness(bin)
+			h.waitFor(15*time.Second, protocol.EventStepped) // initial launch stop
 
-		Expect(h.d.Continue()).To(Succeed(), "Continue so the tracee is running")
-		// Let it actually be running before we kill, so this exercises the
-		// running→exited path rather than racing the resume.
-		time.Sleep(30 * time.Millisecond)
+			Expect(h.d.Continue()).To(Succeed(), "Continue so the tracee is running (iter %d)", i)
+			// Let it actually be running before we kill, so this exercises the
+			// running→exited path rather than racing the resume.
+			time.Sleep(30 * time.Millisecond)
 
-		Expect(h.d.Kill()).To(Succeed(), "Kill running process")
-		// Kill tears the engine down; which signal surfaces depends on which
-		// stop wins the race inside the loop. On linux the real wait4 exit
-		// typically arrives as ErrProcessExited and the loop emits
-		// EventProcessExited before closing; on darwin the synthetic StopExited
-		// injected by Kill wins and the loop returns straight to its deferred
-		// close(events) with no explicit exit event (see engine.loop's
-		// stateExited guard). Both outcomes prove the running tracee was reaped,
-		// so accept either. Only a timeout — neither event nor close — is a
-		// real failure (a wedged Kill that never reaped the process).
-		assertTerminated(h.d.Events(), 15*time.Second)
+			Expect(h.d.Kill()).To(Succeed(), "Kill running process (iter %d)", i)
+			// Kill tears the engine down; which signal surfaces depends on which
+			// stop wins the race inside the loop. On linux the real wait4 exit
+			// typically arrives as ErrProcessExited and the loop emits
+			// EventProcessExited before closing; on darwin the synthetic
+			// StopExited injected by Kill wins and the loop returns straight to
+			// its deferred close(events) with no explicit exit event (see
+			// engine.loop's stateExited guard). Both outcomes prove the running
+			// tracee was reaped, so accept either. Only a timeout — neither event
+			// nor close — is a real failure (a wedged Kill that never reaped it).
+			assertTerminated(h.d.Events(), 15*time.Second)
+		}
+		AddReportEntry("kill-iterations", iters)
 	})
 }
 
