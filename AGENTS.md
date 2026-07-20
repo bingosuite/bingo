@@ -686,7 +686,9 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   (StackFrames chain + Locals + Goroutines at a breakpoint), `breakpoints`
   (a cleared breakpoint stops firing), `kill` (Kill terminates a
   freely-running tracee), `exit` (EventProcessExited reports the tracee's real
-  exit code), and `restart` (hub-level kill+relaunch reinstalls
+  exit code), `attach` (attach by PID to an already-running tracee — one the
+  debugger did not launch — then breakpoint it), and `restart` (hub-level
+  kill+relaunch reinstalls
   breakpoints and reruns from the top), all driving `debugger.Debugger`
   in-process (except `restart`/`fullstack`, which go through the stack); plus
   `fullstack`, which drives operations through the ENTIRE stack (pkg/client →
@@ -704,7 +706,7 @@ side `chan error` — every debugger outcome, failures included, rides the singl
 
   **Platform scoping — both containers run the full set.** The darwin container
   wires the same specs as linux: `basic`, `stepping`, `breakpoints`, `churn`,
-  `kill`, `exit`, `pause`, `inspect`, `restart`, and `fullstack`, plus the
+  `kill`, `exit`, `attach`, `pause`, `inspect`, `restart`, and `fullstack`, plus the
   darwin-only `hygiene` (Mach exception port-right leak regression). This was NOT
   always so:
   under the old darwin wait4/ptrace model the step-off-an-armed-trap specs

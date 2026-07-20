@@ -79,6 +79,9 @@ jobs:
       - name: E2E exit (process exit status)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=exit
 
+      - name: E2E attach (attach to a running process)
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=attach
+
   darwin-arm64:
     name: Darwin arm64 (Mach exceptions)
     runs-on: macos-14
@@ -144,6 +147,10 @@ jobs:
       - name: E2E exit (process exit status)
         if: runner.environment == 'self-hosted'
         run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=exit
+
+      - name: E2E attach (attach to a running process)
+        if: runner.environment == 'self-hosted'
+        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=attach
 
       - name: E2E hygiene (Mach port-right leak regression)
         if: runner.environment == 'self-hosted'
