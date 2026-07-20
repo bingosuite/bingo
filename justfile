@@ -58,13 +58,15 @@ integration:
 # Runs every label (no filter): `basic` correctness, `churn` robustness, `pause`
 # async-interrupt, `stepping` (StepInto/StepOut), `inspect` (StackFrames/Locals/
 # Goroutines), `breakpoints` (ClearBreakpoint), `kill` (kill-while-running),
+# `exit` (real exit code), `attach` (attach by PID to a running process),
 # `restart`, and `fullstack` transport, all under -race.
 e2e-linux:
 	go test -tags e2e -race -count=1 -v -timeout 600s ./test/integration
 
 # Run the debugger E2E acceptance tests on darwin/arm64 (native pure-Mach
 # exception-port backend). Runs every label (no filter): `basic`, `stepping`,
-# `breakpoints`, `churn`, `kill`, `pause`, `inspect`, `restart`, and `fullstack`,
+# `breakpoints`, `churn`, `kill`, `exit`, `attach`, `pause`, `inspect`,
+# `restart`, `fullstack`, and the darwin-only `hygiene` (Mach port-right leak),
 # matching linux. The step-off-an-armed-trap specs and kill-while-running, once
 # linux-only under the old wait4 model, are reliable on darwin under the
 # Mach-exception rearchitecture (#92) — per-thread exception delivery, a

@@ -215,6 +215,46 @@ func main() {
 }
 `
 
+// attachTargetSrc is the target for the Attach spec: a process the debugger did
+// NOT launch. It pins the main goroutine to the main OS thread. Attach on linux
+// only traces the single thread we PTRACE_ATTACH to (the main thread; the
+// PTRACE_O_TRACECLONE option that launch relies on cannot be applied
+// retroactively to the runtime's pre-existing threads), so the breakpointed
+// line must only ever execute on that thread for its SIGTRAP to reach the
+// tracer — otherwise the Go runtime takes the trap as "fatal: trace trap".
+// LockOSThread guarantees it; darwin's task-level exception port would catch
+// the fault on any thread regardless. Otherwise it mirrors basicTargetSrc: a
+// quiet hot loop calling a function on a clearly-marked line.
+const attachTargetSrc = `package main
+
+import (
+	"os"
+	"runtime"
+	"time"
+)
+
+func compute(n int) int {
+	s := 0
+	for i := 0; i < n; i++ {
+		s += i
+	}
+	return s
+}
+
+func main() {
+	runtime.LockOSThread()
+	// Safety net: self-exit if the debugger detaches and abandons us.
+	go func() { time.Sleep(180 * time.Second); os.Exit(0) }()
+	x := 0
+	for i := 0; i < 100000000; i++ {
+		x += compute(i % 10) // BP
+		x++
+		time.Sleep(time.Millisecond)
+		_ = x
+	}
+}
+`
+
 // declareBasicStepOverSpec adds the continue+step-over acceptance spec to the
 // enclosing Ginkgo container. It is the correctness gate: set a breakpoint on a
 // line that calls a function, repeatedly Continue to it and StepOver the call,
@@ -602,6 +642,45 @@ func declareExitCodeSpec() {
 	})
 }
 
+// declareAttachSpec adds the Attach acceptance spec — the only e2e that drives
+// Debugger.Attach against a process the debugger did NOT launch. It starts the
+// target independently, attaches by PID (linux PTRACE_ATTACH; darwin
+// task_for_pid + a task-level Mach exception port, which needs the debugger
+// entitlement), sets a breakpoint through the attached binary's DWARF, and
+// asserts the already-running tracee is caught at that breakpoint across
+// several resume cycles. Runs on both containers so the two attach paths stay
+// in agreement.
+//
+// Cleanup detaches rather than kills: Kill of an *attached* tracee deliberately
+// detaches without terminating it (neither backend owns a process it merely
+// attached to — linux PTRACE_DETACH, darwin resume-all-threads), so
+// newAttachHarness separately reaps the process the spec started.
+func declareAttachSpec() {
+	It("attaches to a running process and catches it at a breakpoint", Label("attach"), func() {
+		line := markerLine(attachTargetSrc, "// BP")
+		bin := buildTarget("attach_target", attachTargetSrc)
+
+		h := newAttachHarness(bin)
+		h.waitFor(15*time.Second, protocol.EventStepped) // initial attach stop
+
+		bp, err := h.d.SetBreakpoint("attach_target.go", line)
+		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint after attach")
+		Expect(bp.Location.Line).To(Equal(line), "breakpoint resolved to the requested line")
+
+		iters := envInt("BINGO_E2E_ATTACH_ITERS", 3)
+		for i := 0; i < iters; i++ {
+			Expect(h.d.Continue()).To(Succeed(), "Continue #%d", i)
+			evt := h.waitFor(20*time.Second,
+				protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+			Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit),
+				"Continue #%d expected BreakpointHit on the attached tracee, got %s: %s",
+				i, evt.Kind, evt.Payload)
+			Expect(bpLine(evt)).To(Equal(line), "BreakpointHit #%d at BP line", i)
+		}
+		AddReportEntry("attach-iterations", iters)
+	})
+}
+
 // bpLine decodes a BreakpointHit event and returns its resolved line.
 func bpLine(evt protocol.Event) int {
 	GinkgoHelper()
@@ -674,6 +753,43 @@ func newE2EHarness(bin string) *e2eHarness {
 			AddReportEntry("kill-timeout", "Kill did not return within 5s (backend may be wedged)")
 		}
 	})
+	return &e2eHarness{d: d}
+}
+
+// newAttachHarness starts bin as an independent OS process (NOT under the
+// debugger) and attaches the real backend to it by PID — the only path that
+// exercises Debugger.Attach end to end. Cleanups are registered LIFO so that at
+// teardown the debugger detaches FIRST (Debugger.Kill on an attached tracee
+// detaches without killing) and the process the spec owns is reaped LAST.
+func newAttachHarness(bin string) *e2eHarness {
+	GinkgoHelper()
+	cmd := exec.Command(bin)
+	Expect(cmd.Start()).To(Succeed(), "start target for attach")
+	// Registered first → runs last: SIGKILL and reap the process we own, since
+	// detaching left it alive.
+	DeferCleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	// Let the Go runtime reach its steady-state loop before attaching so the
+	// breakpoint we set lands promptly on the next iteration rather than racing
+	// process startup.
+	time.Sleep(200 * time.Millisecond)
+
+	d := debugger.New(nil)
+	// Registered second → runs first: detach the debugger (bounded, to surface a
+	// wedged Kill instead of hanging the suite).
+	DeferCleanup(func() {
+		done := make(chan struct{})
+		go func() { _ = d.Kill(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			AddReportEntry("kill-timeout", "attach Kill did not return within 5s (backend may be wedged)")
+		}
+	})
+	Expect(d.Attach(cmd.Process.Pid, bin)).To(Succeed(), "Attach to running target")
 	return &e2eHarness{d: d}
 }
 
