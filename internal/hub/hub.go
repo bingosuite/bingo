@@ -242,6 +242,24 @@ func (h *Hub) removeClient(c *Client) {
 // ends. Re-stamping is needed because the engine has its own seq and the hub
 // also synthesises errors/confirmations.
 func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
+	suspending := suspendingEvents[evt.Kind]
+
+	// Discard any resuming command buffered while the process was still running
+	// BEFORE broadcasting the suspending event. Such a command is necessarily
+	// stale — a legitimate resume can only be sent in response to this event,
+	// which the client hasn't observed yet — so dropping it stops it
+	// auto-continuing past the suspend and robbing the client of its chance to
+	// inspect. Draining *before* the broadcast is what makes that safe: the
+	// broadcast is the starting gun, so any resume the client sends back
+	// necessarily lands in resumeCh after the drain and is caught by the wait
+	// loop below. Draining after the broadcast left a race — an in-process
+	// client with no network latency could put its legitimate resume in
+	// resumeCh before the drain ran, and the drain would silently eat it,
+	// wedging the session (and flaking the hub tests under load).
+	if suspending {
+		h.drainResumeCh()
+	}
+
 	evt.Seq = h.seq.Add(1)
 	h.broadcast(evt)
 
@@ -252,19 +270,11 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 		h.transitionState(protocol.StateExited)
 	}
 
-	if !suspendingEvents[evt.Kind] {
+	if !suspending {
 		return
 	}
 
 	h.log.Info("suspended — waiting for resuming command", "event", evt.Kind)
-
-	// Discard any resuming command that was buffered while the process was
-	// still running. Such a command is necessarily stale: a legitimate resume
-	// can only be sent after the client observes this suspending event, which
-	// hasn't been delivered over the network yet. Without this drain, that
-	// stale resume would be consumed immediately below and auto-continue past
-	// the suspend, robbing the client of its chance to inspect.
-	h.drainResumeCh()
 
 	timeout := time.NewTimer(30 * time.Minute)
 	defer timeout.Stop()
