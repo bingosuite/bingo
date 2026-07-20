@@ -136,6 +136,14 @@ func mustNextEvent(d debugger.Debugger) protocol.Event {
 	return evt
 }
 
+// continueAndConsumeContinued issues Continue and consumes the EventContinued
+// that a successful resume emits, leaving the following stop event for the
+// caller to assert on.
+func continueAndConsumeContinued(d debugger.Debugger) {
+	ExpectWithOffset(1, d.Continue()).To(Succeed())
+	ExpectWithOffset(1, mustNextEvent(d).Kind).To(Equal(protocol.EventContinued))
+}
+
 func drainEvents(d debugger.Debugger) {
 	for {
 		select {
@@ -341,7 +349,7 @@ var _ = Describe("Engine", func() {
 		})
 
 		It("emits EventBreakpointHit when a breakpoint stop arrives", func() {
-			Expect(d.Continue()).To(Succeed())
+			continueAndConsumeContinued(d)
 			fb.pushStop(debugger.StopEvent{
 				Reason: debugger.StopBreakpoint,
 				TID:    1,
@@ -366,7 +374,7 @@ var _ = Describe("Engine", func() {
 			}
 			fb.regs[2] = debugger.Registers{PC: hitPC}
 
-			Expect(d.Continue()).To(Succeed())
+			continueAndConsumeContinued(d)
 			fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint})
 
 			evt := mustNextEvent(d)
@@ -377,7 +385,7 @@ var _ = Describe("Engine", func() {
 		})
 
 		It("emits nothing (resumes silently) for an unrecognised breakpoint PC", func() {
-			Expect(d.Continue()).To(Succeed())
+			continueAndConsumeContinued(d)
 			fb.pushStop(debugger.StopEvent{
 				Reason: debugger.StopBreakpoint,
 				TID:    1,
@@ -404,7 +412,7 @@ var _ = Describe("Engine", func() {
 			}()
 
 			debugger.ExportedForceSuspended(d2)
-			Expect(d2.Continue()).To(Succeed())
+			continueAndConsumeContinued(d2)
 			fb2.pushStop(debugger.StopEvent{
 				Reason:   debugger.StopExited,
 				TID:      1,
@@ -565,6 +573,11 @@ var _ = Describe("Engine", func() {
 			Expect(d.Continue()).To(Succeed())
 			Expect(d.Continue()).To(MatchError(debugger.ErrNotSuspended))
 		})
+
+		It("emits EventContinued when it resumes", func() {
+			Expect(d.Continue()).To(Succeed())
+			Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventContinued))
+		})
 	})
 
 	Describe("Pause", func() {
@@ -591,7 +604,7 @@ var _ = Describe("Engine", func() {
 
 		It("fires StopProcess and emits EventPaused for the resulting SIGSTOP", func() {
 			debugger.ExportedForceSuspended(d)
-			Expect(d.Continue()).To(Succeed())
+			continueAndConsumeContinued(d)
 
 			before := fb.stopProcessCalls
 			Expect(d.Pause()).To(Succeed())
@@ -611,7 +624,7 @@ var _ = Describe("Engine", func() {
 
 		It("does not emit EventPaused for a SIGSTOP when no Pause is pending", func() {
 			debugger.ExportedForceSuspended(d)
-			Expect(d.Continue()).To(Succeed())
+			continueAndConsumeContinued(d)
 
 			// A SIGSTOP with no armed Pause is a leftover: suppress and resume
 			// silently rather than reporting a bogus Paused.
@@ -639,7 +652,7 @@ var _ = Describe("Engine", func() {
 			})
 
 			It("suspends for the breakpoint, then suppresses the leftover SIGSTOP", func() {
-				Expect(d.Continue()).To(Succeed())
+				continueAndConsumeContinued(d)
 				Expect(d.Pause()).To(Succeed())
 
 				// The real breakpoint stop arrives before the SIGSTOP does.
@@ -654,7 +667,7 @@ var _ = Describe("Engine", func() {
 				// Resume; the queued SIGSTOP now surfaces but the Pause flag was
 				// cleared by the breakpoint suspend, so it must be swallowed —
 				// no spurious EventPaused.
-				Expect(d.Continue()).To(Succeed())
+				continueAndConsumeContinued(d)
 				pushSIGSTOP()
 
 				_, ok := nextEvent(d)

@@ -267,13 +267,18 @@ func (e *engine) Continue() error {
 			return err
 		}
 		if e.lastBP != nil {
-			return e.resumeFromBreakpoint(bpResumeContinue, 0)
+			if err := e.resumeFromBreakpoint(bpResumeContinue, 0); err != nil {
+				return err
+			}
+			e.emitContinued()
+			return nil
 		}
 		if err := e.backend.ContinueProcess(); err != nil {
 			return err
 		}
 		e.setState(stateRunning)
 		go e.waitLoop()
+		e.emitContinued()
 		return nil
 	})
 }
@@ -1168,6 +1173,17 @@ func (e *engine) emitPaused(stop StopEvent) {
 		Location:  loc,
 		Frames:    frames,
 	})
+}
+
+// emitContinued reports that the tracee has resumed free execution in response
+// to a Continue. Unlike a step — which self-completes into EventStepped — a
+// plain resume produces no later stop of its own, so without this event a
+// client that did not issue the resume (another WebSocket observer, or a DAP
+// adapter translating it into a `continued` event) has no way to learn the
+// process is running again until it happens to hit the next breakpoint. Steps
+// deliberately do not emit it.
+func (e *engine) emitContinued() {
+	e.emit(protocol.EventContinued, protocol.ContinuedPayload{})
 }
 
 func (e *engine) emitProcessExited(code int) {

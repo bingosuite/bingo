@@ -140,6 +140,15 @@ The hub blocks after broadcasting any of these "suspending" events until a
 While suspended, **non-resuming** commands (`SetBreakpoint`, `Locals`, …) are
 still executed immediately — the process is paused, so it's safe.
 
+A successful `Continue` emits a **non-suspending** `EventContinued` from the
+engine (`engine.Continue` → `emitContinued`) before the process runs free. It is
+not in the suspending set and does not gate the hub — it's a fire-and-forget
+notification so a client that did *not* issue the resume (another WebSocket
+observer, or a DAP adapter mapping it to a `continued` event) learns the tracee
+is running again instead of waiting for the next stop. Steps do **not** emit it:
+they self-complete into a suspending `Stepped`, which DAP maps to `stopped`
+reason=step, not `continued`.
+
 `Pause` and `Kill` are the odd ones out: both must act **while the process is
 running**, not only while suspended, so neither is a resuming command. They ride
 the ordinary `cmdCh` (like `SetBreakpoint`), which both Run's main loop and the
