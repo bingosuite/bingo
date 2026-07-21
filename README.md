@@ -43,16 +43,28 @@ drive a debug session over a TCP socket while BinGo's own visual clients observe
 Start the server with a DAP listener:
 
 ```sh
-bingo -addr :6060 -dap-addr :6061
+bingo -addr :6060 -dap-addr :4711
 ```
 
-Point your editor's debug adapter at `127.0.0.1:6061`. The DAP client creates a
+Point your editor's debug adapter at `127.0.0.1:4711`. The DAP client creates a
 managed session on `launch`/`attach`; WebSocket observers join that same session
 via `/ws?session=<id>` (the id is discoverable through `/api/sessions`, and the
 adapter also prints it as a `console` output event). DAP covers the standard
 debug loop (breakpoints, stepping, stack/variables, continue/pause); BinGo's
 richer concurrency visualizations remain available to WebSocket clients on the
 same session. See [AGENTS.md](AGENTS.md) → *DAP* for the architecture.
+
+BinGo also ships an interactive DAP client, `cmd/dapcli`, that mirrors the
+WebSocket CLI (`cmd/cli`) but drives a session over DAP:
+
+```sh
+just dapcli                       # create a session on launch (default -addr localhost:4711)
+just dapcli -session <id>         # join an existing session as another client
+```
+
+Any number of `dapcli` and `cli` clients can drive and observe the **same**
+session at once — start one, `launch` a target, then join from other terminals
+with the announced session id.
 
 ## Documentation
 

@@ -62,16 +62,31 @@ func (r *cmdRecorder) waitForCommand(t *testing.T, kind protocol.CommandKind) pr
 }
 
 type fakeSession struct {
-	id   string
-	cmds *cmdRecorder
+	id      string
+	cmds    *cmdRecorder
+	welcome protocol.SessionState
 }
 
 func (s *fakeSession) SessionID() string { return s.id }
 
-// AddClient mirrors the hub: it starts a read pump draining the handler's
-// enqueued commands. Returns nil — the handler never calls methods on the
-// *hub.Client it stores.
+// AddClient mirrors the hub: it optionally delivers a welcome EventSessionState
+// (as the real hub's sendStateTo does) and starts a read pump draining the
+// handler's enqueued commands. Returns nil — the handler never calls methods on
+// the *hub.Client it stores.
 func (s *fakeSession) AddClient(conn hub.WSConn, _ *slog.Logger) *hub.Client {
+	if s.welcome != "" {
+		// Deliver the welcome asynchronously, mirroring the hub's write pump so
+		// it lands after AddClient returns (the join path sets its flags before
+		// calling AddClient, so either ordering is handled).
+		go func() {
+			evt := protocol.MustEvent(protocol.EventSessionState, 0, protocol.SessionStatePayload{
+				SessionID: s.id, State: s.welcome, Clients: 1,
+			})
+			if data, err := protocol.MarshalEvent(evt); err == nil {
+				_ = conn.WriteMessage(hub.TextMessage, data)
+			}
+		}()
+	}
 	go func() {
 		for {
 			_, data, err := conn.ReadMessage()
@@ -101,6 +116,12 @@ type harness struct {
 }
 
 func newHarness(t *testing.T) *harness {
+	return newHarnessWelcome(t, "")
+}
+
+// newHarnessWelcome builds a harness whose fake session delivers the given
+// welcome state to a newly-added client (the empty string sends none).
+func newHarnessWelcome(t *testing.T, welcome protocol.SessionState) *harness {
 	t.Helper()
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -109,7 +130,7 @@ func newHarness(t *testing.T) *harness {
 	t.Cleanup(func() { _ = ln.Close() })
 
 	rec := &cmdRecorder{}
-	prov := &fakeProvider{sess: &fakeSession{id: "sess-test", cmds: rec}}
+	prov := &fakeProvider{sess: &fakeSession{id: "sess-test", cmds: rec, welcome: welcome}}
 
 	accepted := make(chan net.Conn, 1)
 	go func() {
@@ -398,4 +419,70 @@ func TestDisconnectTerminatesLaunchedDebuggee(t *testing.T) {
 	_ = recvType[*godap.DisconnectResponse](hh)
 	// A launch session terminates the debuggee: a Kill must be enqueued.
 	hh.cmds.waitForCommand(t, protocol.CmdKill)
+}
+
+// TestJoinExistingSuspendedSession drives the JOIN path: attach with a session
+// id and no pid registers as an additional client on an already-suspended
+// session WITHOUT relaunching it, reflects the welcome as an initial
+// stopped(pause), lets the joiner inspect and drive, and never enqueues a
+// Launch/Attach.
+func TestJoinExistingSuspendedSession(t *testing.T) {
+	hh := newHarnessWelcome(t, protocol.StateSuspended)
+
+	hh.sendReq("initialize", initArgs())
+	_ = recvType[*godap.InitializeResponse](hh)
+
+	ar := &godap.AttachRequest{Arguments: json.RawMessage(`{"session":"sess-test"}`)}
+	joinSeq := hh.sendReq("attach", ar)
+
+	// The join emits `initialized` immediately (no entry stop to wait for) and
+	// translates the suspended welcome into an initial stopped(pause). Order
+	// between the two is not guaranteed, so collect both.
+	var sawInit, sawStopped bool
+	deadline := time.Now().Add(2 * time.Second)
+	for (!sawInit || !sawStopped) && time.Now().Before(deadline) {
+		switch ev := hh.recv().(type) {
+		case *godap.InitializedEvent:
+			sawInit = true
+		case *godap.StoppedEvent:
+			sawStopped = true
+			if ev.Body.Reason != "pause" {
+				t.Errorf("stopped reason = %q, want pause", ev.Body.Reason)
+			}
+		}
+	}
+	if !sawInit || !sawStopped {
+		t.Fatalf("handshake incomplete: initialized=%v stopped=%v", sawInit, sawStopped)
+	}
+
+	// configurationDone completes the join WITHOUT resuming the shared session.
+	hh.sendReq("configurationDone", &godap.ConfigurationDoneRequest{})
+	_ = recvType[*godap.ConfigurationDoneResponse](hh)
+	resp := recvType[*godap.AttachResponse](hh)
+	if resp.RequestSeq != joinSeq {
+		t.Errorf("attach response seq = %d, want %d", resp.RequestSeq, joinSeq)
+	}
+
+	// A joiner must not launch or attach: no such command may have been enqueued.
+	for _, k := range hh.cmds.kinds() {
+		if k == protocol.CmdLaunch || k == protocol.CmdAttach || k == protocol.CmdContinue {
+			t.Fatalf("join enqueued %s; joiners must not launch/attach/resume", k)
+		}
+	}
+
+	// The joiner can inspect the shared suspended session.
+	hh.sendReq("threads", &godap.ThreadsRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdGoroutines)
+	hh.inject(protocol.EventGoroutines, protocol.GoroutinesPayload{
+		Goroutines: []protocol.Goroutine{{ID: 7, Status: "running"}},
+	})
+	thr := recvType[*godap.ThreadsResponse](hh)
+	if len(thr.Body.Threads) != 1 || thr.Body.Threads[0].Id != 7 {
+		t.Fatalf("threads = %+v", thr.Body.Threads)
+	}
+
+	// Driving continue from the joiner resumes the shared session.
+	hh.sendReq("continue", &godap.ContinueRequest{})
+	_ = recvType[*godap.ContinueResponse](hh)
+	hh.cmds.waitForCommand(t, protocol.CmdContinue)
 }
