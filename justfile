@@ -41,6 +41,14 @@ build-target:
 cli *ARGS:
 	go run ./cmd/cli {{ARGS}}
 
+# ARGS: -addr string    DAP server address (default "localhost:4711")
+#	  	-session string existing session ID to join (omit to create on launch)
+# Build and run the interactive DAP CLI client. Drives a session over the Debug
+# Adapter Protocol (server's -dap-addr listener); any number of dapcli and cli
+# clients can join and drive the same session concurrently.
+dapcli *ARGS:
+	go run ./cmd/dapcli {{ARGS}}
+
 # Run unit tests on the PKG (defaults to ./...)
 test PKG="./...":
 	go test -v {{PKG}}

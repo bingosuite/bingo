@@ -68,6 +68,16 @@ type Handler struct {
 	stopOnEntry bool
 	attached    bool
 
+	// joining marks a connection that joined an EXISTING bingo session (a DAP
+	// attach with a `session` argument and no pid) rather than launching or
+	// attaching to a debuggee. A joiner never enqueues Launch/Attach and never
+	// auto-continues at configurationDone — it must not disturb the run state of
+	// a session other clients are already driving. awaitingWelcome is set until
+	// the hub's welcome EventSessionState is consumed to reflect the session's
+	// current state (a `stopped` if already suspended).
+	joining         bool
+	awaitingWelcome bool
+
 	startReqSeq   int
 	startCmd      string
 	restartReqSeq int

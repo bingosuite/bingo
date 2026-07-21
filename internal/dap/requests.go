@@ -115,8 +115,15 @@ func (h *Handler) onAttach(req *godap.AttachRequest) {
 			return
 		}
 	}
+	// A `session` argument with no pid means "join an already-running bingo
+	// session as an additional client", not "attach to an OS process". Route it
+	// to the join path, which registers as a client without relaunching.
+	if cfg.Session != "" && cfg.PID == 0 {
+		h.onJoin(req, cfg)
+		return
+	}
 	if cfg.PID == 0 {
-		h.send(h.errorResponse(req.Seq, "attach", "attach requires 'pid'"))
+		h.send(h.errorResponse(req.Seq, "attach", "attach requires 'pid' (or 'session' to join an existing bingo session)"))
 		return
 	}
 	if err := h.startSession(cfg.Session); err != nil {
@@ -144,6 +151,39 @@ func (h *Handler) onAttach(req *godap.AttachRequest) {
 		return
 	}
 	h.enqueue(cmd)
+}
+
+// onJoin registers this connection as an ADDITIONAL client on an existing bingo
+// session (a DAP attach carrying a `session` argument and no pid). Unlike attach,
+// it enqueues no Launch/Attach command — the session is already running under
+// other clients — so it must not disturb the shared run state. The hub's welcome
+// EventSessionState is translated (onSessionState) into the joiner's initial DAP
+// state. `initialized` fires immediately: the target image is already loaded, so
+// breakpoints resolve right away and there is no entry stop to wait for.
+func (h *Handler) onJoin(req *godap.AttachRequest, cfg launchConfig) {
+	// Set the join flags BEFORE registering as a client: the hub delivers its
+	// welcome EventSessionState as soon as AddClient runs, and onSessionState
+	// must see awaitingWelcome=true to translate it into the initial DAP state.
+	h.mu.Lock()
+	h.startReqSeq = req.Seq
+	h.startCmd = "attach"
+	h.stopOnEntry = cfg.StopOnEntry
+	h.attached = true
+	h.joining = true
+	h.awaitingWelcome = true
+	h.mu.Unlock()
+
+	if err := h.startSession(cfg.Session); err != nil {
+		h.mu.Lock()
+		h.joining = false
+		h.awaitingWelcome = false
+		h.mu.Unlock()
+		h.send(h.errorResponse(req.Seq, "attach", err.Error()))
+		return
+	}
+
+	h.announceSession()
+	h.send(&godap.InitializedEvent{Event: h.event("initialized")})
 }
 
 // startSession creates a new managed session (or joins an existing one) and
@@ -201,8 +241,9 @@ func (h *Handler) onConfigurationDone(req *godap.ConfigurationDoneRequest) {
 	startSeq := h.startReqSeq
 	startCmd := h.startCmd
 	stopOnEntry := h.stopOnEntry
+	joining := h.joining
 	tid := h.curThreadID
-	if !stopOnEntry {
+	if !joining && !stopOnEntry {
 		h.pendingContinues++
 		h.suspended = false
 	}
@@ -215,6 +256,12 @@ func (h *Handler) onConfigurationDone(req *godap.ConfigurationDoneRequest) {
 		h.send(&godap.AttachResponse{Response: h.response(startSeq, "attach")})
 	}
 
+	if joining {
+		// Joined an existing session: never resume it or fabricate an entry
+		// stop. Its current run state was already reflected from the welcome
+		// (onSessionState).
+		return
+	}
 	if stopOnEntry {
 		h.sendStopped("entry", tid)
 		return
