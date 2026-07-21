@@ -213,6 +213,70 @@ func declareDAPMultiClientSpec() {
 	})
 }
 
+// declareDAPJoinSpec proves the JOIN path end to end: a SECOND DAP client
+// attaches to an already-suspended session (attach with a `session` arg, no pid)
+// WITHOUT relaunching it, inspects the shared stop, then DRIVES a continue that
+// the original DAP driver AND a WebSocket observer both witness out of band.
+// This is the many-DAP-clients-per-session capability behind `cmd/dapcli
+// -session`.
+func declareDAPJoinSpec() {
+	It("lets a second DAP client join and drive an existing session", Label("dap"), func() {
+		line := markerLine(dapTargetSrc, "// BP")
+		bin := buildTarget("dap_join_target", dapTargetSrc)
+
+		_, wsAddr, dapAddr := startTestServerWithDAP()
+
+		// Driver: launch, set the breakpoint, run to it — session is now
+		// suspended at the breakpoint with other clients able to join.
+		driver := dialDAP(dapAddr)
+		driver.initialize()
+		launchSeq := driver.launch(bin, false)
+		driver.waitEvent(20*time.Second, "initialized")
+		bps := driver.setBreakpoints("dap_join_target.go", line)
+		Expect(bps.Body.Breakpoints[0].Verified).To(BeTrue())
+		driver.configurationDone()
+		Expect(driver.await(launchSeq).(godap.ResponseMessage).GetResponse().Success).To(BeTrue())
+		firstStop := driver.waitStopped(20 * time.Second)
+		Expect(firstStop.Body.Reason).To(Equal("breakpoint"))
+
+		// A WebSocket observer joins the same session (proving DAP + WS coexist).
+		sessionID := waitForSession(wsAddr)
+		obs, err := client.Join(wsAddr, sessionID)
+		Expect(err).NotTo(HaveOccurred(), "ws observer join")
+		DeferCleanup(func() { _ = obs.Close() })
+
+		// A SECOND DAP client joins the suspended session by id.
+		joiner := dialDAP(dapAddr)
+		welcome := joiner.joinSuspended(sessionID)
+		Expect(welcome.Body.Reason).To(Equal("pause"), "welcome reflects the suspended session")
+
+		// The joiner can inspect the shared stop without having launched it.
+		Expect(joiner.threads().Body.Threads).NotTo(BeEmpty(), "joiner sees threads")
+		st := joiner.stackTrace(welcome.Body.ThreadId)
+		Expect(st.Body.StackFrames).NotTo(BeEmpty(), "joiner sees a stack")
+
+		// The joiner DRIVES a continue; the loop re-hits the breakpoint.
+		joiner.continueThread(welcome.Body.ThreadId)
+		joinerStop := joiner.waitStopped(20 * time.Second)
+		Expect(joinerStop.Body.Reason).To(Equal("breakpoint"), "joiner's continue re-hits the BP")
+
+		// The ORIGINAL driver did not issue that continue, so it must observe the
+		// out-of-band resume (`continued`) followed by the next breakpoint stop.
+		driver.waitEvent(20*time.Second, "continued")
+		driverAgain := driver.waitStopped(20 * time.Second)
+		Expect(driverAgain.Body.Reason).To(Equal("breakpoint"), "driver observes the joiner-driven hit")
+
+		// The WebSocket observer independently sees the same breakpoint hit.
+		evt := awaitEvent(obs.Events(), 20*time.Second,
+			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit),
+			"ws observer sees the joiner-driven hit, got %s: %s", evt.Kind, evt.Payload)
+
+		joiner.disconnect()
+		driver.disconnect()
+	})
+}
+
 // waitForSession polls the REST API until exactly one session is present and
 // returns its id. The DAP client creates it on launch, so it appears shortly
 // after the `initialized` event.
@@ -438,6 +502,45 @@ func (c *dapClient) variables(ref int) godap.ResponseMessage {
 func (c *dapClient) disconnect() {
 	GinkgoHelper()
 	_ = c.request("disconnect", &godap.DisconnectRequest{})
+}
+
+// joinSuspended registers this client as an additional driver on an existing,
+// already-SUSPENDED session: initialize, then attach carrying the session id and
+// no pid. The adapter emits `initialized` immediately plus a welcome `stopped`
+// reflecting the shared suspended state (order between the two is not
+// guaranteed); this drains both, completes configurationDone, awaits the delayed
+// attach response, and returns the welcome stopped event.
+func (c *dapClient) joinSuspended(sessionID string) *godap.StoppedEvent {
+	GinkgoHelper()
+	c.initialize()
+	args, err := json.Marshal(map[string]any{"session": sessionID})
+	Expect(err).NotTo(HaveOccurred())
+	attachSeq := c.send("attach", &godap.AttachRequest{Arguments: args})
+
+	var welcome *godap.StoppedEvent
+	sawInit := false
+	deadline := time.After(20 * time.Second)
+	for !sawInit || welcome == nil {
+		select {
+		case msg, ok := <-c.events:
+			if !ok {
+				Fail("DAP events channel closed during join")
+			}
+			switch ev := msg.(type) {
+			case *godap.InitializedEvent:
+				sawInit = true
+			case *godap.StoppedEvent:
+				welcome = ev
+			}
+		case <-deadline:
+			Fail("timeout waiting for join handshake (initialized + welcome stopped)")
+		}
+	}
+
+	c.configurationDone()
+	resp := c.await(attachSeq)
+	Expect(resp.(godap.ResponseMessage).GetResponse().Success).To(BeTrue(), "attach(join) must succeed")
+	return welcome
 }
 
 // startTestServerWithDAP boots a server with both the WebSocket and DAP

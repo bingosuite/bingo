@@ -33,8 +33,51 @@ func (h *Handler) translateEvent(evt protocol.Event) {
 	case protocol.EventError:
 		h.onError(evt)
 	case protocol.EventSessionState:
-		// Informational for DAP; the IDE has no concept of the bingo session
-		// lifecycle beyond stopped/continued/exited.
+		// For a JOINING connection, the hub's welcome state seeds the joiner's
+		// initial DAP state. For the normal launch/attach path it is
+		// informational (the entry stop drives the initial state instead).
+		h.onSessionState(evt)
+	}
+}
+
+// onSessionState consumes the hub's welcome EventSessionState for a JOINING
+// connection, reflecting the shared session's current run state as the joiner's
+// initial DAP state: a `stopped` if already suspended, `terminated` if already
+// exited, nothing while idle/running. It fires at most once (gated on
+// awaitingWelcome) and is a no-op for the normal launch/attach path, where
+// awaitingWelcome is never set.
+func (h *Handler) onSessionState(evt protocol.Event) {
+	var p protocol.SessionStatePayload
+	if err := protocol.DecodeEventPayload(evt, &p); err != nil {
+		return
+	}
+
+	h.mu.Lock()
+	if !h.awaitingWelcome {
+		h.mu.Unlock()
+		return
+	}
+	h.awaitingWelcome = false
+	tid := h.curThreadID
+	if tid == 0 {
+		// No stop event has been seen yet on a freshly-joined suspended session,
+		// so we have no goroutine id. DAP requires a threadId; the engine
+		// inspects the currently-stopped goroutine regardless, so a synthetic
+		// id is safe here.
+		tid = 1
+	}
+	switch p.State {
+	case protocol.StateSuspended:
+		h.suspended = true
+		h.mu.Unlock()
+		h.sendStopped("pause", tid)
+	case protocol.StateExited:
+		h.suspended = false
+		h.mu.Unlock()
+		h.send(&godap.TerminatedEvent{Event: h.event("terminated")})
+	default:
+		h.suspended = false
+		h.mu.Unlock()
 	}
 }
 

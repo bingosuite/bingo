@@ -90,6 +90,7 @@ follow them so reviews stay about substance, not style.
 | --- | --- |
 | [cmd/bingo](cmd/bingo/) | Server entry point — flag parsing, signal handler, calls into `internal/server`. |
 | [cmd/cli](cmd/cli/) | Interactive readline client. |
+| [cmd/dapcli](cmd/dapcli/) | Interactive readline client that drives a session over DAP (mirrors `cmd/cli`'s UX). Talks to the server's `-dap-addr` listener; can create a session or `-session` join an existing one. |
 | [cmd/target](cmd/target/) | Trivial target program for manual testing. |
 | [cmd/githook](cmd/githook/) | Conventional-commits commitlint, wired via [lefthook.yml](lefthook.yml). |
 | [pkg/protocol](pkg/protocol/) | Wire types: `Event`, `Command`, payload structs, `EventKind`, `CommandKind`, `SessionState`. Single source of truth. |
@@ -735,14 +736,41 @@ structs for the int `Seq`).
    (`pendingContinues++`). Restart reuses a `restarting` flag so the post-restart
    entry `EventStepped` is treated as a fresh entry.
 
+### Joining an existing session (no relaunch)
+
+A DAP `attach` carrying a `session` argument and **no** `pid` means "join an
+already-running bingo session as an ADDITIONAL client", not "attach to an OS
+process". `onAttach` routes this to `onJoin` (`requests.go`). This is what backs
+`cmd/dapcli -session <id>` and lets many DAP + WebSocket clients share one
+session.
+
+- `onJoin` registers as a hub client (`startSession(cfg.Session)` → `AddClient`)
+  but enqueues **no** `CmdLaunch`/`CmdAttach` — the session is already running
+  under other clients, so it must not disturb the shared run state.
+- The join flags (`joining`, `awaitingWelcome`, `attached`, `startCmd="attach"`)
+  are set BEFORE `startSession`, because the hub delivers its welcome
+  `EventSessionState` the instant `AddClient` runs and `onSessionState` must see
+  `awaitingWelcome=true` to translate it.
+- `initialized` fires immediately (the target image is already loaded, so
+  breakpoints resolve right away — there is no entry stop to wait for).
+- `onSessionState` (`events.go`) consumes that welcome **once** (gated on
+  `awaitingWelcome`): `suspended`→`suspended=true` + `stopped reason=pause` (tid
+  defaults to 1 — the engine inspects the currently-stopped goroutine regardless
+  of the DAP threadId); `exited`→`terminated`; idle/running→nothing. For the
+  normal launch/attach path `awaitingWelcome` is never set, so it is a no-op
+  there (the entry stop drives the initial state instead).
+- `onConfigurationDone`'s `joining` branch responds to the attach but does NOT
+  `pendingContinues++`, resume, or fabricate an entry stop.
+
 ### Event → DAP mapping
 
 `EventStepped`(entry)=handshake signal; `EventStepped`(step)→`stopped`
 reason=step; `EventBreakpointHit`→`stopped` reason=breakpoint;
 `EventPanic`→reason=exception; `EventPaused`→reason=pause;
 `EventProcessExited`→`exited`(code)+`terminated`; `EventOutput`→`output`;
-`EventRestarted`→delayed `restart` response; `EventSessionState`→ignored
-(no DAP equivalent).
+`EventRestarted`→delayed `restart` response; `EventSessionState`→ignored on the
+launch/attach path, but consumed **once** as the initial state on the join path
+(see *Joining an existing session*).
 
 `EventContinued` → DAP `continued` **only for out-of-band resumes**. The Handler
 increments `pendingContinues` before enqueuing its OWN continue and decrements it
@@ -802,6 +830,17 @@ first-writer-wins). The recommended posture is DAP-drives + WebSocket-observes,
 but multi-driver resume/step works because those events fan out to everyone; the
 only fragility is the id-less confirmation FIFO above.
 
+**Interactive DAP client (`cmd/dapcli`).** A readline REPL mirroring `cmd/cli`'s
+command set/UX but speaking DAP over TCP (`just dapcli`, default `-addr
+localhost:4711`). Without `-session` it creates a session on the first
+`launch`/`attach` (DAP has no standalone "create session" request) and captures
+the announced id from the `console` output for `state`/discovery; with `-session
+<id>` it JOINS via the `onJoin` path above. `launch`/`attach` default
+`stopOnEntry:true` so the interactive user always gets control and the tracee
+stays alive for others to join. It buffers `break`s set before launch and flushes
+them on `initialized`. Any mix of `dapcli` and `cli` clients can drive/observe
+one session concurrently.
+
 **Option Y (rejected).** The alternative was teaching the hub about DAP directly
 (a second protocol path through `internal/hub`). Rejected: it would fork the most
 fragile fan-out/suspend-gate code for a second protocol. The `hub.WSConn`
@@ -821,12 +860,16 @@ translator keeps DAP entirely outside the hub — a strictly additive package.
   `internal/dap.Handler` → hub → debugger → tracee), see
   [debugger_e2e_dap_test.go](test/integration/debugger_e2e_dap_test.go).
   `declareDAPSpec` (single driver: launch→bp→inspect threads/stack/vars→resume
-  re-hits bp), `declareDAPExitSpec` (clean exit → `exited`+`terminated`), and
+  re-hits bp), `declareDAPExitSpec` (clean exit → `exited`+`terminated`),
   `declareDAPMultiClientSpec` (**1 DAP driver + N WebSocket observers on one
   session all witness the same breakpoint hit** — the coexistence proof;
-  `BINGO_E2E_DAP_OBSERVERS`, default 3). All three run in BOTH the linux and
-  darwin containers (the translator is platform-agnostic; only the backend
-  differs). CI: the `dap` label runs in the `fullstack-*` jobs of
+  `BINGO_E2E_DAP_OBSERVERS`, default 3), and `declareDAPJoinSpec` (**a SECOND DAP
+  client joins an already-suspended session by id — the `onJoin` path — inspects
+  it, then DRIVES a continue that the original DAP driver and a WebSocket observer
+  both witness out of band** — the many-DAP-drivers-per-session proof). All four
+  run in BOTH the linux and darwin containers (the translator is platform-
+  agnostic; only the backend differs). CI: the `dap` label runs in the
+  `fullstack-*` jobs of
   [debugger-e2e.yml](.github/workflows/debugger-e2e.yml).
 
 ## Error handling
@@ -883,7 +926,9 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   Adapter Protocol client over TCP through the SAME whole stack (go-dap client →
   TCP → internal/dap.Handler → hub → debugger → tracee) and, in the multi-client
   spec, attaches N WebSocket observers to the DAP-driven session to prove DAP +
-  WebSocket coexist (see the DAP section above). The `pause` spec
+  WebSocket coexist, and in the join spec attaches a SECOND DAP client to an
+  existing session to prove many DAP drivers coexist (see the DAP section above).
+  The `pause` spec
   (`declarePauseSpec`) is
   wired into **both** the linux and darwin containers — detection is
   platform-agnostic in the engine and each backend's `StopProcess()` surfaces the
