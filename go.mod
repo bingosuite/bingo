@@ -2,7 +2,10 @@ module github.com/bingosuite/bingo
 
 go 1.25.5
 
-tool github.com/evilmartians/lefthook
+tool (
+	github.com/evilmartians/lefthook
+	golang.org/x/tools/cmd/goimports
+)
 
 require (
 	github.com/chzyer/readline v1.5.1

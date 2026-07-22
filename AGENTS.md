@@ -46,7 +46,7 @@ follow them so reviews stay about substance, not style.
 ### Code style
 
 - `gofmt` / `goimports` are mandatory — the lefthook pre-commit hook runs
-  `goimports -w` on staged `*.go` files. Match the surrounding style otherwise.
+  `go tool goimports -w` on staged `*.go` files. Match the surrounding style otherwise.
 - Make surgical, focused changes. Don't opportunistically reformat or refactor
   unrelated code in the same commit.
 - Return errors; don't `panic` in server/hub/debugger control paths. Panics
