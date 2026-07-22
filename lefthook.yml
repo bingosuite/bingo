@@ -6,7 +6,7 @@ pre-commit:
   commands:
     imports:
       glob: "*.go"
-      run: goimports -w {staged_files} && git add {staged_files}
+      run: go tool goimports -w {staged_files} && git add {staged_files}
 
 commit-msg:
   commands:
