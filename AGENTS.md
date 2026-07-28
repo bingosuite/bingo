@@ -488,9 +488,89 @@ are detected by a `mach_msg` receive loop.
   address with line > afterLine. After a step-over completes we **prefer the
   remembered destination** over re-querying `locationForPC` from the new PC,
   because the new PC can land on a DWARF entry with line==0.
+- `locationForPC` must **bracket** the PC (`prev.Address <= pc < next.Address`,
+  `prev` a non-end-sequence row), not merely pick the greatest address `<= pc`.
+  Go emits CUs with `DW_AT_ranges` (no contiguous low/high pc), so `cuContainsPC`
+  can't pre-filter them and every CU is scanned; without the bracket check a CU
+  whose whole line program lies below `pc` would falsely "match" on its trailing
+  end-sequence row and return a bogus file:line. The function name comes from the
+  independent `funcIndex` (binary search over subprograms) and is always right;
+  only the file:line needs the bracket. This matters for the goroutine snapshot,
+  which resolves creation-site file:line for many off-CPU PCs.
+- Runtime-introspection helpers (`runtimeVarAddr`, `structMemberOffset`,
+  `runtimeArrayInfo`) resolve a package var's address, a struct field's byte
+  offset, and an array's base/count/stride from DWARF **by name** (cached). They
+  back the goroutine/thread snapshot reader (`goroutines.go`), which never
+  hardcodes runtime layout — offsets shift between Go versions. See the
+  concurrency snapshot section below.
 - `LocalsForFrame` only handles `DW_OP_addr` (0x03) and `DW_OP_fbreg` (0x91).
   Register-allocated variables come back as `<optimized out>`. Values are
   read as 8 bytes and returned hex; type-aware formatting is a TODO.
+
+## Goroutine / thread snapshot — the concurrency data foundation
+
+Source: [internal/debugger/goroutines.go](internal/debugger/goroutines.go)
+(reader) + the emit sites in [engine.go](internal/debugger/engine.go).
+
+**What it is / why.** The data foundation for concurrency visualization (a
+goroutine-spawn-hierarchy tree, a live-thread view, lifecycle tracking). It
+reads the Go runtime's `runtime.allgs` (every goroutine) and `runtime.allm`
+(every OS thread) straight from tracee memory via DWARF-resolved struct offsets,
+and streams a `GoroutineSnapshotPayload` carrying: the goroutine set with
+`ParentID` spawn linkage, each goroutine's `StartLoc` (startpc) and `CreatedLoc`
+(the `go` statement, gopc), the thread set, the current goroutine, and
+**created/exited goid deltas** since the previous snapshot.
+
+**Version 1.1** (`pkg/protocol`): reshaped `Goroutine` (added `ParentID`,
+`StartLoc`, `CreatedLoc`, `ThreadID`, `Current`; renamed `GoLoc`→`CreatedLoc`),
+new `Thread`, new `GoroutineSnapshotPayload`, new `EventGoroutineSnapshot` +
+`CmdGoroutineSnapshot`.
+
+**Streaming cadence (the load-bearing invariant).** `EventGoroutineSnapshot` is
+auto-emitted on exactly the suspends that can change the concurrency picture —
+**breakpoint hit, pause, and the launch/attach entry stop** — and on demand via
+`CmdGoroutineSnapshot`. It is **NOT** emitted per step: `emitStepped` stays cheap
+(embeds a synthetic single goroutine, no `allgs` scan) to protect the fragile
+single-step/step-over path from extra per-step memory reads. `emitBreakpointHit`
+/ `emitPaused` build the snapshot **once**, embed its current goroutine in the
+stop event, then stream the same snapshot — one build, no double scan, no double
+delta pass.
+
+**Not a suspending event.** It follows a suspending event (or answers a query)
+and never gates the hub. DAP `translateEvent` **deliberately ignores** it:
+translating it would corrupt the FIFO that correlates a DAP `threads` request to
+`EventGoroutines` (snapshots are unsolicited, with no matching request). DAP
+clients get goroutine data from the `threads` request (`EventGoroutines`, which
+now returns the rich list); the snapshot stream is WebSocket-only.
+
+**Lifecycle deltas.** `engine.prevGoids` (loop-thread-only, no lock, like
+`manualStopPending`) remembers the previous live goid set; `diffGoids` returns
+created/exited and adopts the new set. First snapshot returns nil deltas (a fresh
+session must not report every goroutine as "created"). A **degraded** snapshot
+(runtime unreadable — e.g. the pre-init entry stop) does **not** touch
+`prevGoids`: an empty read must not look like every goroutine exited.
+
+**Graceful fallback.** Every read is best-effort. `resolveGoLayout` marks the
+layout invalid if any required `g`/`gobuf`/`stack`/`m` offset is missing, and any
+unreadable address degrades the whole snapshot to the legacy single synthetic
+goroutine (`ID:1, Status:"waiting"`, current PC) rather than erroring the stop.
+This preserves behavior for stripped binaries / attach-without-DWARF and keeps
+the `fakeBackend` engine unit tests green.
+
+**Current goroutine = SP-containment** (platform-independent): the stopped
+thread's SP within `[g.stack.lo, g.stack.hi)`. The current *thread* is the M
+whose `curg` goid equals the current goid. A non-current goroutine's
+`CurrentLoc` uses `gobuf.pc` (where it resumes); the current one uses the live
+PC. Status strings are hardcoded (stable across Go versions); wait-reason
+strings are read dynamically from `runtime.waitReasonStrings`. Goroutines with
+goid<=0 or status `_Gdead` (scan bit stripped) are filtered out — their exit
+surfaces in the next Exited delta.
+
+**Note on `go f(args)` wrappers.** A goroutine started with arguments gets a
+compiler-generated `<caller>.gowrapN` closure as its startpc, so `StartLoc`
+resolves to the wrapper, not `f`. Argument-less `go f()` points startpc straight
+at `f`. `CreatedLoc` (the `go` statement site) and `ParentID` are unaffected —
+they're the robust identifiers for a spawn tree.
 
 ## Logging — one injected logger per component
 
@@ -770,7 +850,10 @@ reason=step; `EventBreakpointHit`→`stopped` reason=breakpoint;
 `EventProcessExited`→`exited`(code)+`terminated`; `EventOutput`→`output`;
 `EventRestarted`→delayed `restart` response; `EventSessionState`→ignored on the
 launch/attach path, but consumed **once** as the initial state on the join path
-(see *Joining an existing session*).
+(see *Joining an existing session*); `EventGoroutineSnapshot`→**deliberately
+ignored** (WebSocket-only concurrency stream with no DAP equivalent; translating
+it would corrupt the `threads`→`EventGoroutines` FIFO — see the goroutine
+snapshot section).
 
 `EventContinued` → DAP `continued` **only for out-of-band resumes**. The Handler
 increments `pendingContinues` before enqueuing its OWN continue and decrements it
@@ -914,7 +997,11 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   (a cleared breakpoint stops firing), `kill` (Kill terminates a
   freely-running tracee), `exit` (EventProcessExited reports the tracee's real
   exit code), `attach` (attach by PID to an already-running tracee — one the
-  debugger did not launch — then breakpoint it), and `restart` (hub-level
+  debugger did not launch — then breakpoint it), `concurrency` (the
+  goroutine/thread snapshot data foundation — drives a known spawn-tree target
+  and asserts parent linkage, start/created locations, the thread set with a
+  single current thread, and created/exited lifecycle deltas across stops), and
+  `restart` (hub-level
   kill+relaunch reinstalls
   breakpoints and reruns from the top), all driving `debugger.Debugger`
   in-process (except `restart`/`fullstack`/`dap`, which go through the stack); plus
@@ -940,7 +1027,8 @@ side `chan error` — every debugger outcome, failures included, rides the singl
 
   **Platform scoping — both containers run the full set.** The darwin container
   wires the same specs as linux: `basic`, `stepping`, `breakpoints`, `churn`,
-  `kill`, `exit`, `attach`, `pause`, `inspect`, `restart`, `fullstack`, and `dap`,
+  `kill`, `exit`, `attach`, `concurrency`, `pause`, `inspect`, `restart`,
+  `fullstack`, and `dap`,
   plus the
   darwin-only `hygiene` (Mach exception port-right leak regression). This was NOT
   always so:
@@ -1044,7 +1132,17 @@ through the justfile.
 ## When you change something
 
 - **Wire protocol** (`pkg/protocol`): bump `Version` for breaking changes,
-  and update the round-trip table in `protocol_test.go`.
+  and update the round-trip table in `protocol_test.go`. Currently **1.1** (the
+  goroutine/thread concurrency snapshot reshaped `Goroutine` and added
+  `Thread`/`GoroutineSnapshotPayload` + `EventGoroutineSnapshot`/
+  `CmdGoroutineSnapshot`).
+- **Goroutine snapshot layout**: the reader resolves runtime struct offsets from
+  DWARF **by name** (`goroutines.go`), never hardcoded. If you add a field, add
+  it to `goLayout`/`resolveGoLayout`; a missing *required* offset invalidates the
+  layout and falls back to the synthetic goroutine — keep new fields optional
+  unless they're truly required. Preserve the streaming-cadence invariant
+  (snapshot on breakpoint/pause/entry, never per-step) and the degraded-snapshot
+  rule (don't touch `prevGoids` on an unreadable read).
 - **Suspend/resume sets**: update both `suspendingEvents` and
   `resumingCommands` in [hub.go](internal/hub/hub.go), and the matching
   hub_test cases.

@@ -40,6 +40,7 @@ type fakeDebugger struct {
 	localsResult     []protocol.Variable
 	framesResult     []protocol.Frame
 	goroutinesResult []protocol.Goroutine
+	snapshotResult   protocol.GoroutineSnapshotPayload
 }
 
 func newFakeDebugger() *fakeDebugger {
@@ -98,6 +99,10 @@ func (f *fakeDebugger) StackFrames() ([]protocol.Frame, error) {
 func (f *fakeDebugger) Goroutines() ([]protocol.Goroutine, error) {
 	f.record("Goroutines")
 	return f.goroutinesResult, nil
+}
+func (f *fakeDebugger) GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error) {
+	f.record("GoroutineSnapshot")
+	return f.snapshotResult, nil
 }
 
 type fakeWSConn struct {

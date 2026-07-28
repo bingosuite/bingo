@@ -28,6 +28,13 @@ func (h *Handler) translateEvent(evt protocol.Event) {
 		h.onFrames(evt)
 	case protocol.EventGoroutines:
 		h.onGoroutines(evt)
+	case protocol.EventGoroutineSnapshot:
+		// Deliberately ignored. The auto-streamed concurrency snapshot has no
+		// DAP equivalent, and translating it would corrupt the FIFO that
+		// correlates a DAP `threads` request to EventGoroutines (snapshots are
+		// broadcast unsolicited, with no matching request). DAP clients that
+		// want goroutine data use the threads request; the rich snapshot is a
+		// WebSocket-only concurrency-visualization stream.
 	case protocol.EventRestarted:
 		h.onRestarted()
 	case protocol.EventError:

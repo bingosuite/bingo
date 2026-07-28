@@ -29,9 +29,20 @@ var sampleBreakpoint = protocol.Breakpoint{
 
 var sampleGoroutine = protocol.Goroutine{
 	ID:         1,
+	ParentID:   0,
 	Status:     "waiting",
 	CurrentLoc: sampleLocation,
-	GoLoc:      protocol.Location{File: "runtime/proc.go", Line: 10},
+	StartLoc:   protocol.Location{File: "main.go", Line: 30, Function: "main.worker"},
+	CreatedLoc: protocol.Location{File: "runtime/proc.go", Line: 10},
+}
+
+var sampleThread = protocol.Thread{
+	ID:         4321,
+	MID:        3,
+	GoID:       1,
+	Spinning:   false,
+	CurrentLoc: sampleLocation,
+	Current:    true,
 }
 
 var sampleFrames = []protocol.Frame{
@@ -281,6 +292,29 @@ var _ = Describe("Event", func() {
 				},
 			),
 
+			Entry("GoroutineSnapshot",
+				protocol.EventGoroutineSnapshot,
+				protocol.GoroutineSnapshotPayload{
+					Goroutines: []protocol.Goroutine{sampleGoroutine},
+					Threads:    []protocol.Thread{sampleThread},
+					Current:    1,
+					Created:    []int{7, 8},
+					Exited:     []int{3},
+				},
+				func(e protocol.Event) {
+					var p protocol.GoroutineSnapshotPayload
+					Expect(protocol.DecodeEventPayload(e, &p)).To(Succeed())
+					Expect(p.Goroutines).To(HaveLen(1))
+					Expect(p.Goroutines[0].StartLoc.Function).To(Equal("main.worker"))
+					Expect(p.Threads).To(HaveLen(1))
+					Expect(p.Threads[0].ID).To(Equal(4321))
+					Expect(p.Threads[0].Current).To(BeTrue())
+					Expect(p.Current).To(Equal(1))
+					Expect(p.Created).To(Equal([]int{7, 8}))
+					Expect(p.Exited).To(Equal([]int{3}))
+				},
+			),
+
 			Entry("Error with command",
 				protocol.EventError,
 				protocol.ErrorPayload{Command: protocol.CmdSetBreakpoint, Message: "address not found"},
@@ -498,6 +532,14 @@ var _ = Describe("Command", func() {
 				json.RawMessage(`{}`),
 				func(c protocol.Command) {
 					Expect(c.Kind).To(Equal(protocol.CmdGoroutines))
+				},
+			),
+
+			Entry("GoroutineSnapshot",
+				protocol.CmdGoroutineSnapshot,
+				json.RawMessage(`{}`),
+				func(c protocol.Command) {
+					Expect(c.Kind).To(Equal(protocol.CmdGoroutineSnapshot))
 				},
 			),
 

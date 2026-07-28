@@ -129,6 +129,17 @@ func dispatch(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, erro
 		}
 		return dispatchResult{event: &evt}, nil
 
+	case protocol.CmdGoroutineSnapshot:
+		snap, err := dbg.GoroutineSnapshot()
+		if err != nil {
+			return dispatchResult{}, err
+		}
+		evt, err := protocol.NewEvent(protocol.EventGoroutineSnapshot, 0, snap)
+		if err != nil {
+			return dispatchResult{}, err
+		}
+		return dispatchResult{event: &evt}, nil
+
 	default:
 		return dispatchResult{}, fmt.Errorf("unknown command kind: %q", cmd.Kind)
 	}
