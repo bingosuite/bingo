@@ -4,7 +4,7 @@ package protocol
 
 import "encoding/json"
 
-const Version = "1.0"
+const Version = "1.1"
 
 // Event is the envelope for all server-to-client messages.
 type Event struct {
@@ -49,6 +49,15 @@ const (
 	EventFrames     EventKind = "Frames"
 	EventGoroutines EventKind = "Goroutines"
 
+	// EventGoroutineSnapshot streams the full concurrency picture (goroutines
+	// with parent linkage, OS threads, current goroutine, and created/exited
+	// lifecycle deltas). It is emitted automatically on every suspend that can
+	// change that picture — breakpoint hit, pause, and launch/attach entry —
+	// and on demand in response to CmdGoroutineSnapshot. It is NOT a suspending
+	// event: it follows a suspending event (or answers a query) and never gates
+	// the hub. See AGENTS.md → goroutine snapshot streaming.
+	EventGoroutineSnapshot EventKind = "GoroutineSnapshot"
+
 	EventSessionState EventKind = "SessionState"
 
 	EventError EventKind = "Error"
@@ -88,6 +97,12 @@ const (
 	CmdLocals     CommandKind = "Locals"
 	CmdFrames     CommandKind = "Frames"
 	CmdGoroutines CommandKind = "Goroutines"
+
+	// CmdGoroutineSnapshot requests a full concurrency snapshot on demand
+	// (answered with EventGoroutineSnapshot). The same snapshot is also pushed
+	// automatically on each suspend, so a UI only needs this to refresh out of
+	// band (e.g. right after connecting). Requires the process to be suspended.
+	CmdGoroutineSnapshot CommandKind = "GoroutineSnapshot"
 
 	// CmdRestart kills the current process (if any) and relaunches the last
 	// Launch'd binary, reinstalling previously-set breakpoints. Only

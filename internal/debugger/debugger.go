@@ -51,6 +51,12 @@ type Debugger interface {
 	StackFrames() ([]protocol.Frame, error)
 	Goroutines() ([]protocol.Goroutine, error)
 
+	// GoroutineSnapshot returns the full concurrency picture — every goroutine
+	// (with parent linkage), every OS thread, the current goroutine, and the
+	// created/exited lifecycle deltas since the previous snapshot. Requires the
+	// process to be suspended.
+	GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error)
+
 	// Events delivers async notifications. Closed on shutdown; caller must drain.
 	Events() <-chan protocol.Event
 }

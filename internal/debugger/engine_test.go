@@ -118,15 +118,26 @@ func (f *fakeBackend) Wait() (debugger.StopEvent, error) {
 
 const eventTimeout = 500 * time.Millisecond
 
+// nextEvent returns the next event, transparently skipping the auxiliary
+// EventGoroutineSnapshot stream. Snapshots are emitted alongside stop events
+// (breakpoint/pause/entry) as an out-of-band concurrency feed; ordering-based
+// assertions here care about the primary event flow, so they are filtered out.
+// A test that specifically exercises snapshots reads d.Events() directly.
 func nextEvent(d debugger.Debugger) (protocol.Event, bool) {
-	select {
-	case evt, ok := <-d.Events():
-		if !ok {
+	deadline := time.After(eventTimeout)
+	for {
+		select {
+		case evt, ok := <-d.Events():
+			if !ok {
+				return protocol.Event{}, false
+			}
+			if evt.Kind == protocol.EventGoroutineSnapshot {
+				continue
+			}
+			return evt, true
+		case <-deadline:
 			return protocol.Event{}, false
 		}
-		return evt, true
-	case <-time.After(eventTimeout):
-		return protocol.Event{}, false
 	}
 }
 

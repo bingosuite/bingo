@@ -94,6 +94,16 @@ type engine struct {
 	// the single engine loop thread. See AGENTS.md → Pause.
 	manualStopPending bool
 
+	// goLayout caches the DWARF-resolved runtime struct offsets used by the
+	// goroutine/thread snapshot reader. Resolved lazily per loaded image and
+	// reset in loadDWARF. nil until first use; see goroutines.go.
+	goLayout *goLayout
+
+	// prevGoids is the set of live goids from the previous snapshot, used to
+	// compute created/exited lifecycle deltas. Loop-thread-only (like
+	// manualStopPending); needs no synchronization. See goroutines.go.
+	prevGoids map[int]struct{}
+
 	// log is the single sink for all engine logging. Never call the
 	// package-level slog functions directly — they bypass the per-session
 	// logger the hub/server configure, producing duplicate, uncorrelated
@@ -430,6 +440,24 @@ func (e *engine) Goroutines() ([]protocol.Goroutine, error) {
 		return err
 	})
 	return goroutines, err
+}
+
+// GoroutineSnapshot returns the full concurrency picture on demand: every
+// goroutine (with parent linkage for a spawn tree), every OS thread, the
+// current goroutine, and the created/exited lifecycle deltas since the previous
+// snapshot. Only valid while suspended (the tracee must be stopped for the
+// memory reads to be race-free). Like the auto-streamed snapshots it advances
+// the lifecycle-delta baseline.
+func (e *engine) GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error) {
+	var snap protocol.GoroutineSnapshotPayload
+	err := e.dispatch(func() error {
+		if err := e.requireSuspended(); err != nil {
+			return err
+		}
+		snap = e.goroutineSnapshot()
+		return nil
+	})
+	return snap, err
 }
 
 func (e *engine) loop() {
@@ -1035,29 +1063,11 @@ func (e *engine) walkStack(regs Registers) []uint64 {
 	return pcs
 }
 
-func (e *engine) readGoroutines() ([]protocol.Goroutine, error) {
-	// Report the stopped thread's location (curTID via activeTID); threads[0] may
-	// be an idle runtime M and would misreport where execution is paused.
-	tid, err := e.activeTID()
-	if err != nil {
-		return nil, nil
-	}
-	regs, err := e.backend.GetRegisters(tid)
-	if err != nil {
-		return nil, fmt.Errorf("Goroutines: %w", err)
-	}
-	loc := protocol.Location{}
-	if e.dw != nil {
-		loc = e.dw.locationForPC(regs.PC)
-	}
-	return []protocol.Goroutine{{
-		ID:         1,
-		Status:     "waiting",
-		CurrentLoc: loc,
-	}}, nil
-}
-
 func (e *engine) loadDWARF(binaryPath string) {
+	// A new image invalidates the cached runtime struct offsets and the
+	// lifecycle delta baseline.
+	e.goLayout = nil
+	e.prevGoids = nil
 	dr, err := openDWARF(binaryPath)
 	if err != nil {
 		e.dw = nil
@@ -1106,16 +1116,23 @@ func (e *engine) emitBreakpointHit(bp *breakpointEntry, stop StopEvent) {
 	// resume.
 	e.manualStopPending = false
 	frames, _ := e.collectFrames(stop.TID)
-	goroutines, _ := e.readGoroutines()
-	var g protocol.Goroutine
-	if len(goroutines) > 0 {
-		g = goroutines[0]
-	}
+	// Build the concurrency snapshot once: the current goroutine is embedded in
+	// the stop event, then the full snapshot is streamed as its own event. One
+	// build avoids a double allgs scan and a double lifecycle-delta pass.
+	snap := e.goroutineSnapshot()
 	e.emit(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{
 		Breakpoint: bp.toProtocol(),
-		Goroutine:  g,
+		Goroutine:  currentGoroutineFrom(snap),
 		Frames:     frames,
 	})
+	e.emit(protocol.EventGoroutineSnapshot, snap)
+}
+
+// emitGoroutineSnapshot builds and streams a standalone concurrency snapshot.
+// Used at the entry stop and on the CmdGoroutineSnapshot on-demand path. It is
+// a non-suspending event, so the hub forwards it without gating.
+func (e *engine) emitGoroutineSnapshot() {
+	e.emit(protocol.EventGoroutineSnapshot, e.goroutineSnapshot())
 }
 
 // emitStoppedAtCurrentPC emits EventStepped at the current PC (used after
@@ -1130,6 +1147,12 @@ func (e *engine) emitStoppedAtCurrentPC() {
 		}
 	}
 	e.emitStepped(stop)
+	// The entry stop is the one Stepped that carries a full snapshot: it seeds a
+	// UI with the initial goroutine/thread picture and establishes the
+	// lifecycle-delta baseline. Regular steps stay cheap (no snapshot). At the
+	// very first entry the runtime may be pre-init, so the snapshot degrades to
+	// the synthetic goroutine.
+	e.emitGoroutineSnapshot()
 }
 
 func (e *engine) emitStepped(stop StopEvent) {
@@ -1140,17 +1163,16 @@ func (e *engine) emitStepped(stop StopEvent) {
 	// Pause the same way a breakpoint hit does (see emitBreakpointHit).
 	e.manualStopPending = false
 	frames, _ := e.collectFrames(stop.TID)
-	goroutines, _ := e.readGoroutines()
-	var g protocol.Goroutine
-	if len(goroutines) > 0 {
-		g = goroutines[0]
-	}
 	loc := protocol.Location{}
 	if e.dw != nil {
 		loc = e.dw.locationForPC(stop.PC)
 	}
+	// Steps are high-frequency and must stay cheap: embed a synthetic goroutine
+	// for the stopped thread rather than scanning runtime.allgs. The rich
+	// snapshot is streamed only on breakpoint/pause/entry stops, protecting the
+	// fragile single-step/step-over path from extra per-step memory reads.
 	e.emit(protocol.EventStepped, protocol.SteppedPayload{
-		Goroutine: g,
+		Goroutine: e.syntheticGoroutine(stop.PC),
 		Location:  loc,
 		Frames:    frames,
 	})
@@ -1158,26 +1180,24 @@ func (e *engine) emitStepped(stop StopEvent) {
 
 // emitPaused reports an asynchronous Pause halt. It mirrors emitStepped but
 // carries EventPaused/PausedPayload: the location is wherever execution was
-// interrupted, not a source-line boundary.
+// interrupted, not a source-line boundary. Like a breakpoint hit it also
+// streams a full concurrency snapshot.
 func (e *engine) emitPaused(stop StopEvent) {
 	if stop.TID != 0 {
 		e.curTID = stop.TID
 	}
 	frames, _ := e.collectFrames(stop.TID)
-	goroutines, _ := e.readGoroutines()
-	var g protocol.Goroutine
-	if len(goroutines) > 0 {
-		g = goroutines[0]
-	}
+	snap := e.goroutineSnapshot()
 	loc := protocol.Location{}
 	if e.dw != nil {
 		loc = e.dw.locationForPC(stop.PC)
 	}
 	e.emit(protocol.EventPaused, protocol.PausedPayload{
-		Goroutine: g,
+		Goroutine: currentGoroutineFrom(snap),
 		Location:  loc,
 		Frames:    frames,
 	})
+	e.emit(protocol.EventGoroutineSnapshot, snap)
 }
 
 // emitContinued reports that the tracee has resumed free execution in response

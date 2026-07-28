@@ -389,6 +389,22 @@ func (c *wsClient) Goroutines() ([]protocol.Goroutine, error) {
 	return p.Goroutines, nil
 }
 
+func (c *wsClient) GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error) {
+	cmd, err := newCommand(protocol.CmdGoroutineSnapshot, struct{}{})
+	if err != nil {
+		return protocol.GoroutineSnapshotPayload{}, err
+	}
+	evt, err := c.sendAndWait(cmd, protocol.EventGoroutineSnapshot)
+	if err != nil {
+		return protocol.GoroutineSnapshotPayload{}, err
+	}
+	var p protocol.GoroutineSnapshotPayload
+	if err := protocol.DecodeEventPayload(evt, &p); err != nil {
+		return protocol.GoroutineSnapshotPayload{}, fmt.Errorf("decode GoroutineSnapshot: %w", err)
+	}
+	return p, nil
+}
+
 // Close disconnects from the server. Safe to call multiple times.
 func (c *wsClient) Close() error {
 	c.signalDone()
