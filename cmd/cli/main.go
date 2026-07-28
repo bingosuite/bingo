@@ -238,13 +238,16 @@ func main() {
 				continue
 			}
 			for _, g := range grs {
-				loc := fmt.Sprintf("%s:%d", g.CurrentLoc.File, g.CurrentLoc.Line)
-				if g.WaitReason != "" {
-					fmt.Printf("  G%-4d %-10s %s  (%s)\n", g.ID, g.Status, loc, g.WaitReason)
-				} else {
-					fmt.Printf("  G%-4d %-10s %s\n", g.ID, g.Status, loc)
-				}
+				printGoroutine(g)
 			}
+
+		case "snapshot", "snap":
+			snap, err := c.GoroutineSnapshot()
+			if err != nil {
+				printErr(err)
+				continue
+			}
+			printSnapshot(snap)
 
 		case "help", "h", "?":
 			printHelp()
@@ -329,8 +332,70 @@ func printEvent(evt protocol.Event) {
 				p.Program, len(p.Breakpoints), len(p.Discarded))
 		}
 
+	case protocol.EventGoroutineSnapshot:
+		var p protocol.GoroutineSnapshotPayload
+		if protocol.DecodeEventPayload(evt, &p) == nil {
+			msg := fmt.Sprintf("\n  [goroutines] %d live, %d threads, current G%d",
+				len(p.Goroutines), len(p.Threads), p.Current)
+			if len(p.Created) > 0 {
+				msg += fmt.Sprintf(", +%v", p.Created)
+			}
+			if len(p.Exited) > 0 {
+				msg += fmt.Sprintf(", -%v", p.Exited)
+			}
+			fmt.Print(msg + "\nbingo> ")
+		}
+
 	default:
 		fmt.Printf("\n  [%s] seq=%d\nbingo> ", evt.Kind, evt.Seq)
+	}
+}
+
+// printGoroutine renders one goroutine line, marking the current one and
+// showing parent linkage and its start function so a spawn tree is visible.
+func printGoroutine(g protocol.Goroutine) {
+	marker := " "
+	if g.Current {
+		marker = "*"
+	}
+	loc := fmt.Sprintf("%s:%d", g.CurrentLoc.File, g.CurrentLoc.Line)
+	line := fmt.Sprintf("%s G%-4d %-10s %s", marker, g.ID, g.Status, loc)
+	if g.ParentID != 0 {
+		line += fmt.Sprintf("  <-G%d", g.ParentID)
+	}
+	if g.StartLoc.Function != "" {
+		line += fmt.Sprintf("  start=%s", g.StartLoc.Function)
+	}
+	if g.WaitReason != "" {
+		line += fmt.Sprintf("  (%s)", g.WaitReason)
+	}
+	fmt.Println(line)
+}
+
+// printSnapshot renders a full concurrency snapshot: goroutines (with spawn
+// linkage), OS threads, and the created/exited lifecycle deltas.
+func printSnapshot(snap protocol.GoroutineSnapshotPayload) {
+	fmt.Printf("  goroutines: %d  threads: %d  current: G%d\n",
+		len(snap.Goroutines), len(snap.Threads), snap.Current)
+	for _, g := range snap.Goroutines {
+		printGoroutine(g)
+	}
+	for _, t := range snap.Threads {
+		marker := " "
+		if t.Current {
+			marker = "*"
+		}
+		spin := ""
+		if t.Spinning {
+			spin = " spinning"
+		}
+		fmt.Printf("%s M%-4d tid=%-6d G%d%s\n", marker, t.MID, t.ID, t.GoID, spin)
+	}
+	if len(snap.Created) > 0 {
+		fmt.Printf("  created: %v\n", snap.Created)
+	}
+	if len(snap.Exited) > 0 {
+		fmt.Printf("  exited:  %v\n", snap.Exited)
 	}
 }
 
@@ -371,7 +436,8 @@ func printHelp() {
 
   locals [frame]             show local variables (default frame 0)
   bt / backtrace             show call stack
-  goroutines / grs           list goroutines
+  goroutines / grs           list goroutines (with parent/start)
+  snapshot / snap            full concurrency snapshot (goroutines + threads + deltas)
 
   help / h / ?               show this help
   quit / q / exit            disconnect and exit`)

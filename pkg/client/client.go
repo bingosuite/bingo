@@ -52,6 +52,11 @@ type Client interface {
 	StackFrames() ([]protocol.Frame, error)
 	Goroutines() ([]protocol.Goroutine, error)
 
+	// GoroutineSnapshot blocks until the server returns the full concurrency
+	// snapshot: every goroutine (with parent linkage), every OS thread, the
+	// current goroutine, and the created/exited lifecycle deltas.
+	GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error)
+
 	Close() error
 }
 

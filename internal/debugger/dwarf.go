@@ -33,6 +33,23 @@ type dwarfReader struct {
 	// wedge the single-threaded engine loop past the client's timeout.
 	funcIndexOnce sync.Once
 	funcIndex     []funcRange
+
+	// cacheMu guards the lazily-populated runtime-introspection caches below.
+	// Struct layouts and variable addresses never change for a loaded image, so
+	// each is resolved from DWARF at most once. Inspection already runs on the
+	// serialized engine loop, but these are guarded anyway so the reader is safe
+	// to share.
+	cacheMu    sync.Mutex
+	varAddrs   map[string]uint64       // package var name → runtime DW_OP_addr (slid); 0 means "resolved, absent"
+	structOffs map[string]structLayout // struct name → member offsets
+}
+
+// structLayout maps a struct's member names to their byte offsets. found is
+// false when the struct type was absent from DWARF, so callers can distinguish
+// "no such struct" from "struct with a zero-offset first member".
+type structLayout struct {
+	found   bool
+	offsets map[string]int64
 }
 
 // funcRange is one subprogram's DWARF PC range (unslid) and name.
@@ -182,25 +199,28 @@ func (r *dwarfReader) locationForPC(pc uint64) protocol.Location {
 			continue
 		}
 
-		// Keep the entry whose address is the greatest <= dwarfPC.
-		var best dwarf.LineEntry
-		var found bool
+		// Keep the entry that brackets dwarfPC: prev.Address <= dwarfPC <
+		// next.Address, with prev a real (non-end-sequence) row. Merely being
+		// the greatest address <= dwarfPC is not enough — a CU whose whole line
+		// program lies below dwarfPC would otherwise match on its trailing
+		// end-sequence row and return a bogus file:line. Go emits CUs with
+		// DW_AT_ranges (no contiguous low/high pc), so cuContainsPC can't
+		// pre-filter them; the bracket check is what makes the lookup correct.
+		var prev dwarf.LineEntry
+		var havePrev bool
 		var le dwarf.LineEntry
 		for {
 			if err := lr.Next(&le); err != nil {
 				break
 			}
-			if le.Address <= dwarfPC {
-				best = le
-				found = true
-			} else {
-				break
+			if havePrev && !prev.EndSequence && prev.File != nil &&
+				prev.Address <= dwarfPC && dwarfPC < le.Address {
+				loc.File = prev.File.Name
+				loc.Line = prev.Line
+				return loc
 			}
-		}
-		if found && best.File != nil {
-			loc.File = best.File.Name
-			loc.Line = best.Line
-			return loc
+			prev = le
+			havePrev = true
 		}
 	}
 	return loc
@@ -431,6 +451,213 @@ func decodeSLEB128(b []byte) (int64, int) {
 			}
 			return result, i + 1
 		}
+	}
+	return result, len(b)
+}
+
+// --- Runtime introspection helpers -----------------------------------------
+//
+// These resolve Go-runtime symbols and struct layouts straight from DWARF so
+// the goroutine/thread reader never hardcodes offsets, which shift between Go
+// versions. See AGENTS.md → goroutine snapshot reading.
+
+// runtimeVarAddr returns the runtime (slid) address of a package-level variable
+// declared with a DW_OP_addr location (e.g. runtime.allgs, runtime.allm). The
+// second result is false when the variable is absent or not a static address.
+func (r *dwarfReader) runtimeVarAddr(name string) (uint64, bool) {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	if r.varAddrs == nil {
+		r.varAddrs = make(map[string]uint64)
+	}
+	if addr, ok := r.varAddrs[name]; ok {
+		return addr, addr != 0
+	}
+
+	addr := r.resolveVarAddr(name)
+	r.varAddrs[name] = addr
+	return addr, addr != 0
+}
+
+func (r *dwarfReader) resolveVarAddr(name string) uint64 {
+	rd := r.data.Reader()
+	for {
+		entry, err := rd.Next()
+		if err != nil || entry == nil {
+			break
+		}
+		if entry.Tag != dwarf.TagVariable {
+			// Variables live at CU top level in Go DWARF; don't descend into
+			// subprograms (their locals share the tag and would shadow globals).
+			if entry.Tag == dwarf.TagSubprogram {
+				rd.SkipChildren()
+			}
+			continue
+		}
+		n, _ := entry.Val(dwarf.AttrName).(string)
+		if n != name {
+			continue
+		}
+		loc, ok := entry.Val(dwarf.AttrLocation).([]byte)
+		if !ok || len(loc) < 9 || loc[0] != 0x03 { // DW_OP_addr
+			return 0
+		}
+		return uint64(int64(binary.LittleEndian.Uint64(loc[1:9])) + r.slide)
+	}
+	return 0
+}
+
+// structMemberOffset returns the byte offset of member field within the struct
+// type named structName (both as they appear in DWARF, e.g. "runtime.g" /
+// "goid"). ok is false when the struct or the member is absent.
+func (r *dwarfReader) structMemberOffset(structName, field string) (int64, bool) {
+	layout := r.structLayout(structName)
+	if !layout.found {
+		return 0, false
+	}
+	off, ok := layout.offsets[field]
+	return off, ok
+}
+
+func (r *dwarfReader) structLayout(structName string) structLayout {
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	if r.structOffs == nil {
+		r.structOffs = make(map[string]structLayout)
+	}
+	if l, ok := r.structOffs[structName]; ok {
+		return l
+	}
+	l := r.resolveStructLayout(structName)
+	r.structOffs[structName] = l
+	return l
+}
+
+func (r *dwarfReader) resolveStructLayout(structName string) structLayout {
+	rd := r.data.Reader()
+	for {
+		entry, err := rd.Next()
+		if err != nil || entry == nil {
+			break
+		}
+		if entry.Tag != dwarf.TagStructType {
+			continue
+		}
+		n, _ := entry.Val(dwarf.AttrName).(string)
+		if n != structName {
+			rd.SkipChildren()
+			continue
+		}
+		offsets := make(map[string]int64)
+		for {
+			child, err := rd.Next()
+			if err != nil || child == nil || child.Tag == 0 {
+				break
+			}
+			if child.Tag != dwarf.TagMember {
+				continue
+			}
+			mn, _ := child.Val(dwarf.AttrName).(string)
+			if mn == "" {
+				continue
+			}
+			if off, ok := memberOffset(child); ok {
+				offsets[mn] = off
+			}
+		}
+		return structLayout{found: true, offsets: offsets}
+	}
+	return structLayout{}
+}
+
+// memberOffset extracts DW_AT_data_member_location, which Go emits as a plain
+// integer constant but the DWARF spec also permits as a location expression
+// (DW_OP_plus_uconst). Both are handled.
+func memberOffset(entry *dwarf.Entry) (int64, bool) {
+	v := entry.Val(dwarf.AttrDataMemberLoc)
+	switch val := v.(type) {
+	case int64:
+		return val, true
+	case []byte:
+		if len(val) >= 2 && val[0] == 0x23 { // DW_OP_plus_uconst
+			u, _ := decodeULEB128(val[1:])
+			return int64(u), true
+		}
+	}
+	return 0, false
+}
+
+// runtimeArrayInfo returns the base address, element count, and element stride
+// (bytes) of a package-level array variable declared with a static address
+// (e.g. runtime.waitReasonStrings). ok is false when it can't be resolved.
+func (r *dwarfReader) runtimeArrayInfo(name string) (base uint64, count int, stride int, ok bool) {
+	base, ok = r.runtimeVarAddr(name)
+	if !ok {
+		return 0, 0, 0, false
+	}
+	rd := r.data.Reader()
+	for {
+		entry, err := rd.Next()
+		if err != nil || entry == nil {
+			break
+		}
+		if entry.Tag != dwarf.TagVariable {
+			if entry.Tag == dwarf.TagSubprogram {
+				rd.SkipChildren()
+			}
+			continue
+		}
+		n, _ := entry.Val(dwarf.AttrName).(string)
+		if n != name {
+			continue
+		}
+		toff, ok := entry.Val(dwarf.AttrType).(dwarf.Offset)
+		if !ok {
+			return 0, 0, 0, false
+		}
+		tr := r.data.Reader()
+		tr.Seek(toff)
+		te, err := tr.Next()
+		if err != nil || te == nil || te.Tag != dwarf.TagArrayType {
+			return 0, 0, 0, false
+		}
+		total, _ := te.Val(dwarf.AttrByteSize).(int64)
+		for {
+			ce, err := tr.Next()
+			if err != nil || ce == nil || ce.Tag == 0 {
+				break
+			}
+			if ce.Tag != dwarf.TagSubrangeType {
+				continue
+			}
+			if c, ok := ce.Val(dwarf.AttrCount).(int64); ok {
+				count = int(c)
+			} else if ub, ok := ce.Val(dwarf.AttrUpperBound).(int64); ok {
+				count = int(ub) + 1
+			}
+			break
+		}
+		if count <= 0 {
+			return 0, 0, 0, false
+		}
+		if total > 0 {
+			stride = int(total) / count
+		}
+		return base, count, stride, true
+	}
+	return 0, 0, 0, false
+}
+
+// decodeULEB128 decodes an unsigned LEB128 integer. Returns (value, bytesRead).
+func decodeULEB128(b []byte) (uint64, int) {
+	var result uint64
+	var shift uint
+	for i, byt := range b {
+		result |= uint64(byt&0x7f) << shift
+		if byt&0x80 == 0 {
+			return result, i + 1
+		}
+		shift += 7
 	}
 	return result, len(b)
 }

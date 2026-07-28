@@ -255,6 +255,86 @@ func main() {
 }
 `
 
+// concurrencyTargetSrc builds a KNOWN goroutine spawn tree so the concurrency
+// snapshot can be asserted against a deterministic hierarchy:
+//
+//	main (g1)
+//	  └─ worker   (spawned in main.spawnAll via `go worker`)
+//	       └─ leaf (spawned in main.worker via `go leaf`)
+//
+// The children park in a spin-until-released loop so they are all simultaneously
+// alive when main hits the breakpoint. main hits the same breakpoint (BP_TICK)
+// three times: once BEFORE spawning (lifecycle-delta baseline), once AFTER both
+// children are confirmed running (they must appear in the Created delta with
+// correct parent linkage and start/created locations), and once AFTER they have
+// been released and reaped (they must appear in the Exited delta). The atomic
+// `ready` gate guarantees both children are scheduled and past their spawn point
+// before the second stop; the WaitGroup + GC guarantees they are fully dead
+// before the third.
+const concurrencyTargetSrc = `package main
+
+import (
+	"runtime"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+var (
+	ready   int32
+	release int32
+	wg      sync.WaitGroup
+)
+
+func leaf() {
+	defer wg.Done()
+	atomic.AddInt32(&ready, 1)
+	for atomic.LoadInt32(&release) == 0 {
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func worker() {
+	defer wg.Done()
+	wg.Add(1)
+	go leaf() // SPAWN_LEAF
+	atomic.AddInt32(&ready, 1)
+	for atomic.LoadInt32(&release) == 0 {
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func spawnAll() {
+	wg.Add(1)
+	go worker() // SPAWN_WORKER
+}
+
+func waitReady() {
+	for atomic.LoadInt32(&ready) < 2 {
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func tick() {
+	time.Sleep(2 * time.Millisecond) // BP_TICK
+}
+
+func main() {
+	tick() // stop #1: baseline, before any child exists
+	spawnAll()
+	waitReady()
+	tick() // stop #2: worker + leaf alive
+	atomic.StoreInt32(&release, 1)
+	wg.Wait()
+	runtime.GC()
+	runtime.GC()
+	tick() // stop #3: worker + leaf reaped
+	for i := 0; i < 100000; i++ {
+		tick() // keep the process alive for teardown
+	}
+}
+`
+
 // declareBasicStepOverSpec adds the continue+step-over acceptance spec to the
 // enclosing Ginkgo container. It is the correctness gate: set a breakpoint on a
 // line that calls a function, repeatedly Continue to it and StepOver the call,
@@ -696,6 +776,138 @@ func bpLine(evt protocol.Event) int {
 	var hit protocol.BreakpointHitPayload
 	Expect(json.Unmarshal(evt.Payload, &hit)).To(Succeed(), "decode BreakpointHit")
 	return hit.Breakpoint.Location.Line
+}
+
+// declareConcurrencySpec is the data-foundation gate for concurrency
+// visualization. It drives the known spawn-tree target (concurrencyTargetSrc)
+// and asserts the goroutine/thread snapshot exposes everything a UI needs to
+// render a goroutine-spawn hierarchy and a live-thread view:
+//
+//   - the rich goroutine set (not the legacy single synthetic goroutine),
+//   - parent linkage (leaf<-worker<-main) for the spawn tree,
+//   - each goroutine's start function and its `go`-statement creation site,
+//   - the OS-thread set with the current thread marked,
+//   - the current goroutine, consistent between the list and the snapshot, and
+//   - created/exited lifecycle deltas across stops.
+//
+// It runs on BOTH platforms: the reader is DWARF-driven and reads the runtime's
+// runtime.allgs / runtime.allm from tracee memory, which is platform-agnostic
+// (only the underlying memory-read primitive differs per backend).
+func declareConcurrencySpec() {
+	It("streams a goroutine spawn tree, threads, and lifecycle deltas", Label("concurrency"), func() {
+		lineTick := markerLine(concurrencyTargetSrc, "// BP_TICK")
+		bin := buildTarget("concurrency_target", concurrencyTargetSrc)
+
+		h := newE2EHarness(bin)
+		h.waitFor(15*time.Second, protocol.EventStepped) // initial launch stop
+
+		_, err := h.d.SetBreakpoint("concurrency_target.go", lineTick)
+		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint on tick")
+
+		// The auto-streamed EventGoroutineSnapshot that follows each breakpoint
+		// hit is the delta-bearing one (its Created/Exited are computed relative
+		// to the previous auto snapshot). We must NOT call GoroutineSnapshot()
+		// on-demand between hits, as that would advance the delta baseline.
+		nextSnapshot := func(stop string) protocol.GoroutineSnapshotPayload {
+			GinkgoHelper()
+			Expect(h.d.Continue()).To(Succeed(), "Continue to %s", stop)
+			hit := h.waitFor(15*time.Second,
+				protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+			Expect(hit.Kind).To(Equal(protocol.EventBreakpointHit), "%s: breakpoint hit", stop)
+			evt := h.waitFor(15*time.Second, protocol.EventGoroutineSnapshot)
+			var snap protocol.GoroutineSnapshotPayload
+			Expect(json.Unmarshal(evt.Payload, &snap)).To(Succeed(), "%s: decode snapshot", stop)
+			return snap
+		}
+
+		// --- stop #1: baseline (before either child exists) ---
+		baseline := nextSnapshot("baseline")
+		Expect(baseline.Goroutines).NotTo(BeEmpty(), "baseline has goroutines")
+		Expect(baseline.Current).To(BeNumerically(">", 0), "baseline current goid resolved")
+		Expect(findByStart(baseline.Goroutines, "main.worker")).To(BeNil(),
+			"worker must not exist yet at the baseline stop")
+
+		// --- stop #2: worker + leaf alive ---
+		spawned := nextSnapshot("spawned")
+
+		worker := findByStart(spawned.Goroutines, "main.worker")
+		Expect(worker).NotTo(BeNil(), "worker goroutine present after spawn")
+		leaf := findByStart(spawned.Goroutines, "main.leaf")
+		Expect(leaf).NotTo(BeNil(), "leaf goroutine present after spawn")
+
+		// Spawn-tree linkage: worker's parent is main (the current goroutine),
+		// leaf's parent is worker. This is the core data a hierarchy view needs.
+		Expect(worker.ParentID).To(Equal(spawned.Current),
+			"worker parent is the main goroutine")
+		Expect(leaf.ParentID).To(Equal(worker.ID),
+			"leaf parent is the worker goroutine")
+
+		// Creation site (the `go` statement) and start function per goroutine.
+		Expect(worker.StartLoc.Function).To(Equal("main.worker"), "worker start function")
+		Expect(worker.CreatedLoc.Function).To(Equal("main.spawnAll"), "worker created in spawnAll")
+		Expect(leaf.StartLoc.Function).To(Equal("main.leaf"), "leaf start function")
+		Expect(leaf.CreatedLoc.Function).To(Equal("main.worker"), "leaf created in worker")
+
+		// Lifecycle: both children are new since the baseline stop.
+		Expect(spawned.Created).To(ContainElement(worker.ID), "worker in created delta")
+		Expect(spawned.Created).To(ContainElement(leaf.ID), "leaf in created delta")
+
+		// Threads: the OS-thread set is populated and exactly one thread is the
+		// current one, running the current goroutine.
+		Expect(spawned.Threads).NotTo(BeEmpty(), "thread set populated")
+		currentThreads := 0
+		for _, t := range spawned.Threads {
+			if t.Current {
+				currentThreads++
+				Expect(t.GoID).To(Equal(spawned.Current),
+					"the current thread runs the current goroutine")
+			}
+		}
+		Expect(currentThreads).To(Equal(1), "exactly one current thread")
+
+		// The current goroutine is consistent between the flag and the id.
+		cur := currentGoroutine(spawned.Goroutines)
+		Expect(cur).NotTo(BeNil(), "a goroutine is marked current")
+		Expect(cur.ID).To(Equal(spawned.Current), "current flag matches current id")
+
+		workerID, leafID := worker.ID, leaf.ID
+
+		// --- stop #3: children released and reaped ---
+		exited := nextSnapshot("exited")
+		Expect(exited.Exited).To(ContainElement(workerID), "worker in exited delta")
+		Expect(exited.Exited).To(ContainElement(leafID), "leaf in exited delta")
+		Expect(findByStart(exited.Goroutines, "main.worker")).To(BeNil(),
+			"worker gone from the live set")
+		Expect(findByStart(exited.Goroutines, "main.leaf")).To(BeNil(),
+			"leaf gone from the live set")
+
+		// The on-demand snapshot command returns a coherent live picture too.
+		onDemand, err := h.d.GoroutineSnapshot()
+		Expect(err).NotTo(HaveOccurred(), "GoroutineSnapshot on demand")
+		Expect(onDemand.Goroutines).NotTo(BeEmpty(), "on-demand snapshot has goroutines")
+		Expect(onDemand.Current).To(BeNumerically(">", 0), "on-demand current goid resolved")
+	})
+}
+
+// findByStart returns the first goroutine whose start function matches fn, or
+// nil. Used to locate a specific goroutine in a snapshot by what it runs.
+func findByStart(gs []protocol.Goroutine, fn string) *protocol.Goroutine {
+	for i := range gs {
+		if gs[i].StartLoc.Function == fn {
+			return &gs[i]
+		}
+	}
+	return nil
+}
+
+// currentGoroutine returns the goroutine marked Current, or nil.
+func currentGoroutine(gs []protocol.Goroutine) *protocol.Goroutine {
+	for i := range gs {
+		if gs[i].Current {
+			return &gs[i]
+		}
+	}
+	return nil
 }
 
 // --- shared acceptance loop ---
