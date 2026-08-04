@@ -84,6 +84,9 @@ jobs:
       - name: E2E attach (attach to a running process)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=attach
 
+      - name: E2E concurrency (goroutine/thread snapshot foundation)
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=concurrency
+
   darwin-arm64:
     name: Darwin arm64 (Mach exceptions)
     runs-on: macos-14
@@ -153,6 +156,10 @@ jobs:
       - name: E2E attach (attach to a running process)
         if: runner.environment == 'self-hosted'
         run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=attach
+
+      - name: E2E concurrency (goroutine/thread snapshot foundation)
+        if: runner.environment == 'self-hosted'
+        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=concurrency
 
       - name: E2E hygiene (Mach port-right leak regression)
         if: runner.environment == 'self-hosted'

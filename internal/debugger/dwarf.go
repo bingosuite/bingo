@@ -591,15 +591,26 @@ func memberOffset(entry *dwarf.Entry) (int64, bool) {
 // (bytes) of a package-level array variable declared with a static address
 // (e.g. runtime.waitReasonStrings). ok is false when it can't be resolved.
 func (r *dwarfReader) runtimeArrayInfo(name string) (base uint64, count int, stride int, ok bool) {
-	base, ok = r.runtimeVarAddr(name)
+	if base, ok = r.runtimeVarAddr(name); !ok {
+		return 0, 0, 0, false
+	}
+	toff, ok := r.varTypeOffset(name)
 	if !ok {
 		return 0, 0, 0, false
 	}
+	if count, stride, ok = r.arrayTypeInfo(toff); !ok {
+		return 0, 0, 0, false
+	}
+	return base, count, stride, true
+}
+
+// varTypeOffset finds the DWARF type offset of a package-level variable by name.
+func (r *dwarfReader) varTypeOffset(name string) (dwarf.Offset, bool) {
 	rd := r.data.Reader()
 	for {
 		entry, err := rd.Next()
 		if err != nil || entry == nil {
-			break
+			return 0, false
 		}
 		if entry.Tag != dwarf.TagVariable {
 			if entry.Tag == dwarf.TagSubprogram {
@@ -607,45 +618,46 @@ func (r *dwarfReader) runtimeArrayInfo(name string) (base uint64, count int, str
 			}
 			continue
 		}
-		n, _ := entry.Val(dwarf.AttrName).(string)
-		if n != name {
+		if n, _ := entry.Val(dwarf.AttrName).(string); n != name {
 			continue
 		}
-		toff, ok := entry.Val(dwarf.AttrType).(dwarf.Offset)
-		if !ok {
-			return 0, 0, 0, false
-		}
-		tr := r.data.Reader()
-		tr.Seek(toff)
-		te, err := tr.Next()
-		if err != nil || te == nil || te.Tag != dwarf.TagArrayType {
-			return 0, 0, 0, false
-		}
-		total, _ := te.Val(dwarf.AttrByteSize).(int64)
-		for {
-			ce, err := tr.Next()
-			if err != nil || ce == nil || ce.Tag == 0 {
-				break
-			}
-			if ce.Tag != dwarf.TagSubrangeType {
-				continue
-			}
-			if c, ok := ce.Val(dwarf.AttrCount).(int64); ok {
-				count = int(c)
-			} else if ub, ok := ce.Val(dwarf.AttrUpperBound).(int64); ok {
-				count = int(ub) + 1
-			}
+		off, ok := entry.Val(dwarf.AttrType).(dwarf.Offset)
+		return off, ok
+	}
+}
+
+// arrayTypeInfo resolves an array type's element count and per-element stride
+// (bytes) from the DWARF type entry at toff.
+func (r *dwarfReader) arrayTypeInfo(toff dwarf.Offset) (count int, stride int, ok bool) {
+	tr := r.data.Reader()
+	tr.Seek(toff)
+	te, err := tr.Next()
+	if err != nil || te == nil || te.Tag != dwarf.TagArrayType {
+		return 0, 0, false
+	}
+	total, _ := te.Val(dwarf.AttrByteSize).(int64)
+	for {
+		ce, err := tr.Next()
+		if err != nil || ce == nil || ce.Tag == 0 {
 			break
 		}
-		if count <= 0 {
-			return 0, 0, 0, false
+		if ce.Tag != dwarf.TagSubrangeType {
+			continue
 		}
-		if total > 0 {
-			stride = int(total) / count
+		if c, ok := ce.Val(dwarf.AttrCount).(int64); ok {
+			count = int(c)
+		} else if ub, ok := ce.Val(dwarf.AttrUpperBound).(int64); ok {
+			count = int(ub) + 1
 		}
-		return base, count, stride, true
+		break
 	}
-	return 0, 0, 0, false
+	if count <= 0 {
+		return 0, 0, false
+	}
+	if total > 0 {
+		stride = int(total) / count
+	}
+	return count, stride, true
 }
 
 // decodeULEB128 decodes an unsigned LEB128 integer. Returns (value, bytesRead).
