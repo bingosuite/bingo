@@ -52,9 +52,16 @@ breakpoint is the `fmt.Printf` inside `worker` (`examples/spawntree/main.go:27`)
 ## 2. Start the server with DAP enabled
 
 ```sh
+just server                       # builds + runs everything: -addr :6060 -dap-addr :4711
+# override addresses:   just server darwin arm64 :7070 :4712
+# verbose / extra flags: just server darwin arm64 :6060 :4711 -v
+# or run the binary directly:
 ./build/bingo/bingo_darwin_arm64 -addr :6060 -dap-addr :4711 -v
 # linux: ./build/bingo/bingo_linux_amd64 -addr :6060 -dap-addr :4711 -v
 ```
+
+`just server` starts both listeners with the defaults below. For a WebSocket-only
+run (DAP disabled) use `just server-ws` instead.
 
 - `:6060` — WebSocket + REST (`/ws`, `/api/sessions`). `cmd/wsmon` connects here.
 - `:4711` — DAP. VS Code / `cmd/dapcli` connect here.
