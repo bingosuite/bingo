@@ -10,6 +10,8 @@ import (
 	"runtime"
 	"sync"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 func newBackend() Backend {
@@ -305,7 +307,26 @@ func (b *linuxBackend) StopProcess() error {
 // that the engine turns into EventPaused. See Backend.PauseSignal.
 func (b *linuxBackend) PauseSignal() int { return int(syscall.SIGSTOP) }
 
+// ReadMemory bulk-copies the tracee's address space. process_vm_readv(2) is the
+// fast path: a single syscall for the whole buffer that — unlike ptrace(2) — is
+// NOT thread-bound, so it runs directly off the calling goroutine without the
+// tracer-thread handoff and never word-at-a-times. This is what keeps the
+// goroutine snapshot (dozens of small reads per stop, across every live
+// goroutine) cheap; the old PTRACE_PEEKDATA-through-execPtrace path was orders
+// of magnitude slower and pushed the churn e2e past its target's watchdog.
+// PTRACE_PEEKDATA remains the fallback for the rare case process_vm_readv is
+// unavailable (old kernel) or short-reads.
 func (b *linuxBackend) ReadMemory(addr uint64, dst []byte) error {
+	if len(dst) == 0 {
+		return nil
+	}
+	if b.pid > 0 {
+		local := []unix.Iovec{{Base: &dst[0], Len: uint64(len(dst))}}
+		remote := []unix.RemoteIovec{{Base: uintptr(addr), Len: len(dst)}}
+		if n, err := unix.ProcessVMReadv(b.pid, local, remote, 0); err == nil && n == len(dst) {
+			return nil
+		}
+	}
 	tid := b.traceTID()
 	var n int
 	var err error

@@ -445,8 +445,19 @@ are detected by a `mach_msg` receive loop.
   the true `ExitCode`, or `StopKilled` on signal death. Returning a hardcoded 0
   here dropped every tracee's exit code (#94).
 - ptrace stops are per-thread. The backend records the last stopped TID and
-  targets `ContinueProcess` / memory reads / memory writes at that TID, not
+  targets `ContinueProcess` / memory writes at that TID, not
   blindly at the process PID. Non-main thread exits are absorbed inside `Wait`.
+- `ReadMemory` uses **`process_vm_readv(2)`** as the fast path, falling back to
+  `PTRACE_PEEKDATA` only when it is unavailable or short-reads. `process_vm_readv`
+  bulk-copies the whole buffer in one syscall and — unlike ptrace ops — is NOT
+  thread-bound, so it runs directly off the caller and skips the `execPtrace`
+  tracer-thread handoff entirely (mirrors Delve). This is load-bearing for the
+  goroutine snapshot: it issues dozens of small reads per stop across every live
+  goroutine, and the old word-at-a-time-PEEKDATA-through-execPtrace path made a
+  snapshot-on-every-breakpoint so slow it pushed the `churn` e2e past its
+  target's 180s watchdog. The fallback keeps the original error semantics for
+  genuinely-unmapped addresses. (Darwin was never affected — it already
+  bulk-reads via `mach_vm_read`.)
 - Single-step vs breakpoint disambiguation uses **both** `stepping` and
   `stepTID` (the exact TID `SingleStep` was issued against). Only a `cause==0`
   SIGTRAP on `stepTID` is the step's completion; the same stop on any other
