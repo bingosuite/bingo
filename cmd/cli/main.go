@@ -316,6 +316,16 @@ func printEvent(evt protocol.Event) {
 				p.Location.File, p.Location.Line, p.Location.Function)
 		}
 
+	default:
+		printAuxEvent(evt)
+	}
+}
+
+// printAuxEvent renders the non-stop events. Split out of printEvent so neither
+// switch trips the cyclomatic-complexity linter as event kinds grow.
+func printAuxEvent(evt protocol.Event) {
+	switch evt.Kind {
+
 	case protocol.EventContinued:
 		fmt.Print("\n  [continued]\nbingo> ")
 
