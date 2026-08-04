@@ -1,0 +1,29 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "bingo DAP: launch spawntree (stop on entry)",
+      "type": "go",
+      "request": "launch",
+      "mode": "exec",
+      "program": "${workspaceFolder}/build/spawntree",
+      "stopOnEntry": true,
+      "debugServer": 4711
+    },
+    {
+      "name": "bingo DAP: join running session",
+      "type": "go",
+      "request": "attach",
+      "mode": "remote",
+      "session": "${input:bingoSession}",
+      "debugServer": 4711
+    }
+  ],
+  "inputs": [
+    {
+      "id": "bingoSession",
+      "type": "promptString",
+      "description": "bingo session ID to join (from the server's console line or /api/sessions)"
+    }
+  ]
+}
