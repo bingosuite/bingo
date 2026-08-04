@@ -43,8 +43,13 @@ drive a debug session over a TCP socket while BinGo's own visual clients observe
 Start the server with a DAP listener:
 
 ```sh
+just server                       # builds + runs with -addr :6060 -dap-addr :4711
+# or, from a prebuilt binary:
 bingo -addr :6060 -dap-addr :4711
 ```
+
+`just server` starts both listeners with the defaults above; use `just server-ws`
+for a WebSocket-only run (DAP disabled).
 
 Point your editor's debug adapter at `127.0.0.1:4711`. The DAP client creates a
 managed session on `launch`/`attach`; WebSocket observers join that same session
@@ -65,6 +70,23 @@ just dapcli -session <id>         # join an existing session as another client
 Any number of `dapcli` and `cli` clients can drive and observe the **same**
 session at once — start one, `launch` a target, then join from other terminals
 with the announced session id.
+
+## Concurrency telemetry (WebSocket)
+
+Alongside the DAP debug loop, BinGo streams **concurrency telemetry** over its
+native WebSocket protocol — a goroutine spawn hierarchy (parent/child linkage),
+the live OS-thread set, and per-stop created/exited goroutine lifecycle deltas —
+so any UI can build a concurrency view on top of the data. `cmd/wsmon` is a
+read-only terminal observer that joins a session and live-renders these streams:
+
+```sh
+go run ./cmd/wsmon -session <id>  # connects to -addr localhost:6060 by default
+```
+
+It never issues run-control commands, so it coexists with a DAP driver and other
+WebSocket clients on the same session. For an end-to-end walkthrough — server, a
+DAP driver (VS Code or `cmd/dapcli`), and the `wsmon` observer against one shared
+session — see [docs/ConcurrencyTelemetry.md](docs/ConcurrencyTelemetry.md).
 
 ## Documentation
 
