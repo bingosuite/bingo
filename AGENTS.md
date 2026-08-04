@@ -91,7 +91,9 @@ follow them so reviews stay about substance, not style.
 | [cmd/bingo](cmd/bingo/) | Server entry point — flag parsing, signal handler, calls into `internal/server`. |
 | [cmd/cli](cmd/cli/) | Interactive readline client. |
 | [cmd/dapcli](cmd/dapcli/) | Interactive readline client that drives a session over DAP (mirrors `cmd/cli`'s UX). Talks to the server's `-dap-addr` listener; can create a session or `-session` join an existing one. |
+| [cmd/wsmon](cmd/wsmon/) | Read-only terminal telemetry observer. `-session`-joins a running session over WebSocket and live-renders the goroutine spawn tree + OS threads + created/exited lifecycle deltas from the `EventGoroutineSnapshot` stream. Never drives execution — the WS-observes half of the DAP-drives/WS-observes demo. |
 | [cmd/target](cmd/target/) | Trivial target program for manual testing. |
+| [examples/spawntree](examples/spawntree/) | Concurrency demo target: a deterministic main → supervisor → worker×N goroutine spawn tree for exercising the telemetry stream (see [docs/ConcurrencyTelemetry.md](docs/ConcurrencyTelemetry.md)). |
 | [cmd/githook](cmd/githook/) | Conventional-commits commitlint, wired via [lefthook.yml](lefthook.yml). |
 | [pkg/protocol](pkg/protocol/) | Wire types: `Event`, `Command`, payload structs, `EventKind`, `CommandKind`, `SessionState`. Single source of truth. |
 | [pkg/client](pkg/client/) | Reference Go client. WebSocket-backed. Public surface: `Client` interface + `Create` / `Join` / `ListSessions`. |
@@ -553,6 +555,14 @@ translating it would corrupt the FIFO that correlates a DAP `threads` request to
 `EventGoroutines` (snapshots are unsolicited, with no matching request). DAP
 clients get goroutine data from the `threads` request (`EventGoroutines`, which
 now returns the rich list); the snapshot stream is WebSocket-only.
+
+**Reference observer + runbook.** [cmd/wsmon](cmd/wsmon/) is the reference
+WebSocket telemetry consumer: it `-session`-joins read-only and live-renders the
+spawn tree / thread set / lifecycle deltas from this stream (a UI-agnostic view
+of exactly the data a spawn-hierarchy visualization needs). The end-to-end
+DAP-drives + WS-observes walkthrough — server, VS Code (or `cmd/dapcli`) driver,
+and `wsmon` against the [examples/spawntree](examples/spawntree/) target — is in
+[docs/ConcurrencyTelemetry.md](docs/ConcurrencyTelemetry.md).
 
 **Lifecycle deltas.** `engine.prevGoids` (loop-thread-only, no lock, like
 `manualStopPending`) remembers the previous live goid set; `diffGoids` returns
