@@ -27,8 +27,24 @@ build OS=os_name ARCH=arch_name:
 run OS=os_name ARCH=arch_name *ARGS="":
 	./build/bingo/bingo_{{OS}}_{{ARCH}} {{ARGS}}
 
-# Builds then runs the bingo binary for the target OS and architecture (Must be valid `go build` targets).
-server OS=os_name ARCH=arch_name *ARGS="": build-target (build OS ARCH) (run OS ARCH ARGS)
+# Default WS (-addr) and DAP (-dap-addr) listen addresses for the server recipes.
+# Override on the CLI, e.g. `just server darwin arm64 :7070 :4712`.
+ws_addr := ":6060"
+dap_addr := ":4711"
+
+# Build then run the server with EVERYTHING enabled: both the WebSocket (-addr)
+# and DAP (-dap-addr) listeners, using the standard defaults so a DAP driver
+# (VS Code / `just dapcli`) and a `go run ./cmd/wsmon` observer can share one
+# session out of the box (see docs/ConcurrencyTelemetry.md). Override addresses
+# via the ADDR/DAP_ADDR positionals; extra flags (e.g. -v) pass through in ARGS.
+server OS=os_name ARCH=arch_name ADDR=ws_addr DAP_ADDR=dap_addr *ARGS="": build-target (build OS ARCH)
+	./build/bingo/bingo_{{OS}}_{{ARCH}} -addr {{ADDR}} -dap-addr {{DAP_ADDR}} {{ARGS}}
+
+# Build then run the server with ONLY the WebSocket (-addr) listener; DAP stays
+# disabled (the binary leaves -dap-addr empty). Override the address via ADDR;
+# extra flags (e.g. -v) pass through in ARGS.
+server-ws OS=os_name ARCH=arch_name ADDR=ws_addr *ARGS="": build-target (build OS ARCH)
+	./build/bingo/bingo_{{OS}}_{{ARCH}} -addr {{ADDR}} {{ARGS}}
 
 # Build the Target with maximum debugging information
 build-target:
