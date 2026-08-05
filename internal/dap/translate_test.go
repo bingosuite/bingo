@@ -3,6 +3,8 @@ package dap
 import (
 	"testing"
 
+	godap "github.com/google/go-dap"
+
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
@@ -92,10 +94,28 @@ func TestDapThreadsMapsGoroutines(t *testing.T) {
 	}
 }
 
-func TestDapVariables(t *testing.T) {
-	out := dapVariables([]protocol.Variable{{Name: "x", Value: "0x1", Type: "int"}})
-	if len(out) != 1 || out[0].Name != "x" || out[0].Value != "0x1" || out[0].VariablesReference != 0 {
-		t.Errorf("dapVariables = %+v", out)
+func TestBuildVarTree(t *testing.T) {
+	h := &Handler{varCache: make(map[int][]godap.Variable)}
+	out := h.buildVarTree([]protocol.Variable{
+		{Name: "x", Value: "42", Type: "int"},
+		{Name: "p", Value: "main.Point{...}", Type: "main.Point", Children: []protocol.Variable{
+			{Name: "X", Value: "1", Type: "int"},
+			{Name: "Y", Value: "2", Type: "int"},
+		}},
+	})
+	if len(out) != 2 {
+		t.Fatalf("got %d vars, want 2", len(out))
+	}
+	if out[0].Name != "x" || out[0].Value != "42" || out[0].VariablesReference != 0 {
+		t.Errorf("leaf var = %+v, want ref 0", out[0])
+	}
+	ref := out[1].VariablesReference
+	if ref < varRefBase {
+		t.Fatalf("struct var ref = %d, want a child ref >= %d", ref, varRefBase)
+	}
+	children, ok := h.varCache[ref]
+	if !ok || len(children) != 2 || children[0].Name != "X" || children[1].Name != "Y" {
+		t.Errorf("cached children = %+v (ok=%v)", children, ok)
 	}
 }
 

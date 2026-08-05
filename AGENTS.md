@@ -850,7 +850,9 @@ structs for the int `Seq`).
 ### Handshake (Delve-style, VS Code-compatible)
 
 1. `initialize` → `Capabilities` (ConfigurationDone/Terminate/Restart +
-   TerminateDebuggee). NO `initialized` event yet.
+   TerminateDebuggee + `SupportsEvaluateForHovers`). NO `initialized` event yet.
+   Only capabilities bingo actually implements are advertised — `evaluate`
+   (name-only, see below) backs the hover cap.
 2. `launch`/`attach` → `startSession` (`CreateSession` + `AddClient(self)`)
    **then** enqueue `CmdLaunch`/`CmdAttach`; set `launching=true`. Registering as
    a client BEFORE enqueuing the launch is what guarantees we receive the entry
@@ -899,9 +901,10 @@ session.
 reason=step; `EventBreakpointHit`→`stopped` reason=breakpoint;
 `EventPanic`→reason=exception; `EventPaused`→reason=pause;
 `EventProcessExited`→`exited`(code)+`terminated`; `EventOutput`→`output`;
-`EventRestarted`→delayed `restart` response; `EventSessionState`→ignored on the
-launch/attach path, but consumed **once** as the initial state on the join path
-(see *Joining an existing session*); `EventGoroutineSnapshot`→**deliberately
+`EventRestarted`→delayed `restart` response; `EventEvaluate`→`evaluate` response
+(correlated via `evalQ`, NOT a stop — see below); `EventSessionState`→ignored on
+the launch/attach path, but consumed **once** as the initial state on the join
+path (see *Joining an existing session*); `EventGoroutineSnapshot`→**deliberately
 ignored** (WebSocket-only concurrency stream with no DAP equivalent; translating
 it would corrupt the `threads`→`EventGoroutines` FIFO — see the goroutine
 snapshot section).
@@ -918,29 +921,53 @@ the prerequisite PR made the engine emit `EventContinued` on resume.
 
 `continue`→Continue; `next/stepIn/stepOut`→StepOver/Into/Out; `pause`→Pause;
 `threads`→Goroutines; `stackTrace`→Frames; `scopes`→synthetic single "Locals"
-scope whose `variablesReference` IS the frame id; `variables`→Locals(frameIndex);
-`disconnect`/`terminate`→Kill; `restart`→Restart. Data requests
-(threads/stackTrace/variables) are only enqueued while the Handler believes it is
-`suspended`; otherwise they return an empty (best-effort) result rather than
-blocking.
+scope whose `variablesReference` IS the frame id; `variables`→Locals(frameIndex)
+for a frame-root ref, or a synchronous cache hit for a child ref (see below);
+`evaluate`→Evaluate(frameIndex, name); `disconnect`/`terminate`→Kill;
+`restart`→Restart. Data requests (threads/stackTrace/variables/evaluate) are only
+enqueued while the Handler believes it is `suspended`; otherwise they return an
+empty (best-effort) result rather than blocking.
 
 `variablesReference = frameIndex+1`, `frameID = frameIndex+1` (both reversible
 via `frameIndexFromRef`, both non-zero since DAP reserves 0). threads =
 goroutines with id `max(id,1)`; empty list → synthetic `{1,"main"}`.
 
+**Structured (expandable) variables — eager tree + `varCache`.** bingo now
+computes a **bounded typed subtree** per local (children inline; see the DWARF
+reader notes). `EventLocals`/`EventEvaluate` carry it. `buildVarTree`
+(`translate.go`) walks that subtree and, for every node with children, allocates
+a fresh `variablesReference` from `varRefBase` (`1<<16`) upward via `allocVarRef`
+and caches the node's DAP children under it in `varCache` (`ref→[]godap.Variable`).
+Child refs start above `varRefBase` so they never collide with a frame-root ref
+(a scope's reference == `frameIndex+1`, bounded by the max stack depth), letting
+`onVariables` tell them apart by magnitude: a ref in `varCache` is served
+synchronously (no round-trip); anything else is a frame-root ref that enqueues
+`CmdLocals`. The cache reflects ONE memory snapshot, so `resetVarsLocked` clears
+`varCache`/`nextVarRef` on every stop (`onStop`) — a child ref from a prior
+suspension is stale and must not expand.
+
+**`evaluate` is name-only.** `onEvaluate` sends `CmdEvaluate{FrameIndex, Name}`
+(Expression = the bare variable name; the `context` field — watch/hover/repl — is
+handled uniformly/ignored). `onEvaluated` correlates the `EventEvaluate` via a new
+`evalQ` FIFO, returns the value string + type, and — if the result has children —
+allocates a child ref (same `varCache` machinery) so the client can expand it. A
+general expression evaluator (arithmetic/dotted-path/indexing) is a LATER PR; this
+is the eager-tree foundation that deliberately avoids needing a path parser.
+
 **FIFO correlation — the key limitation.** bingo's confirmation events
-(`EventBreakpointSet/Cleared`, `EventFrames`, `EventGoroutines`, `EventLocals`)
-carry **no request/correlation id**. The Handler correlates each incoming
-confirmation to the oldest outstanding DAP request of that kind via per-kind FIFO
-queues (`setQ`/`clearQ`/`threadsQ`/`framesQ`/`localsQ`), relying on the hub's
-in-order event stream. **This is valid only while the DAP client is the sole
-driver of breakpoints/data-requests on the session.** A WebSocket client
-concurrently setting breakpoints or requesting frames on the same session could
-misalign the FIFOs. Observers (read-only) are always safe; concurrent *drivers*
-of those specific request kinds are the documented caveat. Fixing it properly
-needs correlation ids in the bingo protocol — deferred. Resume/step/breakpoint-
-hit events are broadcast to all clients and need no correlation, so multi-driver
-continue/step is fine; only the id-less confirmation requests are affected.
+(`EventBreakpointSet/Cleared`, `EventFrames`, `EventGoroutines`, `EventLocals`,
+`EventEvaluate`) carry **no request/correlation id**. The Handler correlates each
+incoming confirmation to the oldest outstanding DAP request of that kind via
+per-kind FIFO queues (`setQ`/`clearQ`/`threadsQ`/`framesQ`/`localsQ`/`evalQ`),
+relying on the hub's in-order event stream. **This is valid only while the DAP
+client is the sole driver of breakpoints/data-requests on the session.** A
+WebSocket client concurrently setting breakpoints or requesting frames/locals/
+evaluate on the same session could misalign the FIFOs. Observers (read-only) are
+always safe; concurrent *drivers* of those specific request kinds are the
+documented caveat. Fixing it properly needs correlation ids in the bingo protocol
+— deferred. Resume/step/breakpoint-hit events are broadcast to all clients and
+need no correlation, so multi-driver continue/step is fine; only the id-less
+confirmation requests are affected.
 
 **setBreakpoints is replace-all** (`breakpoints.go`): diff the requested lines
 for a source against `bpByFile` — clear removed, set new, keep unchanged — and

@@ -76,17 +76,22 @@ func dapStackFrames(frames []protocol.Frame) []godap.StackFrame {
 	return out
 }
 
-// dapVariables converts bingo variables to DAP variables. bingo values are
-// leaf scalars today (no structured children), so VariablesReference is 0.
-func dapVariables(vars []protocol.Variable) []godap.Variable {
+// buildVarTree converts a bingo typed variable subtree to DAP variables,
+// allocating a fresh variablesReference for every node that has children and
+// caching those children under it (varCache) so a follow-up variables request
+// expands the node synchronously. This is the eager-tree analogue of DAP's lazy
+// child fetch: bingo already computed the bounded subtree, so we just index it.
+// Caller MUST hold h.mu (it mutates varCache/nextVarRef).
+func (h *Handler) buildVarTree(vars []protocol.Variable) []godap.Variable {
 	out := make([]godap.Variable, 0, len(vars))
 	for _, v := range vars {
-		out = append(out, godap.Variable{
-			Name:               v.Name,
-			Value:              v.Value,
-			Type:               v.Type,
-			VariablesReference: 0,
-		})
+		dv := godap.Variable{Name: v.Name, Value: v.Value, Type: v.Type}
+		if len(v.Children) > 0 {
+			ref := h.allocVarRef()
+			h.varCache[ref] = h.buildVarTree(v.Children)
+			dv.VariablesReference = ref
+		}
+		out = append(out, dv)
 	}
 	return out
 }

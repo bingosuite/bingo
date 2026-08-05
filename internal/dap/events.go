@@ -24,6 +24,8 @@ func (h *Handler) translateEvent(evt protocol.Event) {
 		h.onBreakpointCleared()
 	case protocol.EventLocals:
 		h.onLocals(evt)
+	case protocol.EventEvaluate:
+		h.onEvaluated(evt)
 	case protocol.EventFrames:
 		h.onFrames(evt)
 	case protocol.EventGoroutines:
@@ -115,6 +117,9 @@ func (h *Handler) onStop(evt protocol.Event) {
 	tid := threadID(stopGoroutine(evt).ID)
 
 	h.mu.Lock()
+	// Every stop is a fresh memory snapshot; drop variable subtrees cached
+	// against the previous suspension so a stale child ref can't be expanded.
+	h.resetVarsLocked()
 	launching := h.launching
 	restarting := h.restarting
 	stopOnEntry := h.stopOnEntry
@@ -294,6 +299,9 @@ func (h *Handler) onLocals(evt protocol.Event) {
 		vr = h.localsQ[0]
 		h.localsQ = h.localsQ[1:]
 	}
+	// Build the typed tree while holding mu: buildVarTree allocates child refs
+	// and populates varCache, both mu-guarded.
+	vars := h.buildVarTree(p.Variables)
 	h.mu.Unlock()
 
 	if vr == nil {
@@ -301,7 +309,40 @@ func (h *Handler) onLocals(evt protocol.Event) {
 	}
 	h.send(&godap.VariablesResponse{
 		Response: h.response(vr.seq, "variables"),
-		Body:     godap.VariablesResponseBody{Variables: dapVariables(p.Variables)},
+		Body:     godap.VariablesResponseBody{Variables: vars},
+	})
+}
+
+// onEvaluated answers a DAP evaluate request from an EventEvaluate confirmation,
+// correlated via the evalQ FIFO. A result with children gets a fresh child ref
+// (cached) so the client can expand it with a follow-up variables request.
+func (h *Handler) onEvaluated(evt protocol.Event) {
+	var p protocol.EvaluatePayload
+	_ = protocol.DecodeEventPayload(evt, &p)
+
+	h.mu.Lock()
+	seq, ok := 0, false
+	if len(h.evalQ) > 0 {
+		seq, ok = h.evalQ[0], true
+		h.evalQ = h.evalQ[1:]
+	}
+	ref := 0
+	if ok && len(p.Result.Children) > 0 {
+		ref = h.allocVarRef()
+		h.varCache[ref] = h.buildVarTree(p.Result.Children)
+	}
+	h.mu.Unlock()
+
+	if !ok {
+		return // out-of-band evaluate (another driver) — nothing to correlate
+	}
+	h.send(&godap.EvaluateResponse{
+		Response: h.response(seq, "evaluate"),
+		Body: godap.EvaluateResponseBody{
+			Result:             p.Result.Value,
+			Type:               p.Result.Type,
+			VariablesReference: ref,
+		},
 	})
 }
 
@@ -361,6 +402,17 @@ func (h *Handler) onError(evt protocol.Event) {
 		h.mu.Unlock()
 		if vr != nil {
 			h.send(&godap.VariablesResponse{Response: h.response(vr.seq, "variables"), Body: godap.VariablesResponseBody{Variables: []godap.Variable{}}})
+		}
+	case protocol.CmdEvaluate:
+		h.mu.Lock()
+		seq, ok := 0, false
+		if len(h.evalQ) > 0 {
+			seq, ok = h.evalQ[0], true
+			h.evalQ = h.evalQ[1:]
+		}
+		h.mu.Unlock()
+		if ok {
+			h.send(h.errorResponse(seq, "evaluate", p.Message))
 		}
 	case protocol.CmdRestart:
 		h.mu.Lock()
