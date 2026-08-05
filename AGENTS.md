@@ -549,6 +549,31 @@ are detected by a `mach_msg` receive loop.
   frame PC first, then a package-level global via `globalVar` (matches the exact
   DWARF name or a package-qualified `pkg.name` suffix, `DW_OP_addr` only). Backs
   the WebSocket `CmdEvaluate`/`EventEvaluate` and the DAP `evaluate` request.
+- **`DW_OP_fbreg` locals resolve against the CFA, not a fixed FP offset** — this
+  is why [frame.go](internal/debugger/frame.go) exists. Go compiles every
+  function's `DW_AT_frame_base` to `DW_OP_call_frame_cfa`, so a local at
+  `DW_OP_fbreg -104` lives at `CFA - 104`, and the CFA (the caller's SP at the
+  call) is **per-function**: on **arm64** it is `frame-pointer + framesize`
+  (x29 points at the saved FP/LR pair at the *bottom* of the frame, locals sit
+  *above* — so it is emphatically NOT `FP + 16`), and on **amd64** the body rule
+  is `FP + 16`. The only thing that encodes framesize is the `.debug_frame` Call
+  Frame Information, which `debug/dwarf` does **not** parse — so `frame.go` is a
+  minimal CFI reader that evaluates just the CFA column (`parseFrameTable` →
+  `runCFAProgram`, which tracks only `def_cfa*` + `advance_loc*` +
+  `remember`/`restore_state` and parses every other opcode solely to skip its
+  operands without desyncing; unknown opcode → stop). `engine.frameLocation`
+  calls `dwarfReader.cfa(pc, sp, fp)` per frame, **chaining outward by
+  `SP_{i+1} = CFA_i`** (a callee's CFA is its caller's SP; Go passes args in
+  registers so arm64 leaves SP unmoved and amd64's retaddr push is already in the
+  FP rule) and walking the saved-FP chain (`fp = *fp`). Missing/uncovered CFI
+  degrades gracefully to the old `FP + 16` heuristic (`cfaFallbackFromFP`) rather
+  than erroring the stop. The reader is arch-generic (maps SP/FP DWARF register
+  numbers by `runtime.GOARCH` — arm64 SP=31/FP=29, amd64 RSP=7/RBP=6) and
+  wrapped in `recover()` so malformed CFI can never crash the engine. Go's DWARF
+  sections are zlib-compressed (`__zdebug_frame`/`.zdebug_frame` with a 12-byte
+  `"ZLIB"` header, or ELF `SHF_COMPRESSED`); `loadDWARFData` inflates the frame
+  section itself (`inflateZlib`) since `debug/dwarf` only decompresses the
+  sections *it* consumes.
 
 ## Goroutine / thread snapshot — the concurrency data foundation
 
