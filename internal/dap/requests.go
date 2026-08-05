@@ -36,6 +36,18 @@ func (h *Handler) dispatchRequest(msg godap.Message) {
 		h.onStep(r.Seq, "stepOut", protocol.CmdStepOut)
 	case *godap.PauseRequest:
 		h.onPause(r)
+	default:
+		h.dispatchInspectRequest(msg)
+	}
+}
+
+// dispatchInspectRequest routes the read-only inspection requests (threads,
+// stack, scopes, variables, evaluate) and the teardown requests (disconnect,
+// terminate, restart). Split out of dispatchRequest purely to keep each switch's
+// cyclomatic complexity in check; the DAP request types are disjoint, so the
+// split has no ordering or behavioural effect.
+func (h *Handler) dispatchInspectRequest(msg godap.Message) {
+	switch r := msg.(type) {
 	case *godap.ThreadsRequest:
 		h.onThreads(r)
 	case *godap.StackTraceRequest:
