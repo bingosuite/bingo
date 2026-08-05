@@ -175,6 +175,42 @@ func main() {
 }
 `
 
+// typedLocalsTargetSrc drives the typed-variable inspection assertions. Built
+// with -N -l so every local is stack-allocated and DWARF-readable, it parks on
+// TYPEDBP with locals whose values are fully deterministic: a scalar int, a
+// string, a named struct, and a slice — one representative of each formatter
+// kind (scalar / string / struct-with-children / slice-with-children). At the
+// TYPEDBP line n/s/pt/nums are all assigned (sum is not yet, and is not asserted).
+const typedLocalsTargetSrc = `package main
+
+import (
+	"os"
+	"time"
+)
+
+type point struct {
+	X int
+	Y int
+}
+
+func inspect() int {
+	n := 42
+	s := "hello"
+	pt := point{X: 1, Y: 2}
+	nums := []int{10, 20, 30}
+	sum := n + pt.X + pt.Y + len(s) + len(nums) // TYPEDBP
+	return sum
+}
+
+func main() {
+	go func() { time.Sleep(180 * time.Second); os.Exit(0) }()
+	for i := 0; i < 1000000; i++ {
+		_ = inspect()
+		time.Sleep(time.Millisecond)
+	}
+}
+`
+
 // twoBPTargetSrc has two distinct breakpoint-able lines in its hot loop (BP_A
 // then BP_B). The ClearBreakpoint spec sets both, then clears A while stopped at
 // B and asserts subsequent Continues only ever stop at B — proving the cleared
@@ -577,6 +613,82 @@ func declareInspectSpec() {
 		Expect(len(grs)).To(BeNumerically(">=", 1), "at least one goroutine")
 		Expect(grs[0].CurrentLoc.Function).NotTo(BeEmpty(),
 			"goroutine current location should resolve to a function")
+	})
+}
+
+// childValues indexes a variable's children by name → value, for asserting
+// expanded struct fields / slice elements.
+func childValues(v protocol.Variable) map[string]string {
+	out := make(map[string]string, len(v.Children))
+	for _, c := range v.Children {
+		out[c.Name] = c.Value
+	}
+	return out
+}
+
+// declareTypedLocalsSpec asserts type-aware, expandable variable inspection at a
+// breakpoint: a scalar int reads its decimal value, a string shows its text, a
+// named struct expands into named fields, and a slice shows its elements. It
+// also cross-checks Evaluate(name) against the same locals. Shares the `inspect`
+// label (wired into both containers) and is platform-agnostic — the typed
+// formatter reads tracee memory through the backend's bulk ReadMemory, which
+// both ptrace (linux) and Mach (darwin) satisfy.
+func declareTypedLocalsSpec() {
+	It("reports type-aware, expandable locals and evaluates a name", Label("inspect"), func() {
+		targetName := "typed_target"
+		bpLine := markerLine(typedLocalsTargetSrc, "// TYPEDBP")
+		bin := buildTarget(targetName, typedLocalsTargetSrc)
+
+		h := newE2EHarness(bin)
+		h.waitFor(15*time.Second, protocol.EventStepped) // initial launch stop
+
+		_, err := h.d.SetBreakpoint(targetName+".go", bpLine)
+		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint at TYPEDBP")
+		Expect(h.d.Continue()).To(Succeed(), "Continue to TYPEDBP")
+		evt := h.waitFor(15*time.Second,
+			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit), "stopped at TYPEDBP")
+
+		locals, err := h.d.Locals(0)
+		Expect(err).NotTo(HaveOccurred(), "Locals(0)")
+		byName := make(map[string]protocol.Variable, len(locals))
+		for _, v := range locals {
+			byName[v.Name] = v
+		}
+
+		n, ok := byName["n"]
+		Expect(ok).To(BeTrue(), "local n present; got %v", locals)
+		Expect(n.Kind).To(Equal("int"), "n kind")
+		Expect(n.Value).To(Equal("42"), "n value")
+
+		s, ok := byName["s"]
+		Expect(ok).To(BeTrue(), "local s present")
+		Expect(s.Kind).To(Equal("string"), "s kind")
+		Expect(s.Value).To(ContainSubstring("hello"), "s value")
+
+		pt, ok := byName["pt"]
+		Expect(ok).To(BeTrue(), "local pt present")
+		Expect(pt.Kind).To(Equal("struct"), "pt kind")
+		Expect(childValues(pt)).To(SatisfyAll(
+			HaveKeyWithValue("X", "1"), HaveKeyWithValue("Y", "2")),
+			"pt fields expand to X=1 Y=2")
+
+		nums, ok := byName["nums"]
+		Expect(ok).To(BeTrue(), "local nums present")
+		Expect(nums.Kind).To(Equal("slice"), "nums kind")
+		Expect(childValues(nums)).To(SatisfyAll(
+			HaveKeyWithValue("[0]", "10"),
+			HaveKeyWithValue("[1]", "20"),
+			HaveKeyWithValue("[2]", "30")),
+			"nums elements expand to 10,20,30")
+
+		// Evaluate(name) resolves the same locals in the same frame.
+		en, err := h.d.Evaluate(0, "n")
+		Expect(err).NotTo(HaveOccurred(), "Evaluate n")
+		Expect(en.Value).To(Equal("42"), "Evaluate n value")
+		ep, err := h.d.Evaluate(0, "pt")
+		Expect(err).NotTo(HaveOccurred(), "Evaluate pt")
+		Expect(childValues(ep)).To(HaveKeyWithValue("X", "1"), "Evaluate pt expands")
 	})
 }
 
