@@ -103,6 +103,23 @@ func dispatch(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, erro
 		}
 		return dispatchResult{event: &evt}, nil
 
+	case protocol.CmdEvaluate:
+		var p protocol.EvaluatePayloadCmd
+		if err := protocol.DecodeCommandPayload(cmd, &p); err != nil {
+			return dispatchResult{}, err
+		}
+		result, err := dbg.Evaluate(p.FrameIndex, p.Name)
+		if err != nil {
+			return dispatchResult{}, err
+		}
+		evt, err := protocol.NewEvent(protocol.EventEvaluate, 0, protocol.EvaluatePayload{
+			Result: result,
+		})
+		if err != nil {
+			return dispatchResult{}, err
+		}
+		return dispatchResult{event: &evt}, nil
+
 	case protocol.CmdFrames:
 		frames, err := dbg.StackFrames()
 		if err != nil {

@@ -357,6 +357,25 @@ func (c *wsClient) Locals(frameIndex int) ([]protocol.Variable, error) {
 	return p.Variables, nil
 }
 
+func (c *wsClient) Evaluate(frameIndex int, name string) (protocol.Variable, error) {
+	cmd, err := newCommand(protocol.CmdEvaluate, protocol.EvaluatePayloadCmd{
+		FrameIndex: frameIndex,
+		Name:       name,
+	})
+	if err != nil {
+		return protocol.Variable{}, err
+	}
+	evt, err := c.sendAndWait(cmd, protocol.EventEvaluate)
+	if err != nil {
+		return protocol.Variable{}, err
+	}
+	var p protocol.EvaluatePayload
+	if err := protocol.DecodeEventPayload(evt, &p); err != nil {
+		return protocol.Variable{}, fmt.Errorf("decode Evaluate: %w", err)
+	}
+	return p.Result, nil
+}
+
 func (c *wsClient) StackFrames() ([]protocol.Frame, error) {
 	cmd, err := newCommand(protocol.CmdFrames, struct{}{})
 	if err != nil {
