@@ -20,17 +20,30 @@ import (
 // degrades a single node to a hex or <optimized out> rendering rather than
 // erroring the stop. See AGENTS.md → DWARF reader notes.
 
-// Bounds on the eager tree. Together with the visited-address cycle guard these
-// keep one stop's inspection cheap and finite regardless of how deep or wide the
-// target's data is, and make self-referential structures (linked lists, back
-// pointers) safe to format.
+// Bounds on the eager tree. The per-node depth (maxValueDepth) and per-aggregate
+// width (maxChildren) caps plus the visited-address cycle guard stop any single
+// path from running away, but a collection-of-collections is still bounded only
+// by their product (e.g. [][][][]int ≈ maxChildren⁴ nodes, each doing its own
+// ReadMemory). maxTotalNodes/maxTotalBytes add a SHARED ceiling across the whole
+// walk — threaded through formatCtx and debited once per node and by each read —
+// so one Locals/Evaluate/variables request can never wedge the single-threaded
+// engine loop no matter how deep or wide the target's data is. Exhausting either
+// budget degrades the subtree to a single truncation node; it never errors the
+// stop.
 const (
 	maxValueDepth  = 4    // aggregate nesting levels expanded
 	maxChildren    = 100  // fields/elements per aggregate before a "… N more" node
 	maxPtrDeref    = 1    // pointer-chase depth
 	maxStringBytes = 256  // bytes read from a string/[]byte before truncation
 	maxScalarBytes = 4096 // defensive cap on any single ReadMemory
+
+	maxTotalNodes = 10000      // nodes across ONE inspection before truncation
+	maxTotalBytes = 256 * 1024 // bytes read across ONE inspection before truncation
 )
+
+// truncatedValue marks a node the eager walk refused to expand because the
+// shared per-inspection node/byte budget (formatCtx) was exhausted.
+const truncatedValue = "<truncated: inspection budget exhausted>"
 
 // Variable.Kind classifier strings.
 const (
@@ -52,23 +65,49 @@ const (
 
 // formatCtx carries the per-inspection state shared across the whole recursive
 // walk. b and visited are shared; depth/ptrDepth are passed by value so a
-// sibling's recursion budget is independent.
+// sibling's recursion budget is independent. nodesLeft and bytesLeft are the
+// shared GLOBAL ceiling (see the bounds block): decremented once per formatNode
+// and by each read, so a collection-of-collections can't fan out unboundedly.
 type formatCtx struct {
-	b       Backend
-	visited map[uint64]bool // addresses whose formatting has begun (cycle guard)
+	b         Backend
+	visited   map[uint64]bool // addresses whose formatting has begun (cycle guard)
+	nodesLeft int             // remaining nodes for this inspection (shared)
+	bytesLeft int             // remaining bytes to read for this inspection (shared)
+}
+
+// read fetches n bytes at addr like readMem, additionally debiting the shared
+// byte budget so the whole eager walk can't over-read across many small nodes.
+func (ctx *formatCtx) read(addr uint64, n int) ([]byte, error) {
+	buf, err := readMem(ctx.b, addr, n)
+	ctx.bytesLeft -= len(buf)
+	return buf, err
+}
+
+// budgetExhausted reports whether the shared node or byte ceiling for one
+// inspection has been reached. Once true the walk emits a single truncation node
+// instead of recursing or reading further — degrading the subtree, never
+// erroring the stop.
+func (ctx *formatCtx) budgetExhausted() bool {
+	return ctx.nodesLeft <= 0 || ctx.bytesLeft <= 0
 }
 
 // formatTyped renders the value of type typ stored at addr into a bounded
 // protocol.Variable tree rooted at name.
 func (r *dwarfReader) formatTyped(b Backend, name string, typ dwarf.Type, addr uint64) protocol.Variable {
-	ctx := &formatCtx{b: b, visited: map[uint64]bool{}}
+	ctx := &formatCtx{b: b, visited: map[uint64]bool{}, nodesLeft: maxTotalNodes, bytesLeft: maxTotalBytes}
 	return r.formatNode(name, typ, addr, 0, 0, ctx)
 }
 
 func (r *dwarfReader) formatNode(name string, typ dwarf.Type, addr uint64, depth, ptrDepth int, ctx *formatCtx) protocol.Variable {
+	// Global budget guard: every node in the tree passes through here, so this
+	// single check bounds the total node count regardless of nesting shape.
+	if ctx.budgetExhausted() {
+		return protocol.Variable{Name: name, Address: addr, Value: truncatedValue}
+	}
+	ctx.nodesLeft--
 	out := protocol.Variable{Name: name, Address: addr}
 	if typ == nil {
-		out.Value = r.hexFallback(ctx.b, addr, 8)
+		out.Value = r.hexFallback(ctx, addr, 8)
 		return out
 	}
 
@@ -78,47 +117,47 @@ func (r *dwarfReader) formatNode(name string, typ dwarf.Type, addr uint64, depth
 	switch special {
 	case kindMap, kindChan:
 		out.Kind = special
-		out.Value = r.summaryPointer(ctx.b, addr, display)
+		out.Value = r.summaryPointer(ctx, addr, display)
 		return out
 	case kindInterface:
 		out.Kind = kindInterface
-		out.Value = r.summaryInterface(ctx.b, addr, display)
+		out.Value = r.summaryInterface(ctx, addr, display)
 		return out
 	}
 
 	switch t := concrete.(type) {
 	case *dwarf.IntType:
 		out.Kind = kindInt
-		r.setScalar(&out, ctx.b, addr, int(t.Size()), formatInt)
+		r.setScalar(&out, ctx, addr, int(t.Size()), formatInt)
 	case *dwarf.CharType:
 		out.Kind = kindInt
-		r.setScalar(&out, ctx.b, addr, int(t.Size()), formatInt)
+		r.setScalar(&out, ctx, addr, int(t.Size()), formatInt)
 	case *dwarf.UintType:
 		out.Kind = kindUint
-		r.setScalar(&out, ctx.b, addr, int(t.Size()), formatUint)
+		r.setScalar(&out, ctx, addr, int(t.Size()), formatUint)
 	case *dwarf.UcharType:
 		out.Kind = kindUint
-		r.setScalar(&out, ctx.b, addr, int(t.Size()), formatUint)
+		r.setScalar(&out, ctx, addr, int(t.Size()), formatUint)
 	case *dwarf.BoolType:
 		out.Kind = kindBool
-		r.setScalar(&out, ctx.b, addr, int(t.Size()), formatBool)
+		r.setScalar(&out, ctx, addr, int(t.Size()), formatBool)
 	case *dwarf.FloatType:
 		out.Kind = kindFloat
-		r.setScalar(&out, ctx.b, addr, int(t.Size()), formatFloat)
+		r.setScalar(&out, ctx, addr, int(t.Size()), formatFloat)
 	case *dwarf.ComplexType:
 		out.Kind = kindComplex
-		r.setScalar(&out, ctx.b, addr, int(t.Size()), formatComplex)
+		r.setScalar(&out, ctx, addr, int(t.Size()), formatComplex)
 	case *dwarf.PtrType:
 		r.formatPointer(&out, t, addr, depth, ptrDepth, ctx)
 	case *dwarf.FuncType:
 		out.Kind = kindFunc
-		out.Value = r.summaryPointer(ctx.b, addr, display)
+		out.Value = r.summaryPointer(ctx, addr, display)
 	case *dwarf.StructType:
 		r.formatStruct(&out, t, addr, depth, ptrDepth, ctx)
 	case *dwarf.ArrayType:
 		r.formatArray(&out, t, addr, depth, ptrDepth, ctx)
 	default:
-		out.Value = r.hexFallback(ctx.b, addr, sizeOf(concrete))
+		out.Value = r.hexFallback(ctx, addr, sizeOf(concrete))
 	}
 	return out
 }
@@ -167,7 +206,7 @@ func unwrapType(typ dwarf.Type) (concrete dwarf.Type, display, special string) {
 
 func (r *dwarfReader) formatPointer(out *protocol.Variable, t *dwarf.PtrType, addr uint64, depth, ptrDepth int, ctx *formatCtx) {
 	out.Kind = kindPtr
-	buf, err := readMem(ctx.b, addr, 8)
+	buf, err := ctx.read(addr, 8)
 	if err != nil {
 		out.Value = unreadable(err)
 		return
@@ -194,7 +233,7 @@ func (r *dwarfReader) formatStruct(out *protocol.Variable, t *dwarf.StructType, 
 	// Go strings and slices are DWARF structs; recognise them by name/shape.
 	if t.StructName == "string" {
 		out.Kind = kindString
-		out.Value = r.readGoString(ctx.b, addr)
+		out.Value = r.readGoString(ctx, addr)
 		return
 	}
 	if strings.HasPrefix(t.StructName, "[]") {
@@ -219,6 +258,10 @@ func (r *dwarfReader) formatStruct(out *protocol.Variable, t *dwarf.StructType, 
 			out.Children = append(out.Children, moreNode(len(t.Field)-maxChildren))
 			break
 		}
+		if ctx.budgetExhausted() {
+			out.Children = append(out.Children, truncatedNode())
+			break
+		}
 		child := r.formatNode(f.Name, f.Type, addr+uint64(f.ByteOffset), depth+1, ptrDepth, ctx)
 		out.Children = append(out.Children, child)
 	}
@@ -226,7 +269,7 @@ func (r *dwarfReader) formatStruct(out *protocol.Variable, t *dwarf.StructType, 
 
 func (r *dwarfReader) formatSlice(out *protocol.Variable, t *dwarf.StructType, addr uint64, depth, ptrDepth int, ctx *formatCtx) {
 	out.Kind = kindSlice
-	hdr, err := readMem(ctx.b, addr, 24) // {array *elem, len int, cap int}
+	hdr, err := ctx.read(addr, 24) // {array *elem, len int, cap int}
 	if err != nil {
 		out.Value = unreadable(err)
 		return
@@ -264,6 +307,10 @@ func (r *dwarfReader) formatElements(out *protocol.Variable, elemType dwarf.Type
 		shown = maxChildren
 	}
 	for i := int64(0); i < shown; i++ {
+		if ctx.budgetExhausted() {
+			out.Children = append(out.Children, truncatedNode())
+			return
+		}
 		elemAddr := base + uint64(i)*uint64(stride)
 		child := r.formatNode(fmt.Sprintf("[%d]", i), elemType, elemAddr, depth+1, ptrDepth, ctx)
 		out.Children = append(out.Children, child)
@@ -275,8 +322,8 @@ func (r *dwarfReader) formatElements(out *protocol.Variable, elemType dwarf.Type
 
 // readGoString reads a Go string header {ptr, len} at addr and returns a quoted,
 // length-bounded rendering.
-func (r *dwarfReader) readGoString(b Backend, addr uint64) string {
-	hdr, err := readMem(b, addr, 16)
+func (r *dwarfReader) readGoString(ctx *formatCtx, addr uint64) string {
+	hdr, err := ctx.read(addr, 16)
 	if err != nil {
 		return unreadable(err)
 	}
@@ -290,7 +337,7 @@ func (r *dwarfReader) readGoString(b Backend, addr uint64) string {
 		length = maxStringBytes
 		truncated = true
 	}
-	data, err := readMem(b, ptr, int(length))
+	data, err := ctx.read(ptr, int(length))
 	if err != nil {
 		return unreadable(err)
 	}
@@ -303,8 +350,8 @@ func (r *dwarfReader) readGoString(b Backend, addr uint64) string {
 
 // summaryPointer renders a value whose storage at addr is a single pointer word
 // (map/chan/func) as "<display> (0x...)" — or "nil".
-func (r *dwarfReader) summaryPointer(b Backend, addr uint64, display string) string {
-	buf, err := readMem(b, addr, 8)
+func (r *dwarfReader) summaryPointer(ctx *formatCtx, addr uint64, display string) string {
+	buf, err := ctx.read(addr, 8)
 	if err != nil {
 		return unreadable(err)
 	}
@@ -317,8 +364,8 @@ func (r *dwarfReader) summaryPointer(b Backend, addr uint64, display string) str
 
 // summaryInterface renders a two-word interface value {type, data} as a nil/
 // non-nil summary. A full dynamic-type resolution is deferred (later PR).
-func (r *dwarfReader) summaryInterface(b Backend, addr uint64, display string) string {
-	buf, err := readMem(b, addr, 16)
+func (r *dwarfReader) summaryInterface(ctx *formatCtx, addr uint64, display string) string {
+	buf, err := ctx.read(addr, 16)
 	if err != nil {
 		return unreadable(err)
 	}
@@ -330,14 +377,14 @@ func (r *dwarfReader) summaryInterface(b Backend, addr uint64, display string) s
 	return fmt.Sprintf("%s (0x%x)", display, data)
 }
 
-func (r *dwarfReader) hexFallback(b Backend, addr uint64, n int) string {
+func (r *dwarfReader) hexFallback(ctx *formatCtx, addr uint64, n int) string {
 	if n <= 0 {
 		n = 8
 	}
 	if n > 8 {
 		n = 8
 	}
-	buf, err := readMem(b, addr, n)
+	buf, err := ctx.read(addr, n)
 	if err != nil {
 		return unreadable(err)
 	}
@@ -350,12 +397,12 @@ func (r *dwarfReader) hexFallback(b Backend, addr uint64, n int) string {
 
 // setScalar reads size bytes at addr and formats them with fn, degrading to a
 // hex/unreadable rendering on a short or failed read.
-func (r *dwarfReader) setScalar(out *protocol.Variable, b Backend, addr uint64, size int, fn func([]byte) string) {
+func (r *dwarfReader) setScalar(out *protocol.Variable, ctx *formatCtx, addr uint64, size int, fn func([]byte) string) {
 	if size <= 0 {
-		out.Value = r.hexFallback(b, addr, 8)
+		out.Value = r.hexFallback(ctx, addr, 8)
 		return
 	}
-	buf, err := readMem(b, addr, size)
+	buf, err := ctx.read(addr, size)
 	if err != nil {
 		out.Value = unreadable(err)
 		return
@@ -439,6 +486,12 @@ func formatComplexParts(re, im float64, bits int) string {
 
 func moreNode(n int) protocol.Variable {
 	return protocol.Variable{Name: "…", Value: fmt.Sprintf("%d more", n)}
+}
+
+// truncatedNode is the single leaf a loop appends when the shared per-inspection
+// budget (formatCtx) is exhausted, standing in for every elided remaining child.
+func truncatedNode() protocol.Variable {
+	return protocol.Variable{Name: "…", Value: truncatedValue}
 }
 
 func unreadable(err error) string { return fmt.Sprintf("<unreadable: %v>", err) }

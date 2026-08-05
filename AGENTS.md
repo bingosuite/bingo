@@ -538,12 +538,23 @@ are detected by a `mach_msg` receive loop.
   `maxChildren=100` (overflow appended as a synthetic `… N more` node),
   pointer-deref depth `1`, `maxStringBytes≈256`, and a **visited-address cycle
   guard** (pointer targets) so self-referential structures can't infinite-loop.
+  Those are *per-path* caps; on top of them a **shared global ceiling**
+  (`maxTotalNodes=10000`, `maxTotalBytes=256 KiB`) is threaded through `formatCtx`
+  and debited once per `formatNode` and by every read. Without it a
+  collection-of-collections stays bounded only by the *product* of the width caps
+  (`[][][][]int` ≈ `maxChildren⁴` ≈ 10⁸ nodes, each its own `ReadMemory`), which
+  would wedge the single-threaded engine loop for a single `Locals`/`Evaluate`/
+  `variables` request. When either budget is exhausted the walk stops expanding
+  and appends **one** truncation node (`Value: "<truncated: inspection budget
+  exhausted>"`) — a per-path degradation, never an error on the stop.
   Reads go through the backend's bulk `ReadMemory` (linux `process_vm_readv`,
   darwin `mach_vm_read`) sized per type — never per-byte. Any unreadable address
   degrades that one node to `<unreadable: …>`; an unknown/absent type degrades to
   an 8-byte hex or `<optimized out>` — the surrounding tree and the stop are
   unaffected. The pure leaf-formatters (`formatInt/Uint/Float/Bool/Complex`) take
-  raw bytes and are unit-tested without DWARF or a backend.
+  raw bytes and are unit-tested without DWARF or a backend; the global ceiling is
+  pinned by `TestFormatTypedBudget` (a pathological nested aggregate truncates to
+  ~`maxTotalNodes`).
 - `EvaluateName` resolves a **single variable name only** (no dotted paths /
   indexing / arithmetic): a local or parameter in the subprogram containing the
   frame PC first, then a package-level global via `globalVar` (matches the exact
