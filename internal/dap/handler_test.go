@@ -394,6 +394,128 @@ func TestStackTraceAndVariablesCorrelation(t *testing.T) {
 	}
 }
 
+// TestInitializeAdvertisesEvaluateForHovers pins the new capability.
+func TestInitializeAdvertisesEvaluateForHovers(t *testing.T) {
+	hh := newHarness(t)
+	hh.sendReq("initialize", initArgs())
+	resp := recvType[*godap.InitializeResponse](hh)
+	if !resp.Body.SupportsEvaluateForHovers {
+		t.Errorf("SupportsEvaluateForHovers = false, want true")
+	}
+}
+
+// TestVariablesExpandsNestedStruct proves a struct local returned in EventLocals
+// with Children is served with a fresh child variablesReference, and that a
+// follow-up variables request on that ref returns the cached children WITHOUT a
+// second CmdLocals round-trip.
+func TestVariablesExpandsNestedStruct(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	hh.inject(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{Goroutine: protocol.Goroutine{ID: 1}})
+	_ = recvType[*godap.StoppedEvent](hh)
+
+	// variables on the frame-root ref → CmdLocals → EventLocals (nested struct).
+	hh.sendReq("variables", &godap.VariablesRequest{Arguments: godap.VariablesArguments{VariablesReference: 1}})
+	hh.cmds.waitForCommand(t, protocol.CmdLocals)
+	hh.inject(protocol.EventLocals, protocol.LocalsPayload{Variables: []protocol.Variable{
+		{Name: "n", Value: "42", Type: "int"},
+		{Name: "p", Value: "main.Point{X:1, Y:2}", Type: "main.Point", Kind: "struct", Children: []protocol.Variable{
+			{Name: "X", Value: "1", Type: "int"},
+			{Name: "Y", Value: "2", Type: "int"},
+		}},
+	}})
+	vr := recvType[*godap.VariablesResponse](hh)
+	if len(vr.Body.Variables) != 2 {
+		t.Fatalf("got %d vars, want 2", len(vr.Body.Variables))
+	}
+	if vr.Body.Variables[0].VariablesReference != 0 {
+		t.Errorf("scalar var has ref %d, want 0", vr.Body.Variables[0].VariablesReference)
+	}
+	childRef := vr.Body.Variables[1].VariablesReference
+	if childRef == 0 {
+		t.Fatalf("struct var has no child ref")
+	}
+
+	// Expanding the child ref is a synchronous cache hit — NO new CmdLocals.
+	before := len(hh.cmds.kinds())
+	hh.sendReq("variables", &godap.VariablesRequest{Arguments: godap.VariablesArguments{VariablesReference: childRef}})
+	child := recvType[*godap.VariablesResponse](hh)
+	if len(child.Body.Variables) != 2 || child.Body.Variables[0].Name != "X" || child.Body.Variables[1].Name != "Y" {
+		t.Fatalf("expanded struct = %+v", child.Body.Variables)
+	}
+	if after := len(hh.cmds.kinds()); after != before {
+		t.Errorf("child expansion enqueued %d commands, want 0 (cache hit)", after-before)
+	}
+}
+
+// TestEvaluateName drives evaluate(name)→value and evalQ correlation, including
+// a nested result that yields an expandable child ref.
+func TestEvaluateName(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	hh.inject(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{Goroutine: protocol.Goroutine{ID: 1}})
+	_ = recvType[*godap.StoppedEvent](hh)
+
+	hh.sendReq("evaluate", &godap.EvaluateRequest{Arguments: godap.EvaluateArguments{
+		Expression: "p", FrameId: 1, Context: "hover",
+	}})
+	evalCmd := hh.cmds.waitForCommand(t, protocol.CmdEvaluate)
+	var ep protocol.EvaluatePayloadCmd
+	if err := protocol.DecodeCommandPayload(evalCmd, &ep); err != nil {
+		t.Fatal(err)
+	}
+	if ep.Name != "p" || ep.FrameIndex != 0 {
+		t.Errorf("evaluate cmd = %+v, want {0 p}", ep)
+	}
+
+	hh.inject(protocol.EventEvaluate, protocol.EvaluatePayload{Result: protocol.Variable{
+		Name: "p", Value: "main.Point{X:1, Y:2}", Type: "main.Point", Kind: "struct",
+		Children: []protocol.Variable{{Name: "X", Value: "1", Type: "int"}},
+	}})
+	resp := recvType[*godap.EvaluateResponse](hh)
+	if resp.Body.Result != "main.Point{X:1, Y:2}" || resp.Body.Type != "main.Point" {
+		t.Errorf("evaluate response = %+v", resp.Body)
+	}
+	if resp.Body.VariablesReference == 0 {
+		t.Errorf("nested evaluate result has no child ref")
+	}
+}
+
+// TestEvaluateNotSuspended returns a best-effort empty result rather than
+// enqueuing a command when the tracee is running.
+func TestEvaluateNotSuspended(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t) // leaves the session running
+
+	hh.sendReq("evaluate", &godap.EvaluateRequest{Arguments: godap.EvaluateArguments{Expression: "x", FrameId: 1}})
+	resp := recvType[*godap.EvaluateResponse](hh)
+	if resp.Body.Result != "" || resp.Body.VariablesReference != 0 {
+		t.Errorf("not-suspended evaluate = %+v, want empty", resp.Body)
+	}
+	for _, k := range hh.cmds.kinds() {
+		if k == protocol.CmdEvaluate {
+			t.Fatalf("evaluate while running enqueued CmdEvaluate")
+		}
+	}
+}
+
+// TestEvaluateErrorPath pops evalQ and errors the request when the engine
+// reports the name is not in scope.
+func TestEvaluateErrorPath(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	hh.inject(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{Goroutine: protocol.Goroutine{ID: 1}})
+	_ = recvType[*godap.StoppedEvent](hh)
+
+	seq := hh.sendReq("evaluate", &godap.EvaluateRequest{Arguments: godap.EvaluateArguments{Expression: "nope", FrameId: 1}})
+	hh.cmds.waitForCommand(t, protocol.CmdEvaluate)
+	hh.inject(protocol.EventError, protocol.ErrorPayload{Command: protocol.CmdEvaluate, Message: `no variable named "nope" in scope`})
+	er := recvType[*godap.ErrorResponse](hh)
+	if er.RequestSeq != seq || er.Success {
+		t.Errorf("error response = %+v, want failure for seq %d", er.Response, seq)
+	}
+}
+
 func TestStepEmitsStoppedStep(t *testing.T) {
 	hh := newHarness(t)
 	hh.doHandshake(t)
