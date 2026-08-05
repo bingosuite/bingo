@@ -55,6 +55,20 @@ var sampleVariables = []protocol.Variable{
 	{Name: "msg", Value: "0xc000014070", Type: "string"},
 }
 
+// sampleNestedVariable exercises the reshaped Variable: Kind + a bounded
+// Children subtree (a struct with two int fields). Both new fields carry
+// omitempty, so leaf entries above must still round-trip without them.
+var sampleNestedVariable = protocol.Variable{
+	Name:  "p",
+	Value: "main.Point{X: 5, Y: 6}",
+	Type:  "main.Point",
+	Kind:  "struct",
+	Children: []protocol.Variable{
+		{Name: "X", Value: "5", Type: "int", Kind: "int"},
+		{Name: "Y", Value: "6", Type: "int", Kind: "int"},
+	},
+}
+
 func mustRaw(v any) json.RawMessage {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -267,6 +281,15 @@ var _ = Describe("Event", func() {
 					Expect(p.Variables).To(HaveLen(2))
 					Expect(p.Variables[0].Name).To(Equal("x"))
 					Expect(p.Variables[0].Type).To(Equal("int"))
+					// Leaf variables drop the optional kind/children fields.
+					var raw struct {
+						Variables []map[string]any `json:"variables"`
+					}
+					Expect(json.Unmarshal(e.Payload, &raw)).To(Succeed())
+					_, hasKind := raw.Variables[0]["kind"]
+					_, hasChildren := raw.Variables[0]["children"]
+					Expect(hasKind).To(BeFalse(), "kind should be omitted for a leaf variable")
+					Expect(hasChildren).To(BeFalse(), "children should be omitted for a leaf variable")
 				},
 			),
 
@@ -278,6 +301,20 @@ var _ = Describe("Event", func() {
 					Expect(protocol.DecodeEventPayload(e, &p)).To(Succeed())
 					Expect(p.Frames).To(HaveLen(2))
 					Expect(p.Frames[0].Index).To(Equal(0))
+				},
+			),
+
+			Entry("Evaluate",
+				protocol.EventEvaluate,
+				protocol.EvaluatePayload{Result: sampleNestedVariable},
+				func(e protocol.Event) {
+					var p protocol.EvaluatePayload
+					Expect(protocol.DecodeEventPayload(e, &p)).To(Succeed())
+					Expect(p.Result.Name).To(Equal("p"))
+					Expect(p.Result.Kind).To(Equal("struct"))
+					Expect(p.Result.Children).To(HaveLen(2))
+					Expect(p.Result.Children[0].Name).To(Equal("X"))
+					Expect(p.Result.Children[0].Value).To(Equal("5"))
 				},
 			),
 
@@ -519,6 +556,17 @@ var _ = Describe("Command", func() {
 				},
 			),
 
+			Entry("Evaluate",
+				protocol.CmdEvaluate,
+				protocol.EvaluatePayloadCmd{FrameIndex: 1, Name: "total"},
+				func(c protocol.Command) {
+					var p protocol.EvaluatePayloadCmd
+					Expect(protocol.DecodeCommandPayload(c, &p)).To(Succeed())
+					Expect(p.FrameIndex).To(Equal(1))
+					Expect(p.Name).To(Equal("total"))
+				},
+			),
+
 			Entry("Frames",
 				protocol.CmdFrames,
 				json.RawMessage(`{}`),
@@ -647,6 +695,7 @@ var _ = Describe("Kind constants", func() {
 			protocol.EventLocals,
 			protocol.EventFrames,
 			protocol.EventGoroutines,
+			protocol.EventEvaluate,
 			protocol.EventError,
 			protocol.EventRestarted,
 			protocol.EventPaused,
@@ -670,6 +719,7 @@ var _ = Describe("Kind constants", func() {
 			protocol.CmdLocals,
 			protocol.CmdFrames,
 			protocol.CmdGoroutines,
+			protocol.CmdEvaluate,
 			protocol.CmdRestart,
 			protocol.CmdPause,
 		}

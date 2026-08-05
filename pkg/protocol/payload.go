@@ -14,12 +14,21 @@ type Breakpoint struct {
 	Enabled  bool     `json:"enabled"`
 }
 
-// Variable is a local variable or function argument.
+// Variable is a local variable, function argument, or a nested field/element
+// within one. Value is a type-aware, human-readable rendering; Kind is the
+// classifier the formatter resolved from DWARF (int/uint/float/bool/string/
+// complex/ptr/struct/slice/array/map/chan/func/interface, or "" when it fell
+// back to raw hex). Children carries the bounded eager subtree for aggregates
+// (struct fields, slice/array elements, one pointer deref) so a client — and
+// DAP's variablesReference tree — can expand a value without a follow-up query.
+// See AGENTS.md → DWARF reader notes (type-aware LocalsForFrame).
 type Variable struct {
-	Name    string `json:"name"`
-	Value   string `json:"value"`
-	Type    string `json:"type"`
-	Address uint64 `json:"address,omitempty"`
+	Name     string     `json:"name"`
+	Value    string     `json:"value"`
+	Type     string     `json:"type"`
+	Address  uint64     `json:"address,omitempty"`
+	Kind     string     `json:"kind,omitempty"`
+	Children []Variable `json:"children,omitempty"`
 }
 
 // Frame is a single entry in the call stack.
@@ -120,6 +129,12 @@ type LocalsPayload struct {
 	Variables  []Variable `json:"variables"`
 }
 
+// EvaluatePayload carries the result of a CmdEvaluate: the resolved variable
+// subtree (with Children when it is an aggregate). See EvaluatePayloadCmd.
+type EvaluatePayload struct {
+	Result Variable `json:"result"`
+}
+
 type FramesPayload struct {
 	Frames []Frame `json:"frames"`
 }
@@ -184,6 +199,16 @@ type ClearBreakpointPayload struct {
 // LocalsPayloadCmd asks for locals in a stack frame. FrameIndex 0 is innermost.
 type LocalsPayloadCmd struct {
 	FrameIndex int `json:"frameIndex"`
+}
+
+// EvaluatePayloadCmd asks the debugger to resolve a single variable NAME in a
+// stack frame (FrameIndex 0 is innermost). This is name-only: no dotted paths,
+// indexing, or arithmetic — those belong to a later expression-evaluator PR.
+// A local or parameter of the frame is resolved first; failing that, a
+// package-level global of the same name. Answered with EventEvaluate.
+type EvaluatePayloadCmd struct {
+	FrameIndex int    `json:"frameIndex"`
+	Name       string `json:"name"`
 }
 
 // RestartPayload optionally overrides the args/env used for the relaunch.
