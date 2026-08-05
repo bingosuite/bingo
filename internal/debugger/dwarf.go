@@ -1,6 +1,8 @@
 package debugger
 
 import (
+	"bytes"
+	"compress/zlib"
 	"debug/dwarf"
 	"debug/elf"
 	"debug/macho"
@@ -24,6 +26,12 @@ const optimizedOut = "<optimized out>"
 type dwarfReader struct {
 	data  *dwarf.Data
 	slide int64
+
+	// frame is the parsed .debug_frame CFA evaluator, or nil when the binary
+	// carries no frame section. It resolves Go's DW_AT_frame_base
+	// (DW_OP_call_frame_cfa) so fbreg locals resolve against the true CFA
+	// rather than a fixed frame-pointer offset. See frame.go.
+	frame *frameTable
 
 	// funcIndex is a lazily-built, lowpc-sorted table of every subprogram's
 	// [low,high) DWARF PC range and name. functionAt binary-searches it instead
@@ -59,34 +67,104 @@ type funcRange struct {
 }
 
 func openDWARF(binaryPath string) (*dwarfReader, error) {
-	data, err := loadDWARFData(binaryPath)
+	data, frameBytes, err := loadDWARFData(binaryPath)
 	if err != nil {
 		return nil, fmt.Errorf("openDWARF %q: %w", binaryPath, err)
 	}
-	return &dwarfReader{data: data}, nil
+	dr := &dwarfReader{data: data}
+	if len(frameBytes) > 0 {
+		dr.frame = parseFrameTable(frameBytes)
+	}
+	return dr, nil
 }
 
-func loadDWARFData(binaryPath string) (*dwarf.Data, error) {
+// loadDWARFData returns the parsed DWARF plus the raw (decompressed)
+// .debug_frame bytes. The frame section backs the CFA evaluator (frame.go);
+// debug/dwarf does not parse Call Frame Information, so we read the section
+// ourselves. A missing frame section is not an error — CFA resolution then
+// degrades to the frame-pointer fallback in engine.frameLocation.
+func loadDWARFData(binaryPath string) (*dwarf.Data, []byte, error) {
 	switch runtime.GOOS {
 	case "linux":
 		f, err := elf.Open(binaryPath)
 		if err != nil {
-			return nil, fmt.Errorf("elf.Open: %w", err)
+			return nil, nil, fmt.Errorf("elf.Open: %w", err)
 		}
 		defer func() { _ = f.Close() }()
-		return f.DWARF()
+		data, err := f.DWARF()
+		if err != nil {
+			return nil, nil, err
+		}
+		return data, elfFrameSection(f), nil
 
 	case "darwin":
 		f, err := macho.Open(binaryPath)
 		if err != nil {
-			return nil, fmt.Errorf("macho.Open: %w", err)
+			return nil, nil, fmt.Errorf("macho.Open: %w", err)
 		}
 		defer func() { _ = f.Close() }()
-		return f.DWARF()
+		data, err := f.DWARF()
+		if err != nil {
+			return nil, nil, err
+		}
+		return data, machoFrameSection(f), nil
 
 	default:
-		return nil, fmt.Errorf("unsupported OS: %s", runtime.GOOS)
+		return nil, nil, fmt.Errorf("unsupported OS: %s", runtime.GOOS)
 	}
+}
+
+// elfFrameSection returns the decompressed .debug_frame bytes, or nil. ELF
+// Section.Data transparently inflates SHF_COMPRESSED sections; the legacy
+// .zdebug_frame form carries its own "ZLIB" header handled by inflateZlib.
+func elfFrameSection(f *elf.File) []byte {
+	if s := f.Section(".debug_frame"); s != nil {
+		if b, err := s.Data(); err == nil {
+			return inflateZlib(b)
+		}
+	}
+	if s := f.Section(".zdebug_frame"); s != nil {
+		if b, err := s.Data(); err == nil {
+			return inflateZlib(b)
+		}
+	}
+	return nil
+}
+
+// machoFrameSection returns the decompressed __debug_frame bytes, or nil. Go
+// darwin binaries store DWARF compressed as __zdebug_frame with a "ZLIB"
+// header; debug/macho does not inflate it, so inflateZlib does.
+func machoFrameSection(f *macho.File) []byte {
+	if s := f.Section("__debug_frame"); s != nil {
+		if b, err := s.Data(); err == nil {
+			return inflateZlib(b)
+		}
+	}
+	if s := f.Section("__zdebug_frame"); s != nil {
+		if b, err := s.Data(); err == nil {
+			return inflateZlib(b)
+		}
+	}
+	return nil
+}
+
+// inflateZlib inflates a legacy "ZLIB"-prefixed DWARF section (4-byte magic +
+// 8-byte big-endian uncompressed size + zlib stream). Non-prefixed input is
+// returned unchanged, so already-inflated bytes pass through.
+func inflateZlib(b []byte) []byte {
+	if len(b) < 12 || string(b[:4]) != "ZLIB" {
+		return b
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(b[12:]))
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = zr.Close() }()
+	out, err := io.ReadAll(zr)
+	if err != nil {
+		return nil
+	}
+	return out
 }
 
 // PCForFileLine returns the lowest is-stmt address for file:line. The file

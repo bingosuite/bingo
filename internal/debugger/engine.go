@@ -429,17 +429,32 @@ func (e *engine) frameLocation(frameIndex int) (framePC, frameBase uint64, err e
 		return 0, 0, fmt.Errorf("frame index %d out of range (have %d frames)",
 			frameIndex, len(framePCs))
 	}
-	frameBase = regs.BP
-	if frameIndex > 0 {
-		bp := regs.BP
-		for i := 0; i < frameIndex && bp != 0; i++ {
-			var buf [8]byte
-			if err := e.backend.ReadMemory(bp, buf[:]); err != nil {
-				break
-			}
-			bp = binary.LittleEndian.Uint64(buf[:])
+	// Resolve the CFA (Go's DW_AT_frame_base) for each frame from 0 up to the
+	// requested one. Locals are DW_OP_fbreg offsets from the CFA, recovered
+	// from .debug_frame CFI: the Go rule is SP-relative on arm64 (frame pointer
+	// + framesize, NOT + 16, because x29 points at the saved FP/LR pair at the
+	// bottom of the frame with locals above it) and frame-pointer-relative on
+	// amd64. Frames chain by SP_{i+1} = CFA_i — a callee's CFA is its caller's
+	// SP at the call, and Go passes arguments in registers so the call itself
+	// leaves SP unmoved (arm64) / only pushes the return address (amd64, which
+	// the FP-relative rule already accounts for).
+	const cfaFallbackFromFP = 16
+	sp, fp := regs.SP, regs.BP
+	for i := 0; i < frameIndex; i++ {
+		cfa, ok := e.dw.cfa(framePCs[i], sp, fp)
+		if !ok {
+			cfa = fp + cfaFallbackFromFP
 		}
-		frameBase = bp
+		var buf [8]byte
+		if err := e.backend.ReadMemory(fp, buf[:]); err != nil {
+			return 0, 0, fmt.Errorf("read frame pointer: %w", err)
+		}
+		sp = cfa
+		fp = binary.LittleEndian.Uint64(buf[:])
+	}
+	frameBase, ok := e.dw.cfa(framePCs[frameIndex], sp, fp)
+	if !ok {
+		frameBase = fp + cfaFallbackFromFP
 	}
 	return framePCs[frameIndex], frameBase, nil
 }
