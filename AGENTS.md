@@ -1153,10 +1153,12 @@ through the justfile.
 ## When you change something
 
 - **Wire protocol** (`pkg/protocol`): bump `Version` for breaking changes,
-  and update the round-trip table in `protocol_test.go`. Currently **1.1** (the
-  goroutine/thread concurrency snapshot reshaped `Goroutine` and added
-  `Thread`/`GoroutineSnapshotPayload` + `EventGoroutineSnapshot`/
-  `CmdGoroutineSnapshot`).
+  and update the round-trip table in `protocol_test.go`. Currently **1.2** (the
+  reshaped `Variable` — added `Kind` + `Children` for the type-aware expandable
+  tree — and the new `CmdEvaluate`/`EventEvaluate` name-only evaluate command/
+  event with `EvaluatePayloadCmd`/`EvaluatePayload`). 1.1 had reshaped
+  `Goroutine` and added `Thread`/`GoroutineSnapshotPayload` +
+  `EventGoroutineSnapshot`/`CmdGoroutineSnapshot`.
 - **Goroutine snapshot layout**: the reader resolves runtime struct offsets from
   DWARF **by name** (`goroutines.go`), never hardcoded. If you add a field, add
   it to `goLayout`/`resolveGoLayout`; a missing *required* offset invalidates the
