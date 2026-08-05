@@ -516,9 +516,39 @@ are detected by a `mach_msg` receive loop.
   back the goroutine/thread snapshot reader (`goroutines.go`), which never
   hardcodes runtime layout — offsets shift between Go versions. See the
   concurrency snapshot section below.
-- `LocalsForFrame` only handles `DW_OP_addr` (0x03) and `DW_OP_fbreg` (0x91).
-  Register-allocated variables come back as `<optimized out>`. Values are
-  read as 8 bytes and returned hex; type-aware formatting is a TODO.
+- `LocalsForFrame` (and `EvaluateName`) only evaluate the `DW_OP_addr` (0x03)
+  and `DW_OP_fbreg` (0x91) location expressions to an address; register-allocated
+  variables come back as `<optimized out>`. Given an address + a resolved
+  `dwarf.Type`, the **type-aware formatter** in
+  [values.go](internal/debugger/values.go) (`formatTyped`) reads the correct
+  number of bytes per type and renders a **bounded, eager `protocol.Variable`
+  tree** — nested structs/slices/arrays and one pointer deref appear inline as
+  `Children`, so both WebSocket and DAP can expand values without a path/
+  expression parser (deferred to a later PR). Supported kinds: signed/unsigned
+  ints of every width, bool, float32/64, complex64/128, `string` (reads the
+  {ptr,len} header then bounded bytes), pointers (hex + one deref child), structs
+  (fields), arrays and slices (slice = {ptr,len,cap} header → elements), plus
+  best-effort one-line summaries for map/chan/func/interface (a pointer/word hex;
+  no children). Type classification unwraps `TypedefType`/`QualType` and detects
+  Go's higher-level kinds by typedef **name** (`map[`, `chan `, `interface {`)
+  before unwrapping, because their underlying representation is a plain pointer/
+  struct that would otherwise misclassify; a visited-typedef guard breaks the
+  `interface {}` / `error` self-reference.
+- **Bounds & fallback (never error the stop):** `maxValueDepth=4`,
+  `maxChildren=100` (overflow appended as a synthetic `… N more` node),
+  pointer-deref depth `1`, `maxStringBytes≈256`, and a **visited-address cycle
+  guard** (pointer targets) so self-referential structures can't infinite-loop.
+  Reads go through the backend's bulk `ReadMemory` (linux `process_vm_readv`,
+  darwin `mach_vm_read`) sized per type — never per-byte. Any unreadable address
+  degrades that one node to `<unreadable: …>`; an unknown/absent type degrades to
+  an 8-byte hex or `<optimized out>` — the surrounding tree and the stop are
+  unaffected. The pure leaf-formatters (`formatInt/Uint/Float/Bool/Complex`) take
+  raw bytes and are unit-tested without DWARF or a backend.
+- `EvaluateName` resolves a **single variable name only** (no dotted paths /
+  indexing / arithmetic): a local or parameter in the subprogram containing the
+  frame PC first, then a package-level global via `globalVar` (matches the exact
+  DWARF name or a package-qualified `pkg.name` suffix, `DW_OP_addr` only). Backs
+  the WebSocket `CmdEvaluate`/`EventEvaluate` and the DAP `evaluate` request.
 
 ## Goroutine / thread snapshot — the concurrency data foundation
 
