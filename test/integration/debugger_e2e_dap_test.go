@@ -128,6 +128,81 @@ func declareDAPSpec() {
 	})
 }
 
+// declareDAPEvaluateSpec drives the type-aware variable surface over DAP against
+// the real backend: at a breakpoint with a struct and a slice local, it expands
+// a nested variable through its variablesReference and evaluates a bare name in
+// both a `watch` and a `hover` context. Proves the evaluate request plus the
+// cached typed-tree variables walk (ref->node) end to end through the adapter.
+func declareDAPEvaluateSpec() {
+	It("expands nested variables and evaluates a name over DAP", Label("dap"), func() {
+		line := markerLine(typedLocalsTargetSrc, "// TYPEDBP")
+		bin := buildTarget("dap_typed_target", typedLocalsTargetSrc)
+
+		_, _, dapAddr := startTestServerWithDAP()
+		dc := dialDAP(dapAddr)
+
+		dc.initialize()
+		launchSeq := dc.launch(bin, false)
+		dc.waitEvent(20*time.Second, "initialized")
+
+		bps := dc.setBreakpoints("dap_typed_target.go", line)
+		Expect(bps.Body.Breakpoints).To(HaveLen(1))
+		Expect(bps.Body.Breakpoints[0].Verified).To(BeTrue(), "breakpoint must resolve")
+
+		dc.configurationDone()
+		Expect(dc.await(launchSeq).(godap.ResponseMessage).GetResponse().Success).
+			To(BeTrue(), "launch must succeed")
+
+		stopped := dc.waitStopped(20 * time.Second)
+		Expect(stopped.Body.Reason).To(Equal("breakpoint"))
+		tid := stopped.Body.ThreadId
+
+		st := dc.stackTrace(tid)
+		Expect(st.Body.StackFrames).NotTo(BeEmpty(), "at least one frame")
+		frameID := st.Body.StackFrames[0].Id
+
+		scopes := dc.scopes(frameID)
+		Expect(scopes.Body.Scopes).To(HaveLen(1))
+
+		// Root locals: the struct local pt carries its own child reference.
+		root := dc.variablesResp(scopes.Body.Scopes[0].VariablesReference)
+		Expect(root.Body.Variables).NotTo(BeEmpty(), "locals present")
+		byName := make(map[string]godap.Variable, len(root.Body.Variables))
+		for _, v := range root.Body.Variables {
+			byName[v.Name] = v
+		}
+		pt, ok := byName["pt"]
+		Expect(ok).To(BeTrue(), "struct local pt present")
+		Expect(pt.VariablesReference).To(BeNumerically(">", 0), "pt is expandable")
+
+		// Expand pt through its child reference → named fields X=1, Y=2.
+		fields := dc.variablesResp(pt.VariablesReference)
+		fv := make(map[string]string, len(fields.Body.Variables))
+		for _, v := range fields.Body.Variables {
+			fv[v.Name] = v.Value
+		}
+		Expect(fv).To(SatisfyAll(HaveKeyWithValue("X", "1"), HaveKeyWithValue("Y", "2")),
+			"pt expands to named fields")
+
+		// evaluate a bare scalar name in the frame → its decimal value.
+		en := dc.evaluate("n", frameID, "watch")
+		Expect(en.GetResponse().Success).To(BeTrue(), "evaluate n succeeds")
+		Expect(en.Body.Result).To(Equal("42"), "evaluate n value")
+
+		// evaluate a struct name → a value string plus an expandable child ref.
+		ep := dc.evaluate("pt", frameID, "hover")
+		Expect(ep.Body.VariablesReference).To(BeNumerically(">", 0), "pt evaluate is expandable")
+		epFields := dc.variablesResp(ep.Body.VariablesReference)
+		efv := make(map[string]string, len(epFields.Body.Variables))
+		for _, v := range epFields.Body.Variables {
+			efv[v.Name] = v.Value
+		}
+		Expect(efv).To(HaveKeyWithValue("X", "1"), "evaluated pt expands to fields")
+
+		dc.disconnect()
+	})
+}
+
 // declareDAPExitSpec proves the exited/terminated mapping end to end: a DAP
 // client launches a target with NO breakpoints and lets it run to a clean exit,
 // asserting the adapter emits `exited` (with the code) followed by `terminated`.
@@ -497,6 +572,20 @@ func (c *dapClient) variables(ref int) godap.ResponseMessage {
 		Arguments: godap.VariablesArguments{VariablesReference: ref},
 	})
 	return resp.(godap.ResponseMessage)
+}
+
+// variablesResp is variables typed to the concrete response for tree assertions.
+func (c *dapClient) variablesResp(ref int) *godap.VariablesResponse {
+	GinkgoHelper()
+	return c.variables(ref).(*godap.VariablesResponse)
+}
+
+// evaluate issues a DAP evaluate request for a bare variable name in a frame.
+func (c *dapClient) evaluate(expr string, frameID int, context string) *godap.EvaluateResponse {
+	GinkgoHelper()
+	return c.request("evaluate", &godap.EvaluateRequest{
+		Arguments: godap.EvaluateArguments{Expression: expr, FrameId: frameID, Context: context},
+	}).(*godap.EvaluateResponse)
 }
 
 func (c *dapClient) disconnect() {
