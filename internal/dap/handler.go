@@ -102,9 +102,25 @@ type Handler struct {
 	threadsQ []int
 	framesQ  []int
 	localsQ  []*varsReq
+	evalQ    []int
 
 	cachedFrames []protocol.Frame
+
+	// varCache maps a child variablesReference to the DAP variables it expands
+	// to. It is populated eagerly from a typed EventLocals/EventEvaluate subtree
+	// (buildVarTree) and read synchronously by a follow-up variables request.
+	// nextVarRef allocates those child refs from varRefBase upward. Both reset
+	// at every stop — the tree reflects one memory snapshot, so refs from a
+	// prior suspension are stale.
+	varCache   map[int][]godap.Variable
+	nextVarRef int
 }
+
+// varRefBase is the first child variablesReference. Child refs start well above
+// any frame-root ref (a scope's reference IS the frameID == frameIndex+1,
+// bounded by the max stack depth), so the two ranges never collide and
+// onVariables can distinguish a child ref from a frame-root ref by magnitude.
+const varRefBase = 1 << 16
 
 // bpSlot is one requested breakpoint within a setBreakpoints request, awaiting
 // (or already holding) its resolved DAP breakpoint.
@@ -170,6 +186,7 @@ func NewHandler(conn net.Conn, provider Provider, log *slog.Logger) *Handler {
 		cmdOut:   make(chan []byte, cmdBufferSize),
 		done:     make(chan struct{}),
 		bpByFile: make(map[string]map[int]int),
+		varCache: make(map[int][]godap.Variable),
 	}
 }
 
@@ -342,4 +359,24 @@ func (h *Handler) enqueue(cmd []byte) {
 	case h.cmdOut <- cmd:
 	case <-h.done:
 	}
+}
+
+// allocVarRef reserves the next child variablesReference. Caller MUST hold h.mu.
+func (h *Handler) allocVarRef() int {
+	if h.nextVarRef < varRefBase {
+		h.nextVarRef = varRefBase
+	}
+	h.nextVarRef++
+	return h.nextVarRef
+}
+
+// resetVarsLocked drops the cached variable subtrees and ref allocator. Child
+// references are only valid within one suspension (they expand a memory
+// snapshot taken at that stop); the cache is rebuilt from the next
+// EventLocals/EventEvaluate. Caller MUST hold h.mu.
+func (h *Handler) resetVarsLocked() {
+	if len(h.varCache) > 0 {
+		h.varCache = make(map[int][]godap.Variable)
+	}
+	h.nextVarRef = 0
 }

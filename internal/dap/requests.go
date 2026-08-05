@@ -44,6 +44,8 @@ func (h *Handler) dispatchRequest(msg godap.Message) {
 		h.onScopes(r)
 	case *godap.VariablesRequest:
 		h.onVariables(r)
+	case *godap.EvaluateRequest:
+		h.onEvaluate(r)
 	case *godap.DisconnectRequest:
 		h.onDisconnect(r)
 	case *godap.TerminateRequest:
@@ -66,6 +68,7 @@ func (h *Handler) onInitialize(req *godap.InitializeRequest) {
 			SupportsTerminateRequest:         true,
 			SupportsRestartRequest:           true,
 			SupportTerminateDebuggee:         true,
+			SupportsEvaluateForHovers:        true,
 		},
 	})
 }
@@ -360,12 +363,25 @@ func (h *Handler) onScopes(req *godap.ScopesRequest) {
 }
 
 func (h *Handler) onVariables(req *godap.VariablesRequest) {
-	frameIndex := frameIndexFromRef(req.Arguments.VariablesReference)
+	ref := req.Arguments.VariablesReference
+
+	h.mu.Lock()
+	// A child ref addresses an already-computed subtree (cached eagerly from a
+	// typed EventLocals/EventEvaluate). Serve it synchronously — no round-trip.
+	if children, ok := h.varCache[ref]; ok {
+		h.mu.Unlock()
+		h.send(&godap.VariablesResponse{
+			Response: h.response(req.Seq, "variables"),
+			Body:     godap.VariablesResponseBody{Variables: children},
+		})
+		return
+	}
+	// Otherwise it is a frame-root ref (a scope's reference == frameIndex+1):
+	// fetch that frame's locals from the engine.
+	frameIndex := frameIndexFromRef(ref)
 	if frameIndex < 0 {
 		frameIndex = 0
 	}
-
-	h.mu.Lock()
 	suspended := h.suspended
 	if suspended {
 		h.localsQ = append(h.localsQ, &varsReq{seq: req.Seq, frameIndex: frameIndex})
@@ -380,6 +396,36 @@ func (h *Handler) onVariables(req *godap.VariablesRequest) {
 		return
 	}
 	if cmd, err := marshalCommand(protocol.CmdLocals, protocol.LocalsPayloadCmd{FrameIndex: frameIndex}); err == nil {
+		h.enqueue(cmd)
+	}
+}
+
+// onEvaluate answers a DAP evaluate request by resolving a single VARIABLE NAME
+// (not an expression) in the given frame. bingo's evaluate is name-only; the
+// context ("watch"/"hover"/"repl") is handled uniformly. Not suspended → a
+// best-effort empty response rather than blocking (matches threads/variables).
+func (h *Handler) onEvaluate(req *godap.EvaluateRequest) {
+	name := req.Arguments.Expression
+	frameIndex := frameIndexFromRef(req.Arguments.FrameId)
+	if frameIndex < 0 {
+		frameIndex = 0
+	}
+
+	h.mu.Lock()
+	suspended := h.suspended
+	if suspended {
+		h.evalQ = append(h.evalQ, req.Seq)
+	}
+	h.mu.Unlock()
+
+	if !suspended {
+		h.send(&godap.EvaluateResponse{
+			Response: h.response(req.Seq, "evaluate"),
+			Body:     godap.EvaluateResponseBody{Result: "", VariablesReference: 0},
+		})
+		return
+	}
+	if cmd, err := marshalCommand(protocol.CmdEvaluate, protocol.EvaluatePayloadCmd{FrameIndex: frameIndex, Name: name}); err == nil {
 		h.enqueue(cmd)
 	}
 }
