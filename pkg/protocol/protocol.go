@@ -4,7 +4,7 @@ package protocol
 
 import "encoding/json"
 
-const Version = "1.1"
+const Version = "1.2"
 
 // Event is the envelope for all server-to-client messages.
 type Event struct {
@@ -48,6 +48,12 @@ const (
 	EventLocals     EventKind = "Locals"
 	EventFrames     EventKind = "Frames"
 	EventGoroutines EventKind = "Goroutines"
+
+	// EventEvaluate answers a CmdEvaluate with the resolved variable subtree.
+	// Like EventLocals it is a non-suspending confirmation (it follows a data
+	// request and never gates the hub), consumed by WebSocket clients directly
+	// and by DAP as an `evaluate` response.
+	EventEvaluate EventKind = "Evaluate"
 
 	// EventGoroutineSnapshot streams the full concurrency picture (goroutines
 	// with parent linkage, OS threads, current goroutine, and created/exited
@@ -97,6 +103,12 @@ const (
 	CmdLocals     CommandKind = "Locals"
 	CmdFrames     CommandKind = "Frames"
 	CmdGoroutines CommandKind = "Goroutines"
+
+	// CmdEvaluate resolves a single variable NAME in a stack frame (answered
+	// with EventEvaluate). Name-only — no expressions. Like CmdLocals it is
+	// executed immediately and is neither a suspending request nor a resuming
+	// command; it requires the process to be suspended.
+	CmdEvaluate CommandKind = "Evaluate"
 
 	// CmdGoroutineSnapshot requests a full concurrency snapshot on demand
 	// (answered with EventGoroutineSnapshot). The same snapshot is also pushed
