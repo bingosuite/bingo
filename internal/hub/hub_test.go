@@ -38,6 +38,7 @@ type fakeDebugger struct {
 	stepOutErr       error
 	pauseErr         error
 	localsResult     []protocol.Variable
+	evalResult       protocol.Variable
 	framesResult     []protocol.Frame
 	goroutinesResult []protocol.Goroutine
 	snapshotResult   protocol.GoroutineSnapshotPayload
@@ -91,6 +92,10 @@ func (f *fakeDebugger) SetBreakpoint(file string, line int) (protocol.Breakpoint
 func (f *fakeDebugger) Locals(fi int) ([]protocol.Variable, error) {
 	f.record("Locals")
 	return f.localsResult, nil
+}
+func (f *fakeDebugger) Evaluate(fi int, name string) (protocol.Variable, error) {
+	f.record("Evaluate")
+	return f.evalResult, nil
 }
 func (f *fakeDebugger) StackFrames() ([]protocol.Frame, error) {
 	f.record("StackFrames")
@@ -476,6 +481,28 @@ var _ = Describe("Hub", func() {
 				}
 				return e.Kind
 			}, "500ms", "10ms").Should(Equal(protocol.EventLocals))
+		})
+
+		It("allows Evaluate while suspended", func() {
+			conn := newFakeWSConn()
+			h.AddClient(conn, nil)
+			fd.evalResult = protocol.Variable{Name: "total", Value: "7", Type: "int", Kind: "int"}
+
+			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+			_, _ = recvEvent(conn)
+
+			conn.inject(mustCommand(protocol.CmdEvaluate,
+				protocol.EvaluatePayloadCmd{FrameIndex: 0, Name: "total"}))
+
+			Eventually(func() protocol.EventKind {
+				e, ok := recvEvent(conn)
+				if !ok {
+					return ""
+				}
+				return e.Kind
+			}, "500ms", "10ms").Should(Equal(protocol.EventEvaluate))
+			Expect(fd.recordedCalls()).To(ContainElement("Evaluate"))
 		})
 
 		It("only the first resuming command wins when multiple clients race", func() {

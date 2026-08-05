@@ -49,6 +49,12 @@ type Client interface {
 	ClearBreakpoint(id int) error
 
 	Locals(frameIndex int) ([]protocol.Variable, error)
+
+	// Evaluate resolves a single variable NAME in the given frame (local or
+	// parameter, then a package global) and blocks until the server returns its
+	// typed value tree. Name-only — no expressions.
+	Evaluate(frameIndex int, name string) (protocol.Variable, error)
+
 	StackFrames() ([]protocol.Frame, error)
 	Goroutines() ([]protocol.Goroutine, error)
 
