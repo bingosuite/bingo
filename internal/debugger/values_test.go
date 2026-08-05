@@ -1,6 +1,74 @@
 package debugger
 
-import "testing"
+import (
+	"debug/dwarf"
+	"testing"
+
+	"github.com/bingosuite/bingo/pkg/protocol"
+)
+
+// readableBackend is a minimal Backend whose ReadMemory always succeeds (returns
+// zeroed bytes), so the pure formatter can be exercised without a real tracee.
+// Only ReadMemory is used by the value walk; the rest satisfy the interface.
+type readableBackend struct{}
+
+func (readableBackend) ContinueProcess() error                { return nil }
+func (readableBackend) SingleStep(int) error                  { return nil }
+func (readableBackend) StopProcess() error                    { return nil }
+func (readableBackend) PauseSignal() int                      { return 0 }
+func (readableBackend) ReadMemory(_ uint64, dst []byte) error { return nil }
+func (readableBackend) WriteMemory(uint64, []byte) error      { return nil }
+func (readableBackend) GetRegisters(int) (Registers, error)   { return Registers{}, nil }
+func (readableBackend) SetRegisters(int, Registers) error     { return nil }
+func (readableBackend) Threads() ([]int, error)               { return []int{1}, nil }
+func (readableBackend) Wait() (StopEvent, error)              { return StopEvent{}, nil }
+
+func countNodes(v protocol.Variable) int {
+	n := 1
+	for i := range v.Children {
+		n += countNodes(v.Children[i])
+	}
+	return n
+}
+
+func hasTruncationNode(v protocol.Variable) bool {
+	if v.Value == truncatedValue {
+		return true
+	}
+	for i := range v.Children {
+		if hasTruncationNode(v.Children[i]) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestFormatTypedBudget guards the shared per-inspection node/byte ceiling: a
+// pathologically wide, deep aggregate ([100][100][100][100]int, ~10^8 potential
+// nodes) must be truncated to O(maxTotalNodes) with a truncation node present,
+// so one Locals/Evaluate request can never wedge the single-threaded engine loop.
+func TestFormatTypedBudget(t *testing.T) {
+	intT := &dwarf.IntType{BasicType: dwarf.BasicType{CommonType: dwarf.CommonType{ByteSize: 8, Name: "int"}}}
+	arr := func(elem dwarf.Type, count int64) *dwarf.ArrayType {
+		return &dwarf.ArrayType{Type: elem, Count: count}
+	}
+	// Four nested levels, each wider than maxChildren, so the product dwarfs the
+	// global budget while each level's own width cap alone would not save us.
+	nested := arr(arr(arr(arr(intT, 100), 100), 100), 100)
+
+	r := &dwarfReader{}
+	root := r.formatTyped(readableBackend{}, "grid", nested, 0x1000)
+
+	total := countNodes(root)
+	// Real nodes are capped at maxTotalNodes; truncation leaves add only O(depth)
+	// along the unwinding path, so a small slack is plenty.
+	if total > maxTotalNodes+1000 {
+		t.Fatalf("node count %d exceeds budget ceiling %d(+slack)", total, maxTotalNodes)
+	}
+	if !hasTruncationNode(root) {
+		t.Fatalf("expected a truncation node when the inspection budget is exhausted")
+	}
+}
 
 // Pure leaf-formatter tests: these take raw little-endian bytes plus an implied
 // width and assert the rendered string, so they need no DWARF data or backend.
