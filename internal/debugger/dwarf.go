@@ -318,16 +318,69 @@ func (r *dwarfReader) FramesForStack(pcs []uint64) []protocol.Frame {
 	return frames
 }
 
-// LocalsForFrame returns variables in the subprogram containing pc. Only
-// DW_OP_addr (0x03) and DW_OP_fbreg (0x91) are evaluated; register-allocated
-// variables come back as "<optimized out>".
+// LocalsForFrame returns type-aware, bounded variable trees for every local and
+// parameter in the subprogram containing pc. Each variable's DWARF type is
+// classified and its value formatted with the correct byte width, with nested
+// aggregates (structs, slices, arrays, one pointer deref) rendered inline as
+// Children; see values.go. Only DW_OP_addr (0x03) and DW_OP_fbreg (0x91)
+// locations are evaluated — register-allocated variables come back as
+// "<optimized out>".
 func (r *dwarfReader) LocalsForFrame(b Backend, pc, frameBase uint64) ([]protocol.Variable, error) {
+	entries, err := r.subprogramVars(pc)
+	if err != nil {
+		return nil, err
+	}
+	var vars []protocol.Variable
+	for _, child := range entries {
+		name, _ := child.Val(dwarf.AttrName).(string)
+		vars = append(vars, r.formatEntry(b, child, name, frameBase))
+	}
+	return vars, nil
+}
+
+// EvaluateName resolves a single variable name — no dotted paths, indexing, or
+// arithmetic (those belong to the later expression-evaluator PR). It first looks
+// for a local or parameter in the subprogram containing pc, then falls back to a
+// package-level global. The result is the same bounded typed tree LocalsForFrame
+// produces.
+func (r *dwarfReader) EvaluateName(b Backend, pc, frameBase uint64, name string) (protocol.Variable, error) {
+	entries, err := r.subprogramVars(pc)
+	if err != nil {
+		return protocol.Variable{}, err
+	}
+	for _, child := range entries {
+		if n, _ := child.Val(dwarf.AttrName).(string); n == name {
+			return r.formatEntry(b, child, name, frameBase), nil
+		}
+	}
+	if addr, typ, ok := r.globalVar(name); ok {
+		return r.formatTyped(b, name, typ, addr), nil
+	}
+	return protocol.Variable{}, fmt.Errorf("no variable named %q in scope", name)
+}
+
+// formatEntry renders one variable/parameter DIE. When its location can't be
+// evaluated (register-allocated, or an unsupported expr) it degrades to
+// "<optimized out>" while still reporting the type name.
+func (r *dwarfReader) formatEntry(b Backend, entry *dwarf.Entry, name string, frameBase uint64) protocol.Variable {
+	typ := r.varType(entry)
+	addr, ok := r.varAddress(entry, frameBase)
+	if !ok {
+		return protocol.Variable{Name: name, Type: typeDisplayName(typ), Value: optimizedOut}
+	}
+	return r.formatTyped(b, name, typ, addr)
+}
+
+// subprogramVars collects the variable and formal-parameter DIEs of the
+// subprogram whose PC range contains pc. The returned entries are stable copies
+// safe to retain past the reader's lifetime.
+func (r *dwarfReader) subprogramVars(pc uint64) ([]*dwarf.Entry, error) {
 	dwarfPC := uint64(int64(pc) - r.slide)
 	rd := r.data.Reader()
 	for {
 		entry, err := rd.Next()
 		if err != nil {
-			return nil, fmt.Errorf("DWARF LocalsForFrame: %w", err)
+			return nil, fmt.Errorf("DWARF subprogramVars: %w", err)
 		}
 		if entry == nil {
 			break
@@ -347,7 +400,7 @@ func (r *dwarfReader) LocalsForFrame(b Backend, pc, frameBase uint64) ([]protoco
 			continue
 		}
 
-		var vars []protocol.Variable
+		var out []*dwarf.Entry
 		for {
 			child, err := rd.Next()
 			if err == io.EOF || child == nil {
@@ -362,80 +415,83 @@ func (r *dwarfReader) LocalsForFrame(b Backend, pc, frameBase uint64) ([]protoco
 			if child.Tag != dwarf.TagVariable && child.Tag != dwarf.TagFormalParameter {
 				continue
 			}
-
-			name, _ := child.Val(dwarf.AttrName).(string)
-			typ := r.typeName(child)
-			value := r.evalLocation(b, child, frameBase)
-
-			vars = append(vars, protocol.Variable{
-				Name:  name,
-				Type:  typ,
-				Value: value,
-			})
+			out = append(out, child)
 		}
-		return vars, nil
+		return out, nil
 	}
 	return nil, nil
 }
 
-func (r *dwarfReader) typeName(entry *dwarf.Entry) string {
+// varType resolves a DIE's DW_AT_type to a concrete dwarf.Type (nil on absence
+// or error — the formatter degrades to a hex fallback).
+func (r *dwarfReader) varType(entry *dwarf.Entry) dwarf.Type {
 	off, ok := entry.Val(dwarf.AttrType).(dwarf.Offset)
 	if !ok {
-		return "unknown"
+		return nil
 	}
-	tr := r.data.Reader()
-	tr.Seek(off)
-	te, err := tr.Next()
-	if err != nil || te == nil {
-		return "unknown"
+	typ, err := r.data.Type(off)
+	if err != nil {
+		return nil
 	}
-	name, _ := te.Val(dwarf.AttrName).(string)
-	if name == "" {
-		return te.Tag.String()
-	}
-	return name
+	return typ
 }
 
-func (r *dwarfReader) evalLocation(b Backend, entry *dwarf.Entry, frameBase uint64) string {
+// varAddress evaluates a DIE's location expression to a runtime address. ok is
+// false for register-allocated variables and unsupported expressions.
+func (r *dwarfReader) varAddress(entry *dwarf.Entry, frameBase uint64) (uint64, bool) {
 	loc := entry.Val(dwarf.AttrLocation)
 	if loc == nil {
-		return optimizedOut
+		return 0, false
 	}
 	expr, ok := loc.([]byte)
 	if !ok || len(expr) == 0 {
-		return optimizedOut
+		return 0, false
 	}
-
 	switch expr[0] {
-	case 0x03: // DW_OP_addr — followed by an 8-byte LE DWARF-relative address
+	case 0x03: // DW_OP_addr — 8-byte LE DWARF-relative address
 		if len(expr) < 9 {
-			return optimizedOut
+			return 0, false
 		}
-		addr := binary.LittleEndian.Uint64(expr[1:9])
-		addr = uint64(int64(addr) + r.slide)
-		return r.readValueAt(b, addr)
-
+		return uint64(int64(binary.LittleEndian.Uint64(expr[1:9])) + r.slide), true
 	case 0x91: // DW_OP_fbreg — signed LEB128 offset from frame base
 		if len(expr) < 2 {
-			return optimizedOut
+			return 0, false
 		}
 		offset, _ := decodeSLEB128(expr[1:])
-		addr := uint64(int64(frameBase) + offset)
-		return r.readValueAt(b, addr)
-
+		return uint64(int64(frameBase) + offset), true
 	default:
-		return optimizedOut
+		return 0, false
 	}
 }
 
-// readValueAt reads 8 bytes and returns a hex string. A complete impl would
-// use the DWARF type to format as int/string/slice header/etc.
-func (r *dwarfReader) readValueAt(b Backend, addr uint64) string {
-	var buf [8]byte
-	if err := b.ReadMemory(addr, buf[:]); err != nil {
-		return fmt.Sprintf("<unreadable: %v>", err)
+// globalVar resolves a package-level variable to its address and type. It
+// matches either the exact DWARF name or a package-qualified "pkg.name" so a
+// caller can pass a bare "name". Mirrors resolveVarAddr but also returns type.
+func (r *dwarfReader) globalVar(name string) (uint64, dwarf.Type, bool) {
+	rd := r.data.Reader()
+	for {
+		entry, err := rd.Next()
+		if err != nil || entry == nil {
+			break
+		}
+		if entry.Tag != dwarf.TagVariable {
+			if entry.Tag == dwarf.TagSubprogram {
+				rd.SkipChildren()
+			}
+			continue
+		}
+		n, _ := entry.Val(dwarf.AttrName).(string)
+		if n != name && !strings.HasSuffix(n, "."+name) {
+			continue
+		}
+		loc, ok := entry.Val(dwarf.AttrLocation).([]byte)
+		if !ok || len(loc) < 9 || loc[0] != 0x03 { // DW_OP_addr
+			continue
+		}
+		addr := uint64(int64(binary.LittleEndian.Uint64(loc[1:9])) + r.slide)
+		return addr, r.varType(entry), true
 	}
-	return fmt.Sprintf("0x%x", binary.LittleEndian.Uint64(buf[:]))
+	return 0, nil, false
 }
 
 // decodeSLEB128 decodes a signed LEB128 integer. Returns (value, bytesConsumed).

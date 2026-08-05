@@ -374,43 +374,74 @@ func (e *engine) Locals(frameIndex int) ([]protocol.Variable, error) {
 		if err := e.requireSuspended(); err != nil {
 			return err
 		}
-		if e.dw == nil {
-			return fmt.Errorf("Locals: no DWARF info")
-		}
-		// Inspect the thread the user is stopped on (curTID via activeTID), not
-		// threads[0]: on Darwin threads[0] is frequently an idle runtime M, so a
-		// breakpoint that fires on another thread would otherwise report an
-		// unrelated frame's locals. See the activeTID/collectFrames invariant.
-		tid, err := e.activeTID()
+		framePC, frameBase, err := e.frameLocation(frameIndex)
 		if err != nil {
 			return fmt.Errorf("Locals: %w", err)
-		}
-		regs, err := e.backend.GetRegisters(tid)
-		if err != nil {
-			return fmt.Errorf("Locals: get registers: %w", err)
-		}
-		framePCs := e.walkStack(regs)
-		if frameIndex < 0 || frameIndex >= len(framePCs) {
-			return fmt.Errorf("Locals: frame index %d out of range (have %d frames)",
-				frameIndex, len(framePCs))
-		}
-		framePC := framePCs[frameIndex]
-		frameBase := regs.BP
-		if frameIndex > 0 {
-			bp := regs.BP
-			for i := 0; i < frameIndex && bp != 0; i++ {
-				var buf [8]byte
-				if err := e.backend.ReadMemory(bp, buf[:]); err != nil {
-					break
-				}
-				bp = binary.LittleEndian.Uint64(buf[:])
-			}
-			frameBase = bp
 		}
 		vars, err = e.dw.LocalsForFrame(e.backend, framePC, frameBase)
 		return err
 	})
 	return vars, err
+}
+
+// Evaluate resolves a single variable NAME in the given frame (local/parameter
+// first, then a package global) and returns its bounded typed tree. It is
+// non-suspending and non-resuming — like Locals, it only reads a suspended
+// tracee. Expression parsing (dotted paths, indexing, arithmetic) is a later PR.
+func (e *engine) Evaluate(frameIndex int, name string) (protocol.Variable, error) {
+	var result protocol.Variable
+	err := e.dispatch(func() error {
+		if err := e.requireSuspended(); err != nil {
+			return err
+		}
+		framePC, frameBase, err := e.frameLocation(frameIndex)
+		if err != nil {
+			return fmt.Errorf("Evaluate: %w", err)
+		}
+		result, err = e.dw.EvaluateName(e.backend, framePC, frameBase, name)
+		return err
+	})
+	return result, err
+}
+
+// frameLocation computes the PC and frame-base address for the given stack frame
+// of the currently-stopped thread. Callers must already be on the engine loop
+// (inside dispatch) and have verified suspension.
+//
+// It inspects the thread the user is stopped on (curTID via activeTID), not
+// threads[0]: on Darwin threads[0] is frequently an idle runtime M, so a
+// breakpoint that fires on another thread would otherwise report an unrelated
+// frame. See the activeTID/collectFrames invariant.
+func (e *engine) frameLocation(frameIndex int) (framePC, frameBase uint64, err error) {
+	if e.dw == nil {
+		return 0, 0, fmt.Errorf("no DWARF info")
+	}
+	tid, err := e.activeTID()
+	if err != nil {
+		return 0, 0, err
+	}
+	regs, err := e.backend.GetRegisters(tid)
+	if err != nil {
+		return 0, 0, fmt.Errorf("get registers: %w", err)
+	}
+	framePCs := e.walkStack(regs)
+	if frameIndex < 0 || frameIndex >= len(framePCs) {
+		return 0, 0, fmt.Errorf("frame index %d out of range (have %d frames)",
+			frameIndex, len(framePCs))
+	}
+	frameBase = regs.BP
+	if frameIndex > 0 {
+		bp := regs.BP
+		for i := 0; i < frameIndex && bp != 0; i++ {
+			var buf [8]byte
+			if err := e.backend.ReadMemory(bp, buf[:]); err != nil {
+				break
+			}
+			bp = binary.LittleEndian.Uint64(buf[:])
+		}
+		frameBase = bp
+	}
+	return framePCs[frameIndex], frameBase, nil
 }
 
 func (e *engine) StackFrames() ([]protocol.Frame, error) {
