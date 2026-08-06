@@ -37,27 +37,24 @@ architecture behind this.
   install it locally:
 
   ```sh
-  just vscode-package
-  code --install-extension dist/bingo.vsix --force
+  just vscode-install
   ```
 
   Reload the VS Code window after installation. The companion owns debugger type
   `"bingo"` and connects directly to bingo's DAP listener; it neither invokes
   nor validates `dlv`, and it does not replace the Go extension's `"go"` type.
-  To update, rebuild and rerun the install command with `--force`; uninstall with
-  `code --uninstall-extension bingo.bingo`.
+  To update, rerun `just vscode-install`; uninstall with
+  `code --uninstall-extension bingosuite.bingo`.
 
-## 1. Build the server and the demo target
-
-```sh
-just build                        # server → ./build/bingo/bingo_<os>_<arch> (codesigned on darwin)
-go build -o build/spawntree ./examples/spawntree
-```
+## 1. Demo target
 
 `examples/spawntree` is a deterministic **main → supervisor → worker×3** spawn
 tree that churns a fresh worker pool each round, so consecutive snapshots show
 workers appearing in the `created` delta and leaving in `exited`. The intended
 breakpoint is the `fmt.Printf` inside `worker` (`examples/spawntree/main.go:27`).
+There is no separate manual build step: the workspace launch configuration runs
+`just build-spawntree` as its pre-launch task and rebuilds the binary with
+`-N -l` before every F5.
 
 ## 2. Start the server with DAP enabled
 
@@ -82,9 +79,10 @@ Leave it running.
 
 1. Open this repo in VS Code.
 2. Select **“bingo DAP: launch spawntree (stop on entry)”** from
-   `.vscode/launch.json` and press F5. Its `"type": "bingo"`, `dapHost`, and
+   `.vscode/launch.json` and press F5. VS Code first runs
+   **“bingo: build spawntree”**, then its `"type": "bingo"`, `dapHost`, and
    `dapPort` fields make the companion connect to `localhost:4711`; bingo
-   launches `build/spawntree` and stops at entry.
+   launches the rebuilt `build/spawntree` and stops at entry.
 3. Set a breakpoint on `examples/spawntree/main.go:27` and **Continue** — the
    tracee stops there with several worker goroutines alive.
 4. Grab the **session id** so the observer can join: it is printed on the server

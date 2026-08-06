@@ -16,10 +16,16 @@ const debuggerContribution = requireRecord(debuggers[0]);
 describe("extension manifest", () => {
   it("owns only the bingo debugger type", () => {
     assert.equal(manifest.name, "bingo");
-    assert.equal(manifest.publisher, "bingo");
+    assert.equal(manifest.publisher, "bingosuite");
     assert.equal(debuggers.length, 1);
     assert.equal(debuggerContribution.type, "bingo");
     assert.notEqual(debuggerContribution.type, "go");
+
+    const extensionDependencies =
+      manifest.extensionDependencies === undefined
+        ? []
+        : requireArray(manifest.extensionDependencies);
+    assert.equal(extensionDependencies.includes("golang.go"), false);
   });
 
   it("enables Go source breakpoints", () => {

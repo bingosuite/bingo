@@ -2,8 +2,9 @@
 
 This companion extension connects VS Code's built-in Debug UI directly to an
 already-running [bingo](https://github.com/bingosuite/bingo) Debug Adapter
-Protocol listener. It owns debugger type `bingo`; it does not launch or validate
-Delve (`dlv`) and does not replace the Microsoft Go extension's debugger type.
+Protocol listener. Its extension ID is `bingosuite.bingo`; it owns debugger type
+`bingo`, does not launch or validate Delve (`dlv`), and does not replace the
+Microsoft Go extension's debugger type.
 
 Keep the Microsoft Go extension installed for `gopls`, navigation, formatting,
 and test integration. The two extensions coexist: Go language tooling comes from
@@ -15,17 +16,17 @@ extension and the bingo server.
 From the repository root:
 
 ```sh
-just vscode-package
-code --install-extension dist/bingo.vsix --force
+just vscode-install
 ```
 
 Reload the VS Code window after installation. To update, rebuild the VSIX and
-rerun the same install command with `--force`.
+reinstall it by rerunning `just vscode-install`. To package without installing,
+run `just vscode-package`; it writes `dist/bingo.vsix`.
 
 To uninstall:
 
 ```sh
-code --uninstall-extension bingo.bingo
+code --uninstall-extension bingosuite.bingo
 ```
 
 Generated dependencies, bundles, and VSIX files are ignored by Git.
@@ -42,7 +43,8 @@ just server
 
 Then select a `bingo` configuration in **Run and Debug** and press F5. This
 repository's `.vscode/launch.json` includes a launch and a session-join example.
-The default DAP endpoint is `localhost:4711`.
+The launch example first runs the workspace's `just build-spawntree` task, then
+connects to the default DAP endpoint at `localhost:4711`.
 
 ### Launch a binary
 
