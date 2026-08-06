@@ -6,9 +6,36 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
+	"github.com/bingosuite/bingo/pkg/protocol"
 	"github.com/gorilla/websocket"
 )
+
+const (
+	serviceIdentity      = "bingo"
+	ManagementAPIVersion = 1
+)
+
+type DAPHealth struct {
+	Enabled bool   `json:"enabled"`
+	Address string `json:"address"`
+}
+
+type ManagedIdleShutdownHealth struct {
+	Enabled   bool  `json:"enabled"`
+	TimeoutMS int64 `json:"timeoutMs"`
+}
+
+type HealthResponse struct {
+	Service              string                    `json:"service"`
+	ManagementAPIVersion int                       `json:"managementApiVersion"`
+	WireProtocolVersion  string                    `json:"wireProtocolVersion"`
+	InstanceID           string                    `json:"instanceId"`
+	DAP                  DAPHealth                 `json:"dap"`
+	ManagedIdleShutdown  ManagedIdleShutdownHealth `json:"managedIdleShutdown"`
+	SessionCount         int                       `json:"sessionCount"`
+}
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
@@ -26,6 +53,52 @@ func sameHostOrigin(r *http.Request) bool {
 		return false
 	}
 	return strings.EqualFold(u.Host, r.Host)
+}
+
+// handleHealth is the stable process-discovery contract frontends use before
+// deciding whether an existing bingo instance is compatible.
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	s.lifecycleMu.RLock()
+	dapAddress := s.dapAddress
+	idleTimeout := s.idleTimeout
+	instanceID := s.instanceID
+	s.lifecycleMu.RUnlock()
+
+	response := HealthResponse{
+		Service:              serviceIdentity,
+		ManagementAPIVersion: ManagementAPIVersion,
+		WireProtocolVersion:  protocol.Version,
+		InstanceID:           instanceID,
+		DAP: DAPHealth{
+			Enabled: dapAddress != "",
+			Address: dapAddress,
+		},
+		ManagedIdleShutdown: ManagedIdleShutdownHealth{
+			Enabled:   idleTimeout > 0,
+			TimeoutMS: durationMilliseconds(idleTimeout),
+		},
+		SessionCount: s.sessions.count(),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		s.log.Error("failed to encode health response", "err", err)
+	}
+}
+
+func durationMilliseconds(duration time.Duration) int64 {
+	millis := duration / time.Millisecond
+	if duration%time.Millisecond != 0 {
+		millis++
+	}
+	return int64(millis)
 }
 
 // handleListSessions: GET /api/sessions
@@ -46,6 +119,11 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 //	GET /ws?create        — create + join
 //	GET /ws?session={id}  — join existing
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
+	if !s.acceptingSessions() {
+		http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+		return
+	}
+
 	query := r.URL.Query()
 
 	_, wantCreate := query["create"]
@@ -73,6 +151,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) wsCreate(conn *websocket.Conn, log *slog.Logger) {
+	if !s.beginSessionOperation() {
+		s.closeShuttingDown(conn)
+		return
+	}
+	defer s.sessionOps.Done()
+
 	sess := s.sessions.create(s.ctx)
 	log = log.With("session", sess.id, "action", "create")
 	log.Info("client creating new session")
@@ -80,6 +164,12 @@ func (s *Server) wsCreate(conn *websocket.Conn, log *slog.Logger) {
 }
 
 func (s *Server) wsJoin(conn *websocket.Conn, sessionID string, log *slog.Logger) {
+	if !s.beginSessionOperation() {
+		s.closeShuttingDown(conn)
+		return
+	}
+	defer s.sessionOps.Done()
+
 	log = log.With("session", sessionID, "action", "join")
 
 	sess := s.sessions.get(sessionID)
@@ -96,4 +186,10 @@ func (s *Server) wsJoin(conn *websocket.Conn, sessionID string, log *slog.Logger
 
 	log.Info("client joining existing session")
 	sess.hub.AddClient(conn, log)
+}
+
+func (s *Server) closeShuttingDown(conn *websocket.Conn) {
+	msg := websocket.FormatCloseMessage(websocket.CloseGoingAway, "server is shutting down")
+	_ = conn.WriteMessage(websocket.CloseMessage, msg)
+	_ = conn.Close()
 }

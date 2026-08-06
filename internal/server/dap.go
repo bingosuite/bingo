@@ -1,6 +1,8 @@
 package server
 
 import (
+	"fmt"
+
 	"github.com/bingosuite/bingo/internal/dap"
 )
 
@@ -14,11 +16,17 @@ type dapProvider struct {
 }
 
 func (p dapProvider) CreateSession() (dap.Session, error) {
+	if !p.srv.acceptingSessions() {
+		return nil, ErrServerClosed
+	}
 	sess := p.srv.sessions.create(p.srv.ctx)
 	return sess.hub, nil
 }
 
 func (p dapProvider) GetSession(id string) (dap.Session, bool) {
+	if !p.srv.acceptingSessions() {
+		return nil, false
+	}
 	sess := p.srv.sessions.get(id)
 	if sess == nil {
 		return nil, false
@@ -30,10 +38,22 @@ func (p dapProvider) GetSession(id string) (dap.Session, bool) {
 // returns immediately once listening; connections are handled in the
 // background. Safe to call at most once.
 func (s *Server) StartDAP(addr string) error {
-	ds := dap.NewServer(dapProvider{srv: s}, s.log.With("component", "dap"))
-	if _, err := ds.Serve(addr); err != nil {
-		return err
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.shutting {
+		return ErrServerClosed
 	}
+	if s.dapStarted {
+		return ErrDAPAlreadyStarted
+	}
+
+	ds := dap.NewServer(dapProvider{srv: s}, s.log.With("component", "dap"))
+	bound, err := ds.Serve(addr)
+	if err != nil {
+		return fmt.Errorf("listen for DAP: %w", err)
+	}
+	s.dapStarted = true
 	s.dapServer = ds
+	s.dapAddress = bound.String()
 	return nil
 }

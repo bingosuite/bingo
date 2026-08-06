@@ -1040,6 +1040,46 @@ observers. `Server.StartDAP(addr)` opens the DAP TCP accept loop; `Shutdown`
 closes it. The DAP client emits a `console` output naming the session id;
 observers join `/ws?session=<id>` (also discoverable via `/api/sessions`).
 
+**Management discovery contract.** `GET /api/health` is the stable,
+non-cacheable process-discovery endpoint frontends use for connect-or-start. Its
+explicit JSON response carries `service:"bingo"`, `managementApiVersion:1`, the
+independent `wireProtocolVersion` from `pkg/protocol.Version`, a per-process
+UUID `instanceId`, the enabled/resolved DAP listener address, managed-idle
+configuration in milliseconds, and the current session count. Management API
+compatibility and WebSocket wire compatibility are separate checks: changing
+one does not implicitly version the other. A DAP bind to `:0` MUST publish the
+actual listener address, never the unresolved configured address. Health
+polling has no lifecycle effect.
+
+**Connect-or-start and ownership.** A frontend health-checks the known
+management address and reuses a compatible process; otherwise it starts bingo
+and lets listener binding arbitrate concurrent startup attempts. Frontends
+NEVER directly kill a potentially shared server. `-idle-timeout` is the opt-in
+process-owner mechanism; omitted/zero keeps manually started servers persistent.
+The server arms the grace at startup and whenever its managed-session count
+reaches zero, cancels it while any session exists, and shuts itself down only
+when the count stayed zero for the whole grace. A bare DAP TCP connection does
+not count: DAP creates a session only on launch/attach, so process owners must
+allow enough startup grace for health-check + connect + handshake.
+
+**Idle generation and shutdown invariants.** `sessionStore` broadcasts changes
+by closing and replacing a channel under its map mutex; snapshots return
+`count`, a monotonically increasing generation, and the current channel after
+releasing the lock. The generation prevents a create/remove burst from looking
+like uninterrupted zero-session time, and close-broadcast lets the idle monitor
+and shutdown waiter observe the same transition without stealing it from each
+other. Never block on the change channel while holding the store lock.
+
+The idle monitor starts only after HTTP binds, owns one reset/drain-safe timer,
+and exits on server cancellation. It may call `Shutdown` itself, so Shutdown
+must not wait for the monitor goroutine. Shutdown is idempotent: mark admission
+closed; close DAP and gracefully stop HTTP; wait for any WebSocket
+create/join operation that crossed the admission gate; cancel all hub contexts;
+then wait event-driven for the session store to empty. DAP Close already waits
+for its handlers, including clients that connected but never created a session.
+This ordering prevents a late client add from escaping registry teardown while
+still allowing every established session to close gracefully.
+
 **One-driver vs many-driver.** DAP assumes a single driver; bingo does not
 enforce it. WebSocket clients CAN also drive (the hub's `resumeCh` is
 first-writer-wins). The recommended posture is DAP-drives + WebSocket-observes,
@@ -1281,6 +1321,10 @@ through the justfile.
   event with `EvaluatePayloadCmd`/`EvaluatePayload`). 1.1 had reshaped
   `Goroutine` and added `Thread`/`GoroutineSnapshotPayload` +
   `EventGoroutineSnapshot`/`CmdGoroutineSnapshot`.
+- **Management API** (`internal/server`): `ManagementAPIVersion` is independent
+  of the wire protocol. Bump it for incompatible `/api/health` or management
+  semantics, keep the response structs/tags and README example aligned, and
+  preserve no-cache + GET-only behavior.
 - **Goroutine snapshot layout**: the reader resolves runtime struct offsets from
   DWARF **by name** (`goroutines.go`), never hardcoded. If you add a field, add
   it to `goLayout`/`resolveGoLayout`; a missing *required* offset invalidates the

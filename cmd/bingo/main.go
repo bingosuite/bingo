@@ -1,10 +1,13 @@
 // Command bingo starts the bingo debug server.
 //
-//	bingo [-addr host:port] [-dap-addr host:port] [-v]
+//	bingo [-addr host:port] [-dap-addr host:port] [-idle-timeout duration] [-v]
 package main
 
 import (
+	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -14,24 +17,39 @@ import (
 	"github.com/bingosuite/bingo/internal/server"
 )
 
+type config struct {
+	addr        string
+	dapAddr     string
+	idleTimeout time.Duration
+	verbose     bool
+}
+
 func main() {
-	addr := flag.String("addr", ":6060", "listen address (host:port)")
-	dapAddr := flag.String("dap-addr", "", "DAP listen address (host:port); empty disables the DAP server")
-	verbose := flag.Bool("v", false, "enable verbose (debug) logging")
-	flag.Parse()
+	cfg, err := parseConfig(os.Args[1:], os.Stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		return
+	}
+	if err != nil {
+		_, _ = fmt.Fprintln(os.Stderr, "bingo:", err)
+		os.Exit(2)
+	}
 
 	level := slog.LevelInfo
-	if *verbose {
+	if cfg.verbose {
 		level = slog.LevelDebug
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: level,
 	}))
 
-	srv := server.New(*addr, log)
+	srv, err := server.NewWithIdleTimeout(cfg.addr, cfg.idleTimeout, log)
+	if err != nil {
+		log.Error("invalid server configuration", "err", err)
+		os.Exit(2)
+	}
 
-	if *dapAddr != "" {
-		if err := srv.StartDAP(*dapAddr); err != nil {
+	if cfg.dapAddr != "" {
+		if err := srv.StartDAP(cfg.dapAddr); err != nil {
 			log.Error("dap server error", "err", err)
 			os.Exit(1)
 		}
@@ -50,4 +68,21 @@ func main() {
 		log.Error("server error", "err", err)
 		os.Exit(1)
 	}
+}
+
+func parseConfig(args []string, output io.Writer) (config, error) {
+	var cfg config
+	flags := flag.NewFlagSet("bingo", flag.ContinueOnError)
+	flags.SetOutput(output)
+	flags.StringVar(&cfg.addr, "addr", ":6060", "listen address (host:port)")
+	flags.StringVar(&cfg.dapAddr, "dap-addr", "", "DAP listen address (host:port); empty disables the DAP server")
+	flags.DurationVar(&cfg.idleTimeout, "idle-timeout", 0, "exit after no managed sessions for this duration; 0 disables")
+	flags.BoolVar(&cfg.verbose, "v", false, "enable verbose (debug) logging")
+	if err := flags.Parse(args); err != nil {
+		return config{}, err
+	}
+	if cfg.idleTimeout < 0 {
+		return config{}, fmt.Errorf("idle timeout must not be negative: %s", cfg.idleTimeout)
+	}
+	return cfg, nil
 }
