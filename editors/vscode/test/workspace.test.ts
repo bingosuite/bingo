@@ -44,7 +44,7 @@ describe("repository VS Code integration", () => {
       assert.equal(configuration.type, "bingo");
       assert.equal("mode" in configuration, false);
       assert.equal("debugServer" in configuration, false);
-      assert.equal(configuration.dapHost, "localhost");
+      assert.equal(configuration.dapHost, "127.0.0.1");
       assert.equal(configuration.dapPort, 4711);
     }
 

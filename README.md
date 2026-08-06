@@ -60,7 +60,7 @@ just vscode-install
 ```
 
 It contributes debugger type `"bingo"` and connects VS Code's built-in Debug UI
-directly to `localhost:4711`. Keep Microsoft's Go extension installed for
+directly to `127.0.0.1:4711`. Keep Microsoft's Go extension installed for
 `gopls`, navigation, formatting, and tests: the extensions coexist, and a bingo
 debug configuration does **not** invoke or validate Delve (`dlv`) or take over
 the Go extension's `"go"` debugger type. See
