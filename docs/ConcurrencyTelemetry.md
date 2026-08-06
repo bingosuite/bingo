@@ -30,12 +30,22 @@ architecture behind this.
 
 - macOS **darwin/arm64** (needs `-tags bingonative` + the codesigned server
   entitlement) or **linux/amd64**. The `just` recipes handle the tag/codesign.
-- For the VS Code driver: the **Go extension** (the repo already sets
-  `go.buildTags: bingonative` in `.vscode/settings.json`). The DAP driver uses
-  VS Code's `debugServer` mode to connect straight to bingo's DAP port — the Go
-  extension is only needed so VS Code recognises the `"type": "go"` config; it
-  does **not** launch its own debugger. If the extension gets in the way, use the
-  `cmd/dapcli` driver in step 3b instead — it proves the exact same coexistence.
+- For Go language tooling in VS Code: Microsoft's **Go extension**. The repo
+  keeps its `go.buildTags: bingonative` settings for gopls, navigation,
+  formatting, and tests.
+- For the VS Code debugger: bingo's separate companion extension. Build and
+  install it locally:
+
+  ```sh
+  just vscode-package
+  code --install-extension dist/bingo.vsix --force
+  ```
+
+  Reload the VS Code window after installation. The companion owns debugger type
+  `"bingo"` and connects directly to bingo's DAP listener; it neither invokes
+  nor validates `dlv`, and it does not replace the Go extension's `"go"` type.
+  To update, rebuild and rerun the install command with `--force`; uninstall with
+  `code --uninstall-extension bingo.bingo`.
 
 ## 1. Build the server and the demo target
 
@@ -71,9 +81,10 @@ Leave it running.
 ## 3a. Drive with VS Code (DAP)
 
 1. Open this repo in VS Code.
-2. Run the **“bingo DAP: launch spawntree (stop on entry)”** configuration
-   (`.vscode/launch.json`). VS Code connects to `:4711`, bingo launches
-   `build/spawntree`, and stops at entry.
+2. Select **“bingo DAP: launch spawntree (stop on entry)”** from
+   `.vscode/launch.json` and press F5. Its `"type": "bingo"`, `dapHost`, and
+   `dapPort` fields make the companion connect to `localhost:4711`; bingo
+   launches `build/spawntree` and stops at entry.
 3. Set a breakpoint on `examples/spawntree/main.go:27` and **Continue** — the
    tracee stops there with several worker goroutines alive.
 4. Grab the **session id** so the observer can join: it is printed on the server
@@ -83,6 +94,9 @@ Leave it running.
 > A second VS Code window can *join* the same session (observe/drive over DAP)
 > with the **“bingo DAP: join running session”** config, which sends a DAP
 > `attach` carrying only the `session` id (no `pid`) — bingo's join path.
+> A separate `"request": "attach"` configuration with numeric `pid` and optional
+> `binaryPath` attaches to an OS process instead; the extension README has the
+> full shape.
 
 ## 3b. Drive with cmd/dapcli (DAP, no IDE)
 

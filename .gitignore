@@ -42,3 +42,8 @@ test/coverage.out
 .DS_Store
 .idea/
 .vscode-test/
+
+# VS Code companion extension outputs
+/editors/vscode/node_modules/
+/editors/vscode/dist/
+/editors/vscode/*.vsix

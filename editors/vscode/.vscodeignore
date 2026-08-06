@@ -1,0 +1,10 @@
+.nvmrc
+.vscodeignore
+eslint.config.mjs
+package-lock.json
+src/**
+test/**
+scripts/**
+tsconfig.json
+node_modules/**
+dist/**/*.map

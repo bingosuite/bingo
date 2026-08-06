@@ -1,0 +1,227 @@
+{
+  "name": "bingo",
+  "displayName": "bingo Debugger",
+  "description": "Connect VS Code's Debug UI to an already-running bingo DAP server.",
+  "version": "0.1.0",
+  "publisher": "bingo",
+  "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bingosuite/bingo.git",
+    "directory": "editors/vscode"
+  },
+  "bugs": {
+    "url": "https://github.com/bingosuite/bingo/issues"
+  },
+  "homepage": "https://github.com/bingosuite/bingo/tree/main/editors/vscode",
+  "categories": [
+    "Debuggers"
+  ],
+  "keywords": [
+    "bingo",
+    "debugger",
+    "go",
+    "dap"
+  ],
+  "engines": {
+    "vscode": "^1.85.0",
+    "node": ">=22 <23"
+  },
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onDebugResolve:bingo"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Debugging starts or attaches to native processes through a separately-running bingo server."
+    }
+  },
+  "contributes": {
+    "breakpoints": [
+      {
+        "language": "go"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "bingo",
+        "label": "bingo Debugger",
+        "languages": [
+          "go"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "dapHost": {
+                "type": "string",
+                "default": "localhost",
+                "description": "Host of the already-running bingo DAP listener."
+              },
+              "dapPort": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535,
+                "default": 4711,
+                "description": "Port of the already-running bingo DAP listener."
+              },
+              "program": {
+                "type": "string",
+                "description": "Absolute path to the compiled Go binary to launch."
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "default": [],
+                "description": "Arguments passed to the launched binary."
+              },
+              "env": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[^=]+=.*$"
+                },
+                "default": [],
+                "description": "Additional environment entries in KEY=value form."
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "default": false,
+                "description": "Stop at the target's entry point before continuing."
+              }
+            }
+          },
+          "attach": {
+            "oneOf": [
+              {
+                "required": [
+                  "session"
+                ]
+              },
+              {
+                "required": [
+                  "pid"
+                ]
+              }
+            ],
+            "properties": {
+              "dapHost": {
+                "type": "string",
+                "default": "localhost",
+                "description": "Host of the already-running bingo DAP listener."
+              },
+              "dapPort": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535,
+                "default": 4711,
+                "description": "Port of the already-running bingo DAP listener."
+              },
+              "session": {
+                "type": "string",
+                "description": "Existing bingo session ID to join without launching or attaching again."
+              },
+              "pid": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Operating-system process ID to attach to."
+              },
+              "binaryPath": {
+                "type": "string",
+                "description": "Path to the process binary. Optional for attach, but required for DWARF-backed breakpoints, stack frames, and locals."
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "default": false,
+                "description": "Stop at the attached process's current entry stop."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "name": "bingo: Launch binary",
+            "type": "bingo",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/target/target",
+            "stopOnEntry": true,
+            "dapHost": "localhost",
+            "dapPort": 4711
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "bingo: Launch binary",
+            "description": "Launch a compiled Go binary through an already-running bingo DAP server.",
+            "body": {
+              "name": "bingo: Launch binary",
+              "type": "bingo",
+              "request": "launch",
+              "program": "${workspaceFolder}/build/target/target",
+              "args": [],
+              "env": [],
+              "stopOnEntry": true,
+              "dapHost": "localhost",
+              "dapPort": 4711
+            }
+          },
+          {
+            "label": "bingo: Join session",
+            "description": "Join an existing managed bingo session without disturbing its run state.",
+            "body": {
+              "name": "bingo: Join session",
+              "type": "bingo",
+              "request": "attach",
+              "session": "replace-with-session-id",
+              "dapHost": "localhost",
+              "dapPort": 4711
+            }
+          },
+          {
+            "label": "bingo: Attach to process",
+            "description": "Attach bingo to an operating-system process.",
+            "body": {
+              "name": "bingo: Attach to process",
+              "type": "bingo",
+              "request": "attach",
+              "pid": 1234,
+              "binaryPath": "${workspaceFolder}/build/target/target",
+              "stopOnEntry": true,
+              "dapHost": "localhost",
+              "dapPort": 4711
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node ./scripts/clean.mjs && esbuild ./src/extension.ts --bundle --tsconfig=./tsconfig.json --external:vscode --format=cjs --platform=node --target=node18 --outfile=dist/extension.js",
+    "check": "npm run lint && npm run typecheck && npm test && npm run build && npm run package:list",
+    "lint": "eslint src test scripts",
+    "package": "node ./scripts/package.mjs",
+    "package:list": "vsce ls --tree",
+    "package:reproducible": "node ./scripts/verify-reproducible.mjs",
+    "test": "tsx --test test/**/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "vscode:prepublish": "npm run build"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.5",
+    "@types/node": "22.20.1",
+    "@types/vscode": "1.85.0",
+    "@vscode/vsce": "3.9.2",
+    "esbuild": "0.28.1",
+    "eslint": "9.39.5",
+    "tsx": "4.23.9",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.66.0"
+  },
+  "packageManager": "npm@10.9.3"
+}
