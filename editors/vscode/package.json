@@ -59,7 +59,7 @@
             "properties": {
               "dapHost": {
                 "type": "string",
-                "default": "localhost",
+                "default": "127.0.0.1",
                 "description": "Host of the already-running bingo DAP listener."
               },
               "dapPort": {
@@ -113,7 +113,7 @@
             "properties": {
               "dapHost": {
                 "type": "string",
-                "default": "localhost",
+                "default": "127.0.0.1",
                 "description": "Host of the already-running bingo DAP listener."
               },
               "dapPort": {
@@ -151,7 +151,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/build/target/target",
             "stopOnEntry": true,
-            "dapHost": "localhost",
+            "dapHost": "127.0.0.1",
             "dapPort": 4711
           }
         ],
@@ -167,7 +167,7 @@
               "args": [],
               "env": [],
               "stopOnEntry": true,
-              "dapHost": "localhost",
+              "dapHost": "127.0.0.1",
               "dapPort": 4711
             }
           },
@@ -179,7 +179,7 @@
               "type": "bingo",
               "request": "attach",
               "session": "replace-with-session-id",
-              "dapHost": "localhost",
+              "dapHost": "127.0.0.1",
               "dapPort": 4711
             }
           },
@@ -193,7 +193,7 @@
               "pid": 1234,
               "binaryPath": "${workspaceFolder}/build/target/target",
               "stopOnEntry": true,
-              "dapHost": "localhost",
+              "dapHost": "127.0.0.1",
               "dapPort": 4711
             }
           }

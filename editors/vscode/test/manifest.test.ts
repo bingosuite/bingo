@@ -41,8 +41,17 @@ describe("extension manifest", () => {
     for (const request of ["launch", "attach"]) {
       const schema = requireRecord(attributes[request]);
       const properties = requireRecord(schema.properties);
-      assert.equal(requireRecord(properties.dapHost).default, "localhost");
+      assert.equal(requireRecord(properties.dapHost).default, "127.0.0.1");
       assert.equal(requireRecord(properties.dapPort).default, 4711);
+    }
+
+    const initialConfigurations = requireArray(
+      debuggerContribution.initialConfigurations,
+    ).map(requireRecord);
+    assert.ok(initialConfigurations.length > 0);
+    for (const configuration of initialConfigurations) {
+      assert.equal(configuration.dapHost, "127.0.0.1");
+      assert.equal(configuration.dapPort, 4711);
     }
   });
 
@@ -51,6 +60,10 @@ describe("extension manifest", () => {
     const bodies = snippets.map((snippet) =>
       requireRecord(requireRecord(snippet).body),
     );
+    for (const body of bodies) {
+      assert.equal(body.dapHost, "127.0.0.1");
+      assert.equal(body.dapPort, 4711);
+    }
 
     assert.ok(
       bodies.some(

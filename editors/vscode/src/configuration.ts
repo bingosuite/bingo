@@ -1,4 +1,4 @@
-export const defaultDapHost = "localhost";
+export const defaultDapHost = "127.0.0.1";
 export const defaultDapPort = 4711;
 
 type JsonRecord = Record<string, unknown>;

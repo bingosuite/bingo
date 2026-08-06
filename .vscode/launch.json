@@ -8,7 +8,7 @@
       "program": "${workspaceFolder}/build/spawntree",
       "preLaunchTask": "bingo: build spawntree",
       "stopOnEntry": true,
-      "dapHost": "localhost",
+      "dapHost": "127.0.0.1",
       "dapPort": 4711
     },
     {
@@ -16,7 +16,7 @@
       "type": "bingo",
       "request": "attach",
       "session": "${input:bingoSession}",
-      "dapHost": "localhost",
+      "dapHost": "127.0.0.1",
       "dapPort": 4711
     }
   ],
