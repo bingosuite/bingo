@@ -268,6 +268,22 @@ var _ = Describe("Hub", func() {
 				Eventually(managed.Done(), "500ms", "10ms").Should(BeClosed())
 			}
 		})
+
+		It("rejects and closes a client after teardown begins", func() {
+			cancel()
+			Eventually(h.Done(), "500ms", "10ms").Should(BeClosed())
+
+			conn := newFakeWSConn()
+			client, err := h.AddClient(conn, nil)
+
+			Expect(err).To(MatchError(hub.ErrHubClosed))
+			Expect(client).To(BeNil())
+			Expect(h.ClientCount()).To(Equal(0))
+			conn.mu.Lock()
+			closed := conn.closed
+			conn.mu.Unlock()
+			Expect(closed).To(BeTrue())
+		})
 	})
 
 	Describe("managed session start failures", func() {

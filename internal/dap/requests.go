@@ -227,7 +227,10 @@ func (h *Handler) startSession(existingID string) error {
 		sess = s
 	}
 
-	client := sess.AddClient(h, h.log)
+	client, err := sess.AddClient(h, h.log)
+	if err != nil {
+		return fmt.Errorf("add client: %w", err)
+	}
 
 	h.mu.Lock()
 	h.session = sess

@@ -3,6 +3,7 @@ package dap
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net"
 	"sync"
@@ -65,15 +66,20 @@ type fakeSession struct {
 	id      string
 	cmds    *cmdRecorder
 	welcome protocol.SessionState
+	addErr  error
 }
 
 func (s *fakeSession) SessionID() string { return s.id }
 
 // AddClient mirrors the hub: it optionally delivers a welcome EventSessionState
 // (as the real hub's sendStateTo does) and starts a read pump draining the
-// handler's enqueued commands. Returns nil — the handler never calls methods on
-// the *hub.Client it stores.
-func (s *fakeSession) AddClient(conn hub.WSConn, _ *slog.Logger) *hub.Client {
+// handler's enqueued commands. The handler never calls methods on the
+// *hub.Client it stores.
+func (s *fakeSession) AddClient(conn hub.WSConn, _ *slog.Logger) (*hub.Client, error) {
+	if s.addErr != nil {
+		_ = conn.Close()
+		return nil, s.addErr
+	}
 	if s.welcome != "" {
 		// Deliver the welcome asynchronously, mirroring the hub's write pump so
 		// it lands after AddClient returns (the join path sets its flags before
@@ -96,13 +102,36 @@ func (s *fakeSession) AddClient(conn hub.WSConn, _ *slog.Logger) *hub.Client {
 			s.cmds.add(data)
 		}
 	}()
-	return nil
+	return nil, nil
 }
 
 type fakeProvider struct{ sess *fakeSession }
 
 func (p *fakeProvider) CreateSession() (Session, error)   { return p.sess, nil }
 func (p *fakeProvider) GetSession(string) (Session, bool) { return p.sess, true }
+
+func TestStartSessionRejectsClosedHub(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer func() { _ = clientConn.Close() }()
+
+	session := &fakeSession{
+		id:     "closed-session",
+		cmds:   &cmdRecorder{},
+		addErr: hub.ErrHubClosed,
+	}
+	handler := NewHandler(serverConn, &fakeProvider{sess: session}, nil)
+	defer func() { _ = handler.Close() }()
+
+	err := handler.startSession("")
+	if !errors.Is(err, hub.ErrHubClosed) {
+		t.Fatalf("expected ErrHubClosed, got %v", err)
+	}
+	handler.mu.Lock()
+	defer handler.mu.Unlock()
+	if handler.session != nil || handler.client != nil {
+		t.Fatal("rejected session was retained by DAP handler")
+	}
+}
 
 // harness wires a Handler to a loopback TCP socket so the test can speak real
 // DAP wire messages to it and inject bingo events via WriteMessage.
