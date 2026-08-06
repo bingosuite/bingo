@@ -76,11 +76,26 @@ type serverRunner interface {
 }
 
 func runServer(srv serverRunner) error {
-	if err := srv.Start(); err != nil {
-		return err
+	startResult := make(chan error, 1)
+	go func() {
+		startResult <- srv.Start()
+	}()
+
+	select {
+	case err := <-startResult:
+		if err != nil {
+			return err
+		}
+		<-srv.Done()
+		return nil
+	case <-srv.Done():
+		select {
+		case err := <-startResult:
+			return err
+		default:
+			return nil
+		}
 	}
-	<-srv.Done()
-	return nil
 }
 
 func parseConfig(args []string, output io.Writer) (config, error) {
