@@ -1072,6 +1072,15 @@ like uninterrupted zero-session time, and close-broadcast lets the idle monitor
 and shutdown waiter observe the same transition without stealing it from each
 other. Never block on the change channel while holding the store lock.
 
+The server also increments an admission generation under `lifecycleMu` before
+every WS or DAP create/join operation. When an idle timer fires, it takes that
+same lock, rechecks both the store and admission generations, and marks
+`shutting` before releasing the lock. An operation admitted after the timer's
+snapshot therefore invalidates the expiry; an operation arriving after the
+commit is rejected. Do not hold `lifecycleMu` over hub/client work: the
+generation increment + WaitGroup admission happen under the lock, while the
+operation runs after release.
+
 The idle monitor starts only after HTTP binds, owns one reset/drain-safe timer,
 and exits on server cancellation. It may call `Shutdown` itself, so Shutdown
 must not wait for the monitor goroutine. Shutdown is idempotent: mark admission
@@ -1093,11 +1102,16 @@ final client triggers one-shot hub teardown. Do not hold the registry lock
 across socket writes.
 
 `http.Server.Shutdown` closes the listener before session draining completes,
-so `Server.Start` can return while `Server.Shutdown` is still working. The
-`cmd/bingo` main goroutine MUST wait on `Server.Done()` after a clean Start
-return; otherwise a signal- or idle-triggered shutdown can be preempted by
-process exit before hijacked WebSockets, hubs, and debuggees are cleaned up.
-Start errors return directly and do not wait for Done.
+and Start can also be delayed in listener setup. `cmd/bingo` therefore runs
+Start in a goroutine with a one-result buffered channel and selects it against
+`Server.Done()`: Start errors return immediately, a clean Start return waits for
+Done, and completed shutdown can win while Start is still unwinding without
+parking its eventual result send. The HTTP bind uses `net.ListenConfig` with the
+server context so cancellation reaches listener setup. Fatal bind/Serve errors
+must run the same one-time Shutdown before Start returns the original error;
+this closes a DAP listener that may have started first and guarantees Done.
+Concurrent duplicate Start calls return `ErrServerStarted` without tearing down
+the first caller.
 
 **One-driver vs many-driver.** DAP assumes a single driver; bingo does not
 enforce it. WebSocket clients CAN also drive (the hub's `resumeCh` is

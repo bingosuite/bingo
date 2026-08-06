@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -32,7 +33,12 @@ func startServer(t *testing.T, idleTimeout time.Duration) runningServer {
 	g := NewWithT(t)
 	srv, err := NewWithIdleTimeout("127.0.0.1:0", idleTimeout, nil)
 	g.Expect(err).NotTo(HaveOccurred())
+	return startConstructedServer(t, srv)
+}
 
+func startConstructedServer(t *testing.T, srv *Server) runningServer {
+	t.Helper()
+	g := NewWithT(t)
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- srv.Start()
@@ -232,6 +238,59 @@ func TestDAPCreatedSessionSuppressesIdleShutdown(t *testing.T) {
 	running.stop(t)
 }
 
+func TestIdleExpiryYieldsToWebSocketAdmission(t *testing.T) {
+	g := NewWithT(t)
+	srv, err := NewWithIdleTimeout("127.0.0.1:0", testIdleTimeout, nil)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	ready := make(chan struct{})
+	proceed := make(chan struct{})
+	var hookOnce sync.Once
+	srv.idleCommitHook = func() {
+		hookOnce.Do(func() {
+			close(ready)
+			<-proceed
+		})
+	}
+	running := startConstructedServer(t, srv)
+	g.Eventually(ready, time.Second).Should(BeClosed())
+
+	conn := dialCreate(t, running.url)
+	defer func() { _ = conn.Close() }()
+	g.Eventually(srv.sessions.count, time.Second).Should(Equal(1))
+	close(proceed)
+
+	g.Consistently(running.errCh, 2*testIdleTimeout).ShouldNot(Receive())
+	g.Expect(conn.Close()).To(Succeed())
+	g.Eventually(running.errCh, time.Second).Should(Receive(BeNil()))
+}
+
+func TestIdleExpiryYieldsToDAPAdmission(t *testing.T) {
+	g := NewWithT(t)
+	srv, err := NewWithIdleTimeout("127.0.0.1:0", testIdleTimeout, nil)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	ready := make(chan struct{})
+	proceed := make(chan struct{})
+	var hookOnce sync.Once
+	srv.idleCommitHook = func() {
+		hookOnce.Do(func() {
+			close(ready)
+			<-proceed
+		})
+	}
+	running := startConstructedServer(t, srv)
+	g.Eventually(ready, time.Second).Should(BeClosed())
+
+	_, err = (dapProvider{srv: srv}).CreateSession()
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Eventually(srv.sessions.count, time.Second).Should(Equal(1))
+	close(proceed)
+
+	g.Consistently(running.errCh, 2*testIdleTimeout).ShouldNot(Receive())
+	running.stop(t)
+}
+
 func TestActiveSessionSuppressesIdleShutdown(t *testing.T) {
 	g := NewWithT(t)
 	running := startServer(t, testIdleTimeout)
@@ -345,6 +404,38 @@ func TestStartIsAtMostOnce(t *testing.T) {
 	running.stop(t)
 
 	g.Expect(running.server.Start()).To(Succeed())
+}
+
+func TestStartBindFailureFinalizesDAPAndDone(t *testing.T) {
+	g := NewWithT(t)
+	occupied, err := net.Listen("tcp4", "127.0.0.1:0")
+	g.Expect(err).NotTo(HaveOccurred())
+	defer func() { _ = occupied.Close() }()
+
+	srv := New(occupied.Addr().String(), nil)
+	g.Expect(srv.StartDAP("127.0.0.1:0")).To(Succeed())
+	srv.lifecycleMu.RLock()
+	dapAddress := srv.dapAddress
+	srv.lifecycleMu.RUnlock()
+
+	startResult := make(chan error, 1)
+	go func() {
+		startResult <- srv.Start()
+	}()
+	var startErr error
+	g.Eventually(startResult, time.Second).Should(Receive(&startErr))
+	g.Expect(startErr).To(HaveOccurred())
+	g.Expect(errors.Is(startErr, ErrServerStarted)).To(BeFalse())
+	var netErr *net.OpError
+	g.Expect(errors.As(startErr, &netErr)).To(BeTrue())
+	g.Expect(netErr.Op).To(Equal("listen"))
+	g.Expect(srv.Done()).To(BeClosed())
+
+	conn, err := net.DialTimeout("tcp4", dapAddress, 100*time.Millisecond)
+	if conn != nil {
+		_ = conn.Close()
+	}
+	g.Expect(err).To(HaveOccurred())
 }
 
 func TestShutdownBeforeStartDoesNotResurrectServer(t *testing.T) {

@@ -39,6 +39,7 @@ type Server struct {
 	lifecycleMu sync.RWMutex
 	started     bool
 	shutting    bool
+	admissions  uint64
 	httpAddress string
 	dapStarted  bool
 	dapServer   *dap.Server
@@ -48,6 +49,10 @@ type Server struct {
 	sessionOps   sync.WaitGroup
 	shutdownOnce sync.Once
 	shutdownDone chan struct{}
+
+	// The hook lets tests hold the narrow timer-fire-to-shutdown-commit window
+	// open without making production timing assumptions.
+	idleCommitHook func()
 }
 
 // New creates a Server that will listen on addr (e.g. ":6060").
@@ -113,32 +118,32 @@ func newServer(addr string, idleTimeout time.Duration, log *slog.Logger) *Server
 
 // Start blocks until shutdown or a fatal listener error.
 func (s *Server) Start() error {
-	s.lifecycleMu.RLock()
-	shutting := s.shutting
-	s.lifecycleMu.RUnlock()
-	if shutting {
+	s.lifecycleMu.Lock()
+	if s.shutting {
+		s.lifecycleMu.Unlock()
 		return nil
 	}
+	if s.started {
+		s.lifecycleMu.Unlock()
+		return ErrServerStarted
+	}
+	s.started = true
+	s.lifecycleMu.Unlock()
 
-	ln, err := net.Listen("tcp4", s.httpServer.Addr)
+	var listenConfig net.ListenConfig
+	ln, err := listenConfig.Listen(s.ctx, "tcp4", s.httpServer.Addr)
 	if err != nil {
+		s.Shutdown(idleShutdownGrace)
 		return err
 	}
 
 	s.lifecycleMu.Lock()
-	switch {
-	case s.shutting:
+	if s.shutting {
 		s.lifecycleMu.Unlock()
 		_ = ln.Close()
 		return nil
-	case s.started:
-		s.lifecycleMu.Unlock()
-		_ = ln.Close()
-		return ErrServerStarted
-	default:
-		s.started = true
-		s.httpAddress = ln.Addr().String()
 	}
+	s.httpAddress = ln.Addr().String()
 	s.lifecycleMu.Unlock()
 
 	s.log.Info("bingo server listening", "addr", ln.Addr().String())
@@ -148,6 +153,7 @@ func (s *Server) Start() error {
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
+	s.Shutdown(idleShutdownGrace)
 	return err
 }
 
@@ -207,7 +213,29 @@ func (s *Server) beginSessionOperation() bool {
 	if s.shutting {
 		return false
 	}
+	s.admissions++
 	s.sessionOps.Add(1)
+	return true
+}
+
+func (s *Server) idleSnapshot() (int, uint64, uint64, <-chan struct{}) {
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+	count, generation, changed := s.sessions.snapshot()
+	return count, generation, s.admissions, changed
+}
+
+func (s *Server) commitIdleShutdown(generation, admissions uint64) bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.shutting || s.admissions != admissions {
+		return false
+	}
+	count, currentGeneration, _ := s.sessions.snapshot()
+	if count != 0 || currentGeneration != generation {
+		return false
+	}
+	s.shutting = true
 	return true
 }
 
@@ -224,7 +252,7 @@ func (s *Server) monitorIdle() {
 	timer := time.NewTimer(time.Hour)
 	stopTimer(timer)
 	var timerC <-chan time.Time
-	count, armedGeneration, changed := s.sessions.snapshot()
+	count, armedGeneration, armedAdmissions, changed := s.idleSnapshot()
 	if count == 0 {
 		resetTimer(timer, s.idleTimeout)
 		timerC = timer.C
@@ -236,7 +264,7 @@ func (s *Server) monitorIdle() {
 		case <-s.ctx.Done():
 			return
 		case <-changed:
-			count, generation, nextChanged := s.sessions.snapshot()
+			count, generation, admissions, nextChanged := s.idleSnapshot()
 			changed = nextChanged
 			if count > 0 {
 				stopTimer(timer)
@@ -246,19 +274,24 @@ func (s *Server) monitorIdle() {
 			resetTimer(timer, s.idleTimeout)
 			timerC = timer.C
 			armedGeneration = generation
+			armedAdmissions = admissions
 		case <-timerC:
-			count, generation, nextChanged := s.sessions.snapshot()
-			changed = nextChanged
 			timerC = nil
-			if count == 0 && generation == armedGeneration {
+			if s.idleCommitHook != nil {
+				s.idleCommitHook()
+			}
+			if s.commitIdleShutdown(armedGeneration, armedAdmissions) {
 				s.log.Info("managed server idle timeout elapsed", "timeout", s.idleTimeout)
 				s.Shutdown(idleShutdownGrace)
 				return
 			}
+			count, generation, admissions, nextChanged := s.idleSnapshot()
+			changed = nextChanged
 			if count == 0 {
 				resetTimer(timer, s.idleTimeout)
 				timerC = timer.C
 				armedGeneration = generation
+				armedAdmissions = admissions
 			}
 		}
 	}
