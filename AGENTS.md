@@ -857,7 +857,8 @@ one hub session (this is the whole point — an IDE gets a working debugger, the
 bingo UI gets its bonus features, both against the same tracee).
 
 **VS Code companion — transport only, separate from Go tooling.**
-[editors/vscode](editors/vscode/) registers a
+[editors/vscode](editors/vscode/) packages as extension ID
+`bingosuite.bingo`, registers a
 `DebugAdapterDescriptorFactory` for debugger type `bingo` and returns
 `DebugAdapterServer(dapPort, dapHost)` (defaults `localhost:4711`). It never
 registers type `go`, launches or validates `dlv`, or calls into Microsoft's Go
@@ -1231,8 +1232,10 @@ just build [linux amd64 | darwin arm64]   # produces ./build/bingo/...
 just test [PKG]                            # go test -v
 just coverage [PKG]                        # writes test/coverage.out
 just integration                           # ginkgo -r ./test/integration (no e2e tag)
+just build-spawntree                       # rebuilds the VS Code demo with -N -l
 just vscode-check                          # lint, typecheck, test, bundle, package-list smoke
 just vscode-package                        # verifies reproducibility, writes ignored dist/bingo.vsix
+just vscode-install                        # explicitly installs/updates bingosuite.bingo
 just e2e-linux                             # native linux/amd64 ptrace E2E (all labels)
 just e2e-darwin                            # native darwin/arm64 Mach-exception E2E (codesigned; all labels)
 # Filter to one label, e.g. only the correctness gate (package path must come

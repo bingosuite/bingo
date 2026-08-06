@@ -3,7 +3,7 @@
   "displayName": "bingo Debugger",
   "description": "Connect VS Code's Debug UI to an already-running bingo DAP server.",
   "version": "0.1.0",
-  "publisher": "bingo",
+  "publisher": "bingosuite",
   "license": "MIT",
   "private": true,
   "repository": {

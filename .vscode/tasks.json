@@ -1,0 +1,14 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "bingo: build spawntree",
+      "type": "process",
+      "command": "just",
+      "args": [
+        "build-spawntree"
+      ],
+      "problemMatcher": []
+    }
+  ]
+}

@@ -20,7 +20,7 @@ const result = spawnSync(
   {
     env: {
       ...process.env,
-      SOURCE_DATE_EPOCH: "315532800",
+      SOURCE_DATE_EPOCH: "946684800",
     },
     stdio: "inherit",
   },

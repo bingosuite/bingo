@@ -51,6 +51,12 @@ build-target:
 	mkdir -p ./build/target
 	go build --gcflags="all=-N -l" -o ./build/target/target ./cmd/target
 
+# VS Code's pre-launch task rebuilds the telemetry demo without optimization so
+# source breakpoints and stepping stay aligned with the checked-out source.
+build-spawntree:
+	mkdir -p ./build
+	go build -gcflags="all=-N -l" -o ./build/spawntree ./examples/spawntree
+
 # ARGS: -addr string    server address (default "localhost:6060")
 #	  	-session string session ID to join (omit to create a new session)
 # Build and run the interactive CLI client
@@ -68,7 +74,7 @@ dapcli *ARGS:
 # Reinstall from the lockfile so local checks exercise the same dependency graph
 # as CI rather than whatever happens to be present in node_modules.
 vscode-check:
-	npm --prefix editors/vscode ci
+	npm --prefix editors/vscode ci --ignore-scripts
 	npm --prefix editors/vscode run check
 
 # Keep the install artifact under the repo-level ignored dist directory so
@@ -76,6 +82,11 @@ vscode-check:
 vscode-package: vscode-check
 	mkdir -p ./dist
 	npm --prefix editors/vscode run package:reproducible
+
+# Explicit opt-in keeps packaging/CI from mutating a developer's normal VS Code
+# profile while still providing a one-command local install/update path.
+vscode-install: vscode-package
+	code --install-extension ./dist/bingo.vsix --force
 
 # Run unit tests on the PKG (defaults to ./...)
 test PKG="./...":
