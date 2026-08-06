@@ -92,6 +92,7 @@ follow them so reviews stay about substance, not style.
 | [cmd/cli](cmd/cli/) | Interactive readline client. |
 | [cmd/dapcli](cmd/dapcli/) | Interactive readline client that drives a session over DAP (mirrors `cmd/cli`'s UX). Talks to the server's `-dap-addr` listener; can create a session or `-session` join an existing one. |
 | [cmd/wsmon](cmd/wsmon/) | Read-only terminal telemetry observer. `-session`-joins a running session over WebSocket and live-renders the goroutine spawn tree + OS threads + created/exited lifecycle deltas from the `EventGoroutineSnapshot` stream. Never drives execution — the WS-observes half of the DAP-drives/WS-observes demo. |
+| [editors/vscode](editors/vscode/) | Locally packaged TypeScript companion extension. Owns VS Code debugger type `bingo`, enables Go breakpoints, and connects the built-in Debug UI to an already-running bingo DAP TCP listener. |
 | [cmd/target](cmd/target/) | Trivial target program for manual testing. |
 | [examples/spawntree](examples/spawntree/) | Concurrency demo target: a deterministic main → supervisor → worker×N goroutine spawn tree for exercising the telemetry stream (see [docs/ConcurrencyTelemetry.md](docs/ConcurrencyTelemetry.md)). |
 | [cmd/githook](cmd/githook/) | Conventional-commits commitlint, wired via [lefthook.yml](lefthook.yml). |
@@ -855,6 +856,20 @@ richer concurrency visualizations stay on the WebSocket side. The two coexist on
 one hub session (this is the whole point — an IDE gets a working debugger, the
 bingo UI gets its bonus features, both against the same tracee).
 
+**VS Code companion — transport only, separate from Go tooling.**
+[editors/vscode](editors/vscode/) registers a
+`DebugAdapterDescriptorFactory` for debugger type `bingo` and returns
+`DebugAdapterServer(dapPort, dapHost)` (defaults `localhost:4711`). It never
+registers type `go`, launches or validates `dlv`, or calls into Microsoft's Go
+extension. Keep `golang.go` installed for gopls/navigation/formatting/tests; a
+`"type": "bingo"` launch is owned entirely by the companion and this DAP server.
+The extension validates launch (`program`), existing-session join (`session`),
+and OS-process attach (`pid`, optional `binaryPath`) before connecting.
+`dapHost`/`dapPort` are client-owned endpoint fields that remain in VS Code's
+raw launch/attach arguments; Go's JSON decoder ignores those unknown fields, so
+they never enter the bingo command payload. Do not add them to the wire protocol
+or `launchConfig`.
+
 **Architecture — a translator at the `hub.WSConn` seam, ZERO hub changes.**
 `dap.Handler` implements `hub.WSConn` and is registered via
 `Session.AddClient(handler, log)`, so from the hub's perspective the DAP client
@@ -1068,6 +1083,12 @@ translator keeps DAP entirely outside the hub — a strictly additive package.
   agnostic; only the backend differs). CI: the `dap` label runs in the
   `fullstack-*` jobs of
   [debugger-e2e.yml](.github/workflows/debugger-e2e.yml).
+- VS Code: [editors/vscode](editors/vscode/) uses strict TypeScript unit tests
+  for endpoint/request validation plus manifest tests that pin debugger ownership,
+  Go breakpoint support, endpoint defaults, and launch/join/PID snippets. The
+  dedicated [vscode-extension.yml](.github/workflows/vscode-extension.yml)
+  workflow lints, typechecks, tests, bundles, and builds the local VSIX without
+  changing the Go CI jobs.
 
 ## Error handling
 
@@ -1210,6 +1231,8 @@ just build [linux amd64 | darwin arm64]   # produces ./build/bingo/...
 just test [PKG]                            # go test -v
 just coverage [PKG]                        # writes test/coverage.out
 just integration                           # ginkgo -r ./test/integration (no e2e tag)
+just vscode-check                          # lint, typecheck, test, bundle, package-list smoke
+just vscode-package                        # verifies reproducibility, writes ignored dist/bingo.vsix
 just e2e-linux                             # native linux/amd64 ptrace E2E (all labels)
 just e2e-darwin                            # native darwin/arm64 Mach-exception E2E (codesigned; all labels)
 # Filter to one label, e.g. only the correctness gate (package path must come
@@ -1268,6 +1291,11 @@ through the justfile.
   are safely ignored in `translateEvent`, but decide deliberately — a new
   *suspending* event especially must map to a `stopped` reason or the IDE won't
   realise the tracee halted.
+- **VS Code debug configuration** (`editors/vscode`): keep debugger ownership on
+  type `bingo` and transport through `DebugAdapterServer`; never route bingo
+  launches back through `type: go`, `debugServer`, or Delve. Keep the manifest
+  schema, pure configuration tests, `.vscode/launch.json`, and extension README
+  aligned when launch/attach arguments change.
 - **New OS or arch**: add a new `backend_<goos>_<goarch>.go` and a matching
   `trap_<goarch>.go` if the trap differs. Update [README.md](README.md) and
   the build matrix in [.github/workflows/](.github/workflows/) and

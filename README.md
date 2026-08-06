@@ -51,7 +51,27 @@ bingo -addr :6060 -dap-addr :4711
 `just server` starts both listeners with the defaults above; use `just server-ws`
 for a WebSocket-only run (DAP disabled).
 
-Point your editor's debug adapter at `127.0.0.1:4711`. The DAP client creates a
+### VS Code companion extension
+
+Build and install the repository's companion extension:
+
+```sh
+just vscode-package
+code --install-extension dist/bingo.vsix --force
+```
+
+It contributes debugger type `"bingo"` and connects VS Code's built-in Debug UI
+directly to `localhost:4711`. Keep Microsoft's Go extension installed for
+`gopls`, navigation, formatting, and tests: the extensions coexist, and a bingo
+debug configuration does **not** invoke or validate Delve (`dlv`) or take over
+the Go extension's `"go"` debugger type. See
+[editors/vscode/README.md](editors/vscode/README.md) for launch, session-join,
+PID-attach, update, and uninstall instructions.
+
+After installing, run `just server`, select a `"type": "bingo"` configuration
+from `.vscode/launch.json`, and press F5.
+
+Other DAP clients can point at `127.0.0.1:4711`. The DAP client creates a
 managed session on `launch`/`attach`; WebSocket observers join that same session
 via `/ws?session=<id>` (the id is discoverable through `/api/sessions`, and the
 adapter also prints it as a `console` output event). DAP covers the standard

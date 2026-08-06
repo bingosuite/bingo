@@ -65,6 +65,18 @@ cli *ARGS:
 dapcli *ARGS:
 	go run ./cmd/dapcli {{ARGS}}
 
+# Reinstall from the lockfile so local checks exercise the same dependency graph
+# as CI rather than whatever happens to be present in node_modules.
+vscode-check:
+	npm --prefix editors/vscode ci
+	npm --prefix editors/vscode run check
+
+# Keep the install artifact under the repo-level ignored dist directory so
+# packaging never dirties the extension source tree.
+vscode-package: vscode-check
+	mkdir -p ./dist
+	npm --prefix editors/vscode run package:reproducible
+
 # Run unit tests on the PKG (defaults to ./...)
 test PKG="./...":
 	go test -v {{PKG}}
