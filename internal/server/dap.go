@@ -16,17 +16,19 @@ type dapProvider struct {
 }
 
 func (p dapProvider) CreateSession() (dap.Session, error) {
-	if !p.srv.acceptingSessions() {
+	if !p.srv.beginSessionOperation() {
 		return nil, ErrServerClosed
 	}
+	defer p.srv.sessionOps.Done()
 	sess := p.srv.sessions.create(p.srv.ctx)
 	return sess.hub, nil
 }
 
 func (p dapProvider) GetSession(id string) (dap.Session, bool) {
-	if !p.srv.acceptingSessions() {
+	if !p.srv.beginSessionOperation() {
 		return nil, false
 	}
+	defer p.srv.sessionOps.Done()
 	sess := p.srv.sessions.get(id)
 	if sess == nil {
 		return nil, false

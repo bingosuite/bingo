@@ -4,17 +4,24 @@ import (
 	"errors"
 	"flag"
 	"io"
+	"net"
 	"testing"
 	"time"
+
+	"github.com/bingosuite/bingo/internal/server"
 )
 
 type fakeServerRunner struct {
-	start chan struct{}
-	done  chan struct{}
-	err   error
+	start       chan struct{}
+	startExited chan struct{}
+	done        chan struct{}
+	err         error
 }
 
 func (f *fakeServerRunner) Start() error {
+	if f.startExited != nil {
+		defer close(f.startExited)
+	}
 	<-f.start
 	return f.err
 }
@@ -106,6 +113,35 @@ func TestRunServerWaitsForShutdownCompletion(t *testing.T) {
 	}
 }
 
+func TestRunServerReturnsWhenDoneWinsBlockedStart(t *testing.T) {
+	runner := &fakeServerRunner{
+		start:       make(chan struct{}),
+		startExited: make(chan struct{}),
+		done:        make(chan struct{}),
+	}
+	result := make(chan error, 1)
+	go func() {
+		result <- runServer(runner)
+	}()
+
+	close(runner.done)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("runServer: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Done did not unblock runServer while Start was blocked")
+	}
+
+	close(runner.start)
+	select {
+	case <-runner.startExited:
+	case <-time.After(time.Second):
+		t.Fatal("buffered Start result left the Start goroutine blocked")
+	}
+}
+
 func TestRunServerReturnsStartError(t *testing.T) {
 	startErr := errors.New("bind failed")
 	runner := &fakeServerRunner{
@@ -117,5 +153,28 @@ func TestRunServerReturnsStartError(t *testing.T) {
 
 	if err := runServer(runner); !errors.Is(err, startErr) {
 		t.Fatalf("expected start error, got %v", err)
+	}
+}
+
+func TestRunServerReturnsFinalizedBindError(t *testing.T) {
+	occupied, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = occupied.Close() }()
+
+	srv := server.New(occupied.Addr().String(), nil)
+	err = runServer(srv)
+	if err == nil {
+		t.Fatal("expected bind error")
+	}
+	var netErr *net.OpError
+	if !errors.As(err, &netErr) || netErr.Op != "listen" {
+		t.Fatalf("expected listen error, got %v", err)
+	}
+	select {
+	case <-srv.Done():
+	default:
+		t.Fatal("bind error returned before lifecycle finalization")
 	}
 }
