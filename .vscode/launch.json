@@ -6,6 +6,7 @@
       "type": "bingo",
       "request": "launch",
       "program": "${workspaceFolder}/build/spawntree",
+      "preLaunchTask": "bingo: build spawntree",
       "stopOnEntry": true,
       "dapHost": "localhost",
       "dapPort": 4711

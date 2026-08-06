@@ -23,7 +23,7 @@ jobs:
           cache-dependency-path: editors/vscode/package-lock.json
 
       - name: Install locked dependencies
-        run: npm --prefix editors/vscode ci
+        run: npm --prefix editors/vscode ci --ignore-scripts
 
       - name: Validate extension
         run: npm --prefix editors/vscode run check
