@@ -81,7 +81,7 @@ Leave it running.
 2. Select **“bingo DAP: launch spawntree (stop on entry)”** from
    `.vscode/launch.json` and press F5. VS Code first runs
    **“bingo: build spawntree”**, then its `"type": "bingo"`, `dapHost`, and
-   `dapPort` fields make the companion connect to `localhost:4711`; bingo
+   `dapPort` fields make the companion connect to `127.0.0.1:4711`; bingo
    launches the rebuilt `build/spawntree` and stops at entry.
 3. Set a breakpoint on `examples/spawntree/main.go:27` and **Continue** — the
    tracee stops there with several worker goroutines alive.

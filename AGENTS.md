@@ -860,10 +860,13 @@ bingo UI gets its bonus features, both against the same tracee).
 [editors/vscode](editors/vscode/) packages as extension ID
 `bingosuite.bingo`, registers a
 `DebugAdapterDescriptorFactory` for debugger type `bingo` and returns
-`DebugAdapterServer(dapPort, dapHost)` (defaults `localhost:4711`). It never
+`DebugAdapterServer(dapPort, dapHost)` (defaults `127.0.0.1:4711`). It never
 registers type `go`, launches or validates `dlv`, or calls into Microsoft's Go
 extension. Keep `golang.go` installed for gopls/navigation/formatting/tests; a
 `"type": "bingo"` launch is owned entirely by the companion and this DAP server.
+The explicit IPv4 default matches `internal/dap/server.go`'s `tcp4` listener;
+do not change it to `localhost`, which older VS Code/Node runtimes can resolve
+to `::1` without falling back to IPv4.
 The extension validates launch (`program`), existing-session join (`session`),
 and OS-process attach (`pid`, optional `binaryPath`) before connecting.
 `dapHost`/`dapPort` are client-owned endpoint fields that remain in VS Code's

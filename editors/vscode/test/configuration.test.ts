@@ -11,6 +11,7 @@ import {
 
 describe("bingo endpoint", () => {
   it("uses the local bingo defaults", () => {
+    assert.equal(defaultDapHost, "127.0.0.1");
     assert.deepEqual(resolveEndpoint({}), {
       host: defaultDapHost,
       port: defaultDapPort,

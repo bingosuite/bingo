@@ -44,7 +44,7 @@ just server
 Then select a `bingo` configuration in **Run and Debug** and press F5. This
 repository's `.vscode/launch.json` includes a launch and a session-join example.
 The launch example first runs the workspace's `just build-spawntree` task, then
-connects to the default DAP endpoint at `localhost:4711`.
+connects to the default DAP endpoint at `127.0.0.1:4711`.
 
 ### Launch a binary
 
@@ -57,7 +57,7 @@ connects to the default DAP endpoint at `localhost:4711`.
   "args": [],
   "env": ["BINGO_MODE=debug"],
   "stopOnEntry": true,
-  "dapHost": "localhost",
+  "dapHost": "127.0.0.1",
   "dapPort": 4711
 }
 ```
@@ -72,7 +72,7 @@ connects to the default DAP endpoint at `localhost:4711`.
   "type": "bingo",
   "request": "attach",
   "session": "replace-with-session-id",
-  "dapHost": "localhost",
+  "dapHost": "127.0.0.1",
   "dapPort": 4711
 }
 ```
@@ -89,7 +89,7 @@ Joining does not relaunch, reattach, or automatically resume the shared session.
   "pid": 1234,
   "binaryPath": "/absolute/path/to/the/binary",
   "stopOnEntry": true,
-  "dapHost": "localhost",
+  "dapHost": "127.0.0.1",
   "dapPort": 4711
 }
 ```
@@ -100,9 +100,11 @@ source breakpoints, stack frames, and locals.
 ## Endpoint and remote environments
 
 `dapHost` and `dapPort` tell the extension host where bingo is listening. The
-extension only connects; it never starts the server. For a remote extension host
-(SSH, a dev container, or Codespaces), use an address reachable from that host
-and bind bingo's `-dap-addr` accordingly.
+extension only connects; it never starts the server. The default host is the
+explicit IPv4 loopback because bingo currently opens its DAP listener with
+`tcp4`; `localhost` can resolve to IPv6 first in older VS Code runtimes. For a
+remote extension host (SSH, a dev container, or Codespaces), use an address
+reachable from that host and bind bingo's `-dap-addr` accordingly.
 
 ## Development
 
