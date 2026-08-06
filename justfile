@@ -22,6 +22,9 @@ build OS=os_name ARCH=arch_name:
 #		 just run linux amd64 -addr 127.0.0.1:6061 -v 	->  runs ./build/bingo/bingo_linux_amd64 -addr 127.0.0.1:6061 -v
 
 # ARGS:  -addr string    listen address (default ":6060")
+#		 -idle-timeout duration
+#		                 exit after no managed sessions for this duration;
+#		                 omitted/0 keeps the server persistent
 #		 -v              verbose logging (debug level)
 # Run the BinGo binary. Takes positional arguments for the target OS and architecture (Must be existing binaries).
 run OS=os_name ARCH=arch_name *ARGS="":
@@ -36,7 +39,9 @@ dap_addr := ":4711"
 # and DAP (-dap-addr) listeners, using the standard defaults so a DAP driver
 # (VS Code / `just dapcli`) and a `go run ./cmd/wsmon` observer can share one
 # session out of the box (see docs/ConcurrencyTelemetry.md). Override addresses
-# via the ADDR/DAP_ADDR positionals; extra flags (e.g. -v) pass through in ARGS.
+# via the ADDR/DAP_ADDR positionals; extra flags (e.g. `-idle-timeout 30s`) pass
+# through in ARGS. No idle timeout is supplied by default, so manual servers
+# remain persistent.
 server OS=os_name ARCH=arch_name ADDR=ws_addr DAP_ADDR=dap_addr *ARGS="": build-target (build OS ARCH)
 	./build/bingo/bingo_{{OS}}_{{ARCH}} -addr {{ADDR}} -dap-addr {{DAP_ADDR}} {{ARGS}}
 

@@ -51,6 +51,57 @@ bingo -addr :6060 -dap-addr :4711
 `just server` starts both listeners with the defaults above; use `just server-ws`
 for a WebSocket-only run (DAP disabled).
 
+### Server discovery and managed lifetime
+
+Frontends can identify and reuse a compatible bingo process through
+`GET /api/health` on the management/WebSocket listener:
+
+```json
+{
+  "service": "bingo",
+  "managementApiVersion": 1,
+  "wireProtocolVersion": "1.2",
+  "instanceId": "4dd4dfdd-7f55-41a5-bd95-c086ce6f3c2a",
+  "dap": {
+    "enabled": true,
+    "address": "0.0.0.0:4711"
+  },
+  "managedIdleShutdown": {
+    "enabled": false,
+    "timeoutMs": 0
+  },
+  "sessionCount": 0
+}
+```
+
+The response is non-cacheable. `managementApiVersion` versions this HTTP
+contract independently of `wireProtocolVersion`; integrations should require
+management API v1 and separately check that they support the advertised bingo
+wire version. `instanceId` changes on every process start. The DAP address is the
+actual bound listener address, including the selected port when bingo was
+started with `-dap-addr ...:0`.
+
+The intended process-owner flow is **connect or start**: health-check the known
+management address, reuse a compatible bingo if present, otherwise start one
+and let listener binding arbitrate concurrent startup attempts. Frontends do not
+kill a shared bingo process directly.
+
+Manual servers remain persistent by default. Process-managing integrations may
+opt into server-owned idle shutdown:
+
+```sh
+bingo -addr 127.0.0.1:6060 -dap-addr 127.0.0.1:4711 -idle-timeout 30s
+# equivalent development recipe:
+just server darwin arm64 :6060 :4711 -idle-timeout 30s
+```
+
+The timeout is armed at startup and whenever the last managed session
+disconnects. Any active session suppresses it, and a new session resets the full
+grace period. Health polling and a DAP connection that has not yet created or
+joined a session do not keep the process alive, so a process owner must allow
+enough grace for its health check and DAP handshake. A zero or omitted timeout
+disables idle shutdown.
+
 ### VS Code companion extension
 
 Build and install the repository's companion extension:
@@ -65,7 +116,9 @@ directly to `127.0.0.1:4711`. Keep Microsoft's Go extension installed for
 debug configuration does **not** invoke or validate Delve (`dlv`) or take over
 the Go extension's `"go"` debugger type. See
 [editors/vscode/README.md](editors/vscode/README.md) for launch, session-join,
-PID-attach, update, and uninstall instructions.
+PID-attach, update, and uninstall instructions. The current extension still
+connects to an already-running server; it does not yet consume the lifecycle
+contract above to start or own a process.
 
 After installing, run `just server`, select the `"type": "bingo"` spawntree
 configuration from `.vscode/launch.json`, and press F5. Its pre-launch task runs
