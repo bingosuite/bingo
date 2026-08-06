@@ -38,14 +38,17 @@ func (s *session) info() SessionInfo {
 
 // sessionStore is the goroutine-safe set of active sessions.
 type sessionStore struct {
-	mu       sync.RWMutex
-	sessions map[string]*session
-	log      *slog.Logger
+	mu         sync.RWMutex
+	sessions   map[string]*session
+	generation uint64
+	changed    chan struct{}
+	log        *slog.Logger
 }
 
 func newSessionStore(log *slog.Logger) *sessionStore {
 	return &sessionStore{
 		sessions: make(map[string]*session),
+		changed:  make(chan struct{}),
 		log:      log,
 	}
 }
@@ -74,6 +77,7 @@ func (ss *sessionStore) create(ctx context.Context) *session {
 
 	ss.mu.Lock()
 	ss.sessions[id] = s
+	ss.notifyLocked()
 	ss.mu.Unlock()
 
 	go func() {
@@ -94,8 +98,12 @@ func (ss *sessionStore) get(id string) *session {
 
 func (ss *sessionStore) remove(id string) {
 	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	if _, ok := ss.sessions[id]; !ok {
+		return
+	}
 	delete(ss.sessions, id)
-	ss.mu.Unlock()
+	ss.notifyLocked()
 }
 
 func (ss *sessionStore) list() []SessionInfo {
@@ -109,7 +117,32 @@ func (ss *sessionStore) list() []SessionInfo {
 }
 
 func (ss *sessionStore) count() int {
+	count, _, _ := ss.snapshot()
+	return count
+}
+
+func (ss *sessionStore) snapshot() (int, uint64, <-chan struct{}) {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()
-	return len(ss.sessions)
+	return len(ss.sessions), ss.generation, ss.changed
+}
+
+func (ss *sessionStore) notifyLocked() {
+	ss.generation++
+	close(ss.changed)
+	ss.changed = make(chan struct{})
+}
+
+func (ss *sessionStore) waitEmpty(ctx context.Context) bool {
+	for {
+		count, _, changed := ss.snapshot()
+		if count == 0 {
+			return true
+		}
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return false
+		}
+	}
 }
