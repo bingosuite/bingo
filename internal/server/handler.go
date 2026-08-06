@@ -94,11 +94,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 func durationMilliseconds(duration time.Duration) int64 {
-	millis := duration / time.Millisecond
-	if duration%time.Millisecond != 0 {
-		millis++
-	}
-	return int64(millis)
+	return int64(duration / time.Millisecond)
 }
 
 // handleListSessions: GET /api/sessions
@@ -160,7 +156,9 @@ func (s *Server) wsCreate(conn *websocket.Conn, log *slog.Logger) {
 	sess := s.sessions.create(s.ctx)
 	log = log.With("session", sess.id, "action", "create")
 	log.Info("client creating new session")
-	sess.hub.AddClient(conn, log)
+	if _, err := sess.hub.AddClient(conn, log); err != nil {
+		log.Warn("session closed while adding client", "err", err)
+	}
 }
 
 func (s *Server) wsJoin(conn *websocket.Conn, sessionID string, log *slog.Logger) {
@@ -185,7 +183,9 @@ func (s *Server) wsJoin(conn *websocket.Conn, sessionID string, log *slog.Logger
 	}
 
 	log.Info("client joining existing session")
-	sess.hub.AddClient(conn, log)
+	if _, err := sess.hub.AddClient(conn, log); err != nil {
+		log.Warn("session closed while joining", "err", err)
+	}
 }
 
 func (s *Server) closeShuttingDown(conn *websocket.Conn) {

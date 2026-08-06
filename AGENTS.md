@@ -1049,7 +1049,9 @@ configuration in milliseconds, and the current session count. Management API
 compatibility and WebSocket wire compatibility are separate checks: changing
 one does not implicitly version the other. A DAP bind to `:0` MUST publish the
 actual listener address, never the unresolved configured address. Health
-polling has no lifecycle effect.
+polling has no lifecycle effect. Positive idle durations below `1ms` or with a
+fractional millisecond are rejected so the timer and integer `timeoutMs` field
+always describe the exact same interval.
 
 **Connect-or-start and ownership.** A frontend health-checks the known
 management address and reuses a compatible process; otherwise it starts bingo
@@ -1079,6 +1081,23 @@ then wait event-driven for the session store to empty. DAP Close already waits
 for its handlers, including clients that connected but never created a session.
 This ordering prevents a late client add from escaping registry teardown while
 still allowing every established session to close gracefully.
+
+Hub admission has a second, session-local gate: `registry.add`, `remove`, and
+`closeAll` serialize on the registry mutex. Removing the final client marks the
+registry closed in the same critical section, before `removeClient` schedules
+hub shutdown; closeAll also marks it closed before removing clients.
+`Hub.AddClient` returns `ErrHubClosed` and closes the supplied connection when
+admission is closed. WebSocket and DAP callers must propagate/handle that error.
+This is what closes the race where a join resolves a session just before its
+final client triggers one-shot hub teardown. Do not hold the registry lock
+across socket writes.
+
+`http.Server.Shutdown` closes the listener before session draining completes,
+so `Server.Start` can return while `Server.Shutdown` is still working. The
+`cmd/bingo` main goroutine MUST wait on `Server.Done()` after a clean Start
+return; otherwise a signal- or idle-triggered shutdown can be preempted by
+process exit before hijacked WebSockets, hubs, and debuggees are cleaned up.
+Start errors return directly and do not wait for Done.
 
 **One-driver vs many-driver.** DAP assumes a single driver; bingo does not
 enforce it. WebSocket clients CAN also drive (the hub's `resumeCh` is

@@ -7,26 +7,35 @@ import "sync"
 type registry struct {
 	mu      sync.RWMutex
 	clients map[*Client]struct{}
+	closed  bool
 }
 
 func newRegistry() *registry {
 	return &registry{clients: make(map[*Client]struct{})}
 }
 
-func (r *registry) add(c *Client) {
+func (r *registry) add(c *Client) bool {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return false
+	}
 	r.clients[c] = struct{}{}
-	r.mu.Unlock()
+	return true
 }
 
-func (r *registry) remove(c *Client) bool {
+func (r *registry) remove(c *Client) (bool, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.clients[c]; !ok {
-		return false
+		return false, len(r.clients)
 	}
 	delete(r.clients, c)
-	return true
+	remaining := len(r.clients)
+	if remaining == 0 {
+		r.closed = true
+	}
+	return true, remaining
 }
 
 func (r *registry) count() int {
@@ -51,6 +60,7 @@ func (r *registry) snapshot() []*Client {
 func (r *registry) closeAll() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	r.closed = true
 	for c := range r.clients {
 		c.closeSend()
 		delete(r.clients, c)

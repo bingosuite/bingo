@@ -64,10 +64,23 @@ func main() {
 		srv.Shutdown(10 * time.Second)
 	}()
 
-	if err := srv.Start(); err != nil {
+	if err := runServer(srv); err != nil {
 		log.Error("server error", "err", err)
 		os.Exit(1)
 	}
+}
+
+type serverRunner interface {
+	Start() error
+	Done() <-chan struct{}
+}
+
+func runServer(srv serverRunner) error {
+	if err := srv.Start(); err != nil {
+		return err
+	}
+	<-srv.Done()
+	return nil
 }
 
 func parseConfig(args []string, output io.Writer) (config, error) {
@@ -81,8 +94,8 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	if err := flags.Parse(args); err != nil {
 		return config{}, err
 	}
-	if cfg.idleTimeout < 0 {
-		return config{}, fmt.Errorf("idle timeout must not be negative: %s", cfg.idleTimeout)
+	if err := server.ValidateIdleTimeout(cfg.idleTimeout); err != nil {
+		return config{}, err
 	}
 	return cfg, nil
 }

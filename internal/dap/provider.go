@@ -15,7 +15,7 @@ type Session interface {
 	// AddClient registers a hub client (here, the DAP handler as a WSConn) so it
 	// receives the session's event stream and can inject commands. Must be called
 	// before the Launch/Attach command is enqueued so the entry stop is delivered.
-	AddClient(conn hub.WSConn, log *slog.Logger) *hub.Client
+	AddClient(conn hub.WSConn, log *slog.Logger) (*hub.Client, error)
 }
 
 // Provider creates and looks up managed sessions. internal/server implements it

@@ -164,9 +164,23 @@ func TestHealthReportsSessionCount(t *testing.T) {
 
 func TestIdleTimeoutValidation(t *testing.T) {
 	g := NewWithT(t)
-	srv, err := NewWithIdleTimeout(":0", -time.Second, nil)
-	g.Expect(err).To(MatchError("idle timeout must not be negative: -1s"))
-	g.Expect(srv).To(BeNil())
+	tests := []struct {
+		timeout time.Duration
+		message string
+	}{
+		{timeout: -time.Second, message: "idle timeout must not be negative: -1s"},
+		{timeout: time.Nanosecond, message: "idle timeout must be zero or at least 1ms: 1ns"},
+		{timeout: 1500 * time.Microsecond, message: "idle timeout must use whole milliseconds: 1.5ms"},
+	}
+	for _, test := range tests {
+		srv, err := NewWithIdleTimeout(":0", test.timeout, nil)
+		g.Expect(err).To(MatchError(test.message))
+		g.Expect(srv).To(BeNil())
+	}
+
+	srv, err := NewWithIdleTimeout(":0", time.Millisecond, nil)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(srv.idleTimeout).To(Equal(time.Millisecond))
 }
 
 func TestIdleShutdownDisabled(t *testing.T) {
@@ -346,6 +360,38 @@ func TestShutdownBeforeStartDoesNotResurrectServer(t *testing.T) {
 	g.Expect(response.Code).To(Equal(http.StatusServiceUnavailable))
 }
 
+func TestWebSocketJoinRejectsClosedHub(t *testing.T) {
+	g := NewWithT(t)
+	srv := New(":0", nil)
+	sessionCtx, cancelSession := context.WithCancel(context.Background())
+	sess := srv.sessions.create(sessionCtx)
+	cancelSession()
+	g.Eventually(sess.hub.Done(), time.Second).Should(BeClosed())
+	g.Eventually(srv.sessions.count, time.Second).Should(Equal(0))
+
+	srv.sessions.mu.Lock()
+	srv.sessions.sessions[sess.id] = sess
+	srv.sessions.notifyLocked()
+	srv.sessions.mu.Unlock()
+
+	httpServer := httptest.NewServer(srv.httpServer.Handler)
+	defer httpServer.Close()
+	conn, _, err := websocket.DefaultDialer.Dial(
+		"ws"+strings.TrimPrefix(httpServer.URL, "http")+"/ws?session="+sess.id,
+		nil,
+	)
+	g.Expect(err).NotTo(HaveOccurred())
+	defer func() { _ = conn.Close() }()
+
+	g.Expect(conn.SetReadDeadline(time.Now().Add(time.Second))).To(Succeed())
+	_, _, err = conn.ReadMessage()
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(sess.hub.ClientCount()).To(Equal(0))
+
+	srv.sessions.remove(sess.id)
+	srv.Shutdown(time.Second)
+}
+
 func TestDAPBindFailureIsRetryable(t *testing.T) {
 	g := NewWithT(t)
 	running := startServer(t, 0)
@@ -356,9 +402,9 @@ func TestDAPBindFailureIsRetryable(t *testing.T) {
 	g.Expect(running.server.StartDAP("127.0.0.1:0")).To(MatchError(ErrDAPAlreadyStarted))
 }
 
-func TestDurationMillisecondsRoundsUp(t *testing.T) {
+func TestDurationMillisecondsIsExact(t *testing.T) {
 	g := NewWithT(t)
 	g.Expect(durationMilliseconds(0)).To(Equal(int64(0)))
-	g.Expect(durationMilliseconds(time.Nanosecond)).To(Equal(int64(1)))
-	g.Expect(durationMilliseconds(1500 * time.Microsecond)).To(Equal(int64(2)))
+	g.Expect(durationMilliseconds(time.Millisecond)).To(Equal(int64(1)))
+	g.Expect(durationMilliseconds(150 * time.Millisecond)).To(Equal(int64(150)))
 }
