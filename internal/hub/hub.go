@@ -5,6 +5,7 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -15,6 +16,8 @@ import (
 	"github.com/bingosuite/bingo/internal/debugger"
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
+
+var ErrHubClosed = errors.New("hub is shutting down")
 
 // suspendingEvents pause the hub and require a resuming command before the
 // process is allowed to continue. EventPaused is included: a Pause request
@@ -207,10 +210,15 @@ func (h *Hub) setDbg(d debugger.Debugger) {
 	h.dbgMu.Unlock()
 }
 
-// AddClient registers conn as a new client. Safe from any goroutine.
-func (h *Hub) AddClient(conn WSConn, log *slog.Logger) *Client {
+// AddClient registers conn as a new client. Safe from any goroutine. Admission
+// closes atomically with registry teardown so a late join cannot enter a dead
+// hub after its one-shot shutdown has completed.
+func (h *Hub) AddClient(conn WSConn, log *slog.Logger) (*Client, error) {
 	c := newClient(conn, h, log)
-	h.registry.add(c)
+	if !h.registry.add(c) {
+		_ = conn.Close()
+		return nil, ErrHubClosed
+	}
 	go c.writePump()
 	go c.readPump()
 	h.log.Info("client connected", "total", h.registry.count())
@@ -219,16 +227,15 @@ func (h *Hub) AddClient(conn WSConn, log *slog.Logger) *Client {
 		h.sendStateTo(c)
 	}
 
-	return c
+	return c, nil
 }
 
 func (h *Hub) removeClient(c *Client) {
-	removed := h.registry.remove(c)
+	removed, remaining := h.registry.remove(c)
 	c.closeSend()
 	if !removed {
 		return
 	}
-	remaining := h.registry.count()
 	h.log.Info("client disconnected", "remaining", remaining)
 	if remaining == 0 {
 		h.log.Info("last client disconnected — shutting down")

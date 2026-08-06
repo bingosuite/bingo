@@ -100,7 +100,8 @@ disconnects. Any active session suppresses it, and a new session resets the full
 grace period. Health polling and a DAP connection that has not yet created or
 joined a session do not keep the process alive, so a process owner must allow
 enough grace for its health check and DAP handshake. A zero or omitted timeout
-disables idle shutdown.
+disables idle shutdown. Positive values must be at least `1ms` and use whole
+milliseconds so the enforced duration exactly matches `timeoutMs`.
 
 ### VS Code companion extension
 

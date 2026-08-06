@@ -59,10 +59,25 @@ func New(addr string, log *slog.Logger) *Server {
 // count remains zero for idleTimeout. A zero timeout preserves persistent
 // server behavior.
 func NewWithIdleTimeout(addr string, idleTimeout time.Duration, log *slog.Logger) (*Server, error) {
-	if idleTimeout < 0 {
-		return nil, fmt.Errorf("idle timeout must not be negative: %s", idleTimeout)
+	if err := ValidateIdleTimeout(idleTimeout); err != nil {
+		return nil, err
 	}
 	return newServer(addr, idleTimeout, log), nil
+}
+
+// ValidateIdleTimeout ensures the timer and timeoutMs health field can represent
+// the configured duration identically.
+func ValidateIdleTimeout(idleTimeout time.Duration) error {
+	switch {
+	case idleTimeout < 0:
+		return fmt.Errorf("idle timeout must not be negative: %s", idleTimeout)
+	case idleTimeout > 0 && idleTimeout < time.Millisecond:
+		return fmt.Errorf("idle timeout must be zero or at least 1ms: %s", idleTimeout)
+	case idleTimeout%time.Millisecond != 0:
+		return fmt.Errorf("idle timeout must use whole milliseconds: %s", idleTimeout)
+	default:
+		return nil
+	}
 }
 
 func newServer(addr string, idleTimeout time.Duration, log *slog.Logger) *Server {
@@ -144,6 +159,12 @@ func (s *Server) Shutdown(timeout time.Duration) {
 		close(s.shutdownDone)
 	})
 	<-s.shutdownDone
+}
+
+// Done closes after the server has finished closing listeners and draining all
+// managed sessions.
+func (s *Server) Done() <-chan struct{} {
+	return s.shutdownDone
 }
 
 func (s *Server) shutdown(timeout time.Duration) {

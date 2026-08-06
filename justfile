@@ -24,7 +24,8 @@ build OS=os_name ARCH=arch_name:
 # ARGS:  -addr string    listen address (default ":6060")
 #		 -idle-timeout duration
 #		                 exit after no managed sessions for this duration;
-#		                 omitted/0 keeps the server persistent
+#		                 omitted/0 keeps the server persistent; positive values
+#		                 use whole milliseconds (minimum 1ms)
 #		 -v              verbose logging (debug level)
 # Run the BinGo binary. Takes positional arguments for the target OS and architecture (Must be existing binaries).
 run OS=os_name ARCH=arch_name *ARGS="":
