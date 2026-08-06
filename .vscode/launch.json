@@ -3,20 +3,20 @@
   "configurations": [
     {
       "name": "bingo DAP: launch spawntree (stop on entry)",
-      "type": "go",
+      "type": "bingo",
       "request": "launch",
-      "mode": "exec",
       "program": "${workspaceFolder}/build/spawntree",
       "stopOnEntry": true,
-      "debugServer": 4711
+      "dapHost": "localhost",
+      "dapPort": 4711
     },
     {
       "name": "bingo DAP: join running session",
-      "type": "go",
+      "type": "bingo",
       "request": "attach",
-      "mode": "remote",
       "session": "${input:bingoSession}",
-      "debugServer": 4711
+      "dapHost": "localhost",
+      "dapPort": 4711
     }
   ],
   "inputs": [

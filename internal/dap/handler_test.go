@@ -243,6 +243,33 @@ func (hh *harness) doHandshake(t *testing.T) {
 	hh.inject(protocol.EventContinued, protocol.ContinuedPayload{})
 }
 
+func TestLaunchIgnoresVSCodeEndpointFields(t *testing.T) {
+	hh := newHarness(t)
+	hh.sendReq("initialize", initArgs())
+	_ = recvType[*godap.InitializeResponse](hh)
+
+	// dapHost and dapPort select the socket before DAP starts, but VS Code also
+	// leaves them in launch arguments. They must not alter the bingo command.
+	hh.sendReq("launch", &godap.LaunchRequest{Arguments: json.RawMessage(
+		`{"program":"/bin/x","args":["one"],"env":["BINGO_TEST=1"],"dapHost":"localhost","dapPort":4711}`,
+	)})
+
+	cmd := hh.cmds.waitForCommand(t, protocol.CmdLaunch)
+	var payload protocol.LaunchPayload
+	if err := protocol.DecodeCommandPayload(cmd, &payload); err != nil {
+		t.Fatalf("decode launch payload: %v", err)
+	}
+	if payload.Program != "/bin/x" {
+		t.Errorf("program = %q, want /bin/x", payload.Program)
+	}
+	if len(payload.Args) != 1 || payload.Args[0] != "one" {
+		t.Errorf("args = %v, want [one]", payload.Args)
+	}
+	if len(payload.Env) != 1 || payload.Env[0] != "BINGO_TEST=1" {
+		t.Errorf("env = %v, want [BINGO_TEST=1]", payload.Env)
+	}
+}
+
 func TestHandshakeLaunchToBreakpoint(t *testing.T) {
 	hh := newHarness(t)
 	hh.doHandshake(t)
