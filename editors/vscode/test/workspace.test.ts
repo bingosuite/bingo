@@ -40,7 +40,7 @@ describe("repository VS Code integration", () => {
     assert.doesNotMatch(sources, /["']type["']\s*:\s*["']go["']/);
   });
 
-  it("uses only bingo product debugging and prepares extension development", () => {
+  it("keeps target and extension-development preparation separate", () => {
     const launch = readJSON(".vscode/launch.json");
     const configurations = requireArray(launch.configurations).map(requireRecord);
 
@@ -64,29 +64,40 @@ describe("repository VS Code integration", () => {
       (configuration) => configuration.request === "launch",
     );
     assert.notEqual(binaryLaunch, undefined);
-    assert.equal(binaryLaunch?.preLaunchTask, "bingo: prepare F5");
+    assert.equal(binaryLaunch?.preLaunchTask, "bingo: build spawntree");
 
     const extensionHost = configurations.find(
       (configuration) => configuration.type === "extensionHost",
     );
     assert.notEqual(extensionHost, undefined);
-    assert.equal(extensionHost?.preLaunchTask, "bingo: prepare F5");
+    assert.equal(
+      extensionHost?.preLaunchTask,
+      "bingo: prepare extension host",
+    );
     assert.deepEqual(extensionHost?.args, [
       "--extensionDevelopmentPath=${workspaceFolder}/editors/vscode",
     ]);
   });
 
-  it("defines the deterministic extension and target preparation task", () => {
+  it("defines deterministic but independent extension and target tasks", () => {
     const tasksConfig = readJSON(".vscode/tasks.json");
     const tasks = requireArray(tasksConfig.tasks).map(requireRecord);
-    const buildTask = tasks.find(
-      (task) => task.label === "bingo: prepare F5",
+    const extensionTask = tasks.find(
+      (task) => task.label === "bingo: prepare extension host",
+    );
+    const targetTask = tasks.find(
+      (task) => task.label === "bingo: build spawntree",
     );
 
-    assert.notEqual(buildTask, undefined);
-    assert.equal(buildTask?.type, "process");
-    assert.equal(buildTask?.command, "just");
-    assert.deepEqual(buildTask?.args, ["vscode-dev"]);
+    assert.notEqual(extensionTask, undefined);
+    assert.equal(extensionTask?.type, "process");
+    assert.equal(extensionTask?.command, "just");
+    assert.deepEqual(extensionTask?.args, ["vscode-dev"]);
+
+    assert.notEqual(targetTask, undefined);
+    assert.equal(targetTask?.type, "process");
+    assert.equal(targetTask?.command, "just");
+    assert.deepEqual(targetTask?.args, ["build-spawntree"]);
   });
 
   it("packages only the two supported native targets", () => {
@@ -95,14 +106,20 @@ describe("repository VS Code integration", () => {
     const prepareScript = readText(
       "editors/vscode/scripts/prepare-binary.mjs",
     );
+    const workflow = readText(".github/workflows/vscode-extension.yml");
 
     assert.match(platform, /"linux-x64"/);
     assert.match(platform, /"darwin-arm64"/);
     assert.doesNotMatch(platform, /win32|ia32|linux-arm64|darwin-x64/);
+    assert.match(platform, /BINGO_VSCODE_TARGET/);
+    assert.match(platform, /darwinCrossBuild/);
     assert.match(packageScript, /"--target"/);
     assert.match(prepareScript, /"bingonative"/);
     assert.match(prepareScript, /"codesign"/);
     assert.match(prepareScript, /normalizeMachOUUID/);
+    assert.match(workflow, /BINGO_VSCODE_TARGET: \$\{\{ matrix\.target \}\}/);
+    assert.match(workflow, /runner\.arch == 'ARM64'/);
+    assert.match(workflow, /runner\.arch != 'ARM64'/);
   });
 });
 

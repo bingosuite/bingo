@@ -52,9 +52,11 @@ architecture behind this.
 tree that churns a fresh worker pool each round, so consecutive snapshots show
 workers appearing in the `created` delta and leaving in `exited`. The intended
 breakpoint is the `fmt.Printf` inside `worker` (`examples/spawntree/main.go:27`).
-There is no separate manual build step: the workspace launch configuration runs
-**bingo: prepare F5** (`just vscode-dev`) and rebuilds both the extension-local
-server and spawntree with debugger-friendly settings before F5.
+There is no separate manual target build step: the normal workspace launch
+configuration runs **bingo: build spawntree** before F5. It uses the installed
+VSIX's bundled server and does not rebuild or codesign extension sources.
+**Run bingo extension** separately runs **bingo: prepare extension host**
+(`just vscode-dev`) to stage the source extension binary and bundle.
 
 ## 2. Drive with VS Code (DAP, automatic server)
 
@@ -63,7 +65,7 @@ server and spawntree with debugger-friendly settings before F5.
    **“bingo DAP: launch spawntree (stop on entry)”** directly. To exercise the
    source extension, first run **“Run bingo extension”**, then select the
    spawntree configuration in the Extension Development Host.
-3. Press F5. VS Code runs **“bingo: prepare F5”**. The companion
+3. Press F5. VS Code runs **“bingo: build spawntree”**. The companion
    health-checks `127.0.0.1:6060`,
    reuses a compatible server or starts its detached bundled server, then
    connects to DAP at `127.0.0.1:4711`. bingo launches the rebuilt

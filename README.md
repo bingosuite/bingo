@@ -134,10 +134,12 @@ Lifecycle configuration is explicit per launch: `serverMode`,
 name the endpoint and persistent log path in the **bingo Server** output channel.
 
 After installing, select the `"type": "bingo"` spawntree configuration from
-`.vscode/launch.json` and press F5. Its pre-launch task prepares the bundled
-development server and rebuilds the demo with debugger-friendly compiler flags;
-no manual `just server` is required. Manual servers remain supported and are
-reused when compatible.
+`.vscode/launch.json` and press F5. Its pre-launch task only rebuilds the demo
+with debugger-friendly compiler flags; the installed VSIX supplies the server,
+so target F5 stays fast and no manual `just server` is required. Use the
+separate **Run bingo extension** launch (or `just vscode-dev`) when changing the
+extension itself; that path stages the source extension binary and bundle.
+Manual servers remain supported and are reused when compatible.
 
 Other DAP clients can point at `127.0.0.1:4711`. The DAP client creates a
 managed session on `launch`/`attach`; WebSocket observers join that same session
