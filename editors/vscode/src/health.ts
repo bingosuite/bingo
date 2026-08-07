@@ -5,6 +5,7 @@ import type { BingoEndpoint } from "./configuration.js";
 export const bingoServiceIdentity = "bingo";
 export const managementApiVersion = 1;
 export const wireProtocolVersion = "1.2";
+export const minimumHealthProbeTimeoutMs = 25;
 
 const maximumHealthBytes = 64 * 1024;
 
