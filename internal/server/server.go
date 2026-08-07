@@ -262,6 +262,43 @@ type idleDecision struct {
 	admissionChanged <-chan struct{}
 }
 
+type idleMonitorState struct {
+	timer            *time.Timer
+	timerC           <-chan time.Time
+	sessionCount     int
+	armedGeneration  uint64
+	sessionChanged   <-chan struct{}
+	admissionChanged <-chan struct{}
+	deadlineExpired  bool
+}
+
+func (state *idleMonitorState) disarm() {
+	stopTimer(state.timer)
+	state.timerC = nil
+	state.deadlineExpired = false
+}
+
+func (state *idleMonitorState) rearm(timeout time.Duration, generation uint64) {
+	resetTimer(state.timer, timeout)
+	state.timerC = state.timer.C
+	state.deadlineExpired = false
+	state.armedGeneration = generation
+}
+
+func (state *idleMonitorState) apply(decision idleDecision, timeout time.Duration) {
+	state.sessionCount = decision.count
+	state.sessionChanged = decision.sessionChanged
+	state.admissionChanged = decision.admissionChanged
+	state.deadlineExpired = decision.expired
+	if state.sessionCount > 0 {
+		state.disarm()
+		return
+	}
+	if !decision.expired {
+		state.rearm(timeout, decision.generation)
+	}
+}
+
 func (s *Server) commitIdleShutdown(generation uint64) idleDecision {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
@@ -314,16 +351,54 @@ func (s *Server) startIdleMonitor() {
 	})
 }
 
+func (s *Server) resolveIdleDecision(state *idleMonitorState, decision idleDecision) bool {
+	state.apply(decision, s.idleTimeout)
+	if !decision.committed {
+		return false
+	}
+	s.log.Info("managed server idle timeout elapsed", "timeout", s.idleTimeout)
+	s.Shutdown(idleShutdownGrace)
+	return true
+}
+
+func (s *Server) handleIdleSessionChange(state *idleMonitorState) {
+	count, generation, nextChanged := s.sessions.snapshot()
+	state.sessionChanged = nextChanged
+	state.sessionCount = count
+	if state.sessionCount > 0 {
+		state.disarm()
+		s.clearIdleExpiry()
+		return
+	}
+	if state.deadlineExpired && generation == state.armedGeneration {
+		return
+	}
+	state.rearm(s.idleTimeout, generation)
+	s.clearIdleExpiry()
+}
+
+func (s *Server) handleIdleAdmissionChange(state *idleMonitorState) bool {
+	if !state.deadlineExpired {
+		_, state.admissionChanged = s.admissionSnapshot()
+		return false
+	}
+	return s.resolveIdleDecision(state, s.commitIdleShutdown(state.armedGeneration))
+}
+
 func (s *Server) monitorIdle() {
 	timer := time.NewTimer(time.Hour)
 	stopTimer(timer)
-	var timerC <-chan time.Time
-	sessionCount, armedGeneration, sessionChanged := s.sessions.snapshot()
+	sessionCount, generation, sessionChanged := s.sessions.snapshot()
 	_, admissionChanged := s.admissionSnapshot()
-	deadlineExpired := false
+	state := idleMonitorState{
+		timer:            timer,
+		sessionCount:     sessionCount,
+		armedGeneration:  generation,
+		sessionChanged:   sessionChanged,
+		admissionChanged: admissionChanged,
+	}
 	if sessionCount == 0 {
-		resetTimer(timer, s.idleTimeout)
-		timerC = timer.C
+		state.rearm(s.idleTimeout, generation)
 	}
 	defer stopTimer(timer)
 
@@ -331,74 +406,20 @@ func (s *Server) monitorIdle() {
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-sessionChanged:
-			count, generation, nextChanged := s.sessions.snapshot()
-			sessionChanged = nextChanged
-			sessionCount = count
-			if sessionCount > 0 {
-				stopTimer(timer)
-				timerC = nil
-				deadlineExpired = false
-				s.clearIdleExpiry()
-				continue
-			}
-			if deadlineExpired && generation == armedGeneration {
-				continue
-			}
-			resetTimer(timer, s.idleTimeout)
-			timerC = timer.C
-			deadlineExpired = false
-			armedGeneration = generation
-			s.clearIdleExpiry()
-		case <-admissionChanged:
-			if !deadlineExpired {
-				_, admissionChanged = s.admissionSnapshot()
-				continue
-			}
-			decision := s.commitIdleShutdown(armedGeneration)
-			sessionChanged = decision.sessionChanged
-			admissionChanged = decision.admissionChanged
-			if decision.committed {
-				s.log.Info("managed server idle timeout elapsed", "timeout", s.idleTimeout)
-				s.Shutdown(idleShutdownGrace)
+		case <-state.sessionChanged:
+			s.handleIdleSessionChange(&state)
+		case <-state.admissionChanged:
+			if s.handleIdleAdmissionChange(&state) {
 				return
 			}
-			sessionCount = decision.count
-			if sessionCount > 0 {
-				stopTimer(timer)
-				timerC = nil
-				deadlineExpired = false
-				continue
-			}
-			if !decision.expired {
-				resetTimer(timer, s.idleTimeout)
-				timerC = timer.C
-				deadlineExpired = false
-				armedGeneration = decision.generation
-			}
-		case <-timerC:
-			timerC = nil
-			decision := s.commitIdleShutdown(armedGeneration)
-			sessionChanged = decision.sessionChanged
-			admissionChanged = decision.admissionChanged
-			deadlineExpired = decision.expired
+		case <-state.timerC:
+			state.timerC = nil
+			decision := s.commitIdleShutdown(state.armedGeneration)
 			if s.idleTimerHook != nil {
 				s.idleTimerHook()
 			}
-			if decision.committed {
-				s.log.Info("managed server idle timeout elapsed", "timeout", s.idleTimeout)
-				s.Shutdown(idleShutdownGrace)
+			if s.resolveIdleDecision(&state, decision) {
 				return
-			}
-			sessionCount = decision.count
-			if sessionCount > 0 {
-				deadlineExpired = false
-				continue
-			}
-			if !decision.expired {
-				resetTimer(timer, s.idleTimeout)
-				timerC = timer.C
-				armedGeneration = decision.generation
 			}
 		}
 	}
