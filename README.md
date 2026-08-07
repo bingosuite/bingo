@@ -40,7 +40,7 @@ alongside its native WebSocket protocol, so a standard IDE (VS Code, neovim) can
 drive a debug session over a TCP socket while BinGo's own visual clients observe
 — and optionally also drive — the **same** session in parallel.
 
-Start the server with a DAP listener:
+Manual clients can start the server with a DAP listener:
 
 ```sh
 just server                       # builds + runs with -addr :6060 -dap-addr :4711
@@ -49,7 +49,8 @@ bingo -addr :6060 -dap-addr :4711
 ```
 
 `just server` starts both listeners with the defaults above; use `just server-ws`
-for a WebSocket-only run (DAP disabled).
+for a WebSocket-only run (DAP disabled). The VS Code companion can instead
+connect-or-start automatically.
 
 ### Server discovery and managed lifetime
 
@@ -112,19 +113,31 @@ just vscode-install
 ```
 
 It contributes debugger type `"bingo"` and connects VS Code's built-in Debug UI
-directly to `127.0.0.1:4711`. Keep Microsoft's Go extension installed for
+directly to bingo. In its default `auto` mode it health-checks
+`127.0.0.1:6060`, reuses a compatible server, or starts the matching bundled
+server with DAP on `127.0.0.1:4711` and a 30-second server-owned idle grace.
+Same-process requests coalesce; listener binding arbitrates concurrent extension
+hosts. The detached child logs to persistent extension storage and the extension
+never kills it. Keep Microsoft's Go extension installed for
 `gopls`, navigation, formatting, and tests: the extensions coexist, and a bingo
 debug configuration does **not** invoke or validate Delve (`dlv`) or take over
 the Go extension's `"go"` debugger type. See
 [editors/vscode/README.md](editors/vscode/README.md) for launch, session-join,
-PID-attach, update, and uninstall instructions. The current extension still
-connects to an already-running server; it does not yet consume the lifecycle
-contract above to start or own a process.
+PID-attach, lifecycle fields, connect-only remote use, log paths, update, and
+uninstall instructions.
 
-After installing, run `just server`, select the `"type": "bingo"` spawntree
-configuration from `.vscode/launch.json`, and press F5. Its pre-launch task runs
-`just build-spawntree`, so the demo binary is rebuilt with debugger-friendly
-compiler flags before every launch.
+Lifecycle configuration is explicit per launch: `serverMode`,
+`managementHost`/`managementPort`, `dapHost`/`dapPort`,
+`serverReadyTimeoutMs`, and `managedIdleTimeoutMs`. The defaults above use
+`auto`; remote, forwarded, and custom endpoints must use
+`"serverMode": "connectOnly"`, which neither probes nor spawns. Startup failures
+name the endpoint and persistent log path in the **bingo Server** output channel.
+
+After installing, select the `"type": "bingo"` spawntree configuration from
+`.vscode/launch.json` and press F5. Its pre-launch task prepares the bundled
+development server and rebuilds the demo with debugger-friendly compiler flags;
+no manual `just server` is required. Manual servers remain supported and are
+reused when compatible.
 
 Other DAP clients can point at `127.0.0.1:4711`. The DAP client creates a
 managed session on `launch`/`attach`; WebSocket observers join that same session
