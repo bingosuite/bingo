@@ -44,24 +44,44 @@ interface Harness {
   readonly logs: string[];
   readonly delays: number[];
   readonly now: () => number;
+  readonly spawnedAt: () => number;
   readonly setProbe: (probe: HealthProbe) => void;
   readonly outcome: (outcome: ServerProcessOutcome) => void;
   readonly stoppedObserving: () => boolean;
 }
 
-function harness(initialProbe: HealthProbe): Harness {
+interface HarnessOptions {
+  readonly probeElapsedMs?: (
+    timeoutMs: number,
+    callIndex: number,
+  ) => number;
+}
+
+function harness(
+  initialProbe: HealthProbe,
+  options: HarnessOptions = {},
+): Harness {
   let clock = 0;
+  let probeCalls = 0;
   let probe = initialProbe;
   let reportOutcome: ((outcome: ServerProcessOutcome) => void) | undefined;
   let observationStopped = false;
+  let spawnTime = -1;
   const requests: SpawnServerRequest[] = [];
   const logs: string[] = [];
   const delays: number[] = [];
   const dependencies: ServerManagerDependencies = {
-    probe: (...args) => probe(...args),
+    probe: async (...args) => {
+      const result = await probe(...args);
+      const elapsed = options.probeElapsedMs?.(args[2], probeCalls) ?? 0;
+      probeCalls += 1;
+      clock += Math.min(args[2], Math.max(0, elapsed));
+      return result;
+    },
     resolveBinary: () => Promise.resolve("/extension/bin/bingo"),
     spawnServer: (request, onOutcome) => {
       requests.push(request);
+      spawnTime = clock;
       reportOutcome = onOutcome;
       return {
         stopObserving(): void {
@@ -92,6 +112,7 @@ function harness(initialProbe: HealthProbe): Harness {
     logs,
     delays,
     now: () => clock,
+    spawnedAt: () => spawnTime,
     setProbe(next) {
       probe = next;
     },
@@ -294,52 +315,85 @@ describe("server manager", () => {
 
   it("uses the full minimum readiness window for fast absent probes", async () => {
     const timeouts: number[] = [];
-    const test = harness((_management, _dap, timeoutMs) => {
-      timeouts.push(timeoutMs);
-      return Promise.resolve(absent);
-    });
+    const test = harness(
+      (_management, _dap, timeoutMs) => {
+        timeouts.push(timeoutMs);
+        return Promise.resolve(absent);
+      },
+      { probeElapsedMs: () => 5 },
+    );
 
     await assert.rejects(
       test.manager.ensureServer(configuration({ readyTimeoutMs: 100 })),
       hasCode("readinessTimedOut"),
     );
-    assert.deepEqual(timeouts, [100, 50, 1]);
-    assert.deepEqual(test.delays, [50, 49, 1]);
-    assert.equal(test.now(), 100);
+    assert.deepEqual(timeouts, [100, 100, 50, 35, 25]);
+    assert.deepEqual(test.delays, [45, 10, 5, 20]);
+    assert.equal(test.now() - test.spawnedAt(), 100);
+    assert.equal(timeouts.every((timeout) => timeout >= 25), true);
     assert.equal(test.delays.every((delay) => delay > 0), true);
+    assert.ok(timeouts.length <= 5);
     assert.equal(test.requests.length, 1);
   });
 
-  it("accepts a server that becomes healthy just before the minimum deadline", async () => {
+  it("accepts a server that becomes healthy during the final window", async () => {
     const timeouts: number[] = [];
-    const test = harness((_management, _dap, timeoutMs) => {
-      timeouts.push(timeoutMs);
-      return Promise.resolve(
-        timeouts.length === 3 ? compatible : absent,
-      );
-    });
+    const test = harness(
+      (_management, _dap, timeoutMs) => {
+        timeouts.push(timeoutMs);
+        return Promise.resolve(
+          timeouts.length === 4 ? compatible : absent,
+        );
+      },
+      { probeElapsedMs: () => 5 },
+    );
 
     await test.manager.ensureServer(
       configuration({ readyTimeoutMs: 100 }),
     );
-    assert.deepEqual(timeouts, [100, 50, 1]);
-    assert.deepEqual(test.delays, [50, 49]);
-    assert.equal(test.now(), 99);
+    assert.deepEqual(timeouts, [100, 100, 50, 35]);
+    assert.deepEqual(test.delays, [45, 10]);
+    assert.equal(test.now() - test.spawnedAt(), 70);
   });
 
   it("passes the remaining readiness deadline to each health probe", async () => {
     const timeouts: number[] = [];
-    const test = harness((_management, _dap, timeoutMs) => {
-      timeouts.push(timeoutMs);
-      return Promise.resolve(absent);
-    });
+    const test = harness(
+      (_management, _dap, timeoutMs) => {
+        timeouts.push(timeoutMs);
+        return Promise.resolve(absent);
+      },
+      { probeElapsedMs: () => 5 },
+    );
     await assert.rejects(
       test.manager.ensureServer(configuration({ readyTimeoutMs: 250 })),
       hasCode("readinessTimedOut"),
     );
-    assert.deepEqual(timeouts, [250, 150, 50, 1]);
-    assert.deepEqual(test.delays, [100, 100, 49, 1]);
-    assert.equal(test.now(), 250);
+    assert.deepEqual(timeouts, [250, 250, 145, 50, 35, 25]);
+    assert.deepEqual(test.delays, [100, 90, 10, 5, 20]);
+    assert.equal(test.now() - test.spawnedAt(), 250);
+  });
+
+  it("keeps a slow probe within the single readiness deadline", async () => {
+    const timeouts: number[] = [];
+    const test = harness(
+      (_management, _dap, timeoutMs) => {
+        timeouts.push(timeoutMs);
+        return Promise.resolve(absent);
+      },
+      {
+        probeElapsedMs: (timeoutMs, callIndex) =>
+          callIndex === 0 ? 5 : timeoutMs,
+      },
+    );
+
+    await assert.rejects(
+      test.manager.ensureServer(configuration({ readyTimeoutMs: 100 })),
+      hasCode("readinessTimedOut"),
+    );
+    assert.deepEqual(timeouts, [100, 100]);
+    assert.deepEqual(test.delays, []);
+    assert.equal(test.now() - test.spawnedAt(), 100);
   });
 
   it("cancels promptly during the final-window delay", async () => {
@@ -384,7 +438,7 @@ describe("server manager", () => {
     manager.dispose();
 
     await assert.rejects(ensured, hasCode("cancelled"));
-    assert.deepEqual(delays, [50, 49]);
+    assert.deepEqual(delays, [50, 10]);
   });
 
   it("fails safely on an incompatible endpoint without spawning", async () => {

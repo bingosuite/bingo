@@ -9,6 +9,7 @@ import { describe, it } from "node:test";
 import {
   bingoServiceIdentity,
   managementApiVersion,
+  minimumHealthProbeTimeoutMs,
   probeBingoHealth,
   validateHealthResponse,
   wireProtocolVersion,
@@ -39,6 +40,19 @@ describe("health compatibility", () => {
   it("accepts the exact bingo contract", () => {
     const result = validateHealthResponse(200, health(), expectedDAP);
     assert.equal(result.kind, "compatible");
+  });
+
+  it("reads localhost health within the minimum practical probe budget", async () => {
+    await withHTTPServer((_request, response) => {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(health());
+    }, async (port) => {
+      const result = await probeWithSafetyAbort(
+        port,
+        minimumHealthProbeTimeoutMs,
+      );
+      assert.equal(result.kind, "compatible");
+    });
   });
 
   it("accepts a wildcard advertised host but keeps port compatibility", () => {
