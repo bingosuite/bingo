@@ -286,6 +286,22 @@ describe("server manager", () => {
     );
   });
 
+  it("reserves a post-spawn probe at the minimum readiness timeout", async () => {
+    const timeouts: number[] = [];
+    const test = harness((_management, _dap, timeoutMs) => {
+      timeouts.push(timeoutMs);
+      return Promise.resolve(
+        timeouts.length === 1 ? absent : compatible,
+      );
+    });
+
+    await test.manager.ensureServer(
+      configuration({ readyTimeoutMs: 100 }),
+    );
+    assert.deepEqual(timeouts, [100, 50]);
+    assert.equal(test.requests.length, 1);
+  });
+
   it("passes the remaining readiness deadline to each health probe", async () => {
     const timeouts: number[] = [];
     const test = harness((_management, _dap, timeoutMs) => {

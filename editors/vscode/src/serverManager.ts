@@ -52,6 +52,7 @@ export interface ServerManagerDependencies {
 
 const probeTimeoutMs = 1000;
 const pollIntervalMs = 100;
+const finalProbeBudgetMs = 50;
 
 export class ServerManager {
   readonly #dependencies: ServerManagerDependencies;
@@ -188,14 +189,21 @@ export class ServerManager {
         if (remaining <= 0) {
           break;
         }
-        await this.#dependencies.delay(
-          Math.min(pollIntervalMs, remaining),
-          this.#lifetime.signal,
+        const delayMs = Math.min(
+          pollIntervalMs,
+          Math.max(0, remaining - finalProbeBudgetMs),
         );
+        if (delayMs > 0) {
+          await this.#dependencies.delay(
+            delayMs,
+            this.#lifetime.signal,
+          );
+        }
         const probeRemaining = deadline - this.#dependencies.now();
         if (probeRemaining <= 0) {
           break;
         }
+        const finalAttempt = probeRemaining <= finalProbeBudgetMs;
         lastProbe = await this.#probe(
           config.managementEndpoint,
           config.dapEndpoint,
@@ -209,6 +217,9 @@ export class ServerManager {
         }
         if (lastProbe.kind === "incompatible") {
           throw occupiedError(config, lastProbe.reason);
+        }
+        if (finalAttempt) {
+          break;
         }
       }
     } catch (error: unknown) {
