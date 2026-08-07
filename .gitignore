@@ -45,5 +45,6 @@ test/coverage.out
 
 # VS Code companion extension outputs
 /editors/vscode/node_modules/
+/editors/vscode/bin/
 /editors/vscode/dist/
 /editors/vscode/*.vsix

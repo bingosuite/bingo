@@ -5,7 +5,13 @@ import {
   ConfigurationError,
   defaultDapHost,
   defaultDapPort,
+  defaultManagedIdleTimeoutMs,
+  defaultManagementHost,
+  defaultManagementPort,
+  defaultServerMode,
+  defaultServerReadyTimeoutMs,
   resolveEndpoint,
+  resolveServerConfiguration,
   validateBingoConfiguration,
 } from "../src/configuration.js";
 
@@ -38,6 +44,68 @@ describe("bingo endpoint", () => {
   }
 });
 
+describe("bingo server configuration", () => {
+  it("uses managed local defaults", () => {
+    assert.deepEqual(resolveServerConfiguration({}), {
+      mode: defaultServerMode,
+      managementEndpoint: {
+        host: defaultManagementHost,
+        port: defaultManagementPort,
+      },
+      dapEndpoint: {
+        host: defaultDapHost,
+        port: defaultDapPort,
+      },
+      readyTimeoutMs: defaultServerReadyTimeoutMs,
+      idleTimeoutMs: defaultManagedIdleTimeoutMs,
+    });
+  });
+
+  it("accepts explicit connect-only endpoints and timing", () => {
+    assert.deepEqual(
+      resolveServerConfiguration({
+        serverMode: "connectOnly",
+        managementHost: "management.internal",
+        managementPort: 16060,
+        dapHost: "debug.internal",
+        dapPort: 14711,
+        serverReadyTimeoutMs: 10000,
+        managedIdleTimeoutMs: 60000,
+      }),
+      {
+        mode: "connectOnly",
+        managementEndpoint: {
+          host: "management.internal",
+          port: 16060,
+        },
+        dapEndpoint: {
+          host: "debug.internal",
+          port: 14711,
+        },
+        readyTimeoutMs: 10000,
+        idleTimeoutMs: 60000,
+      },
+    );
+  });
+
+  for (const [label, config] of [
+    ["unknown mode", { serverMode: "launch" }],
+    ["empty management host", { managementHost: "" }],
+    ["invalid management port", { managementPort: 0 }],
+    ["short readiness timeout", { serverReadyTimeoutMs: 99 }],
+    ["fractional readiness timeout", { serverReadyTimeoutMs: 100.5 }],
+    ["zero managed idle timeout", { managedIdleTimeoutMs: 0 }],
+    ["excessive managed idle timeout", { managedIdleTimeoutMs: 86400001 }],
+  ] as const) {
+    it(`rejects ${label}`, () => {
+      assert.throws(
+        () => resolveServerConfiguration(config),
+        ConfigurationError,
+      );
+    });
+  }
+});
+
 describe("bingo debug configuration", () => {
   it("accepts binary launch arguments", () => {
     const validated = validateBingoConfiguration({
@@ -49,6 +117,7 @@ describe("bingo debug configuration", () => {
     });
 
     assert.equal(validated.request, "launch");
+    assert.equal(validated.server.mode, "auto");
   });
 
   it("accepts existing-session join", () => {

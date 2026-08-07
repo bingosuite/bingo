@@ -2,22 +2,44 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "Run bingo extension",
+      "type": "extensionHost",
+      "request": "launch",
+      "args": [
+        "--extensionDevelopmentPath=${workspaceFolder}/editors/vscode"
+      ],
+      "outFiles": [
+        "${workspaceFolder}/editors/vscode/dist/**/*.js"
+      ],
+      "preLaunchTask": "bingo: prepare F5"
+    },
+    {
       "name": "bingo DAP: launch spawntree (stop on entry)",
       "type": "bingo",
       "request": "launch",
       "program": "${workspaceFolder}/build/spawntree",
-      "preLaunchTask": "bingo: build spawntree",
+      "preLaunchTask": "bingo: prepare F5",
       "stopOnEntry": true,
+      "serverMode": "auto",
+      "managementHost": "127.0.0.1",
+      "managementPort": 6060,
       "dapHost": "127.0.0.1",
-      "dapPort": 4711
+      "dapPort": 4711,
+      "serverReadyTimeoutMs": 5000,
+      "managedIdleTimeoutMs": 30000
     },
     {
       "name": "bingo DAP: join running session",
       "type": "bingo",
       "request": "attach",
       "session": "${input:bingoSession}",
+      "serverMode": "auto",
+      "managementHost": "127.0.0.1",
+      "managementPort": 6060,
       "dapHost": "127.0.0.1",
-      "dapPort": 4711
+      "dapPort": 4711,
+      "serverReadyTimeoutMs": 5000,
+      "managedIdleTimeoutMs": 30000
     }
   ],
   "inputs": [

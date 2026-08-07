@@ -1,7 +1,7 @@
 {
   "name": "bingo",
   "displayName": "bingo Debugger",
-  "description": "Connect VS Code's Debug UI to an already-running bingo DAP server.",
+  "description": "Connect VS Code's Debug UI to bingo, reusing or starting a managed local server.",
   "version": "0.1.0",
   "publisher": "bingosuite",
   "license": "MIT",
@@ -35,7 +35,7 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": false,
-      "description": "Debugging starts or attaches to native processes through a separately-running bingo server."
+      "description": "Debugging starts or attaches to native processes through a shared bingo server."
     }
   },
   "contributes": {
@@ -57,17 +57,52 @@
               "program"
             ],
             "properties": {
+              "serverMode": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "connectOnly"
+                ],
+                "default": "auto",
+                "description": "Reuse or start a compatible local bingo server, or only connect to an existing endpoint."
+              },
+              "managementHost": {
+                "type": "string",
+                "default": "127.0.0.1",
+                "description": "Host of bingo's management API. Auto mode requires 127.0.0.1."
+              },
+              "managementPort": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535,
+                "default": 6060,
+                "description": "Port of bingo's management API."
+              },
               "dapHost": {
                 "type": "string",
                 "default": "127.0.0.1",
-                "description": "Host of the already-running bingo DAP listener."
+                "description": "Host of the bingo DAP listener. Auto mode requires 127.0.0.1."
               },
               "dapPort": {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 65535,
                 "default": 4711,
-                "description": "Port of the already-running bingo DAP listener."
+                "description": "Port of the bingo DAP listener."
+              },
+              "serverReadyTimeoutMs": {
+                "type": "integer",
+                "minimum": 100,
+                "maximum": 120000,
+                "default": 5000,
+                "description": "Maximum time in milliseconds to wait for a managed server to become healthy."
+              },
+              "managedIdleTimeoutMs": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 86400000,
+                "default": 30000,
+                "description": "Server-owned idle grace in milliseconds for a server started by the extension."
               },
               "program": {
                 "type": "string",
@@ -111,17 +146,52 @@
               }
             ],
             "properties": {
+              "serverMode": {
+                "type": "string",
+                "enum": [
+                  "auto",
+                  "connectOnly"
+                ],
+                "default": "auto",
+                "description": "Reuse or start a compatible local bingo server, or only connect to an existing endpoint."
+              },
+              "managementHost": {
+                "type": "string",
+                "default": "127.0.0.1",
+                "description": "Host of bingo's management API. Auto mode requires 127.0.0.1."
+              },
+              "managementPort": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 65535,
+                "default": 6060,
+                "description": "Port of bingo's management API."
+              },
               "dapHost": {
                 "type": "string",
                 "default": "127.0.0.1",
-                "description": "Host of the already-running bingo DAP listener."
+                "description": "Host of the bingo DAP listener. Auto mode requires 127.0.0.1."
               },
               "dapPort": {
                 "type": "integer",
                 "minimum": 1,
                 "maximum": 65535,
                 "default": 4711,
-                "description": "Port of the already-running bingo DAP listener."
+                "description": "Port of the bingo DAP listener."
+              },
+              "serverReadyTimeoutMs": {
+                "type": "integer",
+                "minimum": 100,
+                "maximum": 120000,
+                "default": 5000,
+                "description": "Maximum time in milliseconds to wait for a managed server to become healthy."
+              },
+              "managedIdleTimeoutMs": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 86400000,
+                "default": 30000,
+                "description": "Server-owned idle grace in milliseconds for a server started by the extension."
               },
               "session": {
                 "type": "string",
@@ -151,14 +221,19 @@
             "request": "launch",
             "program": "${workspaceFolder}/build/target/target",
             "stopOnEntry": true,
+            "serverMode": "auto",
+            "managementHost": "127.0.0.1",
+            "managementPort": 6060,
             "dapHost": "127.0.0.1",
-            "dapPort": 4711
+            "dapPort": 4711,
+            "serverReadyTimeoutMs": 5000,
+            "managedIdleTimeoutMs": 30000
           }
         ],
         "configurationSnippets": [
           {
             "label": "bingo: Launch binary",
-            "description": "Launch a compiled Go binary through an already-running bingo DAP server.",
+            "description": "Launch a compiled Go binary through a reused or managed bingo server.",
             "body": {
               "name": "bingo: Launch binary",
               "type": "bingo",
@@ -167,8 +242,13 @@
               "args": [],
               "env": [],
               "stopOnEntry": true,
+              "serverMode": "auto",
+              "managementHost": "127.0.0.1",
+              "managementPort": 6060,
               "dapHost": "127.0.0.1",
-              "dapPort": 4711
+              "dapPort": 4711,
+              "serverReadyTimeoutMs": 5000,
+              "managedIdleTimeoutMs": 30000
             }
           },
           {
@@ -179,8 +259,13 @@
               "type": "bingo",
               "request": "attach",
               "session": "replace-with-session-id",
+              "serverMode": "auto",
+              "managementHost": "127.0.0.1",
+              "managementPort": 6060,
               "dapHost": "127.0.0.1",
-              "dapPort": 4711
+              "dapPort": 4711,
+              "serverReadyTimeoutMs": 5000,
+              "managedIdleTimeoutMs": 30000
             }
           },
           {
@@ -193,8 +278,13 @@
               "pid": 1234,
               "binaryPath": "${workspaceFolder}/build/target/target",
               "stopOnEntry": true,
+              "serverMode": "auto",
+              "managementHost": "127.0.0.1",
+              "managementPort": 6060,
               "dapHost": "127.0.0.1",
-              "dapPort": 4711
+              "dapPort": 4711,
+              "serverReadyTimeoutMs": 5000,
+              "managedIdleTimeoutMs": 30000
             }
           }
         ]
@@ -202,12 +292,15 @@
     ]
   },
   "scripts": {
+    "binary:prepare": "node ./scripts/prepare-binary.mjs",
     "build": "node ./scripts/clean.mjs && esbuild ./src/extension.ts --bundle --tsconfig=./tsconfig.json --external:vscode --format=cjs --platform=node --target=node18 --outfile=dist/extension.js",
     "check": "npm run lint && npm run typecheck && npm test && npm run build && npm run package:list",
     "lint": "eslint src test scripts",
     "package": "node ./scripts/package.mjs",
     "package:list": "vsce ls --tree",
     "package:reproducible": "node ./scripts/verify-reproducible.mjs",
+    "package:verify": "node ./scripts/verify-package.mjs",
+    "smoke:server": "node ./scripts/smoke-server.mjs",
     "test": "tsx --test test/**/*.test.ts",
     "typecheck": "tsc --noEmit",
     "vscode:prepublish": "npm run build"
