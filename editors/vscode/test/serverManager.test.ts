@@ -42,6 +42,8 @@ interface Harness {
   readonly manager: ServerManager;
   readonly requests: SpawnServerRequest[];
   readonly logs: string[];
+  readonly delays: number[];
+  readonly now: () => number;
   readonly setProbe: (probe: HealthProbe) => void;
   readonly outcome: (outcome: ServerProcessOutcome) => void;
   readonly stoppedObserving: () => boolean;
@@ -54,6 +56,7 @@ function harness(initialProbe: HealthProbe): Harness {
   let observationStopped = false;
   const requests: SpawnServerRequest[] = [];
   const logs: string[] = [];
+  const delays: number[] = [];
   const dependencies: ServerManagerDependencies = {
     probe: (...args) => probe(...args),
     resolveBinary: () => Promise.resolve("/extension/bin/bingo"),
@@ -72,6 +75,7 @@ function harness(initialProbe: HealthProbe): Harness {
         error.name = "AbortError";
         return Promise.reject(error);
       }
+      delays.push(milliseconds);
       clock += milliseconds;
       return Promise.resolve();
     },
@@ -86,6 +90,8 @@ function harness(initialProbe: HealthProbe): Harness {
     manager: new ServerManager(dependencies),
     requests,
     logs,
+    delays,
+    now: () => clock,
     setProbe(next) {
       probe = next;
     },
@@ -286,20 +292,39 @@ describe("server manager", () => {
     );
   });
 
-  it("reserves a post-spawn probe at the minimum readiness timeout", async () => {
+  it("uses the full minimum readiness window for fast absent probes", async () => {
+    const timeouts: number[] = [];
+    const test = harness((_management, _dap, timeoutMs) => {
+      timeouts.push(timeoutMs);
+      return Promise.resolve(absent);
+    });
+
+    await assert.rejects(
+      test.manager.ensureServer(configuration({ readyTimeoutMs: 100 })),
+      hasCode("readinessTimedOut"),
+    );
+    assert.deepEqual(timeouts, [100, 50, 1]);
+    assert.deepEqual(test.delays, [50, 49, 1]);
+    assert.equal(test.now(), 100);
+    assert.equal(test.delays.every((delay) => delay > 0), true);
+    assert.equal(test.requests.length, 1);
+  });
+
+  it("accepts a server that becomes healthy just before the minimum deadline", async () => {
     const timeouts: number[] = [];
     const test = harness((_management, _dap, timeoutMs) => {
       timeouts.push(timeoutMs);
       return Promise.resolve(
-        timeouts.length === 1 ? absent : compatible,
+        timeouts.length === 3 ? compatible : absent,
       );
     });
 
     await test.manager.ensureServer(
       configuration({ readyTimeoutMs: 100 }),
     );
-    assert.deepEqual(timeouts, [100, 50]);
-    assert.equal(test.requests.length, 1);
+    assert.deepEqual(timeouts, [100, 50, 1]);
+    assert.deepEqual(test.delays, [50, 49]);
+    assert.equal(test.now(), 99);
   });
 
   it("passes the remaining readiness deadline to each health probe", async () => {
@@ -312,7 +337,54 @@ describe("server manager", () => {
       test.manager.ensureServer(configuration({ readyTimeoutMs: 250 })),
       hasCode("readinessTimedOut"),
     );
-    assert.deepEqual(timeouts, [250, 150, 50]);
+    assert.deepEqual(timeouts, [250, 150, 50, 1]);
+    assert.deepEqual(test.delays, [100, 100, 49, 1]);
+    assert.equal(test.now(), 250);
+  });
+
+  it("cancels promptly during the final-window delay", async () => {
+    let clock = 0;
+    let delayCalls = 0;
+    let markFinalDelayStarted: (() => void) | undefined;
+    const finalDelayStarted = new Promise<void>((resolve) => {
+      markFinalDelayStarted = resolve;
+    });
+    const delays: number[] = [];
+    const manager = new ServerManager({
+      probe: sequence(absent),
+      resolveBinary: () => Promise.resolve("/extension/bin/bingo"),
+      spawnServer: () => ({ stopObserving() {} }),
+      delay: (milliseconds, signal) => {
+        delays.push(milliseconds);
+        delayCalls += 1;
+        if (delayCalls === 1) {
+          clock += milliseconds;
+          return Promise.resolve();
+        }
+        return new Promise((_resolve, reject) => {
+          const rejectCancelled = (): void => {
+            const error = new Error("aborted");
+            error.name = "AbortError";
+            reject(error);
+          };
+          signal.addEventListener("abort", rejectCancelled, { once: true });
+          markFinalDelayStarted?.();
+        });
+      },
+      now: () => clock,
+      runtime: { platform: "darwin", arch: "arm64" },
+      logPathFor: () => Promise.resolve("/logs/bingo-6060.log"),
+      log: () => {},
+    });
+
+    const ensured = manager.ensureServer(
+      configuration({ readyTimeoutMs: 100 }),
+    );
+    await finalDelayStarted;
+    manager.dispose();
+
+    await assert.rejects(ensured, hasCode("cancelled"));
+    assert.deepEqual(delays, [50, 49]);
   });
 
   it("fails safely on an incompatible endpoint without spawning", async () => {
