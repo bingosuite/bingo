@@ -13,6 +13,8 @@ jobs:
     name: Package ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
+    env:
+      BINGO_VSCODE_TARGET: ${{ matrix.target }}
     strategy:
       fail-fast: false
       matrix:
@@ -42,11 +44,19 @@ jobs:
           cache: npm
           cache-dependency-path: editors/vscode/package-lock.json
 
-      - name: Confirm native package target
+      - name: Confirm package builder
         run: |
           test "$(go env GOOS)" = "${{ matrix.goos }}"
-          test "$(go env GOARCH)" = "${{ matrix.goarch }}"
-          test "$(node -p 'process.platform + "/" + process.arch')" = "${{ matrix.goos }}/${{ matrix.target == 'linux-x64' && 'x64' || 'arm64' }}"
+          test "$(node -p 'process.platform')" = "${{ matrix.goos }}"
+          if test "${{ matrix.target }}" = "linux-x64"; then
+            test "$(go env GOARCH)" = "${{ matrix.goarch }}"
+            test "$(node -p 'process.arch')" = "x64"
+          else
+            case "$(node -p 'process.arch')" in
+              arm64|x64) ;;
+              *) exit 1 ;;
+            esac
+          fi
 
       - name: Install locked dependencies without lifecycle scripts
         run: npm --prefix editors/vscode ci --ignore-scripts
@@ -61,7 +71,12 @@ jobs:
         run: npm --prefix editors/vscode run package:verify
 
       - name: Smoke packaged server health and idle exit
+        if: matrix.target == 'linux-x64' || runner.arch == 'ARM64'
         run: npm --prefix editors/vscode run smoke:server
+
+      - name: Report cross-built Darwin smoke
+        if: matrix.target == 'darwin-arm64' && runner.arch != 'ARM64'
+        run: echo "darwin-arm64 package was cross-built, signed, and inspected; execution smoke requires an arm64 runner"
 
       - name: Print artifact hashes
         run: shasum -a 256 "editors/vscode/bin/bingo" "dist/bingo-${{ matrix.target }}.vsix"

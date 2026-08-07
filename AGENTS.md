@@ -900,6 +900,12 @@ checks the target, and repairs executable mode if extraction lost it.
 Packaging rebuilds/signs twice and requires identical binary and VSIX hashes;
 tests drift-check service/API/wire constants against Go source and inspect exact
 archive contents, target metadata, architecture, mode, and entitlements.
+Normal repository `"type":"bingo"` F5 uses the installed VSIX and only rebuilds
+the target; source binary/build preparation belongs to the separate Extension
+Development Host task (`just vscode-dev`). The macOS packaging job may
+cross-build/sign/inspect darwin/arm64 on an Intel runner, but it must run the
+packaged-server smoke only when the runner is actually arm64; local Apple
+Silicon remains the native execution gate.
 Apple's external linker can vary `LC_UUID` even for identical cgo inputs, but
 current dyld rejects binaries with `-no_uuid`; `normalize-mach-o-uuid.mjs`
 therefore derives a stable UUID from the unsigned Mach-O with its UUID and
@@ -1358,7 +1364,7 @@ just coverage [PKG]                        # writes test/coverage.out
 just integration                           # ginkgo -r ./test/integration (no e2e tag)
 just build-spawntree                       # rebuilds the VS Code demo with -N -l
 just vscode-prepare                        # stage the current native server inside the extension
-just vscode-dev                            # build extension + native server + spawntree for F5
+just vscode-dev                            # stage source extension + native server + spawntree for Extension Host F5
 just vscode-check                          # lint, typecheck, test, bundle, package-list smoke
 just vscode-package                        # writes verified dist/bingo-<platform>.vsix
 just vscode-install                        # explicitly installs/updates bingosuite.bingo

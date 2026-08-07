@@ -11,14 +11,14 @@
       "outFiles": [
         "${workspaceFolder}/editors/vscode/dist/**/*.js"
       ],
-      "preLaunchTask": "bingo: prepare F5"
+      "preLaunchTask": "bingo: prepare extension host"
     },
     {
       "name": "bingo DAP: launch spawntree (stop on entry)",
       "type": "bingo",
       "request": "launch",
       "program": "${workspaceFolder}/build/spawntree",
-      "preLaunchTask": "bingo: prepare F5",
+      "preLaunchTask": "bingo: build spawntree",
       "stopOnEntry": true,
       "serverMode": "auto",
       "managementHost": "127.0.0.1",
