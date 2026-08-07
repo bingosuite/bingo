@@ -884,7 +884,9 @@ connect host). Only connection refusal permits spawning; a non-bingo or
 incompatible occupant fails safely. `connectOnly` bypasses management and spawn
 for remote/custom workflows. Health reads have both response abort/error
 handling and an independent wall-clock deadline; readiness probes receive only
-the remaining overall budget, so a slow-drip HTTP peer cannot hold F5 open.
+the remaining overall budget, so a slow-drip HTTP peer cannot hold F5 open. The
+poller reserves a final 50ms probe budget, ensuring the schema's 100ms minimum
+cannot be consumed entirely by the initial delay.
 
 One extension host coalesces in-flight ensures by normalized endpoint. Across
 hosts, listener binding arbitrates races: a child that loses is success if the
