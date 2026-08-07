@@ -175,10 +175,12 @@ just vscode-check     # clean install, lint, typecheck, tests, bundle/list smoke
 just vscode-package   # native reproducible package + content verification
 ```
 
-The repository's **bingo: prepare F5** task runs `just vscode-dev`, so extension
-development and the spawntree demo need no manually running server. Select
-**Run bingo extension** to open an Extension Development Host; in that window,
-select the spawntree bingo configuration to exercise the source extension.
+The repository's **bingo: prepare extension host** task runs `just vscode-dev`
+before **Run bingo extension**, staging the source extension's binary and bundle.
+The normal spawntree F5 configuration uses the installed VSIX and runs only
+**bingo: build spawntree**, so target debugging does not rebuild or codesign the
+extension-local server. In the Extension Development Host, select the same
+spawntree configuration to exercise the already-staged source extension.
 
 ## Troubleshooting
 

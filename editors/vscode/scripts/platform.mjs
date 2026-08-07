@@ -16,6 +16,11 @@ const targets = {
 };
 
 export function currentTarget() {
+  const requested = process.env.BINGO_VSCODE_TARGET;
+  if (requested !== undefined) {
+    validateBuilder(requested);
+    return requested;
+  }
   const match = Object.entries(targets).find(
     ([, target]) =>
       target.platform === process.platform && target.arch === process.arch,
@@ -33,10 +38,24 @@ export function targetDetails(target = currentTarget()) {
   if (details === undefined) {
     throw new Error(`unsupported VS Code package target ${target}`);
   }
-  if (details.platform !== process.platform || details.arch !== process.arch) {
+  validateBuilder(target);
+  return { name: target, ...details };
+}
+
+function validateBuilder(target) {
+  const details = targets[target];
+  if (details === undefined) {
+    throw new Error(`unsupported VS Code package target ${target}`);
+  }
+  const native =
+    details.platform === process.platform && details.arch === process.arch;
+  const darwinCrossBuild =
+    target === "darwin-arm64" &&
+    process.platform === "darwin" &&
+    process.arch === "x64";
+  if (!native && !darwinCrossBuild) {
     throw new Error(
-      `target ${target} requires native host ${details.platform}/${details.arch}, got ${process.platform}/${process.arch}`,
+      `target ${target} requires ${details.platform}/${details.arch} or a darwin/x64 signing host, got ${process.platform}/${process.arch}`,
     );
   }
-  return { name: target, ...details };
 }
