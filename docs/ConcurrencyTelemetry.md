@@ -53,41 +53,38 @@ tree that churns a fresh worker pool each round, so consecutive snapshots show
 workers appearing in the `created` delta and leaving in `exited`. The intended
 breakpoint is the `fmt.Printf` inside `worker` (`examples/spawntree/main.go:27`).
 There is no separate manual build step: the workspace launch configuration runs
-`just build-spawntree` as its pre-launch task and rebuilds the binary with
-`-N -l` before every F5.
+**bingo: prepare F5** (`just vscode-dev`) and rebuilds both the extension-local
+server and spawntree with debugger-friendly settings before F5.
 
-## 2. Start the server with DAP enabled
-
-```sh
-just server                       # builds + runs everything: -addr :6060 -dap-addr :4711
-# override addresses:   just server darwin arm64 :7070 :4712
-# verbose / extra flags: just server darwin arm64 :6060 :4711 -v
-# or run the binary directly:
-./build/bingo/bingo_darwin_arm64 -addr :6060 -dap-addr :4711 -v
-# linux: ./build/bingo/bingo_linux_amd64 -addr :6060 -dap-addr :4711 -v
-```
-
-`just server` starts both listeners with the defaults below. For a WebSocket-only
-run (DAP disabled) use `just server-ws` instead.
-
-- `:6060` — WebSocket + REST (`/ws`, `/api/sessions`). `cmd/wsmon` connects here.
-- `:4711` — DAP. VS Code / `cmd/dapcli` connect here.
-
-Leave it running.
-
-## 3a. Drive with VS Code (DAP)
+## 2. Drive with VS Code (DAP, automatic server)
 
 1. Open this repo in VS Code.
-2. Select **“bingo DAP: launch spawntree (stop on entry)”** from
-   `.vscode/launch.json` and press F5. VS Code first runs
-   **“bingo: build spawntree”**, then its `"type": "bingo"`, `dapHost`, and
-   `dapPort` fields make the companion connect to `127.0.0.1:4711`; bingo
-   launches the rebuilt `build/spawntree` and stops at entry.
-3. Set a breakpoint on `examples/spawntree/main.go:27` and **Continue** — the
+2. For an installed package, select
+   **“bingo DAP: launch spawntree (stop on entry)”** directly. To exercise the
+   source extension, first run **“Run bingo extension”**, then select the
+   spawntree configuration in the Extension Development Host.
+3. Press F5. VS Code runs **“bingo: prepare F5”**. The companion
+   health-checks `127.0.0.1:6060`,
+   reuses a compatible server or starts its detached bundled server, then
+   connects to DAP at `127.0.0.1:4711`. bingo launches the rebuilt
+   `build/spawntree` and stops at entry.
+4. Set a breakpoint on `examples/spawntree/main.go:27` and **Continue** — the
    tracee stops there with several worker goroutines alive.
-4. Grab the **session id** so the observer can join: it is printed on the server
-   console (`bingo session <id> ready …`) and in the bingo DAP `console` output,
-   and is listed by `curl -s localhost:6060/api/sessions`.
+5. Grab the **session id** so the observer can join: it is printed in the bingo
+   DAP `console` output and is listed by
+   `curl -s 127.0.0.1:6060/api/sessions`.
+
+The extension never kills the shared process. The default managed server exits
+only after its 30-second idle grace with no sessions. Open **bingo Server** for
+the persistent child log path. If another extension host starts concurrently,
+listener binding selects one server and both hosts reuse it.
+
+The lifecycle fields are `serverMode`, management host/port, DAP host/port,
+`serverReadyTimeoutMs`, and `managedIdleTimeoutMs`; the checked-in launch file
+pins their local defaults. Remote or forwarded endpoints must explicitly use
+`"serverMode": "connectOnly"`, which bypasses health and spawn. If F5 reports an
+occupied/incompatible endpoint or startup timeout, inspect the endpoint and log
+path in **bingo Server** rather than killing a potentially shared process.
 
 > A second VS Code window can *join* the same session (observe/drive over DAP)
 > with the **“bingo DAP: join running session”** config, which sends a DAP
@@ -96,11 +93,12 @@ Leave it running.
 > `binaryPath` attaches to an OS process instead; the extension README has the
 > full shape.
 
-## 3b. Drive with cmd/dapcli (DAP, no IDE)
+## 3. Drive with cmd/dapcli (DAP, no IDE)
 
-Equivalent driver in a terminal — use this if VS Code isn't set up:
+Equivalent driver in a terminal requires a manual server:
 
 ```sh
+just server
 just dapcli            # or: go run -tags bingonative ./cmd/dapcli -addr localhost:4711
 # in the REPL:
 launch ./build/spawntree      # creates a session, stops on entry

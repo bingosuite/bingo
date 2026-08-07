@@ -1,50 +1,63 @@
 # bingo Debugger for VS Code
 
-This companion extension connects VS Code's built-in Debug UI directly to an
-already-running [bingo](https://github.com/bingosuite/bingo) Debug Adapter
-Protocol listener. Its extension ID is `bingosuite.bingo`; it owns debugger type
-`bingo`, does not launch or validate Delve (`dlv`), and does not replace the
-Microsoft Go extension's debugger type.
+The `bingosuite.bingo` companion connects VS Code's Debug UI directly to bingo.
+It owns debugger type `bingo`; it never registers `go`, invokes or validates
+Delve (`dlv`), or calls the Microsoft Go extension. Keep `golang.go` installed
+for gopls, navigation, formatting, and tests.
 
-Keep the Microsoft Go extension installed for `gopls`, navigation, formatting,
-and test integration. The two extensions coexist: Go language tooling comes from
-`golang.go`, while a launch configuration with `"type": "bingo"` uses this
-extension and the bingo server.
+Platform-specific packages are available for:
 
-## Build and install
+- `darwin-arm64` (Apple Silicon), with the bundled server codesigned for native
+  debugging;
+- `linux-x64`, with the bundled linux/amd64 server.
 
-From the repository root:
+## Install, update, and uninstall
+
+From the repository root on a supported host:
 
 ```sh
 just vscode-install
 ```
 
-Reload the VS Code window after installation. To update, rebuild the VSIX and
-reinstall it by rerunning `just vscode-install`. To package without installing,
-run `just vscode-package`; it writes `dist/bingo.vsix`.
-
-To uninstall:
+This builds, verifies, and installs `dist/bingo-<platform>.vsix`. Rerun the
+command to update. Package without installing with `just vscode-package`.
+Uninstall with:
 
 ```sh
 code --uninstall-extension bingosuite.bingo
 ```
 
-Generated dependencies, bundles, and VSIX files are ignored by Git.
-The package recipe builds twice with normalized ZIP metadata and fails if the
-two VSIX hashes differ.
+Generated binaries and VSIX files are ignored. Packaging rebuilds the native
+binary and VSIX twice and requires both SHA-256 hashes to match.
 
-## Use
+## F5: connect or start
 
-Start bingo's WebSocket and DAP listeners:
+Select a `bingo` configuration and press F5. In the default `auto` mode the
+extension:
 
-```sh
-just server
-```
+1. checks `http://127.0.0.1:6060/api/health`;
+2. reuses a compatible manual or managed bingo server;
+3. if and only if the endpoint refuses the connection, starts its bundled
+   server with management on `127.0.0.1:6060`, DAP on
+   `127.0.0.1:4711`, and a 30-second server-owned idle grace;
+4. waits up to five seconds for compatible health, then connects VS Code to DAP.
 
-Then select a `bingo` configuration in **Run and Debug** and press F5. This
-repository's `.vscode/launch.json` includes a launch and a session-join example.
-The launch example first runs the workspace's `just build-spawntree` task, then
-connects to the default DAP endpoint at `127.0.0.1:4711`.
+Concurrent VS Code extension hosts may both try to start. Listener binding
+chooses the winner; a child that loses the race is harmless because both hosts
+reuse the compatible winner. Requests in one extension host for the same
+endpoint share one readiness operation.
+
+The child is detached and logs to persistent extension storage. Open the
+**bingo Server** output channel to see the absolute server log path. The
+extension never kills a server, including one it spawned. Closing VS Code only
+disconnects its client; bingo's `-idle-timeout` owns managed shutdown so DAP and
+WebSocket clients can share the process safely.
+
+If the management port answers with non-bingo HTTP or an incompatible bingo,
+F5 fails without spawning over it. Errors include the endpoints and server log
+path.
+
+## Configurations
 
 ### Launch a binary
 
@@ -57,14 +70,19 @@ connects to the default DAP endpoint at `127.0.0.1:4711`.
   "args": [],
   "env": ["BINGO_MODE=debug"],
   "stopOnEntry": true,
+  "serverMode": "auto",
+  "managementHost": "127.0.0.1",
+  "managementPort": 6060,
   "dapHost": "127.0.0.1",
-  "dapPort": 4711
+  "dapPort": 4711,
+  "serverReadyTimeoutMs": 5000,
+  "managedIdleTimeoutMs": 30000
 }
 ```
 
-`env` follows bingo's current DAP contract: an array of `KEY=value` strings.
+`env` is an array of `KEY=value` strings.
 
-### Join an existing bingo session
+### Join a managed session
 
 ```json
 {
@@ -72,6 +90,9 @@ connects to the default DAP endpoint at `127.0.0.1:4711`.
   "type": "bingo",
   "request": "attach",
   "session": "replace-with-session-id",
+  "serverMode": "auto",
+  "managementHost": "127.0.0.1",
+  "managementPort": 6060,
   "dapHost": "127.0.0.1",
   "dapPort": 4711
 }
@@ -89,29 +110,84 @@ Joining does not relaunch, reattach, or automatically resume the shared session.
   "pid": 1234,
   "binaryPath": "/absolute/path/to/the/binary",
   "stopOnEntry": true,
+  "serverMode": "auto",
+  "managementHost": "127.0.0.1",
+  "managementPort": 6060,
   "dapHost": "127.0.0.1",
   "dapPort": 4711
 }
 ```
 
-`binaryPath` is optional for attaching, but bingo needs its DWARF data for
-source breakpoints, stack frames, and locals.
+`binaryPath` is optional, but bingo needs its DWARF data for source breakpoints,
+stack frames, and locals.
 
-## Endpoint and remote environments
+## Lifecycle fields
 
-`dapHost` and `dapPort` tell the extension host where bingo is listening. The
-extension only connects; it never starts the server. The default host is the
-explicit IPv4 loopback because bingo currently opens its DAP listener with
-`tcp4`; `localhost` can resolve to IPv6 first in older VS Code runtimes. For a
-remote extension host (SSH, a dev container, or Codespaces), use an address
-reachable from that host and bind bingo's `-dap-addr` accordingly.
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `serverMode` | `"auto"` | Health-check and reuse/start locally. Use `"connectOnly"` for remote or custom endpoints. |
+| `managementHost` | `"127.0.0.1"` | Management/health host. Auto mode requires this exact IPv4 loopback. |
+| `managementPort` | `6060` | Management, REST, and WebSocket port. |
+| `dapHost` | `"127.0.0.1"` | DAP connect host. Auto mode requires this exact IPv4 loopback. |
+| `dapPort` | `4711` | DAP connect/listen port. |
+| `serverReadyTimeoutMs` | `5000` | Bounded wait for compatible health. |
+| `managedIdleTimeoutMs` | `30000` | Idle grace passed only to a server the extension starts. |
+
+The explicit IPv4 defaults match bingo's `tcp4` DAP listener and avoid older
+Node runtimes resolving `localhost` to IPv6 first.
+
+### Remote and custom endpoints
+
+Autostart is local-only. For SSH, dev containers, Codespaces, port forwarding,
+or any custom host, explicitly select connect-only mode:
+
+```json
+{
+  "type": "bingo",
+  "request": "launch",
+  "program": "/workspace/build/target",
+  "serverMode": "connectOnly",
+  "dapHost": "debug.internal",
+  "dapPort": 14711
+}
+```
+
+Connect-only mode does not probe management health, inspect a bundled binary, or
+spawn. Start and secure the reachable bingo server through that environment's
+normal process manager. A future bingo UI can use the same management contract;
+no such UI is included in this extension.
+
+## Manual server option
+
+Autostart is not mandatory. A compatible server already listening on the
+configured endpoints is reused:
+
+```sh
+just server
+# persistent until interrupted; add -idle-timeout 30s for server-owned cleanup
+```
 
 ## Development
 
 ```sh
-just vscode-check
-just vscode-package
+just vscode-dev       # build extension, native bundled server, and spawntree
+just vscode-check     # clean install, lint, typecheck, tests, bundle/list smoke
+just vscode-package   # native reproducible package + content verification
 ```
 
-The check runs ESLint, strict TypeScript type checking, unit and manifest tests,
-the esbuild bundle, and a VSIX file-list smoke check.
+The repository's **bingo: prepare F5** task runs `just vscode-dev`, so extension
+development and the spawntree demo need no manually running server. Select
+**Run bingo extension** to open an Extension Development Host; in that window,
+select the spawntree bingo configuration to exercise the source extension.
+
+## Troubleshooting
+
+- **Unsupported platform:** auto mode packages only linux/x64 and darwin/arm64.
+  Use a matching package or `connectOnly`.
+- **Endpoint occupied/incompatible:** inspect the process on the reported
+  management port. The extension will not replace it.
+- **Startup timeout/child exit:** open **bingo Server** and inspect the persistent
+  log path printed there.
+- **Remote endpoint rejected:** set `"serverMode": "connectOnly"`.
+- **Server remains after VS Code closes:** expected while another session is
+  active or during the idle grace. The extension never sends a kill signal.
