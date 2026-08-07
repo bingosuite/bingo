@@ -126,6 +126,11 @@ func newFakeWSConn() *fakeWSConn {
 	}
 }
 
+func mustAddClient(h *hub.Hub, conn *fakeWSConn) {
+	_, err := h.AddClient(conn, nil)
+	Expect(err).NotTo(HaveOccurred())
+}
+
 func (f *fakeWSConn) recv() ([]byte, bool) {
 	select {
 	case msg := <-f.incoming:
@@ -243,8 +248,10 @@ var _ = Describe("Hub", func() {
 		It("accepts multiple concurrent clients without panicking", func() {
 			conn1 := newFakeWSConn()
 			conn2 := newFakeWSConn()
-			h.AddClient(conn1, nil)
-			h.AddClient(conn2, nil)
+			_, err := h.AddClient(conn1, nil)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = h.AddClient(conn2, nil)
+			Expect(err).NotTo(HaveOccurred())
 			closeFakeWS(conn1)
 			closeFakeWS(conn2)
 		})
@@ -258,7 +265,8 @@ var _ = Describe("Hub", func() {
 
 				go func() {
 					defer GinkgoRecover()
-					managed.AddClient(conn, nil)
+					_, err := managed.AddClient(conn, nil)
+					Expect(err).To(Or(BeNil(), MatchError(hub.ErrHubClosed)))
 					close(done)
 				}()
 				cancelManaged()
@@ -293,7 +301,8 @@ var _ = Describe("Hub", func() {
 			defer cancelManaged()
 
 			conn := newFakeWSConn()
-			managed.AddClient(conn, nil)
+			_, err := managed.AddClient(conn, nil)
+			Expect(err).NotTo(HaveOccurred())
 			_, _ = recvEvent(conn)
 
 			fd.launchErr = errors.New("launch failed")
@@ -321,7 +330,8 @@ var _ = Describe("Hub", func() {
 	Describe("event sequence numbers", func() {
 		It("assigns strictly increasing hub-managed seq to all outbound events", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			_, err := h.AddClient(conn, nil)
+			Expect(err).NotTo(HaveOccurred())
 
 			// Engine-level seq values 99 and 100 must both be rewritten.
 			evt1, _ := protocol.NewEvent(protocol.EventOutput, 99,
@@ -342,7 +352,8 @@ var _ = Describe("Hub", func() {
 
 		It("interleaves debugger events and confirmation events in a single seq stream", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			_, err := h.AddClient(conn, nil)
+			Expect(err).NotTo(HaveOccurred())
 			fd.setBPResult = protocol.Breakpoint{ID: 1}
 
 			fd.push(protocol.MustEvent(protocol.EventOutput, 1,
@@ -362,8 +373,10 @@ var _ = Describe("Hub", func() {
 		It("delivers an informational event to all connected clients", func() {
 			conn1 := newFakeWSConn()
 			conn2 := newFakeWSConn()
-			h.AddClient(conn1, nil)
-			h.AddClient(conn2, nil)
+			_, err := h.AddClient(conn1, nil)
+			Expect(err).NotTo(HaveOccurred())
+			_, err = h.AddClient(conn2, nil)
+			Expect(err).NotTo(HaveOccurred())
 
 			fd.push(protocol.MustEvent(protocol.EventOutput, 1,
 				protocol.OutputPayload{Stream: "stdout", Content: "hello bingo"}))
@@ -378,7 +391,7 @@ var _ = Describe("Hub", func() {
 
 		It("does not deliver events to clients that disconnected before the event", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 			closeFakeWS(conn)
 			time.Sleep(30 * time.Millisecond) // let readPump notice the close
 
@@ -393,7 +406,7 @@ var _ = Describe("Hub", func() {
 	Describe("BreakpointHit suspend/resume cycle", func() {
 		It("broadcasts the event then waits before calling Continue", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 
 			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
 				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
@@ -413,7 +426,7 @@ var _ = Describe("Hub", func() {
 
 		It("accepts StepOver as a resuming command", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 
 			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
 				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
@@ -427,7 +440,7 @@ var _ = Describe("Hub", func() {
 
 		It("accepts StepInto as a resuming command", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 
 			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
 				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
@@ -441,7 +454,7 @@ var _ = Describe("Hub", func() {
 
 		It("accepts StepOut as a resuming command", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 
 			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
 				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
@@ -455,7 +468,7 @@ var _ = Describe("Hub", func() {
 
 		It("allows non-resuming commands (SetBreakpoint) while suspended", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 			fd.setBPResult = protocol.Breakpoint{ID: 2}
 
 			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
@@ -480,7 +493,7 @@ var _ = Describe("Hub", func() {
 
 		It("allows Locals while suspended", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 			fd.localsResult = []protocol.Variable{{Name: "x", Value: "42", Type: "int"}}
 
 			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
@@ -501,7 +514,7 @@ var _ = Describe("Hub", func() {
 
 		It("allows Evaluate while suspended", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 			fd.evalResult = protocol.Variable{Name: "total", Value: "7", Type: "int", Kind: "int"}
 
 			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
@@ -524,8 +537,8 @@ var _ = Describe("Hub", func() {
 		It("only the first resuming command wins when multiple clients race", func() {
 			conn1 := newFakeWSConn()
 			conn2 := newFakeWSConn()
-			h.AddClient(conn1, nil)
-			h.AddClient(conn2, nil)
+			mustAddClient(h, conn1)
+			mustAddClient(h, conn2)
 
 			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 2,
 				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
@@ -550,7 +563,7 @@ var _ = Describe("Hub", func() {
 	Describe("Kill while running", func() {
 		It("terminates the process even with no breakpoint set (no suspend first)", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 
 			// A runaway target with no breakpoints never suspends. Kill must
 			// still reach the debugger: it rides cmdCh (main loop), not
@@ -563,7 +576,7 @@ var _ = Describe("Hub", func() {
 
 		It("still terminates the process while suspended", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 
 			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
 				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
@@ -578,7 +591,7 @@ var _ = Describe("Hub", func() {
 	Describe("stale resume handling", func() {
 		It("discards a resume buffered while running so it can't auto-continue a later suspend", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 			fd.setBPResult = protocol.Breakpoint{ID: 7}
 
 			// Erroneously send Continue while the process is still running: it
@@ -619,7 +632,7 @@ var _ = Describe("Hub", func() {
 		// wedge the session with no way to resume.
 		It("lets a retry Continue reach the debugger after the first fails", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 			fd.continueErr = errors.New("reinstall failed")
 
 			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
@@ -642,7 +655,7 @@ var _ = Describe("Hub", func() {
 
 		It("still resumes via Continue after a failed StepOver", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 			fd.stepOverErr = errors.New("step failed")
 
 			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
@@ -660,7 +673,7 @@ var _ = Describe("Hub", func() {
 
 		It("still services non-resuming commands after a failed resume", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 			fd.setBPResult = protocol.Breakpoint{ID: 9}
 			fd.continueErr = errors.New("boom")
 
@@ -682,7 +695,7 @@ var _ = Describe("Hub", func() {
 	Describe("Pause", func() {
 		It("routes CmdPause to the debugger while the process runs", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 
 			// CmdPause is not a resuming command: it reaches the debugger via
 			// the main-loop cmdCh path, without any suspending event first.
@@ -694,7 +707,7 @@ var _ = Describe("Hub", func() {
 
 		It("suspends the hub on EventPaused, then resumes on Continue", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 
 			fd.push(protocol.MustEvent(protocol.EventPaused, 1,
 				protocol.PausedPayload{Location: protocol.Location{File: "main.go", Line: 7}}))
@@ -716,7 +729,7 @@ var _ = Describe("Hub", func() {
 	Describe("SetBreakpoint confirmation", func() {
 		It("broadcasts BreakpointSet with the assigned breakpoint", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 			fd.setBPResult = protocol.Breakpoint{
 				ID:       1,
 				Location: protocol.Location{File: "main.go", Line: 42},
@@ -738,7 +751,7 @@ var _ = Describe("Hub", func() {
 	Describe("ClearBreakpoint confirmation", func() {
 		It("broadcasts BreakpointCleared with the removed ID", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 
 			conn.inject(mustCommand(protocol.CmdClearBreakpoint,
 				protocol.ClearBreakpointPayload{ID: 5}))
@@ -756,7 +769,7 @@ var _ = Describe("Hub", func() {
 	Describe("command error propagation", func() {
 		It("broadcasts EventError when a command fails", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 			fd.setBPErr = fmt.Errorf("address not found")
 
 			conn.inject(mustCommand(protocol.CmdSetBreakpoint,
@@ -773,7 +786,7 @@ var _ = Describe("Hub", func() {
 
 		It("includes the failing command kind in the error payload", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 			fd.setBPErr = fmt.Errorf("no such file")
 
 			conn.inject(mustCommand(protocol.CmdSetBreakpoint,
@@ -794,7 +807,7 @@ var _ = Describe("Hub", func() {
 	Describe("shutdown when last client disconnects", func() {
 		It("calls Kill on the debugger", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 			closeFakeWS(conn)
 
 			Eventually(fd.recordedCalls, "500ms", "10ms").
@@ -803,7 +816,7 @@ var _ = Describe("Hub", func() {
 
 		It("calls Kill exactly once even when cancel and disconnect race", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 			closeFakeWS(conn)
 			cancel() // races with the disconnect-triggered shutdown
 
@@ -832,7 +845,7 @@ var _ = Describe("Hub", func() {
 
 		It("unblocks the suspend loop when the process exits while paused", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 
 			// Suspend the hub.
 			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
@@ -856,7 +869,7 @@ var _ = Describe("Hub", func() {
 	Describe("unknown command kind", func() {
 		It("broadcasts EventError without panicking", func() {
 			conn := newFakeWSConn()
-			h.AddClient(conn, nil)
+			mustAddClient(h, conn)
 
 			conn.inject(protocol.Command{
 				Version: protocol.Version,
@@ -881,7 +894,8 @@ func newManagedRestartHub(fd *fakeDebugger) (*hub.Hub, *fakeWSConn, context.Canc
 	managed := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
 	cancel := runHub(managed)
 	conn := newFakeWSConn()
-	managed.AddClient(conn, nil)
+	_, err := managed.AddClient(conn, nil)
+	Expect(err).NotTo(HaveOccurred())
 	_, _ = recvEvent(conn) // welcome/state event
 	return managed, conn, cancel
 }
@@ -933,7 +947,7 @@ var _ = Describe("Restart", func() {
 		defer cancel()
 
 		conn := newFakeWSConn()
-		h.AddClient(conn, nil)
+		mustAddClient(h, conn)
 
 		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
 		waitForEventKind(conn, protocol.EventError, nil)
@@ -1028,7 +1042,8 @@ var _ = Describe("dbg access during shutdown", func() {
 			cancel := runHub(managed)
 
 			conn := newFakeWSConn()
-			managed.AddClient(conn, nil)
+			_, err := managed.AddClient(conn, nil)
+			Expect(err).NotTo(HaveOccurred())
 
 			// Launch writes h.dbg on the Run goroutine; closing the only client
 			// spawns `go h.shutdown()`, which reads h.dbg concurrently.
