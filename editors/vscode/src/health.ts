@@ -45,6 +45,9 @@ export async function probeBingoHealth(
     if (isErrorCode(error, "ECONNREFUSED")) {
       return { kind: "absent" };
     }
+    if (isAbortError(error)) {
+      throw error;
+    }
     return { kind: "transportError", error: toError(error) };
   }
 }
@@ -59,6 +62,28 @@ function getHealth(
       reject(abortError());
       return;
     }
+
+    let settled = false;
+    const finish = (
+      outcome:
+        | {
+            readonly kind: "resolve";
+            readonly value: { readonly statusCode: number; readonly body: string };
+          }
+        | { readonly kind: "reject"; readonly error: Error },
+    ): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(deadline);
+      signal.removeEventListener("abort", onAbort);
+      if (outcome.kind === "resolve") {
+        resolve(outcome.value);
+      } else {
+        reject(outcome.error);
+      }
+    };
 
     const req = request(
       {
@@ -77,33 +102,54 @@ function getHealth(
         response.on("data", (chunk: Buffer) => {
           size += chunk.length;
           if (size > maximumHealthBytes) {
-            req.destroy(new Error("bingo health response exceeded 64 KiB"));
+            finish({
+              kind: "reject",
+              error: new Error("bingo health response exceeded 64 KiB"),
+            });
+            req.destroy();
             return;
           }
           chunks.push(chunk);
         });
-        response.on("end", () => {
-          resolve({
-            statusCode: response.statusCode ?? 0,
-            body: Buffer.concat(chunks).toString("utf8"),
+        response.once("aborted", () => {
+          finish({
+            kind: "reject",
+            error: new Error("bingo health response was aborted before completion"),
+          });
+        });
+        response.once("error", (error) => {
+          finish({ kind: "reject", error });
+        });
+        response.once("end", () => {
+          finish({
+            kind: "resolve",
+            value: {
+              statusCode: response.statusCode ?? 0,
+              body: Buffer.concat(chunks).toString("utf8"),
+            },
           });
         });
       },
     );
 
     const onAbort = (): void => {
-      req.destroy(abortError());
+      finish({ kind: "reject", error: abortError() });
+      req.destroy();
     };
     signal.addEventListener("abort", onAbort, { once: true });
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(
-        new Error(`bingo health request timed out after ${String(timeoutMs)}ms`),
-      );
+    const deadline = setTimeout(() => {
+      finish({
+        kind: "reject",
+        error: new Error(
+          `bingo health request timed out after ${String(timeoutMs)}ms`,
+        ),
+      });
+      req.destroy();
+    }, timeoutMs);
+    deadline.unref();
+    req.once("error", (error) => {
+      finish({ kind: "reject", error });
     });
-    req.once("close", () => {
-      signal.removeEventListener("abort", onAbort);
-    });
-    req.once("error", reject);
     req.end();
   });
 }
@@ -239,6 +285,10 @@ function isErrorCode(error: unknown, code: string): boolean {
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function abortError(): Error {

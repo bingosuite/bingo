@@ -4,6 +4,8 @@ import {
   openSync,
   rmSync,
 } from "node:fs";
+import { Buffer } from "node:buffer";
+import { log } from "node:console";
 import { request } from "node:http";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -13,6 +15,8 @@ import { fileURLToPath, URL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 
 import { currentTarget } from "./platform.mjs";
+import { terminateOwnedProcessGroup } from "./owned-process.mjs";
+import { withTimeout } from "./timing.mjs";
 
 const target = currentTarget();
 const vsix = fileURLToPath(
@@ -20,6 +24,10 @@ const vsix = fileURLToPath(
 );
 const extracted = mkdtempSync(join(tmpdir(), "bingo-smoke-"));
 const idleTimeoutMs = 2000;
+let child;
+let exit;
+let childExited = false;
+let failure;
 
 try {
   run("unzip", ["-q", vsix, "-d", extracted]);
@@ -27,7 +35,7 @@ try {
   const binary = join(extracted, "extension", "bin", "bingo");
   const logPath = join(extracted, "server.log");
   const logFD = openSync(logPath, "a", 0o600);
-  const child = spawn(
+  child = spawn(
     binary,
     [
       "-addr",
@@ -43,15 +51,20 @@ try {
       stdio: ["ignore", logFD, logFD],
     },
   );
-  closeSync(logFD);
-  child.unref();
-
-  const exit = new Promise((resolve, reject) => {
-    child.once("error", reject);
+  exit = new Promise((resolve, reject) => {
+    child.once("error", (error) => {
+      childExited = true;
+      reject(error);
+    });
     child.once("exit", (code, signal) => {
+      childExited = true;
       resolve({ code, signal });
     });
   });
+  closeSync(logFD);
+  child.unref();
+  // The harness must stay alive to observe server-owned exit without relying on a leaked timeout.
+  child.ref();
 
   const health = await pollHealth(managementPort, dapPort, exit);
   if (
@@ -79,8 +92,42 @@ try {
   log(
     `Packaged ${target} server became healthy and self-exited cleanly`,
   );
+} catch (error) {
+  failure = error;
 } finally {
-  rmSync(extracted, { force: true, recursive: true });
+  if (failure !== undefined && child !== undefined && !childExited) {
+    try {
+      if (child.pid !== undefined && exit !== undefined) {
+        child.ref();
+        await terminateOwnedProcessGroup(child.pid, exit);
+        childExited = true;
+      }
+    } catch (cleanupError) {
+      failure = new AggregateError(
+        [failure, cleanupError],
+        "packaged server smoke failed and emergency cleanup also failed",
+      );
+    }
+  }
+  if (child === undefined || childExited) {
+    try {
+      rmSync(extracted, { force: true, recursive: true });
+    } catch (cleanupError) {
+      failure =
+        failure === undefined
+          ? cleanupError
+          : new AggregateError(
+              [failure, cleanupError],
+              "packaged server smoke failed and extraction cleanup also failed",
+            );
+    }
+  } else {
+    log(`Preserved ${extracted}: test-owned server exit was not confirmed`);
+  }
+}
+
+if (failure !== undefined) {
+  throw failure;
 }
 
 async function unusedPorts(count) {
@@ -186,15 +233,6 @@ function getHealth(port) {
   });
 }
 
-function withTimeout(promise, milliseconds, message) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      setTimeout(() => reject(new Error(message)), milliseconds);
-    }),
-  ]);
-}
-
 function run(command, args) {
   const result = spawnSync(command, args, { stdio: "inherit" });
   if (result.error !== undefined) {
@@ -206,5 +244,3 @@ function run(command, args) {
     );
   }
 }
-import { Buffer } from "node:buffer";
-import { log } from "node:console";

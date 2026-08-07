@@ -72,6 +72,7 @@ vscode-prepare:
 # Prepare source-extension and target artifacts for an Extension Development
 # Host. Normal target F5 uses the installed VSIX and only rebuilds spawntree.
 vscode-dev: build-spawntree vscode-prepare
+	npm --prefix editors/vscode ci --ignore-scripts
 	npm --prefix editors/vscode run build
 
 # ARGS: -addr string    server address (default "localhost:6060")

@@ -38,6 +38,24 @@ describe("repository VS Code integration", () => {
     assert.doesNotMatch(sources, /\bdlv\b/i);
     assert.doesNotMatch(sources, /getExtension\s*\(\s*["']golang\.go/);
     assert.doesNotMatch(sources, /["']type["']\s*:\s*["']go["']/);
+
+    const productionProcessSources = [
+      readText("editors/vscode/src/extension.ts"),
+      readText("editors/vscode/src/serverManager.ts"),
+      readText("editors/vscode/src/serverProcess.ts"),
+    ].join("\n");
+    assert.doesNotMatch(productionProcessSources, /SIGKILL|process\.kill/);
+    assert.match(
+      readText("editors/vscode/scripts/owned-process.mjs"),
+      /signalProcess\(-pid, "SIGKILL"\)/,
+    );
+    const smoke = readText("editors/vscode/scripts/smoke-server.mjs");
+    assert.match(
+      smoke,
+      /failure !== undefined && child !== undefined && !childExited/,
+    );
+    assert.match(smoke, /terminateOwnedProcessGroup/);
+    assert.match(smoke, /if \(child === undefined \|\| childExited\)/);
   });
 
   it("keeps target and extension-development preparation separate", () => {
@@ -98,6 +116,19 @@ describe("repository VS Code integration", () => {
     assert.equal(targetTask?.type, "process");
     assert.equal(targetTask?.command, "just");
     assert.deepEqual(targetTask?.args, ["build-spawntree"]);
+
+    const justfile = readText("justfile");
+    const devStart = justfile.indexOf("vscode-dev:");
+    const devEnd = justfile.indexOf("\n# ARGS:", devStart);
+    const devRecipe = justfile.slice(devStart, devEnd);
+    const install = devRecipe.indexOf(
+      "npm --prefix editors/vscode ci --ignore-scripts",
+    );
+    const build = devRecipe.indexOf(
+      "npm --prefix editors/vscode run build",
+    );
+    assert.ok(install >= 0);
+    assert.ok(build > install);
   });
 
   it("packages only the two supported native targets", () => {
@@ -118,8 +149,10 @@ describe("repository VS Code integration", () => {
     assert.match(prepareScript, /"codesign"/);
     assert.match(prepareScript, /normalizeMachOUUID/);
     assert.match(workflow, /BINGO_VSCODE_TARGET: \$\{\{ matrix\.target \}\}/);
+    assert.match(workflow, /runner: macos-15/);
+    assert.doesNotMatch(workflow, /runner: macos-14(?:\s|$)/);
+    assert.match(workflow, /test "\$\(uname -m\)" = "\$\{\{ matrix\.unamearch \}\}"/);
     assert.match(workflow, /runner\.arch == 'ARM64'/);
-    assert.match(workflow, /runner\.arch != 'ARM64'/);
   });
 });
 
