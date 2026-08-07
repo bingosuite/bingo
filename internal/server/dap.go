@@ -19,7 +19,7 @@ func (p dapProvider) CreateSession() (dap.Session, error) {
 	if !p.srv.beginSessionOperation() {
 		return nil, ErrServerClosed
 	}
-	defer p.srv.sessionOps.Done()
+	defer p.srv.endSessionOperation()
 	sess := p.srv.sessions.create(p.srv.ctx)
 	return sess.hub, nil
 }
@@ -28,7 +28,7 @@ func (p dapProvider) GetSession(id string) (dap.Session, bool) {
 	if !p.srv.beginSessionOperation() {
 		return nil, false
 	}
-	defer p.srv.sessionOps.Done()
+	defer p.srv.endSessionOperation()
 	sess := p.srv.sessions.get(id)
 	if sess == nil {
 		return nil, false
@@ -41,21 +41,47 @@ func (p dapProvider) GetSession(id string) (dap.Session, bool) {
 // background. Safe to call at most once.
 func (s *Server) StartDAP(addr string) error {
 	s.lifecycleMu.Lock()
-	defer s.lifecycleMu.Unlock()
 	if s.shutting {
+		s.lifecycleMu.Unlock()
 		return ErrServerClosed
 	}
-	if s.dapStarted {
+	if s.dapStarted || s.dapStarting {
+		s.lifecycleMu.Unlock()
 		return ErrDAPAlreadyStarted
 	}
+	s.dapStarting = true
+	startDone := make(chan struct{})
+	s.dapStartDone = startDone
+	serve := s.dapServe
+	s.lifecycleMu.Unlock()
 
 	ds := dap.NewServer(dapProvider{srv: s}, s.log.With("component", "dap"))
-	bound, err := ds.Serve(addr)
+	bound, err := serve(s.ctx, ds, addr)
+
+	s.lifecycleMu.Lock()
+	s.dapStarting = false
 	if err != nil {
+		stopping := s.shutting || s.ctx.Err() != nil
+		if stopping {
+			s.lifecycleMu.Unlock()
+			_ = ds.Close()
+			close(startDone)
+			return ErrServerClosed
+		}
+		close(startDone)
+		s.lifecycleMu.Unlock()
 		return fmt.Errorf("listen for DAP: %w", err)
+	}
+	if s.shutting {
+		s.lifecycleMu.Unlock()
+		_ = ds.Close()
+		close(startDone)
+		return ErrServerClosed
 	}
 	s.dapStarted = true
 	s.dapServer = ds
 	s.dapAddress = bound.String()
+	close(startDone)
+	s.lifecycleMu.Unlock()
 	return nil
 }

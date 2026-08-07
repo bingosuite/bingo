@@ -1064,7 +1064,7 @@ when the count stayed zero for the whole grace. A bare DAP TCP connection does
 not count: DAP creates a session only on launch/attach, so process owners must
 allow enough startup grace for health-check + connect + handshake.
 
-**Idle generation and shutdown invariants.** `sessionStore` broadcasts changes
+**Idle admission and shutdown invariants.** `sessionStore` broadcasts changes
 by closing and replacing a channel under its map mutex; snapshots return
 `count`, a monotonically increasing generation, and the current channel after
 releasing the lock. The generation prevents a create/remove burst from looking
@@ -1072,24 +1072,38 @@ like uninterrupted zero-session time, and close-broadcast lets the idle monitor
 and shutdown waiter observe the same transition without stealing it from each
 other. Never block on the change channel while holding the store lock.
 
-The server also increments an admission generation under `lifecycleMu` before
-every WS or DAP create/join operation. When an idle timer fires, it takes that
-same lock, rechecks both the store and admission generations, and marks
-`shutting` before releasing the lock. An operation admitted after the timer's
-snapshot therefore invalidates the expiry; an operation arriving after the
-commit is rejected. Do not hold `lifecycleMu` over hub/client work: the
-generation increment + WaitGroup admission happen under the lock, while the
-operation runs after release.
+Every WS and DAP create/join increments `activeAdmissions` under `lifecycleMu`
+before doing store, hub, or socket work; its deferred completion decrements the
+count and close-broadcasts `admissionChanged`. Timer expiry takes the same lock
+and may mark `shutting` only when the armed zero-session generation is still
+current, the fresh store count is zero, and no admission is active. Lock order
+is lifecycle then a store read snapshot; neither lock is held across hub or
+socket I/O.
+
+An admission already active when the deadline expires gets to finish, but the
+expired gate rejects further operations so repeated failed joins cannot keep
+the process alive. The original deadline is not reset while that operation is
+in flight: success produces a live session and disarms shutdown; failure with
+the same zero-session generation commits shutdown immediately on completion.
+If the store generation changed because a session became active and later
+returned to zero, the monitor starts a fresh full grace period.
 
 The idle monitor starts only after HTTP binds, owns one reset/drain-safe timer,
 and exits on server cancellation. It may call `Shutdown` itself, so Shutdown
 must not wait for the monitor goroutine. Shutdown is idempotent: mark admission
-closed; close DAP and gracefully stop HTTP; wait for any WebSocket
-create/join operation that crossed the admission gate; cancel all hub contexts;
-then wait event-driven for the session store to empty. DAP Close already waits
-for its handlers, including clients that connected but never created a session.
-This ordering prevents a late client add from escaping registry teardown while
-still allowing every established session to close gracefully.
+closed and cancel the server context; join any in-flight DAP listener startup;
+close DAP and gracefully stop HTTP; wait for every admitted WS/DAP create/join;
+then wait event-driven for the canceled session store to empty. DAP Close
+already waits for its handlers, including clients that connected but never
+created a session. This ordering prevents a late client add from escaping
+registry teardown while still allowing every established session to close.
+
+`StartDAP` reserves its at-most-once start under `lifecycleMu`, releases the
+lock before context-aware listener binding, and publishes the server/address
+only if shutdown has not won. Shutdown cancellation unblocks the bind and waits
+for that start attempt before closing Done, so no DAP listener can appear after
+finalization. A genuine bind failure remains retryable only while the server is
+not shutting down.
 
 Hub admission has a second, session-local gate: `registry.add`, `remove`, and
 `closeAll` serialize on the registry mutex. Removing the final client marks the
@@ -1105,13 +1119,13 @@ across socket writes.
 and Start can also be delayed in listener setup. `cmd/bingo` therefore runs
 Start in a goroutine with a one-result buffered channel and selects it against
 `Server.Done()`: Start errors return immediately, a clean Start return waits for
-Done, and completed shutdown can win while Start is still unwinding without
-parking its eventual result send. The HTTP bind uses `net.ListenConfig` with the
-server context so cancellation reaches listener setup. Fatal bind/Serve errors
-must run the same one-time Shutdown before Start returns the original error;
-this closes a DAP listener that may have started first and guarantees Done.
-Concurrent duplicate Start calls return `ErrServerStarted` without tearing down
-the first caller.
+Done, and a Done-first result still waits for Start to unwind and consumes its
+result. The HTTP bind uses `net.ListenConfig` with the server context so
+Shutdown always unblocks listener setup; lifecycle-owned cancellation is clean,
+while genuine bind/Serve errors run the same one-time Shutdown and remain the
+Start result. This closes a DAP listener that may have started first and
+guarantees Done. Concurrent duplicate Start calls return `ErrServerStarted`
+without tearing down the first caller.
 
 **One-driver vs many-driver.** DAP assumes a single driver; bingo does not
 enforce it. WebSocket clients CAN also drive (the hub's `resumeCh` is

@@ -17,10 +17,12 @@ import (
 	"github.com/gorilla/websocket"
 	. "github.com/onsi/gomega"
 
+	"github.com/bingosuite/bingo/internal/dap"
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
 const testIdleTimeout = 150 * time.Millisecond
+const admissionRaceTimeout = 500 * time.Millisecond
 
 type runningServer struct {
 	server *Server
@@ -240,55 +242,152 @@ func TestDAPCreatedSessionSuppressesIdleShutdown(t *testing.T) {
 
 func TestIdleExpiryYieldsToWebSocketAdmission(t *testing.T) {
 	g := NewWithT(t)
-	srv, err := NewWithIdleTimeout("127.0.0.1:0", testIdleTimeout, nil)
+	srv, err := NewWithIdleTimeout("127.0.0.1:0", admissionRaceTimeout, nil)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	ready := make(chan struct{})
-	proceed := make(chan struct{})
-	var hookOnce sync.Once
-	srv.idleCommitHook = func() {
-		hookOnce.Do(func() {
-			close(ready)
-			<-proceed
+	admissionReady := make(chan struct{})
+	releaseAdmission := make(chan struct{})
+	timerExpired := make(chan struct{})
+	var admissionOnce sync.Once
+	var timerOnce sync.Once
+	srv.admissionHook = func() {
+		admissionOnce.Do(func() {
+			close(admissionReady)
+			<-releaseAdmission
 		})
 	}
+	srv.idleTimerHook = func() {
+		timerOnce.Do(func() { close(timerExpired) })
+	}
 	running := startConstructedServer(t, srv)
-	g.Eventually(ready, time.Second).Should(BeClosed())
 
-	conn := dialCreate(t, running.url)
+	type dialResult struct {
+		conn *websocket.Conn
+		err  error
+	}
+	dialed := make(chan dialResult, 1)
+	go func() {
+		conn, _, dialErr := websocket.DefaultDialer.Dial(
+			"ws"+strings.TrimPrefix(running.url, "http")+"/ws?create",
+			nil,
+		)
+		dialed <- dialResult{conn: conn, err: dialErr}
+	}()
+	g.Eventually(admissionReady, time.Second).Should(BeClosed())
+	g.Eventually(timerExpired, time.Second).Should(BeClosed())
+	g.Expect(srv.beginSessionOperation()).To(BeFalse())
+	select {
+	case err := <-running.errCh:
+		t.Fatalf("server shut down with an active admission: %v", err)
+	default:
+	}
+	close(releaseAdmission)
+	var result dialResult
+	g.Eventually(dialed, time.Second).Should(Receive(&result))
+	g.Expect(result.err).NotTo(HaveOccurred())
+	conn := result.conn
 	defer func() { _ = conn.Close() }()
 	g.Eventually(srv.sessions.count, time.Second).Should(Equal(1))
-	close(proceed)
 
-	g.Consistently(running.errCh, 2*testIdleTimeout).ShouldNot(Receive())
+	g.Consistently(running.errCh, testIdleTimeout).ShouldNot(Receive())
 	g.Expect(conn.Close()).To(Succeed())
 	g.Eventually(running.errCh, time.Second).Should(Receive(BeNil()))
 }
 
 func TestIdleExpiryYieldsToDAPAdmission(t *testing.T) {
 	g := NewWithT(t)
-	srv, err := NewWithIdleTimeout("127.0.0.1:0", testIdleTimeout, nil)
+	srv, err := NewWithIdleTimeout("127.0.0.1:0", admissionRaceTimeout, nil)
 	g.Expect(err).NotTo(HaveOccurred())
 
-	ready := make(chan struct{})
-	proceed := make(chan struct{})
-	var hookOnce sync.Once
-	srv.idleCommitHook = func() {
-		hookOnce.Do(func() {
-			close(ready)
-			<-proceed
+	admissionReady := make(chan struct{})
+	releaseAdmission := make(chan struct{})
+	timerExpired := make(chan struct{})
+	var admissionOnce sync.Once
+	var timerOnce sync.Once
+	srv.admissionHook = func() {
+		admissionOnce.Do(func() {
+			close(admissionReady)
+			<-releaseAdmission
+		})
+	}
+	srv.idleTimerHook = func() {
+		timerOnce.Do(func() { close(timerExpired) })
+	}
+	running := startConstructedServer(t, srv)
+
+	createResult := make(chan error, 1)
+	go func() {
+		_, createErr := (dapProvider{srv: srv}).CreateSession()
+		createResult <- createErr
+	}()
+	g.Eventually(admissionReady, time.Second).Should(BeClosed())
+	g.Eventually(timerExpired, time.Second).Should(BeClosed())
+	close(releaseAdmission)
+	g.Eventually(createResult, time.Second).Should(Receive(BeNil()))
+	g.Eventually(srv.sessions.count, time.Second).Should(Equal(1))
+
+	g.Consistently(running.errCh, testIdleTimeout).ShouldNot(Receive())
+	running.stop(t)
+}
+
+func TestExpiredIdleWaitsForFailedAdmissionThenShutsDown(t *testing.T) {
+	g := NewWithT(t)
+	srv, err := NewWithIdleTimeout("127.0.0.1:0", admissionRaceTimeout, nil)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	admissionReady := make(chan struct{})
+	releaseAdmission := make(chan struct{})
+	timerExpired := make(chan struct{})
+	releaseTimer := make(chan struct{})
+	var admissionOnce sync.Once
+	var timerOnce sync.Once
+	srv.admissionHook = func() {
+		admissionOnce.Do(func() {
+			close(admissionReady)
+			<-releaseAdmission
+		})
+	}
+	srv.idleTimerHook = func() {
+		timerOnce.Do(func() {
+			close(timerExpired)
+			<-releaseTimer
 		})
 	}
 	running := startConstructedServer(t, srv)
-	g.Eventually(ready, time.Second).Should(BeClosed())
 
-	_, err = (dapProvider{srv: srv}).CreateSession()
-	g.Expect(err).NotTo(HaveOccurred())
-	g.Eventually(srv.sessions.count, time.Second).Should(Equal(1))
-	close(proceed)
+	joinResult := make(chan bool, 1)
+	go func() {
+		_, ok := (dapProvider{srv: srv}).GetSession("missing")
+		joinResult <- ok
+	}()
+	g.Eventually(admissionReady, time.Second).Should(BeClosed())
+	g.Eventually(timerExpired, time.Second).Should(BeClosed())
+	g.Expect(srv.beginSessionOperation()).To(BeFalse())
+	select {
+	case err := <-running.errCh:
+		t.Fatalf("server shut down before failed admission completed: %v", err)
+	default:
+	}
 
-	g.Consistently(running.errCh, 2*testIdleTimeout).ShouldNot(Receive())
-	running.stop(t)
+	close(releaseAdmission)
+	g.Eventually(joinResult, time.Second).Should(Receive(BeFalse()))
+	close(releaseTimer)
+	g.Eventually(running.errCh, time.Second).Should(Receive(BeNil()))
+}
+
+func TestFailedAdmissionsDoNotExtendExpiredDeadline(t *testing.T) {
+	g := NewWithT(t)
+	srv := New("127.0.0.1:0", nil)
+
+	for range 100 {
+		_, ok := (dapProvider{srv: srv}).GetSession("missing")
+		g.Expect(ok).To(BeFalse())
+	}
+	g.Expect(srv.commitIdleShutdown(0).committed).To(BeTrue())
+	g.Expect(srv.beginSessionOperation()).To(BeFalse())
+	_, err := (dapProvider{srv: srv}).CreateSession()
+	g.Expect(err).To(MatchError(ErrServerClosed))
+	srv.Shutdown(time.Second)
 }
 
 func TestActiveSessionSuppressesIdleShutdown(t *testing.T) {
@@ -436,6 +535,86 @@ func TestStartBindFailureFinalizesDAPAndDone(t *testing.T) {
 		_ = conn.Close()
 	}
 	g.Expect(err).To(HaveOccurred())
+}
+
+func TestStartCancellationDuringListenReturnsCleanly(t *testing.T) {
+	g := NewWithT(t)
+	srv := New("127.0.0.1:0", nil)
+	listenStarted := make(chan struct{})
+	srv.listen = func(ctx context.Context, _, _ string) (net.Listener, error) {
+		close(listenStarted)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	startResult := make(chan error, 1)
+	go func() {
+		startResult <- srv.Start()
+	}()
+	g.Eventually(listenStarted, time.Second).Should(BeClosed())
+	srv.Shutdown(time.Second)
+
+	g.Eventually(startResult, time.Second).Should(Receive(BeNil()))
+	g.Expect(srv.Done()).To(BeClosed())
+}
+
+func TestStartPreservesBindErrorDuringShutdown(t *testing.T) {
+	g := NewWithT(t)
+	srv := New("127.0.0.1:0", nil)
+	listenStarted := make(chan struct{})
+	bindErr := errors.New("bind failed")
+	srv.listen = func(ctx context.Context, _, _ string) (net.Listener, error) {
+		close(listenStarted)
+		<-ctx.Done()
+		return nil, bindErr
+	}
+
+	startResult := make(chan error, 1)
+	go func() {
+		startResult <- srv.Start()
+	}()
+	g.Eventually(listenStarted, time.Second).Should(BeClosed())
+	srv.Shutdown(time.Second)
+
+	g.Eventually(startResult, time.Second).Should(Receive(MatchError(bindErr)))
+	g.Expect(srv.Done()).To(BeClosed())
+}
+
+func TestShutdownCancelsAndJoinsDAPStart(t *testing.T) {
+	g := NewWithT(t)
+	srv := New("127.0.0.1:0", nil)
+	listenStarted := make(chan struct{})
+	listenCanceled := make(chan struct{})
+	releaseListen := make(chan struct{})
+	srv.dapServe = func(ctx context.Context, _ *dap.Server, _ string) (net.Addr, error) {
+		close(listenStarted)
+		<-ctx.Done()
+		close(listenCanceled)
+		<-releaseListen
+		return nil, ctx.Err()
+	}
+
+	startResult := make(chan error, 1)
+	go func() {
+		startResult <- srv.StartDAP("127.0.0.1:0")
+	}()
+	g.Eventually(listenStarted, time.Second).Should(BeClosed())
+	shutdownResult := make(chan struct{})
+	go func() {
+		srv.Shutdown(time.Second)
+		close(shutdownResult)
+	}()
+	g.Eventually(listenCanceled, time.Second).Should(BeClosed())
+	select {
+	case <-srv.Done():
+		t.Fatal("Done closed before the in-flight DAP start completed")
+	default:
+	}
+
+	close(releaseListen)
+	g.Eventually(startResult, time.Second).Should(Receive(MatchError(ErrServerClosed)))
+	g.Eventually(shutdownResult, time.Second).Should(BeClosed())
+	g.Expect(srv.Done()).To(BeClosed())
 }
 
 func TestShutdownBeforeStartDoesNotResurrectServer(t *testing.T) {

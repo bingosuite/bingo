@@ -113,7 +113,7 @@ func TestRunServerWaitsForShutdownCompletion(t *testing.T) {
 	}
 }
 
-func TestRunServerReturnsWhenDoneWinsBlockedStart(t *testing.T) {
+func TestRunServerWaitsForBlockedStartAfterDone(t *testing.T) {
 	runner := &fakeServerRunner{
 		start:       make(chan struct{}),
 		startExited: make(chan struct{}),
@@ -127,18 +127,23 @@ func TestRunServerReturnsWhenDoneWinsBlockedStart(t *testing.T) {
 	close(runner.done)
 	select {
 	case err := <-result:
-		if err != nil {
-			t.Fatalf("runServer: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Done did not unblock runServer while Start was blocked")
+		t.Fatalf("runServer abandoned blocked Start after Done: %v", err)
+	case <-time.After(50 * time.Millisecond):
 	}
 
 	close(runner.start)
 	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("runServer: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("runServer did not consume Start after Done")
+	}
+	select {
 	case <-runner.startExited:
 	case <-time.After(time.Second):
-		t.Fatal("buffered Start result left the Start goroutine blocked")
+		t.Fatal("Start goroutine did not exit")
 	}
 }
 

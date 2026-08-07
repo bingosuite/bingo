@@ -36,23 +36,31 @@ type Server struct {
 	instanceID  string
 	idleTimeout time.Duration
 
-	lifecycleMu sync.RWMutex
-	started     bool
-	shutting    bool
-	admissions  uint64
-	httpAddress string
-	dapStarted  bool
-	dapServer   *dap.Server
-	dapAddress  string
+	lifecycleMu      sync.RWMutex
+	started          bool
+	shutting         bool
+	httpAddress      string
+	dapStarted       bool
+	dapStarting      bool
+	dapStartDone     chan struct{}
+	dapServer        *dap.Server
+	dapAddress       string
+	activeAdmissions int
+	admissionChanged chan struct{}
+	idleExpired      bool
 
 	monitorOnce  sync.Once
 	sessionOps   sync.WaitGroup
 	shutdownOnce sync.Once
 	shutdownDone chan struct{}
 
-	// The hook lets tests hold the narrow timer-fire-to-shutdown-commit window
-	// open without making production timing assumptions.
-	idleCommitHook func()
+	listen   func(context.Context, string, string) (net.Listener, error)
+	dapServe func(context.Context, *dap.Server, string) (net.Addr, error)
+
+	// These hooks expose admission and timer ordering without making tests rely
+	// on scheduler timing. Production leaves both nil.
+	admissionHook func()
+	idleTimerHook func()
 }
 
 // New creates a Server that will listen on addr (e.g. ":6060").
@@ -93,13 +101,19 @@ func newServer(addr string, idleTimeout time.Duration, log *slog.Logger) *Server
 	ctx, cancel := context.WithCancel(context.Background())
 
 	s := &Server{
-		sessions:     newSessionStore(log.With("component", "sessions")),
-		log:          log,
-		ctx:          ctx,
-		cancel:       cancel,
-		instanceID:   uuid.NewString(),
-		idleTimeout:  idleTimeout,
-		shutdownDone: make(chan struct{}),
+		sessions:         newSessionStore(log.With("component", "sessions")),
+		log:              log,
+		ctx:              ctx,
+		cancel:           cancel,
+		instanceID:       uuid.NewString(),
+		idleTimeout:      idleTimeout,
+		shutdownDone:     make(chan struct{}),
+		admissionChanged: make(chan struct{}),
+	}
+	var listenConfig net.ListenConfig
+	s.listen = listenConfig.Listen
+	s.dapServe = func(ctx context.Context, ds *dap.Server, addr string) (net.Addr, error) {
+		return ds.ServeContext(ctx, addr)
 	}
 
 	mux := http.NewServeMux()
@@ -130,9 +144,11 @@ func (s *Server) Start() error {
 	s.started = true
 	s.lifecycleMu.Unlock()
 
-	var listenConfig net.ListenConfig
-	ln, err := listenConfig.Listen(s.ctx, "tcp4", s.httpServer.Addr)
+	ln, err := s.listen(s.ctx, "tcp4", s.httpServer.Addr)
 	if err != nil {
+		if s.lifecycleStopping() && errors.Is(err, context.Canceled) {
+			return nil
+		}
 		s.Shutdown(idleShutdownGrace)
 		return err
 	}
@@ -177,11 +193,17 @@ func (s *Server) shutdown(timeout time.Duration) {
 	s.lifecycleMu.Lock()
 	s.shutting = true
 	ds := s.dapServer
+	dapStartDone := s.dapStartDone
 	s.dapServer = nil
 	s.dapAddress = ""
 	s.lifecycleMu.Unlock()
 
 	s.log.Info("shutting down server")
+	s.cancel()
+
+	if dapStartDone != nil {
+		<-dapStartDone
+	}
 
 	if ds != nil {
 		if err := ds.Close(); err != nil {
@@ -195,48 +217,92 @@ func (s *Server) shutdown(timeout time.Duration) {
 		s.log.Error("http shutdown error", "err", err)
 	}
 	s.sessionOps.Wait()
-	s.cancel()
 	if !s.sessions.waitEmpty(ctx) {
 		s.log.Error("session shutdown timed out", "remaining", s.sessions.count())
 	}
 }
 
-func (s *Server) acceptingSessions() bool {
-	s.lifecycleMu.RLock()
-	defer s.lifecycleMu.RUnlock()
-	return !s.shutting
-}
-
 func (s *Server) beginSessionOperation() bool {
 	s.lifecycleMu.Lock()
-	defer s.lifecycleMu.Unlock()
-	if s.shutting {
+	if s.shutting || s.idleExpired {
+		s.lifecycleMu.Unlock()
 		return false
 	}
-	s.admissions++
+	s.activeAdmissions++
 	s.sessionOps.Add(1)
+	hook := s.admissionHook
+	s.lifecycleMu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	return true
 }
 
-func (s *Server) idleSnapshot() (int, uint64, uint64, <-chan struct{}) {
+func (s *Server) endSessionOperation() {
+	s.lifecycleMu.Lock()
+	s.activeAdmissions--
+	close(s.admissionChanged)
+	s.admissionChanged = make(chan struct{})
+	s.lifecycleMu.Unlock()
+	s.sessionOps.Done()
+}
+
+func (s *Server) admissionSnapshot() (int, <-chan struct{}) {
 	s.lifecycleMu.RLock()
 	defer s.lifecycleMu.RUnlock()
-	count, generation, changed := s.sessions.snapshot()
-	return count, generation, s.admissions, changed
+	return s.activeAdmissions, s.admissionChanged
 }
 
-func (s *Server) commitIdleShutdown(generation, admissions uint64) bool {
+type idleDecision struct {
+	committed        bool
+	expired          bool
+	count            int
+	generation       uint64
+	sessionChanged   <-chan struct{}
+	admissionChanged <-chan struct{}
+}
+
+func (s *Server) commitIdleShutdown(generation uint64) idleDecision {
 	s.lifecycleMu.Lock()
 	defer s.lifecycleMu.Unlock()
-	if s.shutting || s.admissions != admissions {
-		return false
+	count, currentGeneration, sessionChanged := s.sessions.snapshot()
+	decision := idleDecision{
+		count:            count,
+		generation:       currentGeneration,
+		sessionChanged:   sessionChanged,
+		admissionChanged: s.admissionChanged,
 	}
-	count, currentGeneration, _ := s.sessions.snapshot()
-	if count != 0 || currentGeneration != generation {
-		return false
+	if s.shutting {
+		return decision
+	}
+	if count != 0 {
+		s.idleExpired = false
+		return decision
+	}
+	if currentGeneration != generation {
+		s.idleExpired = false
+		return decision
+	}
+	s.idleExpired = true
+	decision.expired = true
+	if s.activeAdmissions != 0 {
+		return decision
 	}
 	s.shutting = true
-	return true
+	decision.committed = true
+	return decision
+}
+
+func (s *Server) clearIdleExpiry() {
+	s.lifecycleMu.Lock()
+	s.idleExpired = false
+	s.lifecycleMu.Unlock()
+}
+
+func (s *Server) lifecycleStopping() bool {
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+	return s.shutting
 }
 
 func (s *Server) startIdleMonitor() {
@@ -252,8 +318,10 @@ func (s *Server) monitorIdle() {
 	timer := time.NewTimer(time.Hour)
 	stopTimer(timer)
 	var timerC <-chan time.Time
-	count, armedGeneration, armedAdmissions, changed := s.idleSnapshot()
-	if count == 0 {
+	sessionCount, armedGeneration, sessionChanged := s.sessions.snapshot()
+	_, admissionChanged := s.admissionSnapshot()
+	deadlineExpired := false
+	if sessionCount == 0 {
 		resetTimer(timer, s.idleTimeout)
 		timerC = timer.C
 	}
@@ -263,35 +331,74 @@ func (s *Server) monitorIdle() {
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-changed:
-			count, generation, admissions, nextChanged := s.idleSnapshot()
-			changed = nextChanged
-			if count > 0 {
+		case <-sessionChanged:
+			count, generation, nextChanged := s.sessions.snapshot()
+			sessionChanged = nextChanged
+			sessionCount = count
+			if sessionCount > 0 {
 				stopTimer(timer)
 				timerC = nil
+				deadlineExpired = false
+				s.clearIdleExpiry()
+				continue
+			}
+			if deadlineExpired && generation == armedGeneration {
 				continue
 			}
 			resetTimer(timer, s.idleTimeout)
 			timerC = timer.C
+			deadlineExpired = false
 			armedGeneration = generation
-			armedAdmissions = admissions
-		case <-timerC:
-			timerC = nil
-			if s.idleCommitHook != nil {
-				s.idleCommitHook()
+			s.clearIdleExpiry()
+		case <-admissionChanged:
+			if !deadlineExpired {
+				_, admissionChanged = s.admissionSnapshot()
+				continue
 			}
-			if s.commitIdleShutdown(armedGeneration, armedAdmissions) {
+			decision := s.commitIdleShutdown(armedGeneration)
+			sessionChanged = decision.sessionChanged
+			admissionChanged = decision.admissionChanged
+			if decision.committed {
 				s.log.Info("managed server idle timeout elapsed", "timeout", s.idleTimeout)
 				s.Shutdown(idleShutdownGrace)
 				return
 			}
-			count, generation, admissions, nextChanged := s.idleSnapshot()
-			changed = nextChanged
-			if count == 0 {
+			sessionCount = decision.count
+			if sessionCount > 0 {
+				stopTimer(timer)
+				timerC = nil
+				deadlineExpired = false
+				continue
+			}
+			if !decision.expired {
 				resetTimer(timer, s.idleTimeout)
 				timerC = timer.C
-				armedGeneration = generation
-				armedAdmissions = admissions
+				deadlineExpired = false
+				armedGeneration = decision.generation
+			}
+		case <-timerC:
+			timerC = nil
+			decision := s.commitIdleShutdown(armedGeneration)
+			sessionChanged = decision.sessionChanged
+			admissionChanged = decision.admissionChanged
+			deadlineExpired = decision.expired
+			if s.idleTimerHook != nil {
+				s.idleTimerHook()
+			}
+			if decision.committed {
+				s.log.Info("managed server idle timeout elapsed", "timeout", s.idleTimeout)
+				s.Shutdown(idleShutdownGrace)
+				return
+			}
+			sessionCount = decision.count
+			if sessionCount > 0 {
+				deadlineExpired = false
+				continue
+			}
+			if !decision.expired {
+				resetTimer(timer, s.idleTimeout)
+				timerC = timer.C
+				armedGeneration = decision.generation
 			}
 		}
 	}
