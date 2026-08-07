@@ -885,10 +885,11 @@ incompatible occupant fails safely. `connectOnly` bypasses management and spawn
 for remote/custom workflows. Health reads have both response abort/error
 handling and an independent wall-clock deadline; readiness probes receive only
 the remaining overall budget, so a slow-drip HTTP peer cannot hold F5 open. The
-poller reserves a final 50ms probe budget, then after a fast absent response
-delays again while retaining a final 1ms probe; this ensures the schema's 100ms
-minimum both gets post-spawn probes and remains live for its full window without
-spinning.
+poller probes immediately after spawn, uses the normal 100ms cadence outside
+the last 50ms, then a 10ms cadence while every request can retain at least a
+25ms wall-clock budget (covered by a real localhost test). When another useful
+probe no longer fits it waits out the absolute deadline rather than issuing a
+sub-millisecond request or spinning.
 
 One extension host coalesces in-flight ensures by normalized endpoint. Across
 hosts, listener binding arbitrates races: a child that loses is success if the

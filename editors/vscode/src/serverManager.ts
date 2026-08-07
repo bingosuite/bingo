@@ -6,6 +6,7 @@ import type {
   HealthProbe,
   HealthProbeResult,
 } from "./health.js";
+import { minimumHealthProbeTimeoutMs } from "./health.js";
 import {
   supportedTargetFor,
   type RuntimePlatform,
@@ -52,8 +53,8 @@ export interface ServerManagerDependencies {
 
 const probeTimeoutMs = 1000;
 const pollIntervalMs = 100;
-const finalProbeBudgetMs = 50;
-const minimumProbeBudgetMs = 1;
+const finalWindowMs = 50;
+const finalPollIntervalMs = 10;
 
 export class ServerManager {
   readonly #dependencies: ServerManagerDependencies;
@@ -185,41 +186,61 @@ export class ServerManager {
     const deadline = this.#dependencies.now() + config.readyTimeoutMs;
     let lastProbe: HealthProbeResult = initial;
     try {
-      for (;;) {
-        const remaining = deadline - this.#dependencies.now();
-        if (remaining <= 0) {
-          break;
-        }
-        if (remaining <= minimumProbeBudgetMs) {
-          await this.#dependencies.delay(remaining, this.#lifetime.signal);
-          break;
-        }
-        const reservedProbeBudget =
-          remaining > finalProbeBudgetMs
-            ? finalProbeBudgetMs
-            : minimumProbeBudgetMs;
-        const delayMs = Math.min(
-          pollIntervalMs,
-          remaining - reservedProbeBudget,
-        );
-        await this.#dependencies.delay(delayMs, this.#lifetime.signal);
-        const probeRemaining = deadline - this.#dependencies.now();
-        if (probeRemaining <= 0) {
-          break;
-        }
+      const probeReady = async (timeoutMs: number): Promise<boolean> => {
         lastProbe = await this.#probe(
           config.managementEndpoint,
           config.dapEndpoint,
-          Math.min(probeTimeoutMs, probeRemaining),
+          Math.min(probeTimeoutMs, timeoutMs),
         );
         if (lastProbe.kind === "compatible") {
           this.#dependencies.log(
             `bingo instance ${lastProbe.health.instanceId} is ready at ${formatEndpoint(config.dapEndpoint)}`,
           );
-          return config.dapEndpoint;
+          return true;
         }
         if (lastProbe.kind === "incompatible") {
           throw occupiedError(config, lastProbe.reason);
+        }
+        return false;
+      };
+
+      const initialRemaining = deadline - this.#dependencies.now();
+      if (
+        initialRemaining >= minimumHealthProbeTimeoutMs &&
+        (await probeReady(initialRemaining))
+      ) {
+        return config.dapEndpoint;
+      }
+
+      for (;;) {
+        const remaining = deadline - this.#dependencies.now();
+        if (remaining <= 0) {
+          break;
+        }
+        if (remaining <= minimumHealthProbeTimeoutMs) {
+          await this.#dependencies.delay(remaining, this.#lifetime.signal);
+          break;
+        }
+        const delayMs =
+          remaining > finalWindowMs
+            ? Math.min(pollIntervalMs, remaining - finalWindowMs)
+            : Math.min(
+                finalPollIntervalMs,
+                remaining - minimumHealthProbeTimeoutMs,
+              );
+        await this.#dependencies.delay(delayMs, this.#lifetime.signal);
+        const probeRemaining = deadline - this.#dependencies.now();
+        if (probeRemaining < minimumHealthProbeTimeoutMs) {
+          if (probeRemaining > 0) {
+            await this.#dependencies.delay(
+              probeRemaining,
+              this.#lifetime.signal,
+            );
+          }
+          break;
+        }
+        if (await probeReady(probeRemaining)) {
+          return config.dapEndpoint;
         }
       }
     } catch (error: unknown) {
