@@ -92,7 +92,7 @@ follow them so reviews stay about substance, not style.
 | [cmd/cli](cmd/cli/) | Interactive readline client. |
 | [cmd/dapcli](cmd/dapcli/) | Interactive readline client that drives a session over DAP (mirrors `cmd/cli`'s UX). Talks to the server's `-dap-addr` listener; can create a session or `-session` join an existing one. |
 | [cmd/wsmon](cmd/wsmon/) | Read-only terminal telemetry observer. `-session`-joins a running session over WebSocket and live-renders the goroutine spawn tree + OS threads + created/exited lifecycle deltas from the `EventGoroutineSnapshot` stream. Never drives execution — the WS-observes half of the DAP-drives/WS-observes demo. |
-| [editors/vscode](editors/vscode/) | Locally packaged TypeScript companion extension. Owns VS Code debugger type `bingo`, enables Go breakpoints, and connects the built-in Debug UI to an already-running bingo DAP TCP listener. |
+| [editors/vscode](editors/vscode/) | Platform-packaged TypeScript companion extension. Owns VS Code debugger type `bingo`, enables Go breakpoints, and reuses or starts a compatible shared bingo server before connecting the built-in Debug UI to DAP. |
 | [cmd/target](cmd/target/) | Trivial target program for manual testing. |
 | [examples/spawntree](examples/spawntree/) | Concurrency demo target: a deterministic main → supervisor → worker×N goroutine spawn tree for exercising the telemetry stream (see [docs/ConcurrencyTelemetry.md](docs/ConcurrencyTelemetry.md)). |
 | [cmd/githook](cmd/githook/) | Conventional-commits commitlint, wired via [lefthook.yml](lefthook.yml). |
@@ -856,10 +856,11 @@ richer concurrency visualizations stay on the WebSocket side. The two coexist on
 one hub session (this is the whole point — an IDE gets a working debugger, the
 bingo UI gets its bonus features, both against the same tracee).
 
-**VS Code companion — transport only, separate from Go tooling.**
+**VS Code companion — managed transport, separate from Go tooling.**
 [editors/vscode](editors/vscode/) packages as extension ID
 `bingosuite.bingo`, registers a
-`DebugAdapterDescriptorFactory` for debugger type `bingo` and returns
+`DebugAdapterDescriptorFactory` for debugger type `bingo`. The async factory
+first ensures a compatible server, then returns
 `DebugAdapterServer(dapPort, dapHost)` (defaults `127.0.0.1:4711`). It never
 registers type `go`, launches or validates `dlv`, or calls into Microsoft's Go
 extension. Keep `golang.go` installed for gopls/navigation/formatting/tests; a
@@ -869,10 +870,41 @@ do not change it to `localhost`, which older VS Code/Node runtimes can resolve
 to `::1` without falling back to IPv4.
 The extension validates launch (`program`), existing-session join (`session`),
 and OS-process attach (`pid`, optional `binaryPath`) before connecting.
-`dapHost`/`dapPort` are client-owned endpoint fields that remain in VS Code's
-raw launch/attach arguments; Go's JSON decoder ignores those unknown fields, so
-they never enter the bingo command payload. Do not add them to the wire protocol
-or `launchConfig`.
+`serverMode`/management/DAP/timing fields are client-owned and remain in VS
+Code's raw launch/attach arguments; Go's JSON decoder ignores those unknown
+fields, so they never enter the bingo command payload. Do not add them to the
+wire protocol or `launchConfig`.
+
+**VS Code connect-or-start invariants.** Default `serverMode:"auto"` is local
+only: management `127.0.0.1:6060`, DAP `127.0.0.1:4711`, readiness 5s, managed
+idle grace 30s. It health-checks before spawning and requires
+`service:"bingo"`, management API 1, the exact wire version, enabled DAP, and
+the expected DAP port/host (wildcard advertised hosts retain the configured
+connect host). Only connection refusal permits spawning; a non-bingo or
+incompatible occupant fails safely. `connectOnly` bypasses management and spawn
+for remote/custom workflows.
+
+One extension host coalesces in-flight ensures by normalized endpoint. Across
+hosts, listener binding arbitrates races: a child that loses is success if the
+compatible winner becomes healthy before the deadline. The bundled child is
+spawned with argv (never a shell), detached/unref'd with ignored stdin and
+stdout/stderr inherited from a persistent extension-storage log file. The
+extension NEVER kills a server, including one it spawned; disposal only aborts
+bounded probes. Server-owned `-idle-timeout` is the sole teardown owner.
+
+VSIXes are platform-specific: `linux-x64` contains only linux/amd64 bingo;
+`darwin-arm64` contains only a `bingonative` arm64 binary codesigned with
+[entitlements.plist](entitlements.plist). Runtime resolves only
+`bin/bingo` + `bin/target.json` inside the installed/development extension,
+checks the target, and repairs executable mode if extraction lost it.
+Packaging rebuilds/signs twice and requires identical binary and VSIX hashes;
+tests drift-check service/API/wire constants against Go source and inspect exact
+archive contents, target metadata, architecture, mode, and entitlements.
+Apple's external linker can vary `LC_UUID` even for identical cgo inputs, but
+current dyld rejects binaries with `-no_uuid`; `normalize-mach-o-uuid.mjs`
+therefore derives a stable UUID from the unsigned Mach-O with its UUID and
+linker signature zeroed, writes it back, then codesigns. Preserve that
+normalize-before-sign order and the repeated two-build gate.
 
 **Architecture — a translator at the `hub.WSConn` seam, ZERO hub changes.**
 `dap.Handler` implements `hub.WSConn` and is registered via
@@ -1063,6 +1095,8 @@ reaches zero, cancels it while any session exists, and shuts itself down only
 when the count stayed zero for the whole grace. A bare DAP TCP connection does
 not count: DAP creates a session only on launch/attach, so process owners must
 allow enough startup grace for health-check + connect + handshake.
+The VS Code companion is the first implementation of this contract; future UI
+clients can follow it, but no bingo UI process manager is shipped here.
 
 **Idle admission and shutdown invariants.** `sessionStore` broadcasts changes
 by closing and replacing a channel under its map mutex; snapshots return
@@ -1323,8 +1357,10 @@ just test [PKG]                            # go test -v
 just coverage [PKG]                        # writes test/coverage.out
 just integration                           # ginkgo -r ./test/integration (no e2e tag)
 just build-spawntree                       # rebuilds the VS Code demo with -N -l
+just vscode-prepare                        # stage the current native server inside the extension
+just vscode-dev                            # build extension + native server + spawntree for F5
 just vscode-check                          # lint, typecheck, test, bundle, package-list smoke
-just vscode-package                        # verifies reproducibility, writes ignored dist/bingo.vsix
+just vscode-package                        # writes verified dist/bingo-<platform>.vsix
 just vscode-install                        # explicitly installs/updates bingosuite.bingo
 just e2e-linux                             # native linux/amd64 ptrace E2E (all labels)
 just e2e-darwin                            # native darwin/arm64 Mach-exception E2E (codesigned; all labels)

@@ -41,8 +41,7 @@ describe("extension manifest", () => {
     for (const request of ["launch", "attach"]) {
       const schema = requireRecord(attributes[request]);
       const properties = requireRecord(schema.properties);
-      assert.equal(requireRecord(properties.dapHost).default, "127.0.0.1");
-      assert.equal(requireRecord(properties.dapPort).default, 4711);
+      assertLifecycleDefaults(properties);
     }
 
     const initialConfigurations = requireArray(
@@ -50,8 +49,7 @@ describe("extension manifest", () => {
     ).map(requireRecord);
     assert.ok(initialConfigurations.length > 0);
     for (const configuration of initialConfigurations) {
-      assert.equal(configuration.dapHost, "127.0.0.1");
-      assert.equal(configuration.dapPort, 4711);
+      assertLifecycleDefaults(configuration);
     }
   });
 
@@ -61,8 +59,7 @@ describe("extension manifest", () => {
       requireRecord(requireRecord(snippet).body),
     );
     for (const body of bodies) {
-      assert.equal(body.dapHost, "127.0.0.1");
-      assert.equal(body.dapPort, 4711);
+      assertLifecycleDefaults(body);
     }
 
     assert.ok(
@@ -81,6 +78,22 @@ describe("extension manifest", () => {
       ),
     );
   });
+
+  function assertLifecycleDefaults(record: JsonRecord): void {
+    assert.equal(valueOrDefault(record.serverMode), "auto");
+    assert.equal(valueOrDefault(record.managementHost), "127.0.0.1");
+    assert.equal(valueOrDefault(record.managementPort), 6060);
+    assert.equal(valueOrDefault(record.dapHost), "127.0.0.1");
+    assert.equal(valueOrDefault(record.dapPort), 4711);
+    assert.equal(valueOrDefault(record.serverReadyTimeoutMs), 5000);
+    assert.equal(valueOrDefault(record.managedIdleTimeoutMs), 30000);
+  }
+
+  function valueOrDefault(value: unknown): unknown {
+    return typeof value === "object" && value !== null && "default" in value
+      ? value.default
+      : value;
+  }
 });
 
 function requireRecord(value: unknown): JsonRecord {
