@@ -286,6 +286,19 @@ describe("server manager", () => {
     );
   });
 
+  it("passes the remaining readiness deadline to each health probe", async () => {
+    const timeouts: number[] = [];
+    const test = harness((_management, _dap, timeoutMs) => {
+      timeouts.push(timeoutMs);
+      return Promise.resolve(absent);
+    });
+    await assert.rejects(
+      test.manager.ensureServer(configuration({ readyTimeoutMs: 250 })),
+      hasCode("readinessTimedOut"),
+    );
+    assert.deepEqual(timeouts, [250, 150, 50]);
+  });
+
   it("fails safely on an incompatible endpoint without spawning", async () => {
     const test = harness(
       sequence({ kind: "incompatible", reason: "not bingo" }),
@@ -344,6 +357,89 @@ describe("server manager", () => {
     custom.dispose();
     await assert.rejects(ensured, hasCode("cancelled"));
   });
+
+  for (const phase of ["binary", "log"] as const) {
+    it(`dispose during ${phase} resolution prevents spawn`, async () => {
+      const gate = deferred<string>();
+      const entered = deferred<void>();
+      let spawns = 0;
+      const manager = new ServerManager({
+        probe: sequence(absent),
+        resolveBinary: () => {
+          if (phase === "binary") {
+            entered.resolve();
+            return gate.promise;
+          }
+          return Promise.resolve("/extension/bin/bingo");
+        },
+        spawnServer: () => {
+          spawns += 1;
+          return { stopObserving() {} };
+        },
+        delay: () => Promise.resolve(),
+        now: () => 0,
+        runtime: { platform: "darwin", arch: "arm64" },
+        logPathFor: () => {
+          if (phase === "log") {
+            entered.resolve();
+            return gate.promise;
+          }
+          return Promise.resolve("/logs/server.log");
+        },
+        log() {},
+      });
+
+      const ensured = manager.ensureServer(configuration());
+      await entered.promise;
+      manager.dispose();
+      gate.resolve(
+        phase === "binary"
+          ? "/extension/bin/bingo"
+          : "/logs/server.log",
+      );
+
+      await assert.rejects(ensured, hasCode("cancelled"));
+      assert.equal(spawns, 0);
+    });
+  }
+
+  it("classifies abort during the initial probe as cancellation", async () => {
+    const entered = deferred<void>();
+    let spawns = 0;
+    const manager = new ServerManager({
+      probe: (_management, _dap, _timeout, signal) =>
+        new Promise((_resolve, reject) => {
+          entered.resolve();
+          const rejectAbort = (): void => {
+            const error = new Error("operation cancelled");
+            error.name = "AbortError";
+            reject(error);
+          };
+          if (signal.aborted) {
+            rejectAbort();
+            return;
+          }
+          signal.addEventListener("abort", rejectAbort, { once: true });
+        }),
+      resolveBinary: () => Promise.resolve("/extension/bin/bingo"),
+      spawnServer: () => {
+        spawns += 1;
+        return { stopObserving() {} };
+      },
+      delay: () => Promise.resolve(),
+      now: () => 0,
+      runtime: { platform: "darwin", arch: "arm64" },
+      logPathFor: () => Promise.resolve("/logs/server.log"),
+      log() {},
+    });
+
+    const ensured = manager.ensureServer(configuration());
+    await entered.promise;
+    manager.dispose();
+
+    await assert.rejects(ensured, hasCode("cancelled"));
+    assert.equal(spawns, 0);
+  });
 });
 
 function hasCode(code: ServerManagerError["code"]) {
@@ -355,4 +451,21 @@ async function waitForSpawn(requests: SpawnServerRequest[]): Promise<void> {
   while (requests.length === 0) {
     await Promise.resolve();
   }
+}
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+} {
+  let resolvePromise: ((value: T) => void) | undefined;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return {
+    promise,
+    resolve(value) {
+      assert.notEqual(resolvePromise, undefined);
+      resolvePromise?.(value);
+    },
+  };
 }

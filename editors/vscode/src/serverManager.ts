@@ -112,11 +112,10 @@ export class ServerManager {
     this.#dependencies.log(
       `probing bingo management endpoint ${formatEndpoint(config.managementEndpoint)}`,
     );
-    const initial = await this.#dependencies.probe(
+    const initial = await this.#probe(
       config.managementEndpoint,
       config.dapEndpoint,
       Math.min(probeTimeoutMs, config.readyTimeoutMs),
-      this.#lifetime.signal,
     );
     if (initial.kind === "compatible") {
       this.#dependencies.log(
@@ -139,16 +138,25 @@ export class ServerManager {
     try {
       binaryPath = await this.#dependencies.resolveBinary(target);
     } catch (error: unknown) {
+      this.#throwIfCancelled(error);
       throw new ServerManagerError(
         "binaryUnavailable",
         `cannot use the bundled ${target} bingo server: ${errorMessage(error)}`,
         { cause: error },
       );
     }
+    this.#throwIfCancelled();
 
-    const logPath = await this.#dependencies.logPathFor(
-      config.managementEndpoint,
-    );
+    let logPath: string;
+    try {
+      logPath = await this.#dependencies.logPathFor(
+        config.managementEndpoint,
+      );
+    } catch (error: unknown) {
+      this.#throwIfCancelled(error);
+      throw error;
+    }
+    this.#throwIfCancelled();
     const args = serverArguments(config);
     this.#dependencies.log(
       `starting bundled bingo server; logs: ${logPath}`,
@@ -156,6 +164,7 @@ export class ServerManager {
 
     let childOutcome: ServerProcessOutcome | undefined;
     let observation: ServerProcessObservation;
+    this.#throwIfCancelled();
     try {
       observation = this.#dependencies.spawnServer(
         { binaryPath, args, logPath },
@@ -183,11 +192,14 @@ export class ServerManager {
           Math.min(pollIntervalMs, remaining),
           this.#lifetime.signal,
         );
-        lastProbe = await this.#dependencies.probe(
+        const probeRemaining = deadline - this.#dependencies.now();
+        if (probeRemaining <= 0) {
+          break;
+        }
+        lastProbe = await this.#probe(
           config.managementEndpoint,
           config.dapEndpoint,
-          Math.min(probeTimeoutMs, remaining),
-          this.#lifetime.signal,
+          Math.min(probeTimeoutMs, probeRemaining),
         );
         if (lastProbe.kind === "compatible") {
           this.#dependencies.log(
@@ -218,6 +230,34 @@ export class ServerManager {
       childOutcome === undefined ? "readinessTimedOut" : "spawnFailed",
       message,
     );
+  }
+
+  async #probe(
+    managementEndpoint: BingoEndpoint,
+    dapEndpoint: BingoEndpoint,
+    timeoutMs: number,
+  ): Promise<HealthProbeResult> {
+    try {
+      const result = await this.#dependencies.probe(
+        managementEndpoint,
+        dapEndpoint,
+        timeoutMs,
+        this.#lifetime.signal,
+      );
+      this.#throwIfCancelled(
+        result.kind === "transportError" ? result.error : undefined,
+      );
+      return result;
+    } catch (error: unknown) {
+      this.#throwIfCancelled(error);
+      throw error;
+    }
+  }
+
+  #throwIfCancelled(error?: unknown): void {
+    if (this.#lifetime.signal.aborted || isAbortError(error)) {
+      throw cancelledError();
+    }
   }
 
   #validateAutoConfiguration(config: BingoServerConfiguration): void {
