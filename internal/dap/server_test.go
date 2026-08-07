@@ -2,6 +2,7 @@ package dap
 
 import (
 	"bufio"
+	"context"
 	"log/slog"
 	"net"
 	"testing"
@@ -86,5 +87,18 @@ func TestServerCloseAfterInitialize(t *testing.T) {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("Server.Close hung after initialize with no session")
+	}
+}
+
+func TestServeContextRejectsCanceledStartup(t *testing.T) {
+	s := quietServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := s.ServeContext(ctx, "127.0.0.1:0"); err == nil {
+		t.Fatal("ServeContext succeeded after cancellation")
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
 	}
 }

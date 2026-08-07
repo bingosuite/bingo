@@ -89,12 +89,7 @@ func runServer(srv serverRunner) error {
 		<-srv.Done()
 		return nil
 	case <-srv.Done():
-		select {
-		case err := <-startResult:
-			return err
-		default:
-			return nil
-		}
+		return <-startResult
 	}
 }
 

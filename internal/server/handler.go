@@ -115,11 +115,6 @@ func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request) {
 //	GET /ws?create        — create + join
 //	GET /ws?session={id}  — join existing
 func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
-	if !s.acceptingSessions() {
-		http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
-		return
-	}
-
 	query := r.URL.Query()
 
 	_, wantCreate := query["create"]
@@ -129,6 +124,12 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "specify ?create or ?session={id}", http.StatusBadRequest)
 		return
 	}
+
+	if !s.beginSessionOperation() {
+		http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.endSessionOperation()
 
 	// Upgrade before session logic so we can send descriptive close frames on error.
 	conn, err := upgrader.Upgrade(w, r, nil)
@@ -147,12 +148,6 @@ func (s *Server) handleWS(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) wsCreate(conn *websocket.Conn, log *slog.Logger) {
-	if !s.beginSessionOperation() {
-		s.closeShuttingDown(conn)
-		return
-	}
-	defer s.sessionOps.Done()
-
 	sess := s.sessions.create(s.ctx)
 	log = log.With("session", sess.id, "action", "create")
 	log.Info("client creating new session")
@@ -162,12 +157,6 @@ func (s *Server) wsCreate(conn *websocket.Conn, log *slog.Logger) {
 }
 
 func (s *Server) wsJoin(conn *websocket.Conn, sessionID string, log *slog.Logger) {
-	if !s.beginSessionOperation() {
-		s.closeShuttingDown(conn)
-		return
-	}
-	defer s.sessionOps.Done()
-
 	log = log.With("session", sessionID, "action", "join")
 
 	sess := s.sessions.get(sessionID)
@@ -186,10 +175,4 @@ func (s *Server) wsJoin(conn *websocket.Conn, sessionID string, log *slog.Logger
 	if _, err := sess.hub.AddClient(conn, log); err != nil {
 		log.Warn("session closed while joining", "err", err)
 	}
-}
-
-func (s *Server) closeShuttingDown(conn *websocket.Conn) {
-	msg := websocket.FormatCloseMessage(websocket.CloseGoingAway, "server is shutting down")
-	_ = conn.WriteMessage(websocket.CloseMessage, msg)
-	_ = conn.Close()
 }

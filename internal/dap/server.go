@@ -1,6 +1,7 @@
 package dap
 
 import (
+	"context"
 	"log/slog"
 	"net"
 	"sync"
@@ -35,18 +36,37 @@ func NewServer(provider Provider, log *slog.Logger) *Server {
 // the bound address so callers can log it or, in tests, dial an ephemeral port.
 // The accept loop runs in the background; Serve returns once listening.
 func (s *Server) Serve(addr string) (net.Addr, error) {
+	return s.ServeContext(context.Background(), addr)
+}
+
+// ServeContext is Serve with cancellation support for listener setup.
+func (s *Server) ServeContext(ctx context.Context, addr string) (net.Addr, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// tcp4 to match the rest of bingo's local-only listeners and keep the
 	// address predictable for IDE launch configs.
-	ln, err := net.Listen("tcp4", addr)
+	var listenConfig net.ListenConfig
+	ln, err := listenConfig.Listen(ctx, "tcp4", addr)
 	if err != nil {
 		return nil, err
 	}
 
 	s.mu.Lock()
+	if err := ctx.Err(); err != nil {
+		s.mu.Unlock()
+		_ = ln.Close()
+		return nil, err
+	}
+	if s.closed {
+		s.mu.Unlock()
+		_ = ln.Close()
+		return nil, net.ErrClosed
+	}
 	s.listener = ln
+	s.wg.Add(1)
 	s.mu.Unlock()
 
-	s.wg.Add(1)
 	go s.acceptLoop(ln)
 
 	s.log.Info("dap server listening", "addr", ln.Addr().String())
