@@ -5,6 +5,7 @@
 # positional args still override.
 os_name := if os() == "macos" { "darwin" } else { os() }
 arch_name := if arch() == "aarch64" { "arm64" } else if arch() == "x86_64" { "amd64" } else { arch() }
+vscode_target := if os_name + "/" + arch_name == "darwin/arm64" { "darwin-arm64" } else if os_name + "/" + arch_name == "linux/amd64" { "linux-x64" } else { "unsupported" }
 
 # Build the Target, build BinGo and run the Target
 default: build-target build run
@@ -63,6 +64,17 @@ build-spawntree:
 	mkdir -p ./build
 	go build -gcflags="all=-N -l" -o ./build/spawntree ./examples/spawntree
 
+# Build the native server into the extension-local layout used by both an
+# Extension Development Host and the platform-specific VSIX.
+vscode-prepare:
+	npm --prefix editors/vscode run binary:prepare
+
+# Prepare every artifact needed by the repository's bingo F5 configuration.
+# The extension performs connect-or-start, so this builds but never runs a
+# manually-owned server process.
+vscode-dev: build-spawntree vscode-prepare
+	npm --prefix editors/vscode run build
+
 # ARGS: -addr string    server address (default "localhost:6060")
 #	  	-session string session ID to join (omit to create a new session)
 # Build and run the interactive CLI client
@@ -88,11 +100,12 @@ vscode-check:
 vscode-package: vscode-check
 	mkdir -p ./dist
 	npm --prefix editors/vscode run package:reproducible
+	npm --prefix editors/vscode run package:verify
 
 # Explicit opt-in keeps packaging/CI from mutating a developer's normal VS Code
 # profile while still providing a one-command local install/update path.
 vscode-install: vscode-package
-	code --install-extension ./dist/bingo.vsix --force
+	code --install-extension ./dist/bingo-{{vscode_target}}.vsix --force
 
 # Run unit tests on the PKG (defaults to ./...)
 test PKG="./...":

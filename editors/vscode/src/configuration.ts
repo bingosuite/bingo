@@ -1,16 +1,32 @@
 export const defaultDapHost = "127.0.0.1";
 export const defaultDapPort = 4711;
+export const defaultManagementHost = "127.0.0.1";
+export const defaultManagementPort = 6060;
+export const defaultServerMode = "auto";
+export const defaultServerReadyTimeoutMs = 5000;
+export const defaultManagedIdleTimeoutMs = 30000;
 
 type JsonRecord = Record<string, unknown>;
+
+export type ServerMode = "auto" | "connectOnly";
 
 export interface BingoEndpoint {
   readonly host: string;
   readonly port: number;
 }
 
+export interface BingoServerConfiguration {
+  readonly mode: ServerMode;
+  readonly managementEndpoint: BingoEndpoint;
+  readonly dapEndpoint: BingoEndpoint;
+  readonly readyTimeoutMs: number;
+  readonly idleTimeoutMs: number;
+}
+
 export interface ValidatedBingoConfiguration {
   readonly endpoint: BingoEndpoint;
   readonly request: "attach" | "launch";
+  readonly server: BingoServerConfiguration;
 }
 
 export class ConfigurationError extends Error {
@@ -21,7 +37,8 @@ export function validateBingoConfiguration(
   value: unknown,
 ): ValidatedBingoConfiguration {
   const config = requireRecord(value, "debug configuration");
-  const endpoint = resolveEndpoint(config);
+  const server = resolveServerConfiguration(config);
+  const endpoint = server.dapEndpoint;
   const request = requireNonEmptyString(config, "request");
 
   validateOptionalBoolean(config, "stopOnEntry");
@@ -30,12 +47,12 @@ export function validateBingoConfiguration(
     requireNonEmptyString(config, "program");
     validateOptionalStringArray(config, "args");
     validateOptionalStringArray(config, "env");
-    return { endpoint, request };
+    return { endpoint, request, server };
   }
 
   if (request === "attach") {
     validateAttach(config);
-    return { endpoint, request };
+    return { endpoint, request, server };
   }
 
   throw new ConfigurationError(
@@ -45,15 +62,79 @@ export function validateBingoConfiguration(
 
 export function resolveEndpoint(value: unknown): BingoEndpoint {
   const config = requireRecord(value, "debug configuration");
-  const hostValue = config.dapHost;
-  const portValue = config.dapPort;
+  return resolveNamedEndpoint(
+    config,
+    "dapHost",
+    "dapPort",
+    defaultDapHost,
+    defaultDapPort,
+  );
+}
 
+export function resolveServerConfiguration(
+  value: unknown,
+): BingoServerConfiguration {
+  const config = requireRecord(value, "debug configuration");
+  const mode = resolveServerMode(config.serverMode);
+  const managementEndpoint = resolveNamedEndpoint(
+    config,
+    "managementHost",
+    "managementPort",
+    defaultManagementHost,
+    defaultManagementPort,
+  );
+  const dapEndpoint = resolveEndpoint(config);
+  const readyTimeoutMs = resolveBoundedInteger(
+    config.serverReadyTimeoutMs,
+    defaultServerReadyTimeoutMs,
+    "serverReadyTimeoutMs",
+    100,
+    120000,
+  );
+  const idleTimeoutMs = resolveBoundedInteger(
+    config.managedIdleTimeoutMs,
+    defaultManagedIdleTimeoutMs,
+    "managedIdleTimeoutMs",
+    1,
+    86400000,
+  );
+
+  return {
+    mode,
+    managementEndpoint,
+    dapEndpoint,
+    readyTimeoutMs,
+    idleTimeoutMs,
+  };
+}
+
+function resolveServerMode(value: unknown): ServerMode {
+  if (value === undefined) {
+    return defaultServerMode;
+  }
+  if (value === "auto" || value === "connectOnly") {
+    return value;
+  }
+  throw new ConfigurationError(
+    'bingo serverMode must be "auto" or "connectOnly"',
+  );
+}
+
+function resolveNamedEndpoint(
+  config: JsonRecord,
+  hostKey: string,
+  portKey: string,
+  defaultHost: string,
+  defaultPort: number,
+): BingoEndpoint {
   const host =
-    hostValue === undefined
-      ? defaultDapHost
-      : requireNonEmptyString(config, "dapHost");
-  const port = portValue === undefined ? defaultDapPort : requirePort(portValue);
-
+    config[hostKey] === undefined
+      ? defaultHost
+      : requireNonEmptyString(config, hostKey);
+  const port =
+    config[portKey] === undefined
+      ? defaultPort
+      : requirePort(config[portKey], portKey);
   return { host, port };
 }
 
@@ -102,7 +183,7 @@ function validateOptionalStringArray(config: JsonRecord, key: string): void {
   }
 }
 
-function requirePort(value: unknown): number {
+function requirePort(value: unknown, key: string): number {
   if (
     typeof value !== "number" ||
     !Number.isInteger(value) ||
@@ -110,7 +191,30 @@ function requirePort(value: unknown): number {
     value > 65535
   ) {
     throw new ConfigurationError(
-      "bingo dapPort must be an integer between 1 and 65535",
+      `bingo ${key} must be an integer between 1 and 65535`,
+    );
+  }
+  return value;
+}
+
+function resolveBoundedInteger(
+  value: unknown,
+  defaultValue: number,
+  key: string,
+  minimum: number,
+  maximum: number,
+): number {
+  if (value === undefined) {
+    return defaultValue;
+  }
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < minimum ||
+    value > maximum
+  ) {
+    throw new ConfigurationError(
+      `bingo ${key} must be an integer between ${String(minimum)} and ${String(maximum)}`,
     );
   }
   return value;

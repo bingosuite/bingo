@@ -9,11 +9,31 @@ permissions:
   contents: read
 
 jobs:
-  validate:
-    name: Lint, test, and package
-    runs-on: ubuntu-latest
+  package:
+    name: Package ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: linux-x64
+            goos: linux
+            goarch: amd64
+          - runner: macos-14
+            target: darwin-arm64
+            goos: darwin
+            goarch: arm64
+
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+          cache: true
 
       - name: Set up Node
         uses: actions/setup-node@v4
@@ -22,14 +42,36 @@ jobs:
           cache: npm
           cache-dependency-path: editors/vscode/package-lock.json
 
-      - name: Install locked dependencies
+      - name: Confirm native package target
+        run: |
+          test "$(go env GOOS)" = "${{ matrix.goos }}"
+          test "$(go env GOARCH)" = "${{ matrix.goarch }}"
+          test "$(node -p 'process.platform + "/" + process.arch')" = "${{ matrix.goos }}/${{ matrix.target == 'linux-x64' && 'x64' || 'arm64' }}"
+
+      - name: Install locked dependencies without lifecycle scripts
         run: npm --prefix editors/vscode ci --ignore-scripts
 
-      - name: Validate extension
+      - name: Validate extension source
         run: npm --prefix editors/vscode run check
 
-      - name: Build VSIX
+      - name: Build reproducible native VSIX
         run: npm --prefix editors/vscode run package:reproducible
 
-      - name: Verify VSIX artifact
-        run: test -s dist/bingo.vsix
+      - name: Verify exact package contents
+        run: npm --prefix editors/vscode run package:verify
+
+      - name: Smoke packaged server health and idle exit
+        run: npm --prefix editors/vscode run smoke:server
+
+      - name: Print artifact hashes
+        run: shasum -a 256 "editors/vscode/bin/bingo" "dist/bingo-${{ matrix.target }}.vsix"
+
+      - name: Check generated outputs stay ignored
+        run: git diff --exit-code
+
+      - name: Upload platform VSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: bingo-${{ matrix.target }}
+          path: dist/bingo-${{ matrix.target }}.vsix
+          if-no-files-found: error

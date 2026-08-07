@@ -277,10 +277,11 @@ func TestLaunchIgnoresVSCodeEndpointFields(t *testing.T) {
 	hh.sendReq("initialize", initArgs())
 	_ = recvType[*godap.InitializeResponse](hh)
 
-	// dapHost and dapPort select the socket before DAP starts, but VS Code also
-	// leaves them in launch arguments. They must not alter the bingo command.
+	// Endpoint and lifecycle fields select or start the server before DAP begins,
+	// but VS Code also leaves them in launch arguments. They must not alter the
+	// bingo command.
 	hh.sendReq("launch", &godap.LaunchRequest{Arguments: json.RawMessage(
-		`{"program":"/bin/x","args":["one"],"env":["BINGO_TEST=1"],"dapHost":"localhost","dapPort":4711}`,
+		`{"program":"/bin/x","args":["one"],"env":["BINGO_TEST=1"],"serverMode":"auto","managementHost":"127.0.0.1","managementPort":6060,"dapHost":"127.0.0.1","dapPort":4711,"serverReadyTimeoutMs":5000,"managedIdleTimeoutMs":30000}`,
 	)})
 
 	cmd := hh.cmds.waitForCommand(t, protocol.CmdLaunch)

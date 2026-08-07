@@ -2,11 +2,11 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "bingo: build spawntree",
+      "label": "bingo: prepare F5",
       "type": "process",
       "command": "just",
       "args": [
-        "build-spawntree"
+        "vscode-dev"
       ],
       "problemMatcher": []
     }
