@@ -176,7 +176,8 @@ just vscode-package   # native reproducible package + content verification
 ```
 
 The repository's **bingo: prepare extension host** task runs `just vscode-dev`
-before **Run bingo extension**, staging the source extension's binary and bundle.
+before **Run bingo extension**, restoring the exact npm lockfile with lifecycle
+scripts disabled and then staging the source extension's binary and bundle.
 The normal spawntree F5 configuration uses the installed VSIX and runs only
 **bingo: build spawntree**, so target debugging does not rebuild or codesign the
 extension-local server. In the Extension Development Host, select the same

@@ -882,7 +882,9 @@ idle grace 30s. It health-checks before spawning and requires
 the expected DAP port/host (wildcard advertised hosts retain the configured
 connect host). Only connection refusal permits spawning; a non-bingo or
 incompatible occupant fails safely. `connectOnly` bypasses management and spawn
-for remote/custom workflows.
+for remote/custom workflows. Health reads have both response abort/error
+handling and an independent wall-clock deadline; readiness probes receive only
+the remaining overall budget, so a slow-drip HTTP peer cannot hold F5 open.
 
 One extension host coalesces in-flight ensures by normalized endpoint. Across
 hosts, listener binding arbitrates races: a child that loses is success if the
@@ -890,7 +892,10 @@ compatible winner becomes healthy before the deadline. The bundled child is
 spawned with argv (never a shell), detached/unref'd with ignored stdin and
 stdout/stderr inherited from a persistent extension-storage log file. The
 extension NEVER kills a server, including one it spawned; disposal only aborts
-bounded probes. Server-owned `-idle-timeout` is the sole teardown owner.
+bounded probes. Cancellation is rechecked after every awaited binary/log
+prerequisite and immediately before spawn, because a child started after
+deactivation cannot be reclaimed without violating the never-kill contract.
+Server-owned `-idle-timeout` is the sole teardown owner.
 
 VSIXes are platform-specific: `linux-x64` contains only linux/amd64 bingo;
 `darwin-arm64` contains only a `bingonative` arm64 binary codesigned with
@@ -902,10 +907,13 @@ tests drift-check service/API/wire constants against Go source and inspect exact
 archive contents, target metadata, architecture, mode, and entitlements.
 Normal repository `"type":"bingo"` F5 uses the installed VSIX and only rebuilds
 the target; source binary/build preparation belongs to the separate Extension
-Development Host task (`just vscode-dev`). The macOS packaging job may
-cross-build/sign/inspect darwin/arm64 on an Intel runner, but it must run the
-packaged-server smoke only when the runner is actually arm64; local Apple
-Silicon remains the native execution gate.
+Development Host task (`just vscode-dev`), which restores the exact npm lockfile
+with lifecycle scripts disabled before building. The macOS packaging job uses
+the supported `macos-15` arm64 image, asserts `uname -m`, and runs the real
+packaged-server smoke. That smoke observes server-owned idle exit on success;
+only its failure path may SIGKILL the exact detached process group it created,
+then it must await exit before deleting the extracted package. This cleanup
+helper is test-only and must never enter extension production code.
 Apple's external linker can vary `LC_UUID` even for identical cgo inputs, but
 current dyld rejects binaries with `-no_uuid`; `normalize-mach-o-uuid.mjs`
 therefore derives a stable UUID from the unsigned Mach-O with its UUID and
