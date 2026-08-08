@@ -53,9 +53,13 @@ function validateBuilder(target) {
     target === "darwin-arm64" &&
     process.platform === "darwin" &&
     process.arch === "x64";
-  if (!native && !darwinCrossBuild) {
+  const linuxCrossBuild =
+    target === "linux-x64" &&
+    process.platform === "darwin" &&
+    (process.arch === "arm64" || process.arch === "x64");
+  if (!native && !darwinCrossBuild && !linuxCrossBuild) {
     throw new Error(
-      `target ${target} requires ${details.platform}/${details.arch} or a darwin/x64 signing host, got ${process.platform}/${process.arch}`,
+      `target ${target} cannot be packaged from ${process.platform}/${process.arch}`,
     );
   }
 }

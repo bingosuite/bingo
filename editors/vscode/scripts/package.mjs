@@ -13,30 +13,50 @@ const outputDirectory = fileURLToPath(
   new URL("../../../dist/", import.meta.url),
 );
 const outputPath = join(outputDirectory, `bingo-${target}.vsix`);
+const scratch = join(
+  outputDirectory,
+  `.package-bingo-${target}-${String(process.pid)}`,
+);
 mkdirSync(outputDirectory, { recursive: true });
 rmSync(outputPath, { force: true });
+rmSync(scratch, { force: true, recursive: true });
+mkdirSync(scratch, { recursive: true });
+const buildEnvironment = {
+  ...process.env,
+  TMPDIR: scratch,
+  TMP: scratch,
+  TEMP: scratch,
+};
 
-run(process.execPath, [fileURLToPath(new URL("./prepare-binary.mjs", import.meta.url))]);
+try {
+  run(
+    process.execPath,
+    [fileURLToPath(new URL("./prepare-binary.mjs", import.meta.url))],
+    buildEnvironment,
+  );
 
-const vsce = fileURLToPath(
-  new URL("../node_modules/@vscode/vsce/vsce", import.meta.url),
-);
-run(
-  process.execPath,
-  [
-    vsce,
-    "package",
-    "--no-dependencies",
-    "--target",
-    target,
-    "--out",
-    outputPath,
-  ],
-  {
-    ...process.env,
-    SOURCE_DATE_EPOCH: "946684800",
-  },
-);
+  const vsce = fileURLToPath(
+    new URL("../node_modules/@vscode/vsce/vsce", import.meta.url),
+  );
+  run(
+    process.execPath,
+    [
+      vsce,
+      "package",
+      "--no-dependencies",
+      "--target",
+      target,
+      "--out",
+      outputPath,
+    ],
+    {
+      ...buildEnvironment,
+      SOURCE_DATE_EPOCH: "946684800",
+    },
+  );
+} finally {
+  rmSync(scratch, { force: true, recursive: true });
+}
 
 log(`Packaged ${outputPath}`);
 

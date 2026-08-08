@@ -12,7 +12,7 @@ jobs:
   package:
     name: Package ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 20
+    timeout-minutes: 35
     env:
       BINGO_VSCODE_TARGET: ${{ matrix.target }}
     strategy:
@@ -62,11 +62,30 @@ jobs:
       - name: Validate extension source
         run: npm --prefix editors/vscode run check
 
+      - name: Exercise activation, view, and custom-event acknowledgement
+        run: |
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            xvfb-run -a npm --prefix editors/vscode run test:integration
+          else
+            npm --prefix editors/vscode run test:integration
+          fi
+
       - name: Build reproducible native VSIX
         run: npm --prefix editors/vscode run package:reproducible
 
       - name: Verify exact package contents
         run: npm --prefix editors/vscode run package:verify
+
+      - name: Build progressive concurrency targets
+        run: just build-examples
+
+      - name: Exercise packaged DAP and concurrency UI data path
+        if: matrix.target == 'linux-x64' || runner.environment == 'self-hosted'
+        run: npm --prefix editors/vscode run e2e:packaged
+
+      - name: Explain hosted Darwin native-debug gate
+        if: matrix.target == 'darwin-arm64' && runner.environment != 'self-hosted'
+        run: echo "Packaged Darwin runtime execution requires a self-hosted Apple Silicon runner; compile, signature, entitlements, package, and Electron UI remain verified here."
 
       - name: Smoke packaged server health and idle exit
         if: matrix.target == 'linux-x64' || runner.arch == 'ARM64'

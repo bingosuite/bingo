@@ -1,14 +1,13 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import {
   chmod,
-  mkdtemp,
   mkdir,
   rm,
   stat,
   writeFile,
 } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
 
 import { resolveBundledBinary } from "../src/binary.js";
@@ -26,7 +25,13 @@ afterEach(async () => {
 async function extensionFixture(
   target = "darwin-arm64",
 ): Promise<{ readonly root: string; readonly binary: string }> {
-  const root = await mkdtemp(join(tmpdir(), "bingo-extension-"));
+  const root = resolve(
+    process.cwd(),
+    "dist",
+    "test-artifacts",
+    `bingo-extension-${randomUUID()}`,
+  );
+  await mkdir(root, { recursive: true });
   temporaryDirectories.push(root);
   const bin = join(root, "bin");
   await mkdir(bin);

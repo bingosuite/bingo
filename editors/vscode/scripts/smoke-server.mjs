@@ -1,6 +1,6 @@
 import {
   closeSync,
-  mkdtempSync,
+  mkdirSync,
   openSync,
   rmSync,
 } from "node:fs";
@@ -8,8 +8,8 @@ import { Buffer } from "node:buffer";
 import { log } from "node:console";
 import { request } from "node:http";
 import { createServer } from "node:net";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
+import process from "node:process";
 import { setTimeout } from "node:timers";
 import { fileURLToPath, URL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
@@ -22,7 +22,15 @@ const target = currentTarget();
 const vsix = fileURLToPath(
   new URL(`../../../dist/bingo-${target}.vsix`, import.meta.url),
 );
-const extracted = mkdtempSync(join(tmpdir(), "bingo-smoke-"));
+const outputDirectory = fileURLToPath(
+  new URL("../../../dist/", import.meta.url),
+);
+const extracted = join(
+  outputDirectory,
+  `.smoke-bingo-${target}-${String(process.pid)}`,
+);
+rmSync(extracted, { force: true, recursive: true });
+mkdirSync(extracted, { recursive: true });
 const idleTimeoutMs = 2000;
 let child;
 let exit;

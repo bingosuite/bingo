@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdir, rm } from "node:fs/promises";
+import { join, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import type {
   ChildProcess,
@@ -23,7 +23,13 @@ afterEach(async () => {
 
 describe("detached server process", () => {
   it("uses argv without a shell, detaches, logs through files, and only unrefs", async () => {
-    const root = await mkdtemp(join(tmpdir(), "bingo-process-"));
+    const root = resolve(
+      process.cwd(),
+      "dist",
+      "test-artifacts",
+      `bingo-process-${randomUUID()}`,
+    );
+    await mkdir(root, { recursive: true });
     temporaryDirectories.push(root);
     const child = new EventEmitter() as ChildProcess & {
       unrefCalled?: boolean;

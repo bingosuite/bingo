@@ -1,8 +1,8 @@
 {
   "name": "bingo",
   "displayName": "bingo Debugger",
-  "description": "Connect VS Code's Debug UI to bingo, reusing or starting a managed local server.",
-  "version": "0.2.0",
+  "description": "Debug Go concurrency with bingo's DAP adapter and live goroutine visualization.",
+  "version": "0.3.0",
   "publisher": "bingosuite",
   "license": "MIT",
   "private": true,
@@ -30,7 +30,8 @@
   },
   "main": "./dist/extension.js",
   "activationEvents": [
-    "onDebugResolve:bingo"
+    "onDebug",
+    "onView:bingo.concurrency"
   ],
   "capabilities": {
     "untrustedWorkspaces": {
@@ -39,6 +40,69 @@
     }
   },
   "contributes": {
+    "commands": [
+      {
+        "command": "bingo.concurrency.refresh",
+        "title": "Bingo: Refresh Concurrency Snapshot",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "bingo.concurrency.selectSession",
+        "title": "Bingo: Select Concurrency Session"
+      },
+      {
+        "command": "bingo.concurrency.fit",
+        "title": "Bingo: Fit Concurrency Tree",
+        "icon": "$(screen-full)"
+      },
+      {
+        "command": "bingo.concurrency.copySnapshot",
+        "title": "Bingo: Copy Concurrency Snapshot"
+      }
+    ],
+    "configuration": {
+      "title": "Bingo",
+      "properties": {
+        "bingo.concurrency.autoReveal": {
+          "type": "boolean",
+          "default": true,
+          "description": "Reveal Bingo Concurrency when the first debug session publishes its telemetry session."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "bingo",
+          "title": "Bingo",
+          "icon": "media/bingo-activity.svg"
+        }
+      ]
+    },
+    "views": {
+      "bingo": [
+        {
+          "id": "bingo.concurrency",
+          "name": "Bingo Concurrency",
+          "type": "webview",
+          "contextualTitle": "Bingo Concurrency"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "bingo.concurrency.refresh",
+          "when": "view == bingo.concurrency",
+          "group": "navigation@1"
+        },
+        {
+          "command": "bingo.concurrency.fit",
+          "when": "view == bingo.concurrency",
+          "group": "navigation@2"
+        }
+      ]
+    },
     "breakpoints": [
       {
         "language": "go"
@@ -293,27 +357,37 @@
   },
   "scripts": {
     "binary:prepare": "node ./scripts/prepare-binary.mjs",
-    "build": "node ./scripts/clean.mjs && esbuild ./src/extension.ts --bundle --tsconfig=./tsconfig.json --external:vscode --format=cjs --platform=node --target=node18 --outfile=dist/extension.js",
+    "build": "node ./scripts/clean.mjs && esbuild ./src/extension.ts --bundle --tsconfig=./tsconfig.json --external:vscode --format=cjs --platform=node --target=node18 --outfile=dist/extension.js && esbuild ./src/webview.ts --bundle --tsconfig=./tsconfig.json --format=iife --platform=browser --target=es2022 --outfile=dist/webview.js && esbuild ./test/vscodeIntegration.ts --bundle --tsconfig=./tsconfig.json --external:vscode --format=cjs --platform=node --target=node18 --outfile=dist/test/vscodeIntegration.js",
     "check": "npm run lint && npm run typecheck && npm test && npm run build && npm run package:list",
+    "e2e:packaged": "tsx ./test/packagedE2E.ts",
     "lint": "eslint src test scripts",
     "package": "node ./scripts/package.mjs",
     "package:list": "vsce ls --tree",
     "package:reproducible": "node ./scripts/verify-reproducible.mjs",
     "package:verify": "node ./scripts/verify-package.mjs",
     "smoke:server": "node ./scripts/smoke-server.mjs",
-    "test": "tsx --test test/**/*.test.ts",
+    "test": "npm run test:unit",
+    "test:dom": "tsx --test ./test/webviewDom.test.ts",
+    "test:integration": "npm run build && node ./scripts/run-vscode-integration.mjs",
+    "test:unit": "tsx --test test/**/*.test.ts",
     "typecheck": "tsc --noEmit",
     "vscode:prepublish": "npm run build"
+  },
+  "dependencies": {
+    "ws": "8.18.3"
   },
   "devDependencies": {
     "@eslint/js": "9.39.5",
     "@types/node": "22.20.1",
     "@types/vscode": "1.85.0",
+    "@types/ws": "8.18.1",
+    "@vscode/test-electron": "3.1.0",
     "@vscode/vsce": "3.9.2",
     "esbuild": "0.28.1",
     "eslint": "9.39.5",
     "tsx": "4.23.9",
     "typescript": "5.9.3",
+    "linkedom": "0.18.12",
     "typescript-eslint": "8.66.0"
   },
   "packageManager": "npm@10.9.3"
