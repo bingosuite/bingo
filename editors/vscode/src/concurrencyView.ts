@@ -92,7 +92,12 @@ export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
         this.#sendFit();
         break;
       case "rendered":
-        if (this.#delivery.acknowledge(message.revision)) {
+        if (
+          this.#delivery.acknowledge({
+            generation: message.generation,
+            revision: message.revision,
+          })
+        ) {
           this.#render();
         }
         break;
@@ -135,6 +140,7 @@ export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
     void view.webview
       .postMessage({
         type: "render",
+        generation: delivery.generation,
         revision,
         model: this.#model,
       })

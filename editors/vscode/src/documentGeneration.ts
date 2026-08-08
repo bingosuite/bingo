@@ -50,11 +50,11 @@ export class WebviewDeliveryState {
     return true;
   }
 
-  public acknowledge(revision: number): boolean {
-    if (revision !== this.#inFlightRevision) {
+  public acknowledge(token: DeliveryToken): boolean {
+    if (!this.#matches(token)) {
       return false;
     }
-    this.#lastRenderedRevision = revision;
+    this.#lastRenderedRevision = token.revision;
     this.#inFlightRevision = -1;
     return true;
   }

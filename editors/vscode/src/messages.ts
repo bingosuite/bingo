@@ -3,6 +3,7 @@ import type { ConcurrencyViewModel } from "./model.js";
 export type HostMessage =
   | {
       readonly type: "render";
+      readonly generation: number;
       readonly revision: number;
       readonly model: ConcurrencyViewModel;
     }
@@ -10,7 +11,11 @@ export type HostMessage =
 
 export type WebviewMessage =
   | { readonly type: "ready" }
-  | { readonly type: "rendered"; readonly revision: number }
+  | {
+      readonly type: "rendered";
+      readonly generation: number;
+      readonly revision: number;
+    }
   | { readonly type: "selectGoroutine"; readonly id: number }
   | { readonly type: "selectSession"; readonly id: string }
   | { readonly type: "refresh" }
@@ -33,9 +38,10 @@ export function decodeWebviewMessage(value: unknown): WebviewMessage {
       exactKeys(message, ["type"]);
       return { type: message.type };
     case "rendered":
-      exactKeys(message, ["type", "revision"]);
+      exactKeys(message, ["type", "generation", "revision"]);
       return {
         type: "rendered",
+        generation: safeInteger(message.generation, "generation", 1),
         revision: safeInteger(message.revision, "revision", 0),
       };
     case "selectGoroutine":
