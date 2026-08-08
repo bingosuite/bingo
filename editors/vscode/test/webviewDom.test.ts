@@ -88,6 +88,42 @@ describe("concurrency webview DOM", () => {
     assert.deepEqual(messages.at(-1), { type: "selectGoroutine", id: 2 });
   });
 
+  it("moves DOM focus with keyboard tree selection", () => {
+    const { document, window } = parseHTML(
+      "<html><body><div id=app></div></body></html>",
+    );
+    const messages: Record<string, unknown>[] = [];
+    mountConcurrencyView(document, {
+      postMessage: (message) => messages.push(message),
+    })(model());
+    const first = document.querySelector<SVGGElement>('[data-goid="1"]')!;
+    const second = document.querySelector<SVGGElement>('[data-goid="2"]')!;
+    let focused = "";
+    Object.defineProperty(first, "focus", {
+      value: () => {
+        focused = "1";
+      },
+    });
+    Object.defineProperty(second, "focus", {
+      value: () => {
+        focused = "2";
+      },
+    });
+    first.focus();
+    const event = new window.Event("keydown", {
+      bubbles: true,
+      cancelable: true,
+    });
+    Object.defineProperty(event, "key", { value: "ArrowDown" });
+    first.dispatchEvent(event);
+
+    assert.equal(focused, "2");
+    assert.deepEqual(messages.at(-1), {
+      type: "selectGoroutine",
+      id: 2,
+    });
+  });
+
   it("keeps matching descendants connected to visible ancestors", () => {
     const { document, window } = parseHTML("<html><body><div id=app></div></body></html>");
     const nested = snapshot([

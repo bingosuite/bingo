@@ -364,6 +364,11 @@ function renderGraph(
     const direction = event.key === "ArrowDown" || event.key === "ArrowRight" ? 1 : -1;
     const next = visible[(current + direction + visible.length) % visible.length];
     if (next !== undefined) {
+      scene
+        .querySelector<SVGGElement>(
+          `[data-goid="${String(next.goroutine.id)}"]`,
+        )
+        ?.focus();
       host.postMessage({ type: "selectGoroutine", id: next.goroutine.id });
     }
   });
