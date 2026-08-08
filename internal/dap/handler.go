@@ -29,6 +29,18 @@ const cmdBufferSize = 64
 // genuinely wedged, so send() tears the connection down.
 const dapWriteTimeout = 10 * time.Second
 
+const sessionEventName = "bingo/session/v1"
+
+type sessionEvent struct {
+	godap.Event
+	Body sessionEventBody `json:"body"`
+}
+
+type sessionEventBody struct {
+	Version   int    `json:"version"`
+	SessionID string `json:"sessionId"`
+}
+
 // Handler bridges one DAP TCP client to a bingo hub session. It implements
 // hub.WSConn: the hub's write pump feeds it bingo events via WriteMessage
 // (translated to DAP), and the hub's read pump pulls bingo commands from it via
@@ -60,6 +72,9 @@ type Handler struct {
 
 	session Session
 	client  *hub.Client
+
+	sessionStarting  bool
+	sessionAnnounced bool
 
 	// Handshake / lifecycle flags.
 	launching   bool
