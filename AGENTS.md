@@ -1004,10 +1004,13 @@ because a hidden non-retained webview may have discarded its prior delivery;
 otherwise the host can wait forever for an acknowledgement from a dead document.
 Preserve the strict nonce CSP, `dist`-only `localResourceRoots`,
 DOM/textContent rendering, deterministic capped cycle-safe tree, bounded
-lifecycle history, and multi-session selector. Filtering re-lays out a bounded
-matching subtree (match plus at most four ancestors) and resets fit so a deep
-match cannot remain subpixel in the original 500-node viewBox. SVG treeitems
-carry `aria-level`, sibling position/size, selection, and parent context.
+lifecycle history, and multi-session selector. Filtering searches the full
+validated snapshot (up to the protocol's 5,000-goroutine bound) before applying
+the 500-node rendering cap, re-lays out each match with at most four ancestors,
+and resets fit so a deep or previously capped match cannot remain invisible.
+Empty results keep Fit/zoom callbacks safe even without an SVG scene. SVG
+treeitems carry `aria-level`, sibling position/size, selection, and parent
+context; arrow navigation moves DOM focus with selection.
 
 ### Handshake (Delve-style, VS Code-compatible)
 

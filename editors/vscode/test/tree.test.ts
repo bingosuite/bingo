@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
 import {
+  filterFullTree,
   filterTree,
   layoutSpawnTree,
   maximumFilterAncestorDepth,
@@ -78,5 +79,23 @@ describe("spawn tree", () => {
     );
     assert.equal(filtered.width, 1142);
     assert.equal(filtered.height, 496);
+  });
+
+  it("finds matches beyond the rendering cap from the full snapshot", () => {
+    const input = Array.from({ length: 1000 }, (_, index) =>
+      goroutine(index + 1, index, {
+        waitReason: index === 999 ? "needle" : "waiting",
+      }),
+    );
+    const capped = layoutSpawnTree(input);
+    assert.equal(capped.nodes.some((node) => node.goroutine.id === 1000), false);
+
+    const filtered = filterFullTree(capped, "needle", input);
+    assert.deepEqual(
+      filtered.nodes.map((node) => node.goroutine.id),
+      [996, 997, 998, 999, 1000],
+    );
+    assert.equal(filtered.nodes.at(-1)?.goroutine.waitReason, "needle");
+    assert.equal(filtered.omitted, 995);
   });
 });

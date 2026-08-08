@@ -77,7 +77,9 @@ in the selector; the status bar shows active goroutine/thread counts.
 
 - Pan, zoom, fit, search, and keyboard arrows navigate the deterministic spawn
   tree. Parent links, current state, status, and thread badges remain stable
-  across updates, including missing-parent and cyclic runtime data.
+  across updates, including missing-parent and cyclic runtime data. Search runs
+  against the full validated snapshot before the 500-node rendering cap, then
+  fits a bounded match/ancestor layout.
 - Selecting a goroutine shows wait reason, thread, and current/start/creation
   source locations. Thread cards and a bounded created/exited timeline provide
   physical and lifecycle context.
@@ -94,6 +96,8 @@ once. Disable it to keep the view in the background. Connection, degraded,
 empty, sequence-gap, and error states remain visible. Rendering uses a strict
 nonce CSP, local bundles only, DOM `textContent` for tracee strings, VS Code
 theme/high-contrast colors, labelled controls, and keyboard selection.
+Treeitems expose hierarchy level, parent context, sibling position, selection,
+and synchronized keyboard focus to assistive technology.
 
 ## Configurations
 
