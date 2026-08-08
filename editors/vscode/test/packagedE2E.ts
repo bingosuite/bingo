@@ -23,12 +23,7 @@ import {
 } from "../src/sessionEvent.js";
 
 const repositoryRoot = resolve(process.cwd(), "../..");
-const target =
-  process.platform === "darwin" && process.arch === "arm64"
-    ? "darwin-arm64"
-    : process.platform === "linux" && process.arch === "x64"
-      ? "linux-x64"
-      : undefined;
+const target = packageTarget();
 if (target === undefined) {
   throw new Error(`unsupported packaged E2E host ${process.platform}/${process.arch}`);
 }
@@ -40,6 +35,16 @@ const examples = [
   { name: "level4-pipeline", line: 43, minimumDepth: 1 },
   { name: "level5-workflow", line: 83, minimumDepth: 2 },
 ] as const;
+
+function packageTarget(): "darwin-arm64" | "linux-x64" | undefined {
+  if (process.platform === "darwin" && process.arch === "arm64") {
+    return "darwin-arm64";
+  }
+  if (process.platform === "linux" && process.arch === "x64") {
+    return "linux-x64";
+  }
+  return undefined;
+}
 
 void main().catch((error: unknown) => {
   process.stderr.write(

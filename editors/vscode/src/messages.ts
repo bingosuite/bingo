@@ -19,11 +19,11 @@ export type WebviewMessage =
 
 export function decodeWebviewMessage(value: unknown): WebviewMessage {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("webview message must be an object");
+    throw new TypeError("webview message must be an object");
   }
   const message = value as Record<string, unknown>;
   if (typeof message.type !== "string") {
-    throw new Error("webview message requires a type");
+    throw new TypeError("webview message requires a type");
   }
   switch (message.type) {
     case "ready":
@@ -51,14 +51,16 @@ export function decodeWebviewMessage(value: unknown): WebviewMessage {
         message.id.length === 0 ||
         message.id.length > 256
       ) {
-        throw new Error("debug session id must be a bounded non-empty string");
+        throw new TypeError("debug session id must be a bounded non-empty string");
       }
       return {
         type: "selectSession",
         id: message.id,
       };
     default:
-      throw new Error(`unknown webview message ${JSON.stringify(message.type)}`);
+      throw new TypeError(
+        `unknown webview message ${JSON.stringify(message.type)}`,
+      );
   }
 }
 
@@ -66,13 +68,17 @@ function exactKeys(
   value: Record<string, unknown>,
   expected: readonly string[],
 ): void {
-  const actual = Object.keys(value).sort();
-  const wanted = [...expected].sort();
+  const actual = Object.keys(value).sort((left, right) =>
+    left.localeCompare(right),
+  );
+  const wanted = [...expected].sort((left, right) =>
+    left.localeCompare(right),
+  );
   if (
     actual.length !== wanted.length ||
     actual.some((key, index) => key !== wanted[index])
   ) {
-    throw new Error("webview message has unexpected fields");
+    throw new TypeError("webview message has unexpected fields");
   }
 }
 
@@ -82,7 +88,9 @@ function safeInteger(value: unknown, label: string, minimum: number): number {
     !Number.isSafeInteger(value) ||
     value < minimum
   ) {
-    throw new Error(`${label} must be a safe integer >= ${String(minimum)}`);
+    throw new TypeError(
+      `${label} must be a safe integer >= ${String(minimum)}`,
+    );
   }
   return value;
 }

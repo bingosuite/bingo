@@ -353,26 +353,44 @@ function validatePayloadValue(
     return;
   }
   if (Array.isArray(value)) {
-    if (value.length > maximumGoroutines) {
-      throw new Error(`${label} payload array is too large`);
-    }
-    for (const item of value) {
-      validatePayloadValue(item, label, depth + 1, budget);
-    }
+    validatePayloadArray(value, label, depth, budget);
     return;
   }
   if (value !== null && typeof value === "object") {
-    const entries = Object.entries(value);
-    if (entries.length > 128) {
-      throw new Error(`${label} payload object has too many fields`);
-    }
-    for (const [key, item] of entries) {
-      boundedString(key, `${label} field name`);
-      validatePayloadValue(item, label, depth + 1, budget);
-    }
+    validatePayloadObject(value, label, depth, budget);
     return;
   }
-  throw new Error(`${label} payload contains an unsupported value`);
+  throw new TypeError(`${label} payload contains an unsupported value`);
+}
+
+function validatePayloadArray(
+  value: readonly unknown[],
+  label: string,
+  depth: number,
+  budget: { remaining: number },
+): void {
+  if (value.length > maximumGoroutines) {
+    throw new Error(`${label} payload array is too large`);
+  }
+  for (const item of value) {
+    validatePayloadValue(item, label, depth + 1, budget);
+  }
+}
+
+function validatePayloadObject(
+  value: object,
+  label: string,
+  depth: number,
+  budget: { remaining: number },
+): void {
+  const entries = Object.entries(value);
+  if (entries.length > 128) {
+    throw new Error(`${label} payload object has too many fields`);
+  }
+  for (const [key, item] of entries) {
+    boundedString(key, `${label} field name`);
+    validatePayloadValue(item, label, depth + 1, budget);
+  }
 }
 
 function decodeIDs(value: unknown, label: string): readonly number[] {
@@ -413,7 +431,7 @@ function boundedArray(
   maximum: number,
 ): unknown[] {
   if (!Array.isArray(value)) {
-    throw new Error(`${label} must be an array`);
+    throw new TypeError(`${label} must be an array`);
   }
   if (value.length > maximum) {
     throw new Error(`${label} exceeds the ${String(maximum)} item limit`);
@@ -423,7 +441,7 @@ function boundedArray(
 
 function boundedString(value: unknown, label: string): string {
   if (typeof value !== "string") {
-    throw new Error(`${label} must be a string`);
+    throw new TypeError(`${label} must be a string`);
   }
   if (value.length > maximumStringLength) {
     throw new Error(`${label} exceeds ${String(maximumStringLength)} characters`);
@@ -441,7 +459,9 @@ function integer(value: unknown, label: string, minimum: number): number {
     !Number.isSafeInteger(value) ||
     value < minimum
   ) {
-    throw new Error(`${label} must be a safe integer >= ${String(minimum)}`);
+    throw new TypeError(
+      `${label} must be a safe integer >= ${String(minimum)}`,
+    );
   }
   return value;
 }
@@ -455,14 +475,14 @@ function optionalBoolean(value: unknown, label: string): boolean {
     return false;
   }
   if (typeof value !== "boolean") {
-    throw new Error(`${label} must be a boolean`);
+    throw new TypeError(`${label} must be a boolean`);
   }
   return value;
 }
 
 function record(value: unknown, label: string): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error(`${label} must be an object`);
+    throw new TypeError(`${label} must be an object`);
   }
   return value as Record<string, unknown>;
 }

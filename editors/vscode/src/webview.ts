@@ -9,6 +9,9 @@ const vscode = acquireVsCodeApi();
 const render = mountConcurrencyView(document, vscode);
 
 window.addEventListener("message", (event: MessageEvent<unknown>) => {
+  if (event.origin !== window.location.origin) {
+    return;
+  }
   if (isFitMessage(event.data)) {
     document.querySelector<HTMLButtonElement>(".graph-controls button")?.click();
     return;
