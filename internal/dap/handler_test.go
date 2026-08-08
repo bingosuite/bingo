@@ -67,6 +67,10 @@ type fakeSession struct {
 	cmds    *cmdRecorder
 	welcome protocol.SessionState
 	addErr  error
+
+	addStarted chan struct{}
+	allowAdd   <-chan struct{}
+	addOnce    sync.Once
 }
 
 func (s *fakeSession) SessionID() string { return s.id }
@@ -76,6 +80,12 @@ func (s *fakeSession) SessionID() string { return s.id }
 // handler's enqueued commands. The handler never calls methods on the
 // *hub.Client it stores.
 func (s *fakeSession) AddClient(conn hub.WSConn, _ *slog.Logger) (*hub.Client, error) {
+	if s.addStarted != nil {
+		s.addOnce.Do(func() { close(s.addStarted) })
+	}
+	if s.allowAdd != nil {
+		<-s.allowAdd
+	}
 	if s.addErr != nil {
 		_ = conn.Close()
 		return nil, s.addErr
@@ -99,16 +109,29 @@ func (s *fakeSession) AddClient(conn hub.WSConn, _ *slog.Logger) (*hub.Client, e
 			if err != nil {
 				return
 			}
-			s.cmds.add(data)
+			if s.cmds != nil {
+				s.cmds.add(data)
+			}
 		}
 	}()
 	return nil, nil
 }
 
-type fakeProvider struct{ sess *fakeSession }
+type fakeProvider struct {
+	sess      *fakeSession
+	createErr error
+}
 
-func (p *fakeProvider) CreateSession() (Session, error)   { return p.sess, nil }
-func (p *fakeProvider) GetSession(string) (Session, bool) { return p.sess, true }
+func (p *fakeProvider) CreateSession() (Session, error) {
+	if p.createErr != nil {
+		return nil, p.createErr
+	}
+	return p.sess, nil
+}
+
+func (p *fakeProvider) GetSession(string) (Session, bool) {
+	return p.sess, p.sess != nil
+}
 
 func TestStartSessionRejectsClosedHub(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
@@ -128,7 +151,7 @@ func TestStartSessionRejectsClosedHub(t *testing.T) {
 	}
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
-	if handler.session != nil || handler.client != nil {
+	if handler.session != nil || handler.client != nil || handler.sessionStarting || handler.sessionAnnounced {
 		t.Fatal("rejected session was retained by DAP handler")
 	}
 }
@@ -140,6 +163,7 @@ type harness struct {
 	handler *Handler
 	client  net.Conn
 	reader  *bufio.Reader
+	codec   *godap.Codec
 	cmds    *cmdRecorder
 	seq     int
 }
@@ -152,14 +176,18 @@ func newHarness(t *testing.T) *harness {
 // welcome state to a newly-added client (the empty string sends none).
 func newHarnessWelcome(t *testing.T, welcome protocol.SessionState) *harness {
 	t.Helper()
+	rec := &cmdRecorder{}
+	prov := &fakeProvider{sess: &fakeSession{id: "sess-test", cmds: rec, welcome: welcome}}
+	return newHarnessProvider(t, prov, rec)
+}
+
+func newHarnessProvider(t *testing.T, prov Provider, rec *cmdRecorder) *harness {
+	t.Helper()
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
-
-	rec := &cmdRecorder{}
-	prov := &fakeProvider{sess: &fakeSession{id: "sess-test", cmds: rec, welcome: welcome}}
 
 	accepted := make(chan net.Conn, 1)
 	go func() {
@@ -179,12 +207,17 @@ func newHarnessWelcome(t *testing.T, welcome protocol.SessionState) *harness {
 	h := NewHandler(serverConn, prov, slog.New(slog.NewTextHandler(nopWriter{}, nil)))
 	go h.Serve()
 
+	codec := godap.NewCodec()
+	if err := codec.RegisterEvent(sessionEventName, func() godap.Message { return new(sessionEvent) }); err != nil {
+		t.Fatal(err)
+	}
+
 	t.Cleanup(func() {
 		_ = client.Close()
 		_ = h.Close()
 	})
 
-	return &harness{t: t, handler: h, client: client, reader: bufio.NewReader(client), cmds: rec}
+	return &harness{t: t, handler: h, client: client, reader: bufio.NewReader(client), codec: codec, cmds: rec}
 }
 
 type nopWriter struct{}
@@ -209,7 +242,11 @@ func (hh *harness) sendReq(command string, m godap.RequestMessage) int {
 func (hh *harness) recv() godap.Message {
 	hh.t.Helper()
 	_ = hh.client.SetReadDeadline(time.Now().Add(2 * time.Second))
-	m, err := godap.ReadProtocolMessage(hh.reader)
+	data, err := godap.ReadBaseMessage(hh.reader)
+	if err != nil {
+		hh.t.Fatalf("recv: %v", err)
+	}
+	m, err := hh.codec.DecodeMessage(data)
 	if err != nil {
 		hh.t.Fatalf("recv: %v", err)
 	}
@@ -270,6 +307,144 @@ func (hh *harness) doHandshake(t *testing.T) {
 	hh.cmds.waitForCommand(t, protocol.CmdContinue)
 	// Suppress our own continue.
 	hh.inject(protocol.EventContinued, protocol.ContinuedPayload{})
+}
+
+func TestLaunchAnnouncesManagedSessionAfterClientAttach(t *testing.T) {
+	rec := &cmdRecorder{}
+	addStarted := make(chan struct{})
+	allowAdd := make(chan struct{})
+	prov := &fakeProvider{sess: &fakeSession{
+		id:         "sess-launch",
+		cmds:       rec,
+		addStarted: addStarted,
+		allowAdd:   allowAdd,
+	}}
+	hh := newHarnessProvider(t, prov, rec)
+
+	hh.sendReq("initialize", initArgs())
+	_ = recvType[*godap.InitializeResponse](hh)
+	hh.sendReq("launch", &godap.LaunchRequest{Arguments: json.RawMessage(`{"program":"/bin/x"}`)})
+
+	select {
+	case <-addStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("AddClient was not called")
+	}
+	_ = hh.client.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	if _, err := hh.reader.Peek(1); err == nil {
+		t.Fatal("session event arrived before AddClient returned")
+	} else if nerr, ok := err.(net.Error); !ok || !nerr.Timeout() {
+		t.Fatalf("peek before AddClient returned: %v", err)
+	}
+	_ = hh.client.SetReadDeadline(time.Time{})
+
+	close(allowAdd)
+	event := recvType[*sessionEvent](hh)
+	if event.Body != (sessionEventBody{Version: 1, SessionID: "sess-launch"}) {
+		t.Fatalf("session event body = %+v", event.Body)
+	}
+	wire, err := json.Marshal(event)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = `{"seq":2,"type":"event","event":"bingo/session/v1","body":{"version":1,"sessionId":"sess-launch"}}`
+	if string(wire) != want {
+		t.Fatalf("session event JSON = %s, want %s", wire, want)
+	}
+
+	console := recvType[*godap.OutputEvent](hh)
+	if console.Body.Category != "console" ||
+		console.Body.Output != "bingo session sess-launch ready — observers can join with ?session=sess-launch\n" {
+		t.Fatalf("console announcement = %+v", console.Body)
+	}
+	hh.cmds.waitForCommand(t, protocol.CmdLaunch)
+}
+
+func TestJoinAnnouncesManagedSession(t *testing.T) {
+	hh := newHarness(t)
+	hh.sendReq("initialize", initArgs())
+	_ = recvType[*godap.InitializeResponse](hh)
+
+	hh.sendReq("attach", &godap.AttachRequest{Arguments: json.RawMessage(`{"session":"sess-test"}`)})
+	event := recvType[*sessionEvent](hh)
+	if event.Event.Event != sessionEventName {
+		t.Fatalf("event name = %q, want %q", event.Event.Event, sessionEventName)
+	}
+	if event.Body != (sessionEventBody{Version: 1, SessionID: "sess-test"}) {
+		t.Fatalf("session event body = %+v", event.Body)
+	}
+	_ = recvType[*godap.OutputEvent](hh)
+	_ = recvType[*godap.InitializedEvent](hh)
+}
+
+func TestSessionAnnouncementIsSingleWinnerUnderRace(t *testing.T) {
+	hh := newHarness(t)
+
+	const attempts = 32
+	start := make(chan struct{})
+	errs := make(chan error, attempts)
+	var starts sync.WaitGroup
+	for range attempts {
+		starts.Add(1)
+		go func() {
+			defer starts.Done()
+			<-start
+			errs <- hh.handler.startSession("")
+		}()
+	}
+	close(start)
+	starts.Wait()
+	close(errs)
+
+	successes := 0
+	for err := range errs {
+		if err == nil {
+			successes++
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("successful concurrent starts = %d, want 1", successes)
+	}
+
+	var announcements sync.WaitGroup
+	for range attempts {
+		announcements.Add(1)
+		go func() {
+			defer announcements.Done()
+			hh.handler.announceSession()
+		}()
+	}
+	event := recvType[*sessionEvent](hh)
+	if event.Body.SessionID != "sess-test" {
+		t.Fatalf("session id = %q, want sess-test", event.Body.SessionID)
+	}
+	_ = recvType[*godap.OutputEvent](hh)
+	announcements.Wait()
+
+	_ = hh.client.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	if _, err := hh.reader.Peek(1); err == nil {
+		t.Fatal("duplicate session announcement received")
+	} else if nerr, ok := err.(net.Error); !ok || !nerr.Timeout() {
+		t.Fatalf("peek after announcements: %v", err)
+	}
+}
+
+func TestSessionEventNotEmittedWhenCreationFails(t *testing.T) {
+	hh := newHarnessProvider(t, &fakeProvider{createErr: errors.New("create failed")}, &cmdRecorder{})
+	hh.sendReq("initialize", initArgs())
+	_ = recvType[*godap.InitializeResponse](hh)
+
+	hh.sendReq("launch", &godap.LaunchRequest{Arguments: json.RawMessage(`{"program":"/bin/x"}`)})
+	resp := recvType[*godap.ErrorResponse](hh)
+	if resp.Success || resp.Command != "launch" {
+		t.Fatalf("launch response = %+v", resp.Response)
+	}
+	_ = hh.client.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	if _, err := hh.reader.Peek(1); err == nil {
+		t.Fatal("session event emitted after failed creation")
+	} else if nerr, ok := err.(net.Error); !ok || !nerr.Timeout() {
+		t.Fatalf("peek after failed creation: %v", err)
+	}
 }
 
 func TestLaunchIgnoresVSCodeEndpointFields(t *testing.T) {
