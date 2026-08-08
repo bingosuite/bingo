@@ -112,7 +112,7 @@ Build and install the repository's companion extension:
 just vscode-install
 ```
 
-The managed-server/autostart runtime requires extension version **0.2.0 or
+The graphical concurrency runtime requires extension version **0.3.0 or
 newer**. After installing or updating the VSIX, run **Developer: Reload Window**
 once so the current extension host activates the new bundle.
 
@@ -155,6 +155,13 @@ from a terminal with
 `code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"`.
 Compatible manually-started servers remain supported and are reused.
 
+The **Bingo Concurrency** Activity Bar view is included in extension 0.3.0.
+Press F5, choose one of the five progressive examples, and the view
+automatically follows the exact DAP-created session over WebSocket—no session
+ID copy is needed. It visualizes the goroutine spawn tree, OS threads, current
+goroutine, source locations, and bounded created/exited timeline while keeping
+all run control in VS Code's Debug UI.
+
 Other DAP clients can point at `127.0.0.1:4711`. The DAP client creates a
 managed session on `launch`/`attach`; WebSocket observers join that same session
 via `/ws?session=<id>` (the id is discoverable through `/api/sessions`, and the
@@ -180,8 +187,8 @@ with the announced session id.
 Alongside the DAP debug loop, BinGo streams **concurrency telemetry** over its
 native WebSocket protocol — a goroutine spawn hierarchy (parent/child linkage),
 the live OS-thread set, and per-stop created/exited goroutine lifecycle deltas —
-so any UI can build a concurrency view on top of the data. `cmd/wsmon` is a
-read-only terminal observer that joins a session and live-renders these streams:
+so UIs can build concurrency views on top of the data. The VS Code extension
+joins automatically; `cmd/wsmon` remains the read-only terminal fallback:
 
 ```sh
 go run ./cmd/wsmon -session <id>  # connects to -addr localhost:6060 by default

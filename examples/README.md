@@ -27,7 +27,9 @@ In VS Code, install the bingo extension, choose **bingo DAP: launch example
 (stop on entry)**, press F5, and select a level from the picker. The pre-launch
 task rebuilds all five binaries in `build/examples/` with
 `-gcflags="all=-N -l"`. The only other root debug configuration joins an
-existing bingo session.
+existing bingo session. **Bingo Concurrency** automatically joins the selected
+DAP session and makes the increasing hierarchy visible from level 1's single
+application goroutine through level 5's nested workflows and stages.
 
 For a terminal-only DAP session, start `just server`, run `just dapcli`, and
 launch a selected binary:
@@ -38,10 +40,10 @@ break examples/level3-worker-pool/main.go:20
 c
 ```
 
-Join the reported session with `go run ./cmd/wsmon -session <id>` to watch
-goroutine snapshots while DAP drives execution. Concurrent worker and workflow
-status lines can interleave differently between runs, but every level's final
-summary is sorted or otherwise deterministic.
+The graphical view requires no session-id copy. For a terminal-only observer,
+join the reported session with `go run ./cmd/wsmon -session <id>`. Concurrent
+worker and workflow status lines can interleave differently between runs, but
+every level's final summary is sorted or otherwise deterministic.
 
 [`spawntree`](spawntree/) remains the dedicated advanced hierarchy and lifecycle
 telemetry demo. Build it separately with `just build-spawntree` and follow
