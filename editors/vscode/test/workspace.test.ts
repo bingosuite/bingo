@@ -58,64 +58,67 @@ describe("repository VS Code integration", () => {
     assert.match(smoke, /if \(child === undefined \|\| childExited\)/);
   });
 
-  it("keeps target and extension-development preparation separate", () => {
+  it("exposes exactly the two normal bingo debug choices", () => {
     const launch = readJSON(".vscode/launch.json");
     const configurations = requireArray(launch.configurations).map(requireRecord);
+    const serialized = JSON.stringify(configurations);
 
-    assert.ok(configurations.length > 0);
-    assert.equal(
-      configurations.some((configuration) => configuration.type === "go"),
-      false,
+    assert.equal(configurations.length, 2);
+    assert.deepEqual(
+      configurations.map((configuration) => configuration.name),
+      [
+        "bingo DAP: launch spawntree (stop on entry)",
+        "bingo DAP: join running session",
+      ],
     );
-    const bingoConfigurations = configurations.filter(
-      (configuration) => configuration.type === "bingo",
-    );
-    assert.ok(bingoConfigurations.length > 0);
-    for (const configuration of bingoConfigurations) {
+    for (const configuration of configurations) {
       assert.equal(configuration.type, "bingo");
       assert.equal("mode" in configuration, false);
       assert.equal("debugServer" in configuration, false);
       assertLifecycleDefaults(configuration);
     }
+    assert.doesNotMatch(serialized, /extensionHost|Run bingo extension/);
+    assert.doesNotMatch(serialized, /"type":"go"/);
+    assert.doesNotMatch(serialized, /\bdlv\b/i);
 
-    const binaryLaunch = bingoConfigurations.find(
+    const binaryLaunch = configurations.find(
       (configuration) => configuration.request === "launch",
     );
     assert.notEqual(binaryLaunch, undefined);
+    assert.equal(
+      binaryLaunch?.name,
+      "bingo DAP: launch spawntree (stop on entry)",
+    );
+    assert.equal(binaryLaunch?.program, "${workspaceFolder}/build/spawntree");
     assert.equal(binaryLaunch?.preLaunchTask, "bingo: build spawntree");
 
-    const extensionHost = configurations.find(
-      (configuration) => configuration.type === "extensionHost",
+    const sessionJoin = configurations.find(
+      (configuration) => configuration.request === "attach",
     );
-    assert.notEqual(extensionHost, undefined);
-    assert.equal(
-      extensionHost?.preLaunchTask,
-      "bingo: prepare extension host",
-    );
-    assert.deepEqual(extensionHost?.args, [
-      "--extensionDevelopmentPath=${workspaceFolder}/editors/vscode",
-    ]);
+    assert.notEqual(sessionJoin, undefined);
+    assert.equal(sessionJoin?.name, "bingo DAP: join running session");
+    assert.equal(sessionJoin?.session, "${input:bingoSession}");
+    assert.equal("preLaunchTask" in (sessionJoin ?? {}), false);
   });
 
-  it("defines deterministic but independent extension and target tasks", () => {
+  it("defines only the fast target preparation task", () => {
     const tasksConfig = readJSON(".vscode/tasks.json");
     const tasks = requireArray(tasksConfig.tasks).map(requireRecord);
-    const extensionTask = tasks.find(
-      (task) => task.label === "bingo: prepare extension host",
-    );
-    const targetTask = tasks.find(
-      (task) => task.label === "bingo: build spawntree",
-    );
 
-    assert.notEqual(extensionTask, undefined);
-    assert.equal(extensionTask?.type, "process");
-    assert.equal(extensionTask?.command, "just");
-    assert.deepEqual(extensionTask?.args, ["vscode-dev"]);
-
+    assert.equal(tasks.length, 1);
+    const [targetTask] = tasks;
     assert.notEqual(targetTask, undefined);
+    assert.equal(targetTask?.label, "bingo: build spawntree");
     assert.equal(targetTask?.type, "process");
     assert.equal(targetTask?.command, "just");
     assert.deepEqual(targetTask?.args, ["build-spawntree"]);
+
+    const launch = readJSON(".vscode/launch.json");
+    const configurations = requireArray(launch.configurations).map(requireRecord);
+    const binaryLaunch = configurations.find(
+      (configuration) => configuration.request === "launch",
+    );
+    assert.equal(binaryLaunch?.preLaunchTask, targetTask?.label);
 
     const justfile = readText("justfile");
     const devStart = justfile.indexOf("vscode-dev:");
