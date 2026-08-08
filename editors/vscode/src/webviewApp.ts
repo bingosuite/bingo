@@ -2,7 +2,7 @@ import type {
   ConcurrencyViewModel,
   SessionViewModel,
 } from "./model.js";
-import { filterTree, type TreeNode } from "./tree.js";
+import { filterFullTree, type TreeNode } from "./tree.js";
 
 export interface WebviewHost {
   postMessage(message: Record<string, unknown>): void;
@@ -228,6 +228,8 @@ function renderGraph(
   const panel = document.createElement("section");
   panel.className = "graph-panel";
   panel.setAttribute("aria-label", "Goroutine spawn tree");
+  let currentTransform = state.transform;
+  const scene = document.createElementNS(svgNamespace, "g");
   const controls = document.createElement("div");
   controls.className = "graph-controls";
   const fit = button(document, "Fit", () => {
@@ -261,9 +263,8 @@ function renderGraph(
   svg.setAttribute("viewBox", `0 0 ${String(session.tree.width)} ${String(session.tree.height)}`);
   svg.setAttribute("role", "tree");
   svg.setAttribute("aria-label", "Goroutine spawn hierarchy");
-  const scene = document.createElementNS(svgNamespace, "g");
-  let currentTransform = state.transform;
-  svg.append(scene);
+  const activeScene = scene;
+  svg.append(activeScene);
   const byID = new Map(
     session.tree.nodes.map((node) => [node.goroutine.id, node]),
   );
@@ -286,7 +287,7 @@ function renderGraph(
     path.setAttribute("class", "tree-edge");
     path.dataset.from = String(edge.from);
     path.dataset.to = String(edge.to);
-    scene.append(path);
+    activeScene.append(path);
   }
   const siblings = new Map<number, TreeNode[]>();
   for (const node of session.tree.nodes) {
@@ -296,7 +297,7 @@ function renderGraph(
   }
   for (const node of session.tree.nodes) {
     const group = siblings.get(node.parentId) ?? [];
-    scene.append(
+    activeScene.append(
       renderNode(
         document,
         node,
@@ -353,7 +354,7 @@ function renderGraph(
     }
     event.preventDefault();
     const visible = session.tree.nodes.filter((node) => {
-      const element = scene.querySelector<SVGGElement>(
+      const element = activeScene.querySelector<SVGGElement>(
         `[data-goid="${String(node.goroutine.id)}"]`,
       );
       return element?.classList.contains("filtered") !== true;
@@ -364,7 +365,7 @@ function renderGraph(
     const direction = event.key === "ArrowDown" || event.key === "ArrowRight" ? 1 : -1;
     const next = visible[(current + direction + visible.length) % visible.length];
     if (next !== undefined) {
-      scene
+      activeScene
         .querySelector<SVGGElement>(
           `[data-goid="${String(next.goroutine.id)}"]`,
         )
@@ -511,7 +512,11 @@ function filteredSession(
 ): SessionViewModel {
   return {
     ...session,
-    tree: filterTree(session.tree, query),
+    tree: filterFullTree(
+      session.tree,
+      query,
+      session.snapshot?.goroutines ?? [],
+    ),
   };
 }
 

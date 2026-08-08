@@ -152,38 +152,73 @@ function childrenTable(
 }
 
 export function filterTree(layout: TreeLayout, query: string): TreeLayout {
+  return filterFullTree(
+    layout,
+    query,
+    layout.nodes.map((node) => node.goroutine),
+  );
+}
+
+export function filterFullTree(
+  layout: TreeLayout,
+  query: string,
+  goroutines: readonly Goroutine[],
+): TreeLayout {
   const normalized = query.trim().toLocaleLowerCase();
   if (normalized.length === 0) {
     return layout;
   }
-  const byID = new Map(
-    layout.nodes.map((node) => [node.goroutine.id, node] as const),
+  const unique = uniqueGoroutines(goroutines);
+  const matches = [...unique.values()].filter((goroutine) =>
+    searchText(goroutine).includes(normalized),
   );
   const visible = new Set<number>();
-  for (const node of layout.nodes) {
-    if (!searchText(node.goroutine).includes(normalized)) {
-      continue;
+  for (const match of matches) {
+    if (visible.size >= maximumRenderedGoroutines) {
+      break;
     }
-    let current: TreeNode | undefined = node;
-    let ancestors = 0;
-    while (
-      current !== undefined &&
-      !visible.has(current.goroutine.id) &&
-      ancestors <= maximumFilterAncestorDepth
-    ) {
-      visible.add(current.goroutine.id);
-      current = byID.get(current.parentId);
-      ancestors += 1;
+    const chain = boundedAncestorChain(match, unique);
+    const additions = chain.filter((goroutine) => !visible.has(goroutine.id));
+    const remaining = maximumRenderedGoroutines - visible.size;
+    for (const goroutine of additions.slice(-remaining)) {
+      visible.add(goroutine.id);
     }
   }
-  const goroutines = layout.nodes
-    .filter((node) => visible.has(node.goroutine.id))
-    .map((node) => node.goroutine);
-  const filtered = layoutSpawnTree(goroutines, Math.max(1, goroutines.length));
+  const selected = [...visible]
+    .map((id) => unique.get(id))
+    .filter((goroutine): goroutine is Goroutine => goroutine !== undefined);
+  const filtered = layoutSpawnTree(selected, maximumRenderedGoroutines);
   return {
     ...filtered,
-    omitted: layout.omitted + layout.nodes.length - goroutines.length,
+    omitted: Math.max(0, unique.size - filtered.nodes.length),
   };
+}
+
+function boundedAncestorChain(
+  match: Goroutine,
+  byID: ReadonlyMap<number, Goroutine>,
+): readonly Goroutine[] {
+  const chain = [match];
+  const seen = new Set<number>([match.id]);
+  let current = match;
+  for (
+    let ancestors = 0;
+    ancestors < maximumFilterAncestorDepth;
+    ancestors += 1
+  ) {
+    const parent = byID.get(current.parentId);
+    if (
+      parent === undefined ||
+      parent.id === current.id ||
+      seen.has(parent.id)
+    ) {
+      break;
+    }
+    chain.push(parent);
+    seen.add(parent.id);
+    current = parent;
+  }
+  return chain.reverse();
 }
 
 function searchText(goroutine: Goroutine): string {

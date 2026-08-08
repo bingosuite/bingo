@@ -159,12 +159,12 @@ describe("concurrency webview DOM", () => {
     assert.doesNotMatch(label, /not displayed/);
   });
 
-  it("compacts and fits a large tree around filtered matches", () => {
+  it("finds, compacts, and fits matches beyond the rendering cap", () => {
     const { document, window } = parseHTML("<html><body><div id=app></div></body></html>");
     const goroutines = [goroutine(1, 0, { current: true })];
-    for (let id = 2; id <= 500; id += 1) {
+    for (let id = 2; id <= 1000; id += 1) {
       goroutines.push(
-        goroutine(id, id - 1, id === 500 ? { waitReason: "needle" } : {}),
+        goroutine(id, id - 1, id === 1000 ? { waitReason: "needle" } : {}),
       );
     }
     mountConcurrencyView(document, { postMessage() {} })(
@@ -182,12 +182,12 @@ describe("concurrency webview DOM", () => {
       "0 0 1142 496",
     );
     assert.match(
-      document.querySelector('[data-goid="496"]')?.getAttribute("aria-label") ??
+      document.querySelector('[data-goid="996"]')?.getAttribute("aria-label") ??
         "",
-      /displayed root, reported parent goroutine 495 is not displayed/,
+      /displayed root, reported parent goroutine 995 is not displayed/,
     );
     assert.equal(
-      document.querySelector('[data-goid="500"]')?.getAttribute("transform"),
+      document.querySelector('[data-goid="1000"]')?.getAttribute("transform"),
       "translate(874 370)",
     );
 
@@ -195,6 +195,39 @@ describe("concurrency webview DOM", () => {
     search.dispatchEvent(new window.Event("input"));
     assert.equal(document.querySelectorAll(".tree-node").length, 500);
     assert.match(document.querySelector("svg")?.getAttribute("viewBox") ?? "", /41086$/);
+  });
+
+  it("keeps fit and zoom controls safe for an empty filter result", () => {
+    const { document, window } = parseHTML(
+      "<html><body><div id=app></div></body></html>",
+    );
+    mountConcurrencyView(document, { postMessage() {} })(model());
+    const search = document.querySelector<HTMLInputElement>(
+      'input[type="search"]',
+    )!;
+    search.value = "no-such-goroutine";
+    search.dispatchEvent(new window.Event("input"));
+
+    assert.equal(document.querySelectorAll(".tree-node").length, 0);
+    assert.match(
+      document.querySelector(".graph-panel")?.textContent ?? "",
+      /No goroutines in this snapshot/,
+    );
+    const controls = [
+      ...document.querySelectorAll<HTMLButtonElement>(
+        ".graph-controls button",
+      ),
+    ];
+    assert.deepEqual(
+      controls.map((control) => control.textContent),
+      ["Fit", "−", "+"],
+    );
+    assert.doesNotThrow(() => {
+      for (const control of controls) {
+        control.click();
+      }
+    });
+    assert.equal(document.querySelectorAll(".tree-node").length, 0);
   });
 
   it("renders empty and error states", () => {
