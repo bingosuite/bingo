@@ -12,8 +12,25 @@ const manifest = requireRecord(
 const contributes = requireRecord(manifest.contributes);
 const debuggers = requireArray(contributes.debuggers);
 const debuggerContribution = requireRecord(debuggers[0]);
+const expectedExtensionVersion = "0.2.0";
 
 describe("extension manifest", () => {
+  it("versions the managed-server runtime as an installable upgrade", () => {
+    const lock = requireRecord(
+      JSON.parse(
+        readFileSync(resolve(process.cwd(), "package-lock.json"), "utf8"),
+      ) as unknown,
+    );
+    const packages = requireRecord(lock.packages);
+
+    assert.equal(manifest.version, expectedExtensionVersion);
+    assert.equal(lock.version, expectedExtensionVersion);
+    assert.equal(
+      requireRecord(packages[""]).version,
+      expectedExtensionVersion,
+    );
+  });
+
   it("owns only the bingo debugger type", () => {
     assert.equal(manifest.name, "bingo");
     assert.equal(manifest.publisher, "bingosuite");

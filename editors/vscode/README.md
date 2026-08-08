@@ -19,9 +19,11 @@ From the repository root on a supported host:
 just vscode-install
 ```
 
-This builds, verifies, and installs `dist/bingo-<platform>.vsix`. Rerun the
-command to update. Package without installing with `just vscode-package`.
-Uninstall with:
+This builds, verifies, and installs `dist/bingo-<platform>.vsix`. Managed local
+server autostart first ships in **0.2.0**; older `0.1.0` installs are
+connect-only and must be upgraded. Rerun the command to update, then run
+**Developer: Reload Window** once so the active extension host loads the new
+bundle. Package without installing with `just vscode-package`. Uninstall with:
 
 ```sh
 code --uninstall-extension bingosuite.bingo
