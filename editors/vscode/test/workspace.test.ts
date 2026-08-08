@@ -165,6 +165,7 @@ describe("repository VS Code integration", () => {
     assert.doesNotMatch(platform, /win32|ia32|linux-arm64|darwin-x64/);
     assert.match(platform, /BINGO_VSCODE_TARGET/);
     assert.match(platform, /darwinCrossBuild/);
+    assert.match(platform, /linuxCrossBuild/);
     assert.match(packageScript, /"--target"/);
     assert.match(prepareScript, /"bingonative"/);
     assert.match(prepareScript, /"codesign"/);

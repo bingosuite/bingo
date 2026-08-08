@@ -6,6 +6,7 @@ import * as vscode from "vscode";
 import { resolveBundledBinary } from "./binary.js";
 import {
   ConfigurationError,
+  resolveServerConfiguration,
   validateBingoConfiguration,
 } from "./configuration.js";
 import { probeBingoHealth } from "./health.js";
@@ -15,8 +16,26 @@ import {
   ServerManagerError,
 } from "./serverManager.js";
 import { spawnDetachedServer } from "./serverProcess.js";
+import {
+  concurrencyViewId,
+  ConcurrencyViewProvider,
+  copySnapshot,
+} from "./concurrencyView.js";
+import type { ConcurrencyViewModel } from "./model.js";
+import { SessionRegistry } from "./registry.js";
+import { decodeSessionAnnouncement } from "./sessionEvent.js";
 
 const debugType = "bingo";
+
+export interface BingoExtensionAPI {
+  readonly version: 1;
+  getConcurrencyState(): ConcurrencyViewModel;
+  getLastRenderedRevision(): number;
+  getConcurrencyViewStatus(): {
+    readonly resolved: boolean;
+    readonly ready: boolean;
+  };
+}
 
 class BingoDebugConfigurationProvider
   implements vscode.DebugConfigurationProvider
@@ -83,8 +102,33 @@ class BingoDebugAdapterDescriptorFactory
   }
 }
 
-export function activate(context: vscode.ExtensionContext): void {
+export function activate(context: vscode.ExtensionContext): BingoExtensionAPI {
   const output = vscode.window.createOutputChannel("bingo Server");
+  const registry = new SessionRegistry();
+  const concurrencyView = new ConcurrencyViewProvider(
+    context.extensionUri,
+    registry,
+  );
+  const status = vscode.window.createStatusBarItem(
+    vscode.StatusBarAlignment.Left,
+    10,
+  );
+  status.command = "bingo.concurrency.focus";
+  status.name = "Bingo Concurrency";
+  let autoRevealed = false;
+  const updateStatus = (): void => {
+    const active = registry.activeModel();
+    if (active === undefined) {
+      status.hide();
+      return;
+    }
+    const goroutines = active.snapshot?.goroutines.length ?? 0;
+    const threads = active.snapshot?.threads.length ?? 0;
+    status.text = `$(type-hierarchy) Bingo ${String(goroutines)}g · ${String(threads)}t`;
+    status.tooltip = `${active.debugSessionName} · ${active.connection} · ${active.sessionState}`;
+    status.show();
+  };
+  const unsubscribeStatus = registry.onChange(updateStatus);
   const manager = new ServerManager({
     probe: probeBingoHealth,
     resolveBinary: async (target) =>
@@ -111,6 +155,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     output,
+    status,
+    registry,
+    concurrencyView,
+    { dispose: unsubscribeStatus },
     {
       dispose(): void {
         manager.dispose();
@@ -124,5 +172,100 @@ export function activate(context: vscode.ExtensionContext): void {
       debugType,
       new BingoDebugAdapterDescriptorFactory(manager, output),
     ),
+    vscode.window.registerWebviewViewProvider(
+      concurrencyViewId,
+      concurrencyView,
+      { webviewOptions: { retainContextWhenHidden: false } },
+    ),
+    vscode.debug.onDidStartDebugSession((session) => {
+      if (session.type === debugType) {
+        registry.select(session.id);
+      }
+    }),
+    vscode.debug.onDidReceiveDebugSessionCustomEvent((event) => {
+      let announcement;
+      try {
+        announcement = decodeSessionAnnouncement(event.event, event.body);
+      } catch (error: unknown) {
+        output.appendLine(
+          `ignored invalid bingo session event: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        return;
+      }
+      if (
+        event.session.type !== debugType ||
+        announcement === undefined
+      ) {
+        return;
+      }
+      let server;
+      try {
+        server = resolveServerConfiguration(event.session.configuration);
+      } catch (error: unknown) {
+        output.appendLine(
+          `cannot start concurrency observer: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        return;
+      }
+      const added = registry.add({
+        debugSessionId: event.session.id,
+        debugSessionName: event.session.name,
+        sessionId: announcement.sessionId,
+        managementEndpoint: server.managementEndpoint,
+      });
+      if (
+        added &&
+        !autoRevealed &&
+        vscode.workspace
+          .getConfiguration("bingo.concurrency")
+          .get<boolean>("autoReveal", true)
+      ) {
+        autoRevealed = true;
+        void vscode.commands.executeCommand(`${concurrencyViewId}.focus`);
+      }
+    }),
+    vscode.debug.onDidChangeActiveDebugSession((session) => {
+      if (session?.type === debugType) {
+        registry.select(session.id);
+      }
+    }),
+    vscode.debug.onDidTerminateDebugSession((session) => {
+      registry.remove(session.id);
+    }),
+    vscode.commands.registerCommand("bingo.concurrency.refresh", () => {
+      registry.refresh();
+    }),
+    vscode.commands.registerCommand("bingo.concurrency.selectSession", async () => {
+      const sessions = registry.viewModel.sessions;
+      const selected = await vscode.window.showQuickPick(
+        sessions.map((session) => ({
+          label: session.debugSessionName,
+          description: session.sessionId,
+          id: session.debugSessionId,
+        })),
+        { title: "Select Bingo Concurrency session" },
+      );
+      if (selected !== undefined) {
+        registry.select(selected.id);
+        await vscode.commands.executeCommand(`${concurrencyViewId}.focus`);
+      }
+    }),
+    vscode.commands.registerCommand("bingo.concurrency.fit", async () => {
+      await vscode.commands.executeCommand(`${concurrencyViewId}.focus`);
+      concurrencyView.fit();
+    }),
+    vscode.commands.registerCommand("bingo.concurrency.copySnapshot", () =>
+      copySnapshot(registry),
+    ),
   );
+  return {
+    version: 1,
+    getConcurrencyState: () => registry.viewModel,
+    getLastRenderedRevision: () => concurrencyView.lastRenderedRevision,
+    getConcurrencyViewStatus: () => concurrencyView.status,
+  };
 }
