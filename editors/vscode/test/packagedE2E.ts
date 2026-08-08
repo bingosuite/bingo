@@ -30,9 +30,9 @@ if (target === undefined) {
 
 const examples = [
   { name: "level1-loop", line: 8, minimumDepth: 0 },
-  { name: "level2-channel", line: 23, minimumDepth: 1 },
-  { name: "level3-worker-pool", line: 44, minimumDepth: 1 },
-  { name: "level4-pipeline", line: 65, minimumDepth: 1 },
+  { name: "level2-channel", line: 22, minimumDepth: 1 },
+  { name: "level3-worker-pool", line: 39, minimumDepth: 1 },
+  { name: "level4-pipeline", line: 63, minimumDepth: 1 },
   { name: "level5-workflow", line: 83, minimumDepth: 2 },
 ] as const;
 

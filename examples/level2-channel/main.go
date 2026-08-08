@@ -18,8 +18,9 @@ func produce(values []int) <-chan int {
 }
 
 func main() {
+	output := produce([]int{2, 4, 6, 8})
 	values := make([]int, 0, 4)
-	for value := range produce([]int{2, 4, 6, 8}) {
+	for value := range output {
 		values = append(values, value)
 		fmt.Printf("received=%d square=%d\n", value, value*value)
 	}
