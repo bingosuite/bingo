@@ -161,10 +161,7 @@ class FakeDAPServer {
   }
 
   public get port(): number {
-    const address = this.#server.address();
-    assert.notEqual(address, null);
-    assert.equal(typeof address, "object");
-    return (address as { readonly port: number }).port;
+    return listeningPort(this.#server.address());
   }
 
   public static async start(): Promise<FakeDAPServer> {
@@ -344,10 +341,7 @@ class FakeTelemetryServer {
   }
 
   public get port(): number {
-    const address = this.#server.address();
-    assert.notEqual(address, null);
-    assert.equal(typeof address, "object");
-    return (address as { readonly port: number }).port;
+    return listeningPort(this.#server.address());
   }
 
   public static async start(): Promise<FakeTelemetryServer> {
@@ -395,6 +389,14 @@ class FakeTelemetryServer {
 interface DAPRequest {
   readonly seq: number;
   readonly command: string;
+}
+
+function listeningPort(
+  address: string | { readonly port: number } | null,
+): number {
+  assert.notEqual(address, null);
+  assert.equal(typeof address, "object");
+  return (address as { readonly port: number }).port;
 }
 
 function snapshotPayload(): Record<string, unknown> {

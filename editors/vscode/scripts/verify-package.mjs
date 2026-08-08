@@ -43,8 +43,10 @@ try {
     "extension/media/bingo-activity.svg",
     "extension/package.json",
     "extension/readme.md",
-  ].sort();
-  const sortedEntries = [...entries].sort();
+  ].sort((left, right) => left.localeCompare(right));
+  const sortedEntries = [...entries].sort((left, right) =>
+    left.localeCompare(right),
+  );
   if (JSON.stringify(sortedEntries) !== JSON.stringify(expectedEntries)) {
     throw new Error(
       `unexpected VSIX contents:\n${sortedEntries.join("\n")}`,

@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import process from "node:process";
@@ -7,30 +8,32 @@ import { runTests } from "@vscode/test-electron";
 
 const extensionRoot = fileURLToPath(new URL("../", import.meta.url));
 const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
+const runID = randomBytes(16).toString("hex");
 const scratch = join(
   repositoryRoot,
   "dist",
-  `.vscode-integration-${String(process.pid)}`,
+  `.vscode-integration-${runID}`,
 );
 const profile = join(
   repositoryRoot,
   "dist",
-  `.vu-${String(process.pid)}`,
+  `.vu-${runID}`,
 );
 const extensions = join(
   repositoryRoot,
   "dist",
-  `.ve-${String(process.pid)}`,
+  `.ve-${runID}`,
 );
 rmSync(scratch, { force: true, recursive: true });
-mkdirSync(scratch, { recursive: true });
+mkdirSync(scratch, { recursive: true, mode: 0o700 });
 rmSync(profile, { force: true, recursive: true });
 rmSync(extensions, { force: true, recursive: true });
-mkdirSync(profile, { recursive: true });
-mkdirSync(extensions, { recursive: true });
-process.env.TMPDIR = scratch;
-process.env.TMP = scratch;
-process.env.TEMP = scratch;
+mkdirSync(profile, { recursive: true, mode: 0o700 });
+mkdirSync(extensions, { recursive: true, mode: 0o700 });
+// The unpredictable, mode-0700 directory is private despite temp-variable heuristics.
+process.env.TMPDIR = scratch; // NOSONAR
+process.env.TMP = scratch; // NOSONAR
+process.env.TEMP = scratch; // NOSONAR
 
 try {
   await runTests({
@@ -53,9 +56,9 @@ try {
     ],
     extensionTestsEnv: {
       ...process.env,
-      TMPDIR: scratch,
-      TMP: scratch,
-      TEMP: scratch,
+      TMPDIR: scratch, // NOSONAR -- same private directory described above.
+      TMP: scratch, // NOSONAR
+      TEMP: scratch, // NOSONAR
     },
   });
 } finally {
