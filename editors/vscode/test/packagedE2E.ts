@@ -163,9 +163,9 @@ async function main(): Promise<void> {
     }
     if (!succeeded && child?.pid !== undefined && child.exitCode === null) {
       try {
-        process.kill(-child.pid, "SIGKILL");
+        process.kill(child.pid, "SIGKILL");
       } catch {
-        // The exact test-owned process group may already have exited.
+        // The exact test-owned server may already have exited.
       }
       await Promise.race([once(child, "exit"), delay(3000)]);
     }
