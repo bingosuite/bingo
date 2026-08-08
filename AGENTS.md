@@ -910,15 +910,19 @@ checks the target, and repairs executable mode if extraction lost it.
 Packaging rebuilds/signs twice and requires identical binary and VSIX hashes;
 tests drift-check service/API/wire constants against Go source and inspect exact
 archive contents, target metadata, architecture, mode, and entitlements.
-Normal repository `"type":"bingo"` F5 uses the installed VSIX and only rebuilds
-the target; source binary/build preparation belongs to the separate Extension
-Development Host task (`just vscode-dev`), which restores the exact npm lockfile
-with lifecycle scripts disabled before building. The macOS packaging job uses
-the supported `macos-15` arm64 image, asserts `uname -m`, and runs the real
-packaged-server smoke. That smoke observes server-owned idle exit on success;
-only its failure path may SIGKILL the exact detached process group it created,
-then it must await exit before deleting the extracted package. This cleanup
-helper is test-only and must never enter extension production code.
+The root Run and Debug dropdown exposes exactly two `"type":"bingo"` choices:
+launch spawntree and join a running session. Normal F5 uses the installed VSIX
+and only rebuilds the target; contributor source-extension development runs
+`just vscode-dev` and launches an Extension Development Host explicitly from
+the CLI with
+`code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"`,
+outside the root launch configurations. The recipe restores the exact npm
+lockfile with lifecycle scripts disabled before building. The macOS packaging
+job uses the supported `macos-15` arm64 image, asserts `uname -m`, and runs the
+real packaged-server smoke. That smoke observes server-owned idle exit on
+success; only its failure path may SIGKILL the exact detached process group it
+created, then it must await exit before deleting the extracted package. This
+cleanup helper is test-only and must never enter extension production code.
 Apple's external linker can vary `LC_UUID` even for identical cgo inputs, but
 current dyld rejects binaries with `-no_uuid`; `normalize-mach-o-uuid.mjs`
 therefore derives a stable UUID from the unsigned Mach-O with its UUID and
@@ -1377,7 +1381,7 @@ just coverage [PKG]                        # writes test/coverage.out
 just integration                           # ginkgo -r ./test/integration (no e2e tag)
 just build-spawntree                       # rebuilds the VS Code demo with -N -l
 just vscode-prepare                        # stage the current native server inside the extension
-just vscode-dev                            # stage source extension + native server + spawntree for Extension Host F5
+just vscode-dev                            # stage source extension + native server + spawntree for CLI-launched Extension Host
 just vscode-check                          # lint, typecheck, test, bundle, package-list smoke
 just vscode-package                        # writes verified dist/bingo-<platform>.vsix
 just vscode-install                        # explicitly installs/updates bingosuite.bingo

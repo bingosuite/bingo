@@ -2,15 +2,6 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "bingo: prepare extension host",
-      "type": "process",
-      "command": "just",
-      "args": [
-        "vscode-dev"
-      ],
-      "problemMatcher": []
-    },
-    {
       "label": "bingo: build spawntree",
       "type": "process",
       "command": "just",
