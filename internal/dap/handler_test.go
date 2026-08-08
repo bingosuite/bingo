@@ -447,6 +447,24 @@ func TestSessionEventNotEmittedWhenCreationFails(t *testing.T) {
 	}
 }
 
+func TestSessionEventNotEmittedWhenJoinFails(t *testing.T) {
+	hh := newHarnessProvider(t, &fakeProvider{}, &cmdRecorder{})
+	hh.sendReq("initialize", initArgs())
+	_ = recvType[*godap.InitializeResponse](hh)
+
+	hh.sendReq("attach", &godap.AttachRequest{Arguments: json.RawMessage(`{"session":"missing"}`)})
+	resp := recvType[*godap.ErrorResponse](hh)
+	if resp.Success || resp.Command != "attach" {
+		t.Fatalf("attach response = %+v", resp.Response)
+	}
+	_ = hh.client.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	if _, err := hh.reader.Peek(1); err == nil {
+		t.Fatal("session event emitted after failed join")
+	} else if nerr, ok := err.(net.Error); !ok || !nerr.Timeout() {
+		t.Fatalf("peek after failed join: %v", err)
+	}
+}
+
 func TestLaunchIgnoresVSCodeEndpointFields(t *testing.T) {
 	hh := newHarness(t)
 	hh.sendReq("initialize", initArgs())
