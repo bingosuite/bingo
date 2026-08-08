@@ -206,11 +206,22 @@ func (h *Handler) onJoin(req *godap.AttachRequest, cfg launchConfig) {
 // command is enqueued guarantees the entry-stop event is delivered to us.
 func (h *Handler) startSession(existingID string) error {
 	h.mu.Lock()
-	already := h.session != nil
-	h.mu.Unlock()
-	if already {
+	if h.session != nil || h.sessionStarting {
+		h.mu.Unlock()
 		return fmt.Errorf("session already started for this connection")
 	}
+	h.sessionStarting = true
+	h.mu.Unlock()
+
+	started := false
+	defer func() {
+		if started {
+			return
+		}
+		h.mu.Lock()
+		h.sessionStarting = false
+		h.mu.Unlock()
+	}()
 
 	var sess Session
 	if existingID != "" {
@@ -235,20 +246,30 @@ func (h *Handler) startSession(existingID string) error {
 	h.mu.Lock()
 	h.session = sess
 	h.client = client
+	h.sessionStarting = false
+	started = true
 	h.mu.Unlock()
 	return nil
 }
 
-// announceSession emits a console line naming the session id so WebSocket
-// observers know which session to join (also discoverable via /api/sessions).
+// announceSession publishes the managed-session identity once the handler is
+// attached. The state is claimed under mu, but DAP writes happen after unlock
+// because hub delivery and request handling can call this path concurrently.
 func (h *Handler) announceSession() {
 	h.mu.Lock()
 	sess := h.session
-	h.mu.Unlock()
-	if sess == nil {
+	if sess == nil || h.sessionAnnounced {
+		h.mu.Unlock()
 		return
 	}
 	id := sess.SessionID()
+	h.sessionAnnounced = true
+	h.mu.Unlock()
+
+	h.send(&sessionEvent{
+		Event: h.event(sessionEventName),
+		Body:  sessionEventBody{Version: 1, SessionID: id},
+	})
 	h.emitConsole(fmt.Sprintf("bingo session %s ready — observers can join with ?session=%s\n", id, id))
 }
 
