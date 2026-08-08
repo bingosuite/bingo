@@ -40,10 +40,11 @@ architecture behind this.
   just vscode-install
   ```
 
-  Reload the VS Code window after installation. The companion owns debugger type
-  `"bingo"` and connects directly to bingo's DAP listener; it neither invokes
-  nor validates `dlv`, and it does not replace the Go extension's `"go"` type.
-  To update, rerun `just vscode-install`; uninstall with
+  Managed server autostart requires **bingosuite.bingo 0.2.0 or newer**. Run
+  **Developer: Reload Window** once after installation or update. The companion
+  owns debugger type `"bingo"` and connects directly to bingo's DAP listener;
+  it neither invokes nor validates `dlv`, and it does not replace the Go
+  extension's `"go"` type. To update, rerun `just vscode-install`; uninstall with
   `code --uninstall-extension bingosuite.bingo`.
 
 ## 1. Demo target

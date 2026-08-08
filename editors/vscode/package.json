@@ -2,7 +2,7 @@
   "name": "bingo",
   "displayName": "bingo Debugger",
   "description": "Connect VS Code's Debug UI to bingo, reusing or starting a managed local server.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "bingosuite",
   "license": "MIT",
   "private": true,
