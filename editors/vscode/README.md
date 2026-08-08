@@ -19,9 +19,8 @@ From the repository root on a supported host:
 just vscode-install
 ```
 
-This builds, verifies, and installs `dist/bingo-<platform>.vsix`. Managed local
-server autostart first ships in **0.2.0**; older `0.1.0` installs are
-connect-only and must be upgraded. Rerun the command to update, then run
+This builds, verifies, and installs `dist/bingo-<platform>.vsix`. The graphical
+concurrency view ships in **0.3.0**. Rerun the command to update, then run
 **Developer: Reload Window** once so the active extension host loads the new
 bundle. Package without installing with `just vscode-package`. Uninstall with:
 
@@ -45,7 +44,9 @@ separate server-start or extension-host choice. In the default `auto` mode the e
 3. if and only if the endpoint refuses the connection, starts its bundled
    server with management on `127.0.0.1:6060`, DAP on
    `127.0.0.1:4711`, and a 30-second server-owned idle grace;
-4. waits up to five seconds for compatible health, then connects VS Code to DAP.
+4. waits up to five seconds for compatible health, then connects VS Code to DAP;
+5. receives the DAP adapter's `bingo/session/v1` event and automatically joins
+   that exact managed session over WebSocket in **Bingo Concurrency**.
 
 Concurrent VS Code extension hosts may both try to start. Listener binding
 chooses the winner; a child that loses the race is harmless because both hosts
@@ -61,6 +62,33 @@ WebSocket clients can share the process safely.
 If the management port answers with non-bingo HTTP or an incompatible bingo,
 F5 fails without spawning over it. Errors include the endpoints and server log
 path.
+
+## Bingo Concurrency
+
+The Bingo Activity Bar icon opens a session-aware graphical observer. The
+extension host owns the WebSocket and validated model, so hiding or recreating
+the webview does not lose the latest snapshot. Multiple debug sessions appear
+in the selector; the status bar shows active goroutine/thread counts.
+
+- Pan, zoom, fit, search, and keyboard arrows navigate the deterministic spawn
+  tree. Parent links, current state, status, and thread badges remain stable
+  across updates, including missing-parent and cyclic runtime data.
+- Selecting a goroutine shows wait reason, thread, and current/start/creation
+  source locations. Thread cards and a bounded created/exited timeline provide
+  physical and lifecycle context.
+- Snapshots arrive at entry, breakpoints, and pauses—not per step. The view sends
+  one read-only `GoroutineSnapshot` request after joining and only sends another
+  when **Refresh** is explicit. It never sends run-control commands.
+- **Bingo: Copy Concurrency Snapshot** copies validated JSON. **Select
+  Concurrency Session**, **Refresh**, and **Fit** are available from the
+  Command Palette; the Activity Bar icon and status item focus the view through
+  VS Code's generated `bingo.concurrency.focus` command.
+
+`bingo.concurrency.autoReveal` defaults to `true` and reveals the first session
+once. Disable it to keep the view in the background. Connection, degraded,
+empty, sequence-gap, and error states remain visible. Rendering uses a strict
+nonce CSP, local bundles only, DOM `textContent` for tracee strings, VS Code
+theme/high-contrast colors, labelled controls, and keyboard selection.
 
 ## Configurations
 
@@ -159,8 +187,8 @@ or any custom host, explicitly select connect-only mode:
 
 Connect-only mode does not probe management health, inspect a bundled binary, or
 spawn. Start and secure the reachable bingo server through that environment's
-normal process manager. A future bingo UI can use the same management contract;
-no such UI is included in this extension.
+normal process manager. The concurrency observer uses the same configured
+management host/port for its WebSocket connection.
 
 ## Manual server option
 
@@ -178,6 +206,8 @@ just server
 just vscode-dev       # build extension, native bundled server, and examples
 just vscode-check     # clean install, lint, typecheck, tests, bundle/list smoke
 just vscode-package   # native reproducible package + content verification
+npm --prefix editors/vscode run test:integration # isolated Electron view/event acknowledgement
+npm --prefix editors/vscode run e2e:packaged     # actual packaged server + DAP + WS graphical model
 ```
 
 `just vscode-dev` restores the exact npm lockfile with lifecycle scripts
@@ -195,6 +225,12 @@ debugging instead uses the installed VSIX and runs only
 **bingo: build examples**, so F5 does not rebuild or codesign the
 extension-local server.
 
+The packaged E2E reserves unique loopback management/DAP ports, proves
+compatible-instance reuse without a competing spawn, drives levels 1–5 (with a
+nested level-5 tree), exercises select/filter/copy/refresh, and waits for the
+managed server to exit by its idle policy. It signals only its exact captured
+server PID, and only on failure.
+
 ## Troubleshooting
 
 - **Unsupported platform:** auto mode packages only linux/x64 and darwin/arm64.
@@ -206,3 +242,7 @@ extension-local server.
 - **Remote endpoint rejected:** set `"serverMode": "connectOnly"`.
 - **Server remains after VS Code closes:** expected while another session is
   active or during the idle grace. The extension never sends a kill signal.
+- **Concurrency view is empty:** stop at entry, a breakpoint, or Pause, then use
+  **Bingo: Refresh Concurrency Snapshot**. Stripped/pre-runtime targets can
+  degrade to a synthetic single goroutine. `cmd/wsmon` remains available as a
+  terminal observer.
