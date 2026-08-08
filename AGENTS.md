@@ -997,7 +997,9 @@ The recreatable webview receives validated view models through a
 ready/rendered-ack protocol. Every document has a generation token; async
 `postMessage` completions may mutate delivery state only while their captured
 view and generation are current, even when an old and new render share a
-revision. A fresh `ready` resets any in-flight revision
+revision. Rendered acknowledgements echo both generation and revision, so a
+destroyed document cannot acknowledge its replacement. A fresh `ready` resets
+any in-flight revision
 because a hidden non-retained webview may have discarded its prior delivery;
 otherwise the host can wait forever for an acknowledgement from a dead document.
 Preserve the strict nonce CSP, `dist`-only `localResourceRoots`,
