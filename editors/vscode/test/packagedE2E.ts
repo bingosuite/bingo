@@ -29,11 +29,11 @@ if (target === undefined) {
 }
 
 const examples = [
-  { name: "level1-loop", line: 8, minimumDepth: 0, stop: "breakpoint" },
-  { name: "level2-channel", line: undefined, minimumDepth: 1, stop: "pause" },
-  { name: "level3-worker-pool", line: undefined, minimumDepth: 1, stop: "pause" },
-  { name: "level4-pipeline", line: undefined, minimumDepth: 1, stop: "pause" },
-  { name: "level5-workflow", line: 83, minimumDepth: 2, stop: "breakpoint" },
+  { name: "level1-loop", line: 8, minimumDepth: 0 },
+  { name: "level2-channel", line: 23, minimumDepth: 1 },
+  { name: "level3-worker-pool", line: 44, minimumDepth: 1 },
+  { name: "level4-pipeline", line: 65, minimumDepth: 1 },
+  { name: "level5-workflow", line: 83, minimumDepth: 2 },
 ] as const;
 
 function packageTarget(): "darwin-arm64" | "linux-x64" | undefined {
@@ -122,7 +122,6 @@ async function main(): Promise<void> {
         config,
         example.name,
         example.line,
-        example.stop,
         `debug-${String(index + 1)}`,
       );
       observedDepths.push(result.depth);
@@ -182,8 +181,7 @@ async function main(): Promise<void> {
 async function runExample(
   config: BingoServerConfiguration,
   name: string,
-  line: number | undefined,
-  stop: "breakpoint" | "pause",
+  line: number,
   debugSessionId: string,
 ): Promise<{
   readonly sessionId: string;
@@ -232,23 +230,20 @@ async function runExample(
     10_000,
   );
 
-  if (stop === "breakpoint") {
-    assert.notEqual(line, undefined);
-    const breakpoint = client.request("setBreakpoints", {
-      source: {
-        name: basename(program),
-        path: resolve(repositoryRoot, "examples", name, "main.go"),
-      },
-      breakpoints: [{ line }],
-      sourceModified: false,
-    });
-    const breakpointResponse = await client.response(breakpoint);
-    assert.equal(
-      ((breakpointResponse.body as { readonly breakpoints?: readonly { verified?: boolean }[] })
-        .breakpoints?.[0]?.verified),
-      true,
-    );
-  }
+  const breakpoint = client.request("setBreakpoints", {
+    source: {
+      name: basename(program),
+      path: resolve(repositoryRoot, "examples", name, "main.go"),
+    },
+    breakpoints: [{ line }],
+    sourceModified: false,
+  });
+  const breakpointResponse = await client.response(breakpoint);
+  assert.equal(
+    ((breakpointResponse.body as { readonly breakpoints?: readonly { verified?: boolean }[] })
+      .breakpoints?.[0]?.verified),
+    true,
+  );
   const configured = client.request("configurationDone", {});
   await Promise.all([client.response(configured), client.response(launch)]);
   await client.message(
@@ -260,17 +255,12 @@ async function runExample(
   );
   const continued = client.request("continue", { threadId: 1 });
   await client.response(continued);
-  if (stop === "pause") {
-    await delay(10);
-    const pause = client.request("pause", { threadId: 1 });
-    await client.response(pause);
-  }
   await client.message(
     (message) =>
       message.type === "event" &&
       message.event === "stopped" &&
       (message.body as { readonly reason?: unknown } | undefined)?.reason ===
-        stop,
+        "breakpoint",
     30_000,
   );
 
