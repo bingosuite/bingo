@@ -47,15 +47,20 @@ architecture behind this.
   extension's `"go"` type. To update, rerun `just vscode-install`; uninstall with
   `code --uninstall-extension bingosuite.bingo`.
 
-## 1. Demo target
+## 1. Demo targets
 
-`examples/spawntree` is a deterministic **main → supervisor → worker×3** spawn
-tree that churns a fresh worker pool each round, so consecutive snapshots show
-workers appearing in the `created` delta and leaving in `exited`. The intended
-breakpoint is the `fmt.Printf` inside `worker` (`examples/spawntree/main.go:27`).
-There is no separate manual target build step: the normal workspace launch
-configuration runs **bingo: build spawntree** before F5. It uses the installed
-VSIX's bundled server and does not rebuild or codesign extension sources.
+The [progressive example suite](../examples/README.md) is available from the
+normal workspace launch picker. `level5-workflow` gives the richest hierarchy:
+**main → workflow×3 → stage×3**, including a deterministic canceled workflow.
+The intended telemetry breakpoint is the result send in `inventoryStage`
+(`examples/level5-workflow/main.go:83`). The workspace launch runs
+**bingo: build examples** before F5 and uses the installed VSIX's bundled
+server; it does not rebuild or codesign extension sources.
+
+`examples/spawntree` remains the dedicated long-running lifecycle demo. It
+churns a deterministic **main → supervisor → worker×3** tree so consecutive
+snapshots show workers appearing in `created` and leaving in `exited`. Build it
+with `just build-spawntree` and drive it with `cmd/dapcli` as shown below.
 Contributor source-extension work is a separate command-line path: run
 `just vscode-dev`, then
 `code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"`.
@@ -64,16 +69,17 @@ It is intentionally absent from the root Run and Debug dropdown.
 ## 2. Drive with VS Code (DAP, automatic server)
 
 1. Open this repo in VS Code.
-2. Select **“bingo DAP: launch spawntree (stop on entry)”**. The only other root
+2. Select **“bingo DAP: launch example (stop on entry)”**. The only other root
    choice is **“bingo DAP: join running session”**.
-3. Press F5. VS Code runs **“bingo: build spawntree”**. The companion
+3. Press F5, choose **level5-workflow**, and let VS Code run
+   **“bingo: build examples”**. The companion
    health-checks `127.0.0.1:6060`,
    reuses a compatible server or starts its detached bundled server, waits up
    to `serverReadyTimeoutMs` (five seconds by default) for compatible readiness,
-   then connects to DAP at `127.0.0.1:4711`. bingo launches the rebuilt
-   `build/spawntree` and stops at entry.
-4. Set a breakpoint on `examples/spawntree/main.go:27` and **Continue** — the
-   tracee stops there with several worker goroutines alive.
+   then connects to DAP at `127.0.0.1:4711`. bingo launches
+   `build/examples/level5-workflow` and stops at entry.
+4. Set a breakpoint on `examples/level5-workflow/main.go:83` and **Continue** —
+   the tracee stops with several workflow and stage goroutines alive.
 5. Grab the **session id** so the observer can join: it is printed in the bingo
    DAP `console` output and is listed by
    `curl -s 127.0.0.1:6060/api/sessions`.
@@ -103,6 +109,7 @@ path in **bingo Server** rather than killing a potentially shared process.
 Equivalent driver in a terminal requires a manual server:
 
 ```sh
+just build-spawntree
 just server
 just dapcli            # or: go run -tags bingonative ./cmd/dapcli -addr localhost:4711
 # in the REPL:

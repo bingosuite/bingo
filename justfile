@@ -58,8 +58,16 @@ build-target:
 	mkdir -p ./build/target
 	go build --gcflags="all=-N -l" -o ./build/target/target ./cmd/target
 
-# VS Code's pre-launch task rebuilds the telemetry demo without optimization so
-# source breakpoints and stepping stay aligned with the checked-out source.
+# The picker has one pre-launch task, so build every selectable target with
+# debugger-friendly code generation before resolving its chosen binary.
+build-examples:
+	mkdir -p ./build/examples
+	go build -gcflags="all=-N -l" -o ./build/examples/level1-loop ./examples/level1-loop
+	go build -gcflags="all=-N -l" -o ./build/examples/level2-channel ./examples/level2-channel
+	go build -gcflags="all=-N -l" -o ./build/examples/level3-worker-pool ./examples/level3-worker-pool
+	go build -gcflags="all=-N -l" -o ./build/examples/level4-pipeline ./examples/level4-pipeline
+	go build -gcflags="all=-N -l" -o ./build/examples/level5-workflow ./examples/level5-workflow
+
 build-spawntree:
 	mkdir -p ./build
 	go build -gcflags="all=-N -l" -o ./build/spawntree ./examples/spawntree
@@ -70,8 +78,8 @@ vscode-prepare:
 	npm --prefix editors/vscode run binary:prepare
 
 # Prepare source-extension and target artifacts for an Extension Development
-# Host. Normal target F5 uses the installed VSIX and only rebuilds spawntree.
-vscode-dev: build-spawntree vscode-prepare
+# Host. Normal target F5 uses the installed VSIX and only rebuilds the examples.
+vscode-dev: build-examples vscode-prepare
 	npm --prefix editors/vscode ci --ignore-scripts
 	npm --prefix editors/vscode run build
 

@@ -2,11 +2,11 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "bingo DAP: launch spawntree (stop on entry)",
+      "name": "bingo DAP: launch example (stop on entry)",
       "type": "bingo",
       "request": "launch",
-      "program": "${workspaceFolder}/build/spawntree",
-      "preLaunchTask": "bingo: build spawntree",
+      "program": "${workspaceFolder}/build/examples/${input:bingoExample}",
+      "preLaunchTask": "bingo: build examples",
       "stopOnEntry": true,
       "serverMode": "auto",
       "managementHost": "127.0.0.1",
@@ -31,6 +31,19 @@
     }
   ],
   "inputs": [
+    {
+      "id": "bingoExample",
+      "type": "pickString",
+      "description": "Progressive debugger example",
+      "options": [
+        "level1-loop",
+        "level2-channel",
+        "level3-worker-pool",
+        "level4-pipeline",
+        "level5-workflow"
+      ],
+      "default": "level1-loop"
+    },
     {
       "id": "bingoSession",
       "type": "promptString",

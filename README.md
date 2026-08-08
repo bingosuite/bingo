@@ -138,10 +138,11 @@ Lifecycle configuration is explicit per launch: `serverMode`,
 name the endpoint and persistent log path in the **bingo Server** output channel.
 
 Install the platform VSIX once (and update it when a newer version ships), then
-select **bingo DAP: launch spawntree (stop on entry)** from the repository's Run
-and Debug dropdown and press F5. The only other root choice is
-**bingo DAP: join running session**. The launch pre-task rebuilds only the demo
-with debugger-friendly compiler flags; the installed extension health-checks
+select **bingo DAP: launch example (stop on entry)** from the repository's Run
+and Debug dropdown, press F5, and choose one of the five
+[progressive examples](examples/README.md). The only other root choice is
+**bingo DAP: join running session**. The launch pre-task rebuilds all five
+targets with debugger-friendly compiler flags; the installed extension health-checks
 `127.0.0.1:6060`, reuses a compatible server or starts its bundled server, waits
 for DAP on `127.0.0.1:4711`, and connects. No manual `just server` or separate
 server-start/extension-host launch is required. The extension never kills the

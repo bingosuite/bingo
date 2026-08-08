@@ -35,10 +35,10 @@ binary and VSIX twice and requires both SHA-256 hashes to match.
 ## F5: connect or start
 
 Install the matching platform VSIX once, select
-**bingo DAP: launch spawntree (stop on entry)** (or
+**bingo DAP: launch example (stop on entry)** (or
 **bingo DAP: join running session**) from the repository's Run and Debug
-dropdown, and press F5. There is no separate server-start or extension-host
-choice. In the default `auto` mode the extension:
+dropdown, press F5, and choose one of the five progressive targets. There is no
+separate server-start or extension-host choice. In the default `auto` mode the extension:
 
 1. checks `http://127.0.0.1:6060/api/health`;
 2. reuses a compatible manual or managed bingo server;
@@ -175,14 +175,14 @@ just server
 ## Contributor extension development
 
 ```sh
-just vscode-dev       # build extension, native bundled server, and spawntree
+just vscode-dev       # build extension, native bundled server, and examples
 just vscode-check     # clean install, lint, typecheck, tests, bundle/list smoke
 just vscode-package   # native reproducible package + content verification
 ```
 
 `just vscode-dev` restores the exact npm lockfile with lifecycle scripts
 disabled, stages the source extension's native binary, builds its bundle, and
-rebuilds spawntree. It does not add contributor tooling to the root Run and
+rebuilds the progressive examples. It does not add contributor tooling to the root Run and
 Debug dropdown. To exercise the staged source extension, launch its Extension
 Development Host explicitly from a terminal:
 
@@ -190,9 +190,9 @@ Development Host explicitly from a terminal:
 code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"
 ```
 
-Inside that window, select the normal spawntree configuration. Ordinary target
+Inside that window, select the normal example configuration. Ordinary target
 debugging instead uses the installed VSIX and runs only
-**bingo: build spawntree**, so F5 does not rebuild or codesign the
+**bingo: build examples**, so F5 does not rebuild or codesign the
 extension-local server.
 
 ## Troubleshooting
