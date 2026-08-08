@@ -77,7 +77,11 @@ jobs:
         run: npm --prefix editors/vscode run package:verify
 
       - name: Build progressive concurrency targets
-        run: just build-examples
+        run: |
+          mkdir -p build/examples
+          for example in level1-loop level2-channel level3-worker-pool level4-pipeline level5-workflow; do
+            go build -gcflags="all=-N -l" -o "build/examples/${example}" "./examples/${example}"
+          done
 
       - name: Exercise packaged DAP and concurrency UI data path
         if: matrix.target == 'linux-x64' || runner.environment == 'self-hosted'
