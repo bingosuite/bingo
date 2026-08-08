@@ -67,7 +67,7 @@ describe("repository VS Code integration", () => {
     assert.deepEqual(
       configurations.map((configuration) => configuration.name),
       [
-        "bingo DAP: launch spawntree (stop on entry)",
+        "bingo DAP: launch example (stop on entry)",
         "bingo DAP: join running session",
       ],
     );
@@ -87,10 +87,28 @@ describe("repository VS Code integration", () => {
     assert.notEqual(binaryLaunch, undefined);
     assert.equal(
       binaryLaunch?.name,
-      "bingo DAP: launch spawntree (stop on entry)",
+      "bingo DAP: launch example (stop on entry)",
     );
-    assert.equal(binaryLaunch?.program, "${workspaceFolder}/build/spawntree");
-    assert.equal(binaryLaunch?.preLaunchTask, "bingo: build spawntree");
+    assert.equal(
+      binaryLaunch?.program,
+      "${workspaceFolder}/build/examples/${input:bingoExample}",
+    );
+    assert.equal(binaryLaunch?.preLaunchTask, "bingo: build examples");
+    assert.equal(binaryLaunch?.stopOnEntry, true);
+
+    const inputs = requireArray(launch.inputs).map(requireRecord);
+    assert.equal(inputs.length, 2);
+    const examplePicker = inputs.find((input) => input.id === "bingoExample");
+    assert.notEqual(examplePicker, undefined);
+    assert.equal(examplePicker?.type, "pickString");
+    assert.equal(examplePicker?.default, "level1-loop");
+    assert.deepEqual(examplePicker?.options, [
+      "level1-loop",
+      "level2-channel",
+      "level3-worker-pool",
+      "level4-pipeline",
+      "level5-workflow",
+    ]);
 
     const sessionJoin = configurations.find(
       (configuration) => configuration.request === "attach",
@@ -108,10 +126,10 @@ describe("repository VS Code integration", () => {
     assert.equal(tasks.length, 1);
     const [targetTask] = tasks;
     assert.notEqual(targetTask, undefined);
-    assert.equal(targetTask?.label, "bingo: build spawntree");
+    assert.equal(targetTask?.label, "bingo: build examples");
     assert.equal(targetTask?.type, "process");
     assert.equal(targetTask?.command, "just");
-    assert.deepEqual(targetTask?.args, ["build-spawntree"]);
+    assert.deepEqual(targetTask?.args, ["build-examples"]);
 
     const launch = readJSON(".vscode/launch.json");
     const configurations = requireArray(launch.configurations).map(requireRecord);

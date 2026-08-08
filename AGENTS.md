@@ -94,6 +94,7 @@ follow them so reviews stay about substance, not style.
 | [cmd/wsmon](cmd/wsmon/) | Read-only terminal telemetry observer. `-session`-joins a running session over WebSocket and live-renders the goroutine spawn tree + OS threads + created/exited lifecycle deltas from the `EventGoroutineSnapshot` stream. Never drives execution — the WS-observes half of the DAP-drives/WS-observes demo. |
 | [editors/vscode](editors/vscode/) | Platform-packaged TypeScript companion extension. Owns VS Code debugger type `bingo`, enables Go breakpoints, and reuses or starts a compatible shared bingo server before connecting the built-in Debug UI to DAP. |
 | [cmd/target](cmd/target/) | Trivial target program for manual testing. |
+| [examples/level1-loop](examples/level1-loop/) … [examples/level5-workflow](examples/level5-workflow/) | Progressive debugger targets, selected by the root VS Code launch picker and built together with `just build-examples` (see [examples/README.md](examples/README.md)). |
 | [examples/spawntree](examples/spawntree/) | Concurrency demo target: a deterministic main → supervisor → worker×N goroutine spawn tree for exercising the telemetry stream (see [docs/ConcurrencyTelemetry.md](docs/ConcurrencyTelemetry.md)). |
 | [cmd/githook](cmd/githook/) | Conventional-commits commitlint, wired via [lefthook.yml](lefthook.yml). |
 | [pkg/protocol](pkg/protocol/) | Wire types: `Event`, `Command`, payload structs, `EventKind`, `CommandKind`, `SessionState`. Single source of truth. |
@@ -916,8 +917,9 @@ or VS Code can retain an older bundle under the same identity. The manifest test
 and package verifier pin the current version (**0.2.0**) in source and VSIX
 metadata.
 The root Run and Debug dropdown exposes exactly two `"type":"bingo"` choices:
-launch spawntree and join a running session. Normal F5 uses the installed VSIX
-and only rebuilds the target; contributor source-extension development runs
+launch one of five progressive examples through a `pickString`, and join a
+running session. Normal F5 uses the installed VSIX and rebuilds the five targets
+with `just build-examples`; contributor source-extension development runs
 `just vscode-dev` and launches an Extension Development Host explicitly from
 the CLI with
 `code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"`,
@@ -1384,9 +1386,10 @@ just build [linux amd64 | darwin arm64]   # produces ./build/bingo/...
 just test [PKG]                            # go test -v
 just coverage [PKG]                        # writes test/coverage.out
 just integration                           # ginkgo -r ./test/integration (no e2e tag)
-just build-spawntree                       # rebuilds the VS Code demo with -N -l
+just build-examples                        # build five progressive targets with -N -l
+just build-spawntree                       # build the dedicated telemetry demo with -N -l
 just vscode-prepare                        # stage the current native server inside the extension
-just vscode-dev                            # stage source extension + native server + spawntree for CLI-launched Extension Host
+just vscode-dev                            # stage source extension + native server + examples for CLI-launched Extension Host
 just vscode-check                          # lint, typecheck, test, bundle, package-list smoke
 just vscode-package                        # writes verified dist/bingo-<platform>.vsix
 just vscode-install                        # explicitly installs/updates bingosuite.bingo
