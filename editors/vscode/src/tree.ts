@@ -1,6 +1,7 @@
 import type { Goroutine } from "./telemetry.js";
 
 export const maximumRenderedGoroutines = 500;
+export const maximumFilterAncestorDepth = 4;
 
 export interface TreeNode {
   readonly goroutine: Goroutine;
@@ -164,9 +165,15 @@ export function filterTree(layout: TreeLayout, query: string): TreeLayout {
       continue;
     }
     let current: TreeNode | undefined = node;
-    while (current !== undefined && !visible.has(current.goroutine.id)) {
+    let ancestors = 0;
+    while (
+      current !== undefined &&
+      !visible.has(current.goroutine.id) &&
+      ancestors <= maximumFilterAncestorDepth
+    ) {
       visible.add(current.goroutine.id);
       current = byID.get(current.parentId);
+      ancestors += 1;
     }
   }
   const goroutines = layout.nodes

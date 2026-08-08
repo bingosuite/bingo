@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { filterTree, layoutSpawnTree } from "../src/tree.js";
+import {
+  filterTree,
+  layoutSpawnTree,
+  maximumFilterAncestorDepth,
+} from "../src/tree.js";
 import { goroutine } from "./fixtures.js";
 
 describe("spawn tree", () => {
@@ -52,7 +56,27 @@ describe("spawn tree", () => {
     const filtered = filterTree(full, "needle");
     assert.deepEqual(
       filtered.nodes.map((node) => node.goroutine.id),
-      input.map((item) => item.id),
+      [16, 17, 18, 19, 20],
     );
+    assert.equal(maximumFilterAncestorDepth, 4);
+  });
+
+  it("bounds ancestor context and relayouts a 500-node filtered chain", () => {
+    const input = Array.from({ length: 500 }, (_, index) =>
+      goroutine(index + 1, index, {
+        waitReason: index === 499 ? "needle" : "waiting",
+      }),
+    );
+    const filtered = filterTree(layoutSpawnTree(input), "needle");
+    assert.deepEqual(
+      filtered.nodes.map((node) => node.goroutine.id),
+      [496, 497, 498, 499, 500],
+    );
+    assert.deepEqual(
+      filtered.nodes.map((node) => node.depth),
+      [0, 1, 2, 3, 4],
+    );
+    assert.equal(filtered.width, 1142);
+    assert.equal(filtered.height, 496);
   });
 });

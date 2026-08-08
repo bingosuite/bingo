@@ -10,7 +10,7 @@ bingo speaks two protocols against **one** debug session at the same time:
   the OS-thread set, and created/exited lifecycle deltas — streams here as
   `EventGoroutineSnapshot`.
 
-The VS Code 0.3.0 extension wires both together automatically: DAP drives while
+The VS Code 0.3.1 extension wires both together automatically: DAP drives while
 the **Bingo Concurrency** Activity Bar view observes the exact session over
 WebSocket. `cmd/wsmon` remains the terminal observer for non-VS Code workflows.
 
@@ -40,7 +40,7 @@ architecture behind this.
   just vscode-install
   ```
 
-  Automatic graphical telemetry requires **bingosuite.bingo 0.3.0 or newer**. Run
+  Automatic graphical telemetry requires **bingosuite.bingo 0.3.1 or newer**. Run
   **Developer: Reload Window** once after installation or update. The companion
   owns debugger type `"bingo"` and connects directly to bingo's DAP listener;
   it neither invokes nor validates `dlv`, and it does not replace the Go

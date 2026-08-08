@@ -8,6 +8,7 @@ import { describe, it } from "node:test";
 
 import {
   bingoServiceIdentity,
+  dapSessionEventVersion,
   managementApiVersion,
   minimumHealthProbeTimeoutMs,
   probeBingoHealth,
@@ -26,6 +27,7 @@ function health(overrides: Record<string, unknown> = {}): string {
     dap: {
       enabled: true,
       address: "127.0.0.1:4711",
+      sessionEventVersion: 1,
     },
     managedIdleShutdown: {
       enabled: true,
@@ -40,6 +42,12 @@ describe("health compatibility", () => {
   it("accepts the exact bingo contract", () => {
     const result = validateHealthResponse(200, health(), expectedDAP);
     assert.equal(result.kind, "compatible");
+    if (result.kind === "compatible") {
+      assert.equal(
+        result.health.dapSessionEventVersion,
+        dapSessionEventVersion,
+      );
+    }
   });
 
   it("reads localhost health within the minimum practical probe budget", async () => {
@@ -59,7 +67,9 @@ describe("health compatibility", () => {
     for (const address of ["0.0.0.0:4711", "[::]:4711", ":4711"]) {
       const result = validateHealthResponse(
         200,
-        health({ dap: { enabled: true, address } }),
+        health({
+          dap: { enabled: true, address, sessionEventVersion: 1 },
+        }),
         expectedDAP,
       );
       assert.equal(result.kind, "compatible");
@@ -126,10 +136,34 @@ describe("health compatibility", () => {
       { status: 200, body: health({ wireProtocolVersion: "9" }) },
     ],
     [
+      "older bingo without DAP session discovery",
+      {
+        status: 200,
+        body: health({
+          dap: { enabled: true, address: "127.0.0.1:4711" },
+        }),
+      },
+    ],
+    [
+      "wrong DAP session event version",
+      {
+        status: 200,
+        body: health({
+          dap: {
+            enabled: true,
+            address: "127.0.0.1:4711",
+            sessionEventVersion: 2,
+          },
+        }),
+      },
+    ],
+    [
       "disabled DAP",
       {
         status: 200,
-        body: health({ dap: { enabled: false, address: "" } }),
+        body: health({
+          dap: { enabled: false, address: "", sessionEventVersion: 1 },
+        }),
       },
     ],
     [
@@ -137,7 +171,11 @@ describe("health compatibility", () => {
       {
         status: 200,
         body: health({
-          dap: { enabled: true, address: "127.0.0.1:9999" },
+          dap: {
+            enabled: true,
+            address: "127.0.0.1:9999",
+            sessionEventVersion: 1,
+          },
         }),
       },
     ],
@@ -146,7 +184,11 @@ describe("health compatibility", () => {
       {
         status: 200,
         body: health({
-          dap: { enabled: true, address: "192.0.2.1:4711" },
+          dap: {
+            enabled: true,
+            address: "192.0.2.1:4711",
+            sessionEventVersion: 1,
+          },
         }),
       },
     ],
@@ -167,6 +209,10 @@ describe("health compatibility", () => {
       resolve(root, "pkg/protocol/protocol.go"),
       "utf8",
     );
+    const dapProtocol = readFileSync(
+      resolve(root, "pkg/protocol/dap.go"),
+      "utf8",
+    );
 
     assert.match(
       handler,
@@ -181,6 +227,12 @@ describe("health compatibility", () => {
     assert.match(
       protocol,
       new RegExp(`const Version\\s*=\\s*"${wireProtocolVersion}"`),
+    );
+    assert.match(
+      dapProtocol,
+      new RegExp(
+        `DAPSessionEventVersion\\s*=\\s*${String(dapSessionEventVersion)}`,
+      ),
     );
   });
 });

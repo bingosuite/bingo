@@ -99,7 +99,9 @@ func TestHealthDiscovery(t *testing.T) {
 	g.Expect(health.ManagementAPIVersion).To(Equal(ManagementAPIVersion))
 	g.Expect(health.WireProtocolVersion).To(Equal(protocol.Version))
 	g.Expect(uuid.Validate(health.InstanceID)).To(Succeed())
-	g.Expect(health.DAP).To(Equal(DAPHealth{}))
+	g.Expect(health.DAP).To(Equal(DAPHealth{
+		SessionEventVersion: protocol.DAPSessionEventVersion,
+	}))
 	g.Expect(health.ManagedIdleShutdown).To(Equal(ManagedIdleShutdownHealth{}))
 	g.Expect(health.SessionCount).To(Equal(0))
 

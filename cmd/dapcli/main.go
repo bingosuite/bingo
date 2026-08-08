@@ -13,8 +13,8 @@
 //
 // Without -session the session is created lazily by the first `launch`/`attach`
 // command (the DAP model has no standalone "create empty session" request). The
-// adapter prints the new session id on an `output` event so other clients can
-// join it.
+// adapter publishes the new session id on `bingo/session/v1` (and preserves its
+// console output) so other clients can join it.
 package main
 
 import (
@@ -30,6 +30,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bingosuite/bingo/internal/dapclient"
+	"github.com/bingosuite/bingo/pkg/protocol"
 	"github.com/chzyer/readline"
 	godap "github.com/google/go-dap"
 )
@@ -279,7 +281,7 @@ func (h *dapCLI) dispatch(args []string) bool {
 // handshake-driven) until the connection closes.
 func (h *dapCLI) readLoop() {
 	for {
-		msg, err := godap.ReadProtocolMessage(h.reader)
+		msg, err := readDAPMessage(h.reader)
 		if err != nil {
 			h.failPending()
 			if !isClosed(err) {
@@ -296,6 +298,10 @@ func (h *dapCLI) readLoop() {
 			h.onEvent(m)
 		}
 	}
+}
+
+func readDAPMessage(reader *bufio.Reader) (godap.Message, error) {
+	return dapclient.ReadProtocolMessage(reader)
 }
 
 func (h *dapCLI) onResponse(rm godap.ResponseMessage, msg godap.Message) {
@@ -383,6 +389,12 @@ func (h *dapCLI) close() { _ = h.conn.Close() }
 
 func (h *dapCLI) onEvent(em godap.EventMessage) {
 	switch e := em.(type) {
+	case *dapclient.SessionEvent:
+		if e.Body.Version == protocol.DAPSessionEventVersion &&
+			e.Body.SessionID != "" {
+			h.setSessionID(e.Body.SessionID)
+			h.printAsync("[session] " + e.Body.SessionID)
+		}
 	case *godap.InitializedEvent:
 		h.printAsync("[initialized] session ready")
 		go h.onInitialized()

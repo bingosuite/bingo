@@ -268,7 +268,10 @@ func (h *Handler) announceSession() {
 
 	h.send(&sessionEvent{
 		Event: h.event(sessionEventName),
-		Body:  sessionEventBody{Version: 1, SessionID: id},
+		Body: sessionEventBody{
+			Version:   protocol.DAPSessionEventVersion,
+			SessionID: id,
+		},
 	})
 	h.emitConsole(fmt.Sprintf("bingo session %s ready — observers can join with ?session=%s\n", id, id))
 }

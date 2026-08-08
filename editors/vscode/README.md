@@ -20,7 +20,8 @@ just vscode-install
 ```
 
 This builds, verifies, and installs `dist/bingo-<platform>.vsix`. The graphical
-concurrency view ships in **0.3.0**. Rerun the command to update, then run
+concurrency view debuted in 0.3.0; **0.3.1** adds capability-safe managed-server
+reuse and is the minimum supported version. Rerun the command to update, then run
 **Developer: Reload Window** once so the active extension host loads the new
 bundle. Package without installing with `just vscode-package`. Uninstall with:
 
@@ -47,6 +48,10 @@ separate server-start or extension-host choice. In the default `auto` mode the e
 4. waits up to five seconds for compatible health, then connects VS Code to DAP;
 5. receives the DAP adapter's `bingo/session/v1` event and automatically joins
    that exact managed session over WebSocket in **Bingo Concurrency**.
+
+Compatible health must advertise `dap.sessionEventVersion: 1`; an older server
+that lacks managed-session discovery is reported as incompatible and is never
+reused or replaced while it occupies the configured endpoint.
 
 Concurrent VS Code extension hosts may both try to start. Listener binding
 chooses the winner; a child that loses the race is harmless because both hosts

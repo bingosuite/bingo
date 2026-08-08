@@ -65,7 +65,8 @@ Frontends can identify and reuse a compatible bingo process through
   "instanceId": "4dd4dfdd-7f55-41a5-bd95-c086ce6f3c2a",
   "dap": {
     "enabled": true,
-    "address": "0.0.0.0:4711"
+    "address": "0.0.0.0:4711",
+    "sessionEventVersion": 1
   },
   "managedIdleShutdown": {
     "enabled": false,
@@ -78,7 +79,9 @@ Frontends can identify and reuse a compatible bingo process through
 The response is non-cacheable. `managementApiVersion` versions this HTTP
 contract independently of `wireProtocolVersion`; integrations should require
 management API v1 and separately check that they support the advertised bingo
-wire version. `instanceId` changes on every process start. The DAP address is the
+wire version. Graphical clients also require `dap.sessionEventVersion: 1`,
+which guarantees the server emits `bingo/session/v1` after managed session
+discovery. `instanceId` changes on every process start. The DAP address is the
 actual bound listener address, including the selected port when bingo was
 started with `-dap-addr ...:0`.
 
@@ -112,7 +115,7 @@ Build and install the repository's companion extension:
 just vscode-install
 ```
 
-The graphical concurrency runtime requires extension version **0.3.0 or
+The capability-safe graphical concurrency runtime requires extension version **0.3.1 or
 newer**. After installing or updating the VSIX, run **Developer: Reload Window**
 once so the current extension host activates the new bundle.
 
@@ -155,7 +158,8 @@ from a terminal with
 `code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"`.
 Compatible manually-started servers remain supported and are reused.
 
-The **Bingo Concurrency** Activity Bar view is included in extension 0.3.0.
+The **Bingo Concurrency** Activity Bar view was introduced in 0.3.0; use 0.3.1
+or newer so managed-server reuse requires the session-discovery capability.
 Press F5, choose one of the five progressive examples, and the view
 automatically follows the exact DAP-created session over WebSocket—no session
 ID copy is needed. It visualizes the goroutine spawn tree, OS threads, current

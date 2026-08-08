@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 
 import * as vscode from "vscode";
 
+import { WebviewDeliveryState } from "./documentGeneration.js";
 import type { ConcurrencyViewModel } from "./model.js";
 import { decodeWebviewMessage } from "./messages.js";
 import type { SessionRegistry } from "./registry.js";
@@ -10,10 +11,8 @@ export const concurrencyViewId = "bingo.concurrency";
 
 export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
   #view: vscode.WebviewView | undefined;
-  #ready = false;
-  #lastRenderedRevision = -1;
-  #inFlightRevision = -1;
   #fitPending = false;
+  readonly #delivery = new WebviewDeliveryState();
   #model: ConcurrencyViewModel;
   readonly #unsubscribe: () => void;
 
@@ -29,10 +28,8 @@ export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
   }
 
   public resolveWebviewView(view: vscode.WebviewView): void {
+    this.#delivery.beginDocument();
     this.#view = view;
-    this.#ready = false;
-    this.#lastRenderedRevision = -1;
-    this.#inFlightRevision = -1;
     const dist = vscode.Uri.joinPath(this.extensionUri, "dist");
     view.webview.options = {
       enableScripts: true,
@@ -40,20 +37,20 @@ export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
     };
     view.webview.html = this.#html(view.webview);
     view.webview.onDidReceiveMessage((message: unknown) => {
-      this.#receive(message);
+      if (this.#view === view && view.visible) {
+        this.#receive(message);
+      }
     });
     const visibility = view.onDidChangeVisibility(() => {
       if (this.#view === view && !view.visible) {
-        this.#ready = false;
-        this.#inFlightRevision = -1;
+        this.#delivery.markHidden();
       }
     });
     view.onDidDispose(() => {
       visibility.dispose();
       if (this.#view === view) {
+        this.#delivery.beginDocument();
         this.#view = undefined;
-        this.#ready = false;
-        this.#inFlightRevision = -1;
       }
     });
   }
@@ -64,7 +61,7 @@ export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
   }
 
   public get lastRenderedRevision(): number {
-    return this.#lastRenderedRevision;
+    return this.#delivery.lastRenderedRevision;
   }
 
   public get status(): {
@@ -73,7 +70,7 @@ export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
   } {
     return {
       resolved: this.#view !== undefined,
-      ready: this.#ready,
+      ready: this.#delivery.ready,
     };
   }
 
@@ -90,18 +87,12 @@ export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
     }
     switch (message.type) {
       case "ready":
-        this.#ready = true;
-        this.#lastRenderedRevision = -1;
-        this.#inFlightRevision = -1;
+        this.#delivery.markReady();
         this.#render();
         this.#sendFit();
         break;
       case "rendered":
-        if (
-          message.revision === this.#inFlightRevision
-        ) {
-          this.#lastRenderedRevision = message.revision;
-          this.#inFlightRevision = -1;
+        if (this.#delivery.acknowledge(message.revision)) {
           this.#render();
         }
         break;
@@ -121,15 +112,13 @@ export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
   }
 
   #render(): void {
-    if (
-      !this.#ready ||
-      this.#view === undefined ||
-      this.#inFlightRevision >= 0 ||
-      this.#lastRenderedRevision === this.#model.revision
-    ) {
+    if (this.#view === undefined) {
       return;
     }
-    this.#inFlightRevision = this.#model.revision;
+    const delivery = this.#delivery.beginDelivery(this.#model.revision);
+    if (delivery === undefined) {
+      return;
+    }
     const active = this.#model.sessions.find(
       (session) =>
         session.debugSessionId === this.#model.activeDebugSessionId,
@@ -142,34 +131,42 @@ export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
             tooltip: `${String(active.snapshot.goroutines.length)} goroutines · ${String(active.snapshot.threads.length)} threads`,
           };
     const revision = this.#model.revision;
-    void this.#view.webview
+    const view = this.#view;
+    void view.webview
       .postMessage({
         type: "render",
         revision,
         model: this.#model,
       })
-      .then((delivered) => {
-        if (!delivered && this.#inFlightRevision === revision) {
-          this.#inFlightRevision = -1;
-          this.#ready = false;
-        }
-      }, () => {
-        this.#inFlightRevision = -1;
-        this.#ready = false;
-      });
+      .then(
+        (delivered) => {
+          if (!delivered && this.#view === view) {
+            this.#delivery.rejectDelivery(delivery);
+          }
+        },
+        () => {
+          if (this.#view === view) {
+            this.#delivery.rejectDelivery(delivery);
+          }
+        },
+      );
   }
 
   #sendFit(): void {
-    if (!this.#fitPending || !this.#ready || this.#view === undefined) {
+    if (!this.#fitPending || !this.#delivery.ready || this.#view === undefined) {
       return;
     }
-    void this.#view.webview
-      .postMessage({ type: "fit" })
-      .then((delivered) => {
-        if (delivered) {
-          this.#fitPending = false;
-        }
-      }, () => undefined);
+    const view = this.#view;
+    const generation = this.#delivery.captureGeneration();
+    void view.webview.postMessage({ type: "fit" }).then((delivered) => {
+      if (
+        delivered &&
+        this.#view === view &&
+        this.#delivery.isCurrent(generation)
+      ) {
+        this.#fitPending = false;
+      }
+    }, () => undefined);
   }
 
   #html(webview: vscode.Webview): string {
@@ -242,7 +239,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, .graph-viewport
 .tree-node text { fill: var(--vscode-foreground); pointer-events: none; }
 .node-id { font-size: 14px; font-weight: 700; }
 .node-status, .node-thread { font-size: 10px; fill: var(--vscode-descriptionForeground) !important; }
-.filtered { display: none; }
 .omitted { position: absolute; bottom: 2px; left: 8px; color: var(--vscode-descriptionForeground); font-size: 10px; }
 .inspector, .threads, .timeline { padding: 11px; }
 h2 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; color: var(--vscode-descriptionForeground); }

@@ -55,6 +55,18 @@ describe("concurrency webview DOM", () => {
     assert.match(document.querySelector(".inspector")?.textContent ?? "", /main\.worker/);
     assert.match(document.querySelector(".timeline")?.textContent ?? "", /\+ g2/);
     assert.equal(document.querySelector("svg")?.getAttribute("role"), "tree");
+    const treeItems = document.querySelectorAll(".tree-node");
+    assert.equal(treeItems[0]?.getAttribute("aria-level"), "1");
+    assert.match(treeItems[0]?.getAttribute("aria-label") ?? "", /root goroutine/);
+    assert.equal(treeItems[0]?.getAttribute("aria-selected"), "true");
+    assert.equal(treeItems[1]?.getAttribute("aria-level"), "2");
+    assert.match(
+      treeItems[1]?.getAttribute("aria-label") ?? "",
+      /child of goroutine 1/,
+    );
+    assert.equal(treeItems[1]?.getAttribute("aria-selected"), "false");
+    assert.equal(treeItems[1]?.getAttribute("aria-posinset"), "1");
+    assert.equal(treeItems[1]?.getAttribute("aria-setsize"), "1");
     assert.equal(document.querySelector(".graph-viewport")?.getAttribute("tabindex"), "0");
     assert.equal(document.querySelector(".graph-viewport")?.id, "concurrency-tree");
     assert.deepEqual(messages.at(-1), { type: "rendered", revision: 1 });
@@ -87,6 +99,62 @@ describe("concurrency webview DOM", () => {
     search.dispatchEvent(new window.Event("input"));
     assert.equal(document.querySelectorAll(".tree-node.filtered").length, 0);
     assert.equal(document.querySelectorAll(".tree-edge.filtered").length, 0);
+  });
+
+  it("describes cycle-normalized roots without claiming their parent is absent", () => {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    mountConcurrencyView(document, { postMessage() {} })(
+      model({
+        snapshot: snapshot([
+          goroutine(1, 2, { current: true }),
+          goroutine(2, 1),
+        ]),
+      }),
+    );
+
+    const label =
+      document.querySelector('[data-goid="1"]')?.getAttribute("aria-label") ?? "";
+    assert.match(label, /displayed root after cycle normalization/);
+    assert.match(label, /reported parent goroutine 2/);
+    assert.doesNotMatch(label, /not displayed/);
+  });
+
+  it("compacts and fits a large tree around filtered matches", () => {
+    const { document, window } = parseHTML("<html><body><div id=app></div></body></html>");
+    const goroutines = [goroutine(1, 0, { current: true })];
+    for (let id = 2; id <= 500; id += 1) {
+      goroutines.push(
+        goroutine(id, id - 1, id === 500 ? { waitReason: "needle" } : {}),
+      );
+    }
+    mountConcurrencyView(document, { postMessage() {} })(
+      model({ snapshot: snapshot(goroutines), selectedGoroutine: 1 }),
+    );
+    assert.match(document.querySelector("svg")?.getAttribute("viewBox") ?? "", /41086$/);
+
+    const search = document.querySelector<HTMLInputElement>('input[type="search"]')!;
+    search.value = "needle";
+    search.dispatchEvent(new window.Event("input"));
+
+    assert.equal(document.querySelectorAll(".tree-node").length, 5);
+    assert.equal(
+      document.querySelector("svg")?.getAttribute("viewBox"),
+      "0 0 1142 496",
+    );
+    assert.match(
+      document.querySelector('[data-goid="496"]')?.getAttribute("aria-label") ??
+        "",
+      /displayed root, reported parent goroutine 495 is not displayed/,
+    );
+    assert.equal(
+      document.querySelector('[data-goid="500"]')?.getAttribute("transform"),
+      "translate(874 370)",
+    );
+
+    search.value = "";
+    search.dispatchEvent(new window.Event("input"));
+    assert.equal(document.querySelectorAll(".tree-node").length, 500);
+    assert.match(document.querySelector("svg")?.getAttribute("viewBox") ?? "", /41086$/);
   });
 
   it("renders empty and error states", () => {

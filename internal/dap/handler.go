@@ -13,6 +13,7 @@ import (
 
 	godap "github.com/google/go-dap"
 
+	"github.com/bingosuite/bingo/internal/dapclient"
 	"github.com/bingosuite/bingo/internal/hub"
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
@@ -29,17 +30,10 @@ const cmdBufferSize = 64
 // genuinely wedged, so send() tears the connection down.
 const dapWriteTimeout = 10 * time.Second
 
-const sessionEventName = "bingo/session/v1"
+const sessionEventName = protocol.DAPSessionEventName
 
-type sessionEvent struct {
-	godap.Event
-	Body sessionEventBody `json:"body"`
-}
-
-type sessionEventBody struct {
-	Version   int    `json:"version"`
-	SessionID string `json:"sessionId"`
-}
+type sessionEvent = dapclient.SessionEvent
+type sessionEventBody = dapclient.SessionEventBody
 
 // Handler bridges one DAP TCP client to a bingo hub session. It implements
 // hub.WSConn: the hub's write pump feeds it bingo events via WriteMessage
