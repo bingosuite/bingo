@@ -12,7 +12,7 @@ const manifest = requireRecord(
 const contributes = requireRecord(manifest.contributes);
 const debuggers = requireArray(contributes.debuggers);
 const debuggerContribution = requireRecord(debuggers[0]);
-const expectedExtensionVersion = "0.2.0";
+const expectedExtensionVersion = "0.3.0";
 
 describe("extension manifest", () => {
   it("versions the managed-server runtime as an installable upgrade", () => {
@@ -49,6 +49,39 @@ describe("extension manifest", () => {
     const breakpoints = requireArray(contributes.breakpoints);
     assert.deepEqual(breakpoints, [{ language: "go" }]);
     assert.deepEqual(debuggerContribution.languages, ["go"]);
+  });
+
+  it("contributes the concurrency Activity Bar view and controls", () => {
+    const containers = requireRecord(contributes.viewsContainers);
+    const activity = requireArray(requireRecord(containers).activitybar).map(requireRecord);
+    assert.deepEqual(
+      activity.map((item) => item.id),
+      ["bingo"],
+    );
+    assert.equal(activity[0]?.icon, "media/bingo-activity.svg");
+    const views = requireArray(requireRecord(contributes.views).bingo).map(requireRecord);
+    assert.equal(views.length, 1);
+    assert.equal(views[0]?.id, "bingo.concurrency");
+    assert.equal(views[0]?.type, "webview");
+
+    const commands = requireArray(contributes.commands)
+      .map(requireRecord)
+      .map((command) => command.command);
+    for (const command of [
+      "bingo.concurrency.refresh",
+      "bingo.concurrency.selectSession",
+      "bingo.concurrency.fit",
+      "bingo.concurrency.copySnapshot",
+    ]) {
+      assert.ok(commands.includes(command));
+    }
+    assert.equal(commands.includes("bingo.concurrency.focus"), false);
+    const properties = requireRecord(requireRecord(contributes.configuration).properties);
+    assert.equal(
+      requireRecord(properties["bingo.concurrency.autoReveal"]).default,
+      true,
+    );
+    assert.ok(requireArray(manifest.activationEvents).includes("onDebug"));
   });
 
   it("declares bingo endpoint defaults", () => {
