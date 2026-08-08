@@ -69,7 +69,11 @@ describe("concurrency webview DOM", () => {
     assert.equal(treeItems[1]?.getAttribute("aria-setsize"), "1");
     assert.equal(document.querySelector(".graph-viewport")?.getAttribute("tabindex"), "0");
     assert.equal(document.querySelector(".graph-viewport")?.id, "concurrency-tree");
-    assert.deepEqual(messages.at(-1), { type: "rendered", revision: 1 });
+    assert.deepEqual(messages.at(-1), {
+      type: "rendered",
+      generation: 1,
+      revision: 1,
+    });
   });
 
   it("filters and selects through DOM events", () => {

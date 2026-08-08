@@ -15,8 +15,9 @@ describe("webview document generations", () => {
     const current = delivery.beginDelivery(7)!;
 
     assert.equal(delivery.rejectDelivery(stale), false);
+    assert.equal(delivery.acknowledge(stale), false);
     assert.equal(delivery.ready, true);
-    assert.equal(delivery.acknowledge(current.revision), true);
+    assert.equal(delivery.acknowledge(current), true);
     assert.equal(delivery.lastRenderedRevision, 7);
   });
 });
