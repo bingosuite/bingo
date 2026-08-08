@@ -2,18 +2,6 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Run bingo extension",
-      "type": "extensionHost",
-      "request": "launch",
-      "args": [
-        "--extensionDevelopmentPath=${workspaceFolder}/editors/vscode"
-      ],
-      "outFiles": [
-        "${workspaceFolder}/editors/vscode/dist/**/*.js"
-      ],
-      "preLaunchTask": "bingo: prepare extension host"
-    },
-    {
       "name": "bingo DAP: launch spawntree (stop on entry)",
       "type": "bingo",
       "request": "launch",

@@ -32,8 +32,11 @@ binary and VSIX twice and requires both SHA-256 hashes to match.
 
 ## F5: connect or start
 
-Select a `bingo` configuration and press F5. In the default `auto` mode the
-extension:
+Install the matching platform VSIX once, select
+**bingo DAP: launch spawntree (stop on entry)** (or
+**bingo DAP: join running session**) from the repository's Run and Debug
+dropdown, and press F5. There is no separate server-start or extension-host
+choice. In the default `auto` mode the extension:
 
 1. checks `http://127.0.0.1:6060/api/health`;
 2. reuses a compatible manual or managed bingo server;
@@ -167,7 +170,7 @@ just server
 # persistent until interrupted; add -idle-timeout 30s for server-owned cleanup
 ```
 
-## Development
+## Contributor extension development
 
 ```sh
 just vscode-dev       # build extension, native bundled server, and spawntree
@@ -175,13 +178,20 @@ just vscode-check     # clean install, lint, typecheck, tests, bundle/list smoke
 just vscode-package   # native reproducible package + content verification
 ```
 
-The repository's **bingo: prepare extension host** task runs `just vscode-dev`
-before **Run bingo extension**, restoring the exact npm lockfile with lifecycle
-scripts disabled and then staging the source extension's binary and bundle.
-The normal spawntree F5 configuration uses the installed VSIX and runs only
-**bingo: build spawntree**, so target debugging does not rebuild or codesign the
-extension-local server. In the Extension Development Host, select the same
-spawntree configuration to exercise the already-staged source extension.
+`just vscode-dev` restores the exact npm lockfile with lifecycle scripts
+disabled, stages the source extension's native binary, builds its bundle, and
+rebuilds spawntree. It does not add contributor tooling to the root Run and
+Debug dropdown. To exercise the staged source extension, launch its Extension
+Development Host explicitly from a terminal:
+
+```sh
+code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"
+```
+
+Inside that window, select the normal spawntree configuration. Ordinary target
+debugging instead uses the installed VSIX and runs only
+**bingo: build spawntree**, so F5 does not rebuild or codesign the
+extension-local server.
 
 ## Troubleshooting
 

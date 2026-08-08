@@ -133,13 +133,22 @@ Lifecycle configuration is explicit per launch: `serverMode`,
 `"serverMode": "connectOnly"`, which neither probes nor spawns. Startup failures
 name the endpoint and persistent log path in the **bingo Server** output channel.
 
-After installing, select the `"type": "bingo"` spawntree configuration from
-`.vscode/launch.json` and press F5. Its pre-launch task only rebuilds the demo
-with debugger-friendly compiler flags; the installed VSIX supplies the server,
-so target F5 stays fast and no manual `just server` is required. Use the
-separate **Run bingo extension** launch (or `just vscode-dev`) when changing the
-extension itself; that path stages the source extension binary and bundle.
-Manual servers remain supported and are reused when compatible.
+Install the platform VSIX once, then select
+**bingo DAP: launch spawntree (stop on entry)** from the repository's Run and
+Debug dropdown and press F5. The only other root choice is
+**bingo DAP: join running session**. The launch pre-task rebuilds only the demo
+with debugger-friendly compiler flags; the installed extension health-checks
+`127.0.0.1:6060`, reuses a compatible server or starts its bundled server, waits
+for DAP on `127.0.0.1:4711`, and connects. No manual `just server` or separate
+server-start/extension-host launch is required. The extension never kills the
+shared server; after every client disconnects, a managed server exits after its
+server-owned idle grace.
+
+Contributor development of the extension source is deliberately separate from
+normal target debugging. Run `just vscode-dev`, then launch VS Code explicitly
+from a terminal with
+`code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"`.
+Compatible manually-started servers remain supported and are reused.
 
 Other DAP clients can point at `127.0.0.1:4711`. The DAP client creates a
 managed session on `launch`/`attach`; WebSocket observers join that same session

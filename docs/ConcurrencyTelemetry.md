@@ -34,7 +34,7 @@ architecture behind this.
   keeps its `go.buildTags: bingonative` settings for gopls, navigation,
   formatting, and tests.
 - For the VS Code debugger: bingo's separate companion extension. Build and
-  install it locally:
+  install the matching platform VSIX once:
 
   ```sh
   just vscode-install
@@ -55,20 +55,21 @@ breakpoint is the `fmt.Printf` inside `worker` (`examples/spawntree/main.go:27`)
 There is no separate manual target build step: the normal workspace launch
 configuration runs **bingo: build spawntree** before F5. It uses the installed
 VSIX's bundled server and does not rebuild or codesign extension sources.
-**Run bingo extension** separately runs **bingo: prepare extension host**
-(`just vscode-dev`) to stage the source extension binary and bundle.
+Contributor source-extension work is a separate command-line path: run
+`just vscode-dev`, then
+`code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"`.
+It is intentionally absent from the root Run and Debug dropdown.
 
 ## 2. Drive with VS Code (DAP, automatic server)
 
 1. Open this repo in VS Code.
-2. For an installed package, select
-   **“bingo DAP: launch spawntree (stop on entry)”** directly. To exercise the
-   source extension, first run **“Run bingo extension”**, then select the
-   spawntree configuration in the Extension Development Host.
+2. Select **“bingo DAP: launch spawntree (stop on entry)”**. The only other root
+   choice is **“bingo DAP: join running session”**.
 3. Press F5. VS Code runs **“bingo: build spawntree”**. The companion
    health-checks `127.0.0.1:6060`,
-   reuses a compatible server or starts its detached bundled server, then
-   connects to DAP at `127.0.0.1:4711`. bingo launches the rebuilt
+   reuses a compatible server or starts its detached bundled server, waits up
+   to `serverReadyTimeoutMs` (five seconds by default) for compatible readiness,
+   then connects to DAP at `127.0.0.1:4711`. bingo launches the rebuilt
    `build/spawntree` and stops at entry.
 4. Set a breakpoint on `examples/spawntree/main.go:27` and **Continue** — the
    tracee stops there with several worker goroutines alive.
@@ -76,10 +77,11 @@ VSIX's bundled server and does not rebuild or codesign extension sources.
    DAP `console` output and is listed by
    `curl -s 127.0.0.1:6060/api/sessions`.
 
-The extension never kills the shared process. The default managed server exits
-only after its 30-second idle grace with no sessions. Open **bingo Server** for
-the persistent child log path. If another extension host starts concurrently,
-listener binding selects one server and both hosts reuse it.
+No manual `just server` is required. The extension never kills the shared
+process. The default managed server exits only after its 30-second idle grace
+with no sessions. Open **bingo Server** for the persistent child log path. If
+another extension host starts concurrently, listener binding selects one server
+and both hosts reuse it.
 
 The lifecycle fields are `serverMode`, management host/port, DAP host/port,
 `serverReadyTimeoutMs`, and `managedIdleTimeoutMs`; the checked-in launch file
