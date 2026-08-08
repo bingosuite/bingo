@@ -332,6 +332,7 @@ async function runExample(
   client.close();
   registry.remove(debugSessionId);
   registry.dispose();
+  await waitForNoSessions(config.managementEndpoint, 10_000);
   return {
     sessionId,
     goroutines: snapshot.goroutines.length,
@@ -339,6 +340,25 @@ async function runExample(
     depth,
     seq: stopped.lastSeq,
   };
+}
+
+async function waitForNoSessions(
+  endpoint: { readonly host: string; readonly port: number },
+  timeoutMs: number,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const response = await fetch(
+      `http://${endpoint.host}:${String(endpoint.port)}/api/health`,
+      { headers: { "Cache-Control": "no-cache" } },
+    );
+    const decoded = (await response.json()) as { readonly sessionCount?: unknown };
+    if (decoded.sessionCount === 0) {
+      return;
+    }
+    await delay(20);
+  }
+  throw new Error("timed out waiting for the previous managed session to close");
 }
 
 interface DAPMessage {
