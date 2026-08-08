@@ -13,6 +13,7 @@ import { spawnSync } from "node:child_process";
 import { currentTarget } from "./platform.mjs";
 
 const target = currentTarget();
+const expectedExtensionVersion = "0.2.0";
 const vsix = fileURLToPath(
   new URL(`../../../dist/bingo-${target}.vsix`, import.meta.url),
 );
@@ -66,6 +67,19 @@ try {
   );
   if (!manifest.includes(`TargetPlatform="${target}"`)) {
     throw new Error(`VSIX manifest does not declare target ${target}`);
+  }
+  if (!manifest.includes(`Version="${expectedExtensionVersion}"`)) {
+    throw new Error(
+      `VSIX manifest does not declare version ${expectedExtensionVersion}`,
+    );
+  }
+  const extensionPackage = JSON.parse(
+    readFileSync(join(extracted, "extension", "package.json"), "utf8"),
+  );
+  if (extensionPackage.version !== expectedExtensionVersion) {
+    throw new Error(
+      `packaged extension version is ${String(extensionPackage.version)}, expected ${expectedExtensionVersion}`,
+    );
   }
 
   const binary = join(extracted, "extension", "bin", "bingo");

@@ -112,6 +112,10 @@ Build and install the repository's companion extension:
 just vscode-install
 ```
 
+The managed-server/autostart runtime requires extension version **0.2.0 or
+newer**. After installing or updating the VSIX, run **Developer: Reload Window**
+once so the current extension host activates the new bundle.
+
 It contributes debugger type `"bingo"` and connects VS Code's built-in Debug UI
 directly to bingo. In its default `auto` mode it health-checks
 `127.0.0.1:6060`, reuses a compatible server, or starts the matching bundled
@@ -133,9 +137,9 @@ Lifecycle configuration is explicit per launch: `serverMode`,
 `"serverMode": "connectOnly"`, which neither probes nor spawns. Startup failures
 name the endpoint and persistent log path in the **bingo Server** output channel.
 
-Install the platform VSIX once, then select
-**bingo DAP: launch spawntree (stop on entry)** from the repository's Run and
-Debug dropdown and press F5. The only other root choice is
+Install the platform VSIX once (and update it when a newer version ships), then
+select **bingo DAP: launch spawntree (stop on entry)** from the repository's Run
+and Debug dropdown and press F5. The only other root choice is
 **bingo DAP: join running session**. The launch pre-task rebuilds only the demo
 with debugger-friendly compiler flags; the installed extension health-checks
 `127.0.0.1:6060`, reuses a compatible server or starts its bundled server, waits

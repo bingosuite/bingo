@@ -910,6 +910,11 @@ checks the target, and repairs executable mode if extraction lost it.
 Packaging rebuilds/signs twice and requires identical binary and VSIX hashes;
 tests drift-check service/API/wire constants against Go source and inspect exact
 archive contents, target metadata, architecture, mode, and entitlements.
+The extension package version is the installed-runtime upgrade boundary:
+material shipped behavior changes must bump both `package.json` and the lockfile
+or VS Code can retain an older bundle under the same identity. The manifest test
+and package verifier pin the current version (**0.2.0**) in source and VSIX
+metadata.
 The root Run and Debug dropdown exposes exactly two `"type":"bingo"` choices:
 launch spawntree and join a running session. Normal F5 uses the installed VSIX
 and only rebuilds the target; contributor source-extension development runs
