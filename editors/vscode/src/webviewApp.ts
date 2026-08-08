@@ -13,7 +13,7 @@ const svgNamespace = "http://www.w3.org/2000/svg";
 export function mountConcurrencyView(
   document: Document,
   host: WebviewHost,
-): (model: ConcurrencyViewModel) => void {
+): (model: ConcurrencyViewModel, generation?: number) => void {
   const root = document.getElementById("app");
   if (root === null) {
     throw new Error("Bingo Concurrency root is missing");
@@ -21,7 +21,7 @@ export function mountConcurrencyView(
   let query = "";
   let transform = { x: 20, y: 20, scale: 1 };
 
-  return (model) => {
+  return (model, generation = 1) => {
     const focused = focusIdentity(document.activeElement);
     root.replaceChildren();
     root.className = "app";
@@ -50,7 +50,11 @@ export function mountConcurrencyView(
           }),
     );
     restoreFocus(root, focused);
-    host.postMessage({ type: "rendered", revision: model.revision });
+    host.postMessage({
+      type: "rendered",
+      generation,
+      revision: model.revision,
+    });
   };
 }
 

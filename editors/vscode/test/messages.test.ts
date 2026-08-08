@@ -14,6 +14,14 @@ describe("webview message codec", () => {
       decodeWebviewMessage({ type: "selectGoroutine", id: 42 }),
       { type: "selectGoroutine", id: 42 },
     );
+    assert.deepEqual(
+      decodeWebviewMessage({
+        type: "rendered",
+        generation: 3,
+        revision: 42,
+      }),
+      { type: "rendered", generation: 3, revision: 42 },
+    );
   });
 
   it("rejects unknown commands, extra fields, and invalid identifiers", () => {
@@ -25,6 +33,10 @@ describe("webview message codec", () => {
     assert.throws(
       () => decodeWebviewMessage({ type: "selectGoroutine", id: -1 }),
       /safe integer/,
+    );
+    assert.throws(
+      () => decodeWebviewMessage({ type: "rendered", revision: 1 }),
+      /unexpected fields/,
     );
   });
 });

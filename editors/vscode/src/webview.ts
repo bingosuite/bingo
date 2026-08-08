@@ -22,7 +22,7 @@ window.addEventListener("message", (event: MessageEvent<unknown>) => {
   if (event.data.revision !== event.data.model.revision) {
     return;
   }
-  render(event.data.model);
+  render(event.data.model, event.data.generation);
 });
 vscode.postMessage({ type: "ready" });
 
@@ -30,6 +30,7 @@ function isRenderMessage(
   value: unknown,
 ): value is {
   readonly type: "render";
+  readonly generation: number;
   readonly revision: number;
   readonly model: ConcurrencyViewModel;
 } {
@@ -38,12 +39,16 @@ function isRenderMessage(
     value !== null &&
     "type" in value &&
     value.type === "render" &&
+    "generation" in value &&
+    typeof value.generation === "number" &&
+    Number.isSafeInteger(value.generation) &&
+    value.generation > 0 &&
     "revision" in value &&
     Number.isSafeInteger(value.revision) &&
     "model" in value &&
     typeof value.model === "object" &&
     value.model !== null &&
-    Object.keys(value).length === 3
+    Object.keys(value).length === 4
   );
 }
 
