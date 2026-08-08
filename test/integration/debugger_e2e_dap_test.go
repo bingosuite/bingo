@@ -380,6 +380,11 @@ type dapClient struct {
 	events  chan godap.Message
 }
 
+type customEvent struct {
+	godap.Event
+	Body json.RawMessage `json:"body,omitempty"`
+}
+
 // dialDAP connects to the DAP server and starts the demux read loop. Cleanup
 // closes the connection.
 func dialDAP(addr string) *dapClient {
@@ -400,7 +405,7 @@ func dialDAP(addr string) *dapClient {
 
 func (c *dapClient) readLoop() {
 	for {
-		msg, err := godap.ReadProtocolMessage(c.reader)
+		msg, err := readDAPMessage(c.reader)
 		if err != nil {
 			return
 		}
@@ -424,6 +429,28 @@ func (c *dapClient) readLoop() {
 			}
 		}
 	}
+}
+
+func readDAPMessage(reader *bufio.Reader) (godap.Message, error) {
+	content, err := godap.ReadBaseMessage(reader)
+	if err != nil {
+		return nil, err
+	}
+	var envelope struct {
+		Type  string `json:"type"`
+		Event string `json:"event"`
+	}
+	if err := json.Unmarshal(content, &envelope); err != nil {
+		return nil, err
+	}
+	if envelope.Type == "event" && envelope.Event == "bingo/session/v1" {
+		var event customEvent
+		if err := json.Unmarshal(content, &event); err != nil {
+			return nil, err
+		}
+		return &event, nil
+	}
+	return godap.DecodeProtocolMessage(content)
 }
 
 // send writes a request with an auto-incrementing seq, registers a waiter for
