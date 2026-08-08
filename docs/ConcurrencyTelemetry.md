@@ -10,14 +10,14 @@ bingo speaks two protocols against **one** debug session at the same time:
   the OS-thread set, and created/exited lifecycle deltas — streams here as
   `EventGoroutineSnapshot`.
 
-This runbook wires both together A–Z: a server, a **DAP driver** (VS Code or
-`cmd/dapcli`), and a terminal **WS observer** (`cmd/wsmon`) that live-renders the
-telemetry while the driver steps through a goroutine spawn tree.
+The VS Code 0.3.0 extension wires both together automatically: DAP drives while
+the **Bingo Concurrency** Activity Bar view observes the exact session over
+WebSocket. `cmd/wsmon` remains the terminal observer for non-VS Code workflows.
 
 ```
              drives (DAP :4711)                observes (WS :6060)
-  VS Code  ─────────────────────►  bingo server  ◄─────────────────  cmd/wsmon
-  / dapcli                          (one session)                    (spawn tree,
+  VS Code  ─────────────────────►  bingo server  ◄─────────────────  Concurrency view
+  / dapcli                          (one session)                    / cmd/wsmon
                                           │                            threads,
                                           ▼                            lifecycle)
                                     spawntree tracee
@@ -40,7 +40,7 @@ architecture behind this.
   just vscode-install
   ```
 
-  Managed server autostart requires **bingosuite.bingo 0.2.0 or newer**. Run
+  Automatic graphical telemetry requires **bingosuite.bingo 0.3.0 or newer**. Run
   **Developer: Reload Window** once after installation or update. The companion
   owns debugger type `"bingo"` and connects directly to bingo's DAP listener;
   it neither invokes nor validates `dlv`, and it does not replace the Go
@@ -80,9 +80,12 @@ It is intentionally absent from the root Run and Debug dropdown.
    `build/examples/level5-workflow` and stops at entry.
 4. Set a breakpoint on `examples/level5-workflow/main.go:83` and **Continue** —
    the tracee stops with several workflow and stage goroutines alive.
-5. Grab the **session id** so the observer can join: it is printed in the bingo
-   DAP `console` output and is listed by
-   `curl -s 127.0.0.1:6060/api/sessions`.
+5. Open **Bingo Concurrency** in the Activity Bar. The DAP adapter publishes the
+   versioned `bingo/session/v1` custom event after session attachment, and the
+   extension joins it automatically. No session-id copy is required.
+6. Search/select nodes, inspect current/start/creation locations and threads,
+   or use the title-bar Refresh/Fit actions. The first graphical session
+   auto-reveals unless `bingo.concurrency.autoReveal` is disabled.
 
 No manual `just server` is required. The extension never kills the shared
 process. The default managed server exits only after its 30-second idle grace
@@ -121,7 +124,7 @@ c                             # continue → hits the breakpoint
 `dapcli` prints the session id it created (also on the server console). Continue
 again to churn rounds; each stop pushes a fresh telemetry snapshot to observers.
 
-## 4. Observe the telemetry with cmd/wsmon
+## 4. Terminal fallback with cmd/wsmon
 
 In another terminal, join the **same session id** read-only and watch it update:
 
@@ -145,7 +148,10 @@ repaints with the new round's workers — the plumbing, end to end.
 
 - `wsmon` is a pure observer: it never sends run-control commands, so it cannot
   disturb the DAP driver. Many `wsmon` + DAP clients can share one session.
+- The graphical observer is also read-only. It sends exactly one on-demand
+  snapshot request after joining and on explicit Refresh only.
 - Snapshots stream on **breakpoint / pause / entry**, not per single-step (steps
   stay cheap). Use the driver's breakpoints/continue to advance between frames.
 - If the tracee is a stripped binary or stopped before runtime init, the snapshot
-  degrades to a single synthetic goroutine; `wsmon` renders whatever is present.
+  degrades to a single synthetic goroutine; both observers render the degraded
+  state rather than failing the debug session.

@@ -92,7 +92,7 @@ follow them so reviews stay about substance, not style.
 | [cmd/cli](cmd/cli/) | Interactive readline client. |
 | [cmd/dapcli](cmd/dapcli/) | Interactive readline client that drives a session over DAP (mirrors `cmd/cli`'s UX). Talks to the server's `-dap-addr` listener; can create a session or `-session` join an existing one. |
 | [cmd/wsmon](cmd/wsmon/) | Read-only terminal telemetry observer. `-session`-joins a running session over WebSocket and live-renders the goroutine spawn tree + OS threads + created/exited lifecycle deltas from the `EventGoroutineSnapshot` stream. Never drives execution — the WS-observes half of the DAP-drives/WS-observes demo. |
-| [editors/vscode](editors/vscode/) | Platform-packaged TypeScript companion extension. Owns VS Code debugger type `bingo`, enables Go breakpoints, and reuses or starts a compatible shared bingo server before connecting the built-in Debug UI to DAP. |
+| [editors/vscode](editors/vscode/) | Platform-packaged TypeScript companion extension. Owns debugger type `bingo`, manages the shared server, and hosts the read-only Bingo Concurrency Activity Bar WebSocket observer. |
 | [cmd/target](cmd/target/) | Trivial target program for manual testing. |
 | [examples/level1-loop](examples/level1-loop/) … [examples/level5-workflow](examples/level5-workflow/) | Progressive debugger targets, selected by the root VS Code launch picker and built together with `just build-examples` (see [examples/README.md](examples/README.md)). |
 | [examples/spawntree](examples/spawntree/) | Concurrency demo target: a deterministic main → supervisor → worker×N goroutine spawn tree for exercising the telemetry stream (see [docs/ConcurrencyTelemetry.md](docs/ConcurrencyTelemetry.md)). |
@@ -624,13 +624,15 @@ translating it would corrupt the FIFO that correlates a DAP `threads` request to
 clients get goroutine data from the `threads` request (`EventGoroutines`, which
 now returns the rich list); the snapshot stream is WebSocket-only.
 
-**Reference observer + runbook.** [cmd/wsmon](cmd/wsmon/) is the reference
-WebSocket telemetry consumer: it `-session`-joins read-only and live-renders the
-spawn tree / thread set / lifecycle deltas from this stream (a UI-agnostic view
-of exactly the data a spawn-hierarchy visualization needs). The end-to-end
+**Observers + runbook.** The VS Code extension's Bingo Concurrency view is the
+graphical consumer; it joins from the DAP discovery event without user input.
+[cmd/wsmon](cmd/wsmon/) is the terminal fallback and joins with `-session`.
+Both are read-only and render the spawn tree / thread set / lifecycle deltas
+from this stream (a UI-agnostic view of exactly the data a spawn-hierarchy
+visualization needs). The end-to-end
 DAP-drives + WS-observes walkthrough — server, VS Code (or `cmd/dapcli`) driver,
-and `wsmon` against the [examples/spawntree](examples/spawntree/) target — is in
-[docs/ConcurrencyTelemetry.md](docs/ConcurrencyTelemetry.md).
+and either observer against the [examples/spawntree](examples/spawntree/)
+target — is in [docs/ConcurrencyTelemetry.md](docs/ConcurrencyTelemetry.md).
 
 **Lifecycle deltas.** `engine.prevGoids` (loop-thread-only, no lock, like
 `manualStopPending`) remembers the previous live goid set; `diffGoids` returns
@@ -910,11 +912,12 @@ VSIXes are platform-specific: `linux-x64` contains only linux/amd64 bingo;
 checks the target, and repairs executable mode if extraction lost it.
 Packaging rebuilds/signs twice and requires identical binary and VSIX hashes;
 tests drift-check service/API/wire constants against Go source and inspect exact
-archive contents, target metadata, architecture, mode, and entitlements.
+archive contents (one native binary plus the two bundles and original icon),
+target metadata, architecture, mode, and entitlements.
 The extension package version is the installed-runtime upgrade boundary:
 material shipped behavior changes must bump both `package.json` and the lockfile
 or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.2.0**) in source and VSIX
+and package verifier pin the current version (**0.3.0**) in source and VSIX
 metadata.
 The root Run and Debug dropdown exposes exactly two `"type":"bingo"` choices:
 launch one of five progressive examples through a `pickString`, and join a
@@ -926,10 +929,14 @@ the CLI with
 outside the root launch configurations. The recipe restores the exact npm
 lockfile with lifecycle scripts disabled before building. The macOS packaging
 job uses the supported `macos-15` arm64 image, asserts `uname -m`, and runs the
-real packaged-server smoke. That smoke observes server-owned idle exit on
-success; only its failure path may SIGKILL the exact detached process group it
-created, then it must await exit before deleting the extracted package. This
-cleanup helper is test-only and must never enter extension production code.
+real packaged-server smoke. Both package matrix legs run the pinned Electron
+activation/view/custom-event acknowledgement test; linux additionally runs the
+real packaged DAP→WebSocket graphical-model E2E. Darwin native-debug execution
+requires local/self-hosted Apple Silicon, where the same E2E covers all five
+examples. Both tests observe server-owned idle exit on success. On failure the
+smoke may SIGKILL only the detached process group it created; the packaged E2E
+may signal only its exact captured server PID. Cleanup is test-only and must
+never enter extension production code.
 Apple's external linker can vary `LC_UUID` even for identical cgo inputs, but
 current dyld rejects binaries with `-no_uuid`; `normalize-mach-o-uuid.mjs`
 therefore derives a stable UUID from the unsigned Mach-O with its UUID and
@@ -963,6 +970,30 @@ guards coordination state; `writeMu` serialises socket writes + the DAP `seq`.
 `mu`, then take `writeMu`). go-dap's `WriteProtocolMessage` does not set `Seq`,
 so `send` stamps it via reflection (`setSeqField` walks anonymous-embedded
 structs for the int `Seq`).
+
+**Managed-session discovery event.** Immediately after `startSession` has
+successfully attached the DAP handler to a created or joined managed session,
+the adapter emits exactly one custom DAP event named `bingo/session/v1` with
+body `{"version":1,"sessionId":"…"}` and preserves the console announcement.
+It emits neither event on create/join failure. `sessionAnnounced` is claimed
+under `mu`, but the event write occurs after unlocking, preserving the
+no-lock-across-socket-write invariant. The VS Code extension subscribes at
+activation and keys observers by `DebugSession.id`, never
+`activeDebugSession`.
+
+**Concurrency webview ownership/security.** The extension host, not the
+webview, owns one bounded WebSocket observer/model per live DAP session. It
+reuses the normalized management endpoint, validates protocol 1.2 envelopes,
+payload/string/count limits and seq gaps, and reconnects only while the DAP
+session lives. It sends `CmdGoroutineSnapshot` once after every successful
+WebSocket join and thereafter only for explicit Refresh—never run control.
+The recreatable webview receives validated view models through a
+ready/rendered-ack protocol. A fresh `ready` resets any in-flight revision
+because a hidden non-retained webview may have discarded its prior delivery;
+otherwise the host can wait forever for an acknowledgement from a dead document.
+Preserve the strict nonce CSP, `dist`-only
+`localResourceRoots`, DOM/textContent rendering, deterministic capped
+cycle-safe tree, bounded lifecycle history, and multi-session selector.
 
 ### Handshake (Delve-style, VS Code-compatible)
 
@@ -1239,8 +1270,13 @@ translator keeps DAP entirely outside the hub — a strictly additive package.
   `fullstack-*` jobs of
   [debugger-e2e.yml](.github/workflows/debugger-e2e.yml).
 - VS Code: [editors/vscode](editors/vscode/) uses strict TypeScript unit tests
-  for endpoint/request validation plus manifest tests that pin debugger ownership,
-  Go breakpoint support, endpoint defaults, and launch/join/PID snippets. The
+  for endpoint/request validation, telemetry codecs/observer/reconnect/session
+  registry, tree normalization/layout/lifecycle, a real lightweight DOM renderer,
+  webview security/messages, and manifest/workspace/package contracts; a pinned
+  `@vscode/test-electron` run activates the real extension/view and acknowledges
+  a fake adapter's namespaced custom event, while `packagedE2E.ts` drives the
+  actual native packaged server, DAP, WebSocket observer, and graphical model.
+  The
   dedicated [vscode-extension.yml](.github/workflows/vscode-extension.yml)
   workflow lints, typechecks, tests, bundles, and builds the local VSIX without
   changing the Go CI jobs.
@@ -1393,6 +1429,8 @@ just vscode-dev                            # stage source extension + native ser
 just vscode-check                          # lint, typecheck, test, bundle, package-list smoke
 just vscode-package                        # writes verified dist/bingo-<platform>.vsix
 just vscode-install                        # explicitly installs/updates bingosuite.bingo
+npm --prefix editors/vscode run test:integration # pinned Electron activation/view/custom-event test
+npm --prefix editors/vscode run e2e:packaged     # real native packaged DAP + graphical telemetry path
 just e2e-linux                             # native linux/amd64 ptrace E2E (all labels)
 just e2e-darwin                            # native darwin/arm64 Mach-exception E2E (codesigned; all labels)
 # Filter to one label, e.g. only the correctness gate (package path must come
