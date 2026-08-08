@@ -102,6 +102,7 @@ follow them so reviews stay about substance, not style.
 | [internal/server](internal/server/) | HTTP/WebSocket entry. `Server`, `sessionStore`, `/api/sessions` and `/ws` handlers. |
 | [internal/hub](internal/hub/) | Per-session bridge between connected clients and one `Debugger`. |
 | [internal/dap](internal/dap/) | Debug Adapter Protocol translator. A `Handler` implements `hub.WSConn`, so a DAP/IDE client plugs into a hub session as just another client (ZERO hub changes). |
+| [internal/dapclient](internal/dapclient/) | Lightweight DAP decoder shared by in-repo clients so namespaced bingo events coexist with standard go-dap messages. |
 | [internal/debugger](internal/debugger/) | The actual debugger. Engine + per-platform Backend. |
 | [test/integration](test/integration/) | Ginkgo suite. Placeholder specs + the platform-split debugger E2E acceptance tests (`e2e` build tag). |
 
@@ -881,7 +882,8 @@ wire protocol or `launchConfig`.
 **VS Code connect-or-start invariants.** Default `serverMode:"auto"` is local
 only: management `127.0.0.1:6060`, DAP `127.0.0.1:4711`, readiness 5s, managed
 idle grace 30s. It health-checks before spawning and requires
-`service:"bingo"`, management API 1, the exact wire version, enabled DAP, and
+`service:"bingo"`, management API 1, the exact wire version, enabled DAP,
+`dap.sessionEventVersion:1`, and
 the expected DAP port/host (wildcard advertised hosts retain the configured
 connect host). Only connection refusal permits spawning; a non-bingo or
 incompatible occupant fails safely. `connectOnly` bypasses management and spawn
@@ -917,7 +919,7 @@ target metadata, architecture, mode, and entitlements.
 The extension package version is the installed-runtime upgrade boundary:
 material shipped behavior changes must bump both `package.json` and the lockfile
 or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.3.0**) in source and VSIX
+and package verifier pin the current version (**0.3.1**) in source and VSIX
 metadata.
 The root Run and Debug dropdown exposes exactly two `"type":"bingo"` choices:
 launch one of five progressive examples through a `pickString`, and join a
@@ -977,7 +979,11 @@ the adapter emits exactly one custom DAP event named `bingo/session/v1` with
 body `{"version":1,"sessionId":"…"}` and preserves the console announcement.
 It emits neither event on create/join failure. `sessionAnnounced` is claimed
 under `mu`, but the event write occurs after unlocking, preserving the
-no-lock-across-socket-write invariant. The VS Code extension subscribes at
+no-lock-across-socket-write invariant. Go DAP clients must read through
+`internal/dapclient`, which recognizes this namespaced event before delegating
+standard messages to go-dap; `cmd/dapcli` and the native E2E client share that
+path. The VS
+Code extension subscribes at
 activation and keys observers by `DebugSession.id`, never
 `activeDebugSession`.
 
@@ -988,12 +994,18 @@ payload/string/count limits and seq gaps, and reconnects only while the DAP
 session lives. It sends `CmdGoroutineSnapshot` once after every successful
 WebSocket join and thereafter only for explicit Refresh—never run control.
 The recreatable webview receives validated view models through a
-ready/rendered-ack protocol. A fresh `ready` resets any in-flight revision
+ready/rendered-ack protocol. Every document has a generation token; async
+`postMessage` completions may mutate delivery state only while their captured
+view and generation are current, even when an old and new render share a
+revision. A fresh `ready` resets any in-flight revision
 because a hidden non-retained webview may have discarded its prior delivery;
 otherwise the host can wait forever for an acknowledgement from a dead document.
-Preserve the strict nonce CSP, `dist`-only
-`localResourceRoots`, DOM/textContent rendering, deterministic capped
-cycle-safe tree, bounded lifecycle history, and multi-session selector.
+Preserve the strict nonce CSP, `dist`-only `localResourceRoots`,
+DOM/textContent rendering, deterministic capped cycle-safe tree, bounded
+lifecycle history, and multi-session selector. Filtering re-lays out a bounded
+matching subtree (match plus at most four ancestors) and resets fit so a deep
+match cannot remain subpixel in the original 500-node viewBox. SVG treeitems
+carry `aria-level`, sibling position/size, selection, and parent context.
 
 ### Handshake (Delve-style, VS Code-compatible)
 
@@ -1138,7 +1150,10 @@ non-cacheable process-discovery endpoint frontends use for connect-or-start. Its
 explicit JSON response carries `service:"bingo"`, `managementApiVersion:1`, the
 independent `wireProtocolVersion` from `pkg/protocol.Version`, a per-process
 UUID `instanceId`, the enabled/resolved DAP listener address, managed-idle
-configuration in milliseconds, and the current session count. Management API
+configuration in milliseconds, and the current session count. The DAP object
+also advertises `sessionEventVersion:1`; graphical clients require it before
+reusing a managed server because older API-v1/wire-v1.2 servers do not emit the
+`bingo/session/v1` discovery event. Management API
 compatibility and WebSocket wire compatibility are separate checks: changing
 one does not implicitly version the other. A DAP bind to `:0` MUST publish the
 actual listener address, never the unresolved configured address. Health
@@ -1477,6 +1492,10 @@ through the justfile.
   of the wire protocol. Bump it for incompatible `/api/health` or management
   semantics, keep the response structs/tags and README example aligned, and
   preserve no-cache + GET-only behavior.
+- **DAP session discovery**: when the `bingo/session/v1` body contract changes,
+  bump `protocol.DAPSessionEventVersion`, the `dap.sessionEventVersion` health
+  capability, the extension compatibility check, and the shared
+  `internal/dapclient` decoder/tests together.
 - **Goroutine snapshot layout**: the reader resolves runtime struct offsets from
   DWARF **by name** (`goroutines.go`), never hardcoded. If you add a field, add
   it to `goLayout`/`resolveGoLayout`; a missing *required* offset invalidates the

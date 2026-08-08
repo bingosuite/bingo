@@ -2,7 +2,7 @@ import type {
   ConcurrencyViewModel,
   SessionViewModel,
 } from "./model.js";
-import type { TreeNode } from "./tree.js";
+import { filterTree, type TreeNode } from "./tree.js";
 
 export interface WebviewHost {
   postMessage(message: Record<string, unknown>): void;
@@ -158,16 +158,29 @@ function renderSession(
 
   const workspace = document.createElement("div");
   workspace.className = "workspace";
-  const graph = renderGraph(document, session, host, state);
+  let graph = renderGraph(
+    document,
+    filteredSession(session, state.query),
+    host,
+    state,
+  );
   const side = renderInspector(document, session);
   workspace.append(graph, side);
   main.append(workspace, renderThreads(document, session), renderTimeline(document, session));
 
   search.addEventListener("input", () => {
     state.setQuery(search.value);
-    applyGraphFilter(graph, search.value);
+    const fitted = { x: 20, y: 20, scale: 1 };
+    state.setTransform(fitted);
+    const replacement = renderGraph(
+      document,
+      filteredSession(session, search.value),
+      host,
+      { ...state, query: search.value, transform: fitted },
+    );
+    graph.replaceWith(replacement);
+    graph = replacement;
   });
-  applyGraphFilter(graph, state.query);
   return main;
 }
 
@@ -271,13 +284,30 @@ function renderGraph(
     path.dataset.to = String(edge.to);
     scene.append(path);
   }
+  const siblings = new Map<number, TreeNode[]>();
   for (const node of session.tree.nodes) {
-    scene.append(renderNode(document, node, session.selectedGoroutine, host));
+    const group = siblings.get(node.parentId) ?? [];
+    group.push(node);
+    siblings.set(node.parentId, group);
+  }
+  for (const node of session.tree.nodes) {
+    const group = siblings.get(node.parentId) ?? [];
+    scene.append(
+      renderNode(
+        document,
+        node,
+        session.selectedGoroutine,
+        host,
+        group.indexOf(node) + 1,
+        group.length,
+        byID.has(node.goroutine.parentId),
+      ),
+    );
   }
   if (session.tree.omitted > 0) {
     const note = document.createElement("p");
     note.className = "omitted";
-    note.textContent = `${String(session.tree.omitted)} additional goroutines omitted from the visual cap`;
+    note.textContent = `${String(session.tree.omitted)} additional goroutines omitted by the filter or visual cap`;
     panel.append(note);
   }
   viewport.append(svg);
@@ -383,6 +413,9 @@ function renderNode(
   node: TreeNode,
   selected: number,
   host: WebviewHost,
+  position: number,
+  siblingCount: number,
+  reportedParentDisplayed: boolean,
 ): SVGGElement {
   const group = document.createElementNS(svgNamespace, "g");
   group.setAttribute("transform", `translate(${String(node.x)} ${String(node.y)})`);
@@ -391,7 +424,14 @@ function renderNode(
     `tree-node${node.goroutine.current ? " current" : ""}${node.goroutine.id === selected ? " selected" : ""}`,
   );
   group.setAttribute("role", "treeitem");
-  group.setAttribute("aria-label", goroutineLabel(node.goroutine));
+  group.setAttribute(
+    "aria-label",
+    `${goroutineLabel(node.goroutine)}, ${hierarchyLabel(node, reportedParentDisplayed)}`,
+  );
+  group.setAttribute("aria-level", String(node.depth + 1));
+  group.setAttribute("aria-posinset", String(position));
+  group.setAttribute("aria-setsize", String(siblingCount));
+  group.setAttribute("aria-selected", String(node.goroutine.id === selected));
   group.dataset.goid = String(node.goroutine.id);
   group.dataset.parent = String(node.parentId);
   group.dataset.search = goroutineLabel(node.goroutine).toLocaleLowerCase();
@@ -437,38 +477,33 @@ function renderNode(
   return group;
 }
 
-function applyGraphFilter(panel: HTMLElement, value: string): void {
-  const query = value.trim().toLocaleLowerCase();
-  const visible = new Set<string>();
-  const nodes = [...panel.querySelectorAll<SVGGElement>(".tree-node")];
-  const byID = new Map(
-    nodes.map((node) => [node.dataset.goid ?? "", node] as const),
-  );
-  for (const node of nodes) {
-    const matched = query.length === 0 || node.dataset.search?.includes(query) === true;
-    if (matched && node.dataset.goid !== undefined) {
-      let current: SVGGElement | undefined = node;
-      while (
-        current?.dataset.goid !== undefined &&
-        !visible.has(current.dataset.goid)
-      ) {
-        visible.add(current.dataset.goid);
-        current = byID.get(current.dataset.parent ?? "");
-      }
+function hierarchyLabel(
+  node: TreeNode,
+  reportedParentDisplayed: boolean,
+): string {
+  if (node.parentId !== 0) {
+    return `child of goroutine ${String(node.parentId)}`;
+  }
+  if (
+    node.goroutine.parentId > 0 &&
+    node.goroutine.parentId !== node.goroutine.id
+  ) {
+    if (reportedParentDisplayed) {
+      return `displayed root after cycle normalization, reported parent goroutine ${String(node.goroutine.parentId)}`;
     }
+    return `displayed root, reported parent goroutine ${String(node.goroutine.parentId)} is not displayed`;
   }
-  for (const node of nodes) {
-    node.classList.toggle(
-      "filtered",
-      !visible.has(node.dataset.goid ?? ""),
-    );
-  }
-  for (const edge of panel.querySelectorAll<SVGPathElement>(".tree-edge")) {
-    edge.classList.toggle(
-      "filtered",
-      !visible.has(edge.dataset.from ?? "") || !visible.has(edge.dataset.to ?? ""),
-    );
-  }
+  return "root goroutine";
+}
+
+function filteredSession(
+  session: SessionViewModel,
+  query: string,
+): SessionViewModel {
+  return {
+    ...session,
+    tree: filterTree(session.tree, query),
+  };
 }
 
 function renderInspector(
