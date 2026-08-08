@@ -449,8 +449,7 @@ function applyGraphFilter(panel: HTMLElement, value: string): void {
     if (matched && node.dataset.goid !== undefined) {
       let current: SVGGElement | undefined = node;
       while (
-        current !== undefined &&
-        current.dataset.goid !== undefined &&
+        current?.dataset.goid !== undefined &&
         !visible.has(current.dataset.goid)
       ) {
         visible.add(current.dataset.goid);
@@ -528,10 +527,10 @@ function renderThreads(
     const label = document.createElement("strong");
     label.textContent = `t${String(thread.id)}`;
     const detail = document.createElement("span");
-    detail.textContent =
-      thread.goid > 0
-        ? `g${String(thread.goid)}${thread.spinning ? " · spinning" : ""}`
-        : `idle${thread.spinning ? " · spinning" : ""}`;
+    const scheduled =
+      thread.goid > 0 ? `g${String(thread.goid)}` : "idle";
+    const schedulerState = thread.spinning ? " · spinning" : "";
+    detail.textContent = scheduled + schedulerState;
     item.append(label, detail);
     list.append(item);
   }
@@ -621,10 +620,10 @@ function locationText(location: {
   if (location.file.length === 0 && location.function.length === 0) {
     return "unknown";
   }
-  const source =
-    location.file.length === 0
-      ? ""
-      : `${location.file}${location.line > 0 ? `:${String(location.line)}` : ""}`;
+  let source = location.file;
+  if (source.length > 0 && location.line > 0) {
+    source += `:${String(location.line)}`;
+  }
   return [location.function, source].filter((item) => item.length > 0).join(" · ");
 }
 
@@ -660,8 +659,8 @@ function focusIdentity(element: Element | null | undefined): string {
   if (element.id.length > 0) {
     return `#${element.id}`;
   }
-  const goid = element.getAttribute("data-goid");
-  if (goid !== null) {
+  const goid = (element as HTMLElement | SVGElement).dataset.goid;
+  if (goid !== undefined) {
     return `[data-goid="${goid}"]`;
   }
   return "";

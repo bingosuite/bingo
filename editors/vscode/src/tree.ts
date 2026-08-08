@@ -30,53 +30,12 @@ export function layoutSpawnTree(
   preferredIDs: readonly number[] = [],
 ): TreeLayout {
   const limit = Math.max(1, Math.min(maximumRenderedGoroutines, Math.trunc(cap)));
-  const unique = new Map<number, Goroutine>();
-  for (const goroutine of [...goroutines].sort(compareGoroutines)) {
-    if (!unique.has(goroutine.id)) {
-      unique.set(goroutine.id, goroutine);
-    }
-  }
-
-  const selectedIDs = new Set<number>();
-  for (const id of preferredIDs) {
-    if (unique.has(id) && selectedIDs.size < limit) {
-      selectedIDs.add(id);
-    }
-  }
-  for (const item of unique.values()) {
-    if (selectedIDs.size >= limit) {
-      break;
-    }
-    selectedIDs.add(item.id);
-  }
-  const selected = [...selectedIDs]
-    .map((id) => unique.get(id))
-    .filter((item): item is Goroutine => item !== undefined)
-    .sort(compareGoroutines);
-
-  const parent = new Map<number, number>();
-  for (const item of selected) {
-    parent.set(
-      item.id,
-      item.parentId !== item.id && selectedIDs.has(item.parentId)
-        ? item.parentId
-        : 0,
-    );
-  }
+  const unique = uniqueGoroutines(goroutines);
+  const selected = selectGoroutines(unique, preferredIDs, limit);
+  const selectedIDs = new Set(selected.map((item) => item.id));
+  const parent = parentTable(selected, selectedIDs);
   breakCycles(parent);
-
-  const children = new Map<number, number[]>();
-  for (const item of selected) {
-    const parentID = parent.get(item.id) ?? 0;
-    const group = children.get(parentID) ?? [];
-    group.push(item.id);
-    children.set(parentID, group);
-  }
-  for (const group of children.values()) {
-    group.sort((left, right) =>
-      compareGoroutines(unique.get(left) as Goroutine, unique.get(right) as Goroutine),
-    );
-  }
+  const children = childrenTable(selected, parent);
 
   const nodes: TreeNode[] = [];
   const edges: TreeEdge[] = [];
@@ -123,6 +82,72 @@ export function layoutSpawnTree(
     width: Math.max(420, 310 + maxDepth * 208),
     height: Math.max(240, 86 + nodes.length * 82),
   };
+}
+
+function uniqueGoroutines(
+  goroutines: readonly Goroutine[],
+): Map<number, Goroutine> {
+  const unique = new Map<number, Goroutine>();
+  for (const goroutine of [...goroutines].sort(compareGoroutines)) {
+    if (!unique.has(goroutine.id)) {
+      unique.set(goroutine.id, goroutine);
+    }
+  }
+  return unique;
+}
+
+function selectGoroutines(
+  unique: ReadonlyMap<number, Goroutine>,
+  preferredIDs: readonly number[],
+  limit: number,
+): readonly Goroutine[] {
+  const selectedIDs = new Set<number>();
+  for (const id of preferredIDs) {
+    if (unique.has(id) && selectedIDs.size < limit) {
+      selectedIDs.add(id);
+    }
+  }
+  for (const item of unique.values()) {
+    if (selectedIDs.size >= limit) {
+      break;
+    }
+    selectedIDs.add(item.id);
+  }
+  return [...selectedIDs]
+    .map((id) => unique.get(id))
+    .filter((item): item is Goroutine => item !== undefined)
+    .sort(compareGoroutines);
+}
+
+function parentTable(
+  selected: readonly Goroutine[],
+  selectedIDs: ReadonlySet<number>,
+): Map<number, number> {
+  return new Map(
+    selected.map((item) => [
+      item.id,
+      item.parentId !== item.id && selectedIDs.has(item.parentId)
+        ? item.parentId
+        : 0,
+    ]),
+  );
+}
+
+function childrenTable(
+  selected: readonly Goroutine[],
+  parent: ReadonlyMap<number, number>,
+): Map<number, number[]> {
+  const children = new Map<number, number[]>();
+  for (const item of selected) {
+    const parentID = parent.get(item.id) ?? 0;
+    const group = children.get(parentID) ?? [];
+    group.push(item.id);
+    children.set(parentID, group);
+  }
+  for (const group of children.values()) {
+    group.sort((left, right) => left - right);
+  }
+  return children;
 }
 
 export function filterTree(layout: TreeLayout, query: string): TreeLayout {
