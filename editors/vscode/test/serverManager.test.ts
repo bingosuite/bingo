@@ -21,6 +21,7 @@ const compatible: HealthProbeResult = {
   health: {
     instanceId: "winner",
     dapAddress: "127.0.0.1:4711",
+    dapSessionEventVersion: 1,
   },
 };
 const absent: HealthProbeResult = { kind: "absent" };
@@ -137,7 +138,7 @@ function sequence(...results: HealthProbeResult[]): HealthProbe {
 }
 
 describe("server manager", () => {
-  it("reuses a compatible server without spawning", async () => {
+  it("reuses a session-discovery-compatible server without spawning", async () => {
     const test = harness(sequence(compatible));
     assert.deepEqual(
       await test.manager.ensureServer(configuration()),
@@ -441,13 +442,19 @@ describe("server manager", () => {
     assert.deepEqual(delays, [50, 10]);
   });
 
-  it("fails safely on an incompatible endpoint without spawning", async () => {
+  it("treats an older server as an occupied endpoint without spawning", async () => {
     const test = harness(
-      sequence({ kind: "incompatible", reason: "not bingo" }),
+      sequence({
+        kind: "incompatible",
+        reason: "DAP session event version is undefined, expected 1",
+      }),
     );
     await assert.rejects(
       test.manager.ensureServer(configuration()),
-      hasCode("endpointOccupied"),
+      (error: unknown) =>
+        error instanceof ServerManagerError &&
+        error.code === "endpointOccupied" &&
+        /DAP session event version is undefined, expected 1/.test(error.message),
     );
     assert.equal(test.requests.length, 0);
   });

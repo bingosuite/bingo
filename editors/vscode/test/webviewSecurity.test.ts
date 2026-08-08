@@ -30,6 +30,7 @@ describe("webview security contract", () => {
   it("keeps ready/rendered acknowledgements in the host protocol", () => {
     assert.match(provider, /case "ready"/);
     assert.match(provider, /case "rendered"/);
-    assert.match(provider, /#inFlightRevision/);
+    assert.match(provider, /#delivery/);
+    assert.match(provider, /rejectDelivery/);
   });
 });
