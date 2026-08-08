@@ -2,11 +2,11 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "bingo: build spawntree",
+      "label": "bingo: build examples",
       "type": "process",
       "command": "just",
       "args": [
-        "build-spawntree"
+        "build-examples"
       ],
       "problemMatcher": []
     }
