@@ -65,18 +65,18 @@ func PackSnapshot(snap GoroutineSnapshotPayload, goroutinesClipped, threadsClipp
 	// shape is the single source of the payload: pack measures through it and
 	// the caller assembles through it, so the measured bytes cannot drift from
 	// the bytes actually returned.
-	shape := func(gs []Goroutine, ts []Thread, totals *SnapshotTotals) GoroutineSnapshotPayload {
+	shape := func(gs []Goroutine, ts []Thread, current int, totals *SnapshotTotals) GoroutineSnapshotPayload {
 		return GoroutineSnapshotPayload{
 			Goroutines: gs,
 			Threads:    ts,
-			Current:    snap.Current,
+			Current:    current,
 			Created:    snap.Created,
 			Exited:     snap.Exited,
 			Totals:     totals,
 		}
 	}
-	build := func(gs []Goroutine, ts []Thread, totals *SnapshotTotals) any {
-		return shape(gs, ts, totals)
+	build := func(gs []Goroutine, ts []Thread, current int, totals *SnapshotTotals) any {
+		return shape(gs, ts, current, totals)
 	}
 
 	// The snapshot shape IS a tree, so the whole spawn chain is required.
@@ -87,7 +87,7 @@ func PackSnapshot(snap GoroutineSnapshotPayload, goroutinesClipped, threadsClipp
 	if len(snap.Created) > MaxLifecycleDeltaIDs || len(snap.Exited) > MaxLifecycleDeltaIDs {
 		report.Oversized = true
 	}
-	return shape(gs, ts, payloadTotals(totals, report)), report
+	return shape(gs, ts, deliveredCurrent(gs, snap.Current), payloadTotals(totals, report)), report
 }
 
 // PackGoroutines bounds the EventGoroutines list. It shares PackSnapshot's exact
@@ -99,7 +99,7 @@ func PackGoroutines(gs []Goroutine, goroutinesClipped bool) (GoroutinesPayload, 
 	shape := func(gs []Goroutine, totals *SnapshotTotals) GoroutinesPayload {
 		return GoroutinesPayload{Goroutines: gs, Totals: totals}
 	}
-	build := func(gs []Goroutine, _ []Thread, totals *SnapshotTotals) any {
+	build := func(gs []Goroutine, _ []Thread, _ int, totals *SnapshotTotals) any {
 		return shape(gs, totals)
 	}
 
@@ -123,8 +123,10 @@ func payloadTotals(totals SnapshotTotals, report GoroutinePackReport) *SnapshotT
 }
 
 // payloadBuilder assembles one of the two goroutine payload shapes. Taking it as
-// a parameter is what lets both packers share a single exact algorithm.
-type payloadBuilder func(gs []Goroutine, ts []Thread, totals *SnapshotTotals) any
+// a parameter is what lets both packers share a single exact algorithm. current
+// is threaded through because a degraded result must not keep pointing at a
+// goroutine it did not deliver.
+type payloadBuilder func(gs []Goroutine, ts []Thread, current int, totals *SnapshotTotals) any
 
 // pack is the shared algorithm. It marshals each candidate at most twice and
 // makes at most two ordered passes, so cost is O(n) marshals (plus the ordering
@@ -145,9 +147,12 @@ func pack(
 	}
 
 	degraded := func() ([]Goroutine, []Thread, GoroutinePackReport) {
+		// current is dropped along with the collections: naming a goroutine the
+		// payload does not carry is a dangling reference, and a consumer would
+		// either render a selection that does not exist or have to guess.
 		gs, ts := []Goroutine{}, []Thread{}
 		report := GoroutinePackReport{Totals: totals, Degraded: true}
-		report.Bytes, _ = packBudget(kind, build(gs, ts, payloadTotals(totals, report)))
+		report.Bytes, _ = packBudget(kind, build(gs, ts, 0, payloadTotals(totals, report)))
 		// Emptying the collections is the last lever available: the lifecycle
 		// deltas are never trimmed, so if they alone overflow there is nothing
 		// left to give. Say so rather than pretending the result conforms.
@@ -168,12 +173,12 @@ func pack(
 	// (Note the weaker claim "pass 2 omits at least as many" is false: with
 	// skip-and-continue a tighter budget can reject one big early element and
 	// admit several small later ones.)
-	gs, ts, report, ok := packOnce(orderedG, anchorG, orderedT, anchorT, totals, totals.AnyClipped(), kind, build)
+	gs, ts, report, ok := packOnce(orderedG, anchorG, orderedT, anchorT, current, totals, totals.AnyClipped(), kind, build)
 	if !ok {
 		return degraded()
 	}
 	if !totals.AnyClipped() && report.Omitted() {
-		gs, ts, report, ok = packOnce(orderedG, anchorG, orderedT, anchorT, totals, true, kind, build)
+		gs, ts, report, ok = packOnce(orderedG, anchorG, orderedT, anchorT, current, totals, true, kind, build)
 		if !ok {
 			return degraded()
 		}
@@ -183,12 +188,29 @@ func pack(
 	// the measured size of the payload the caller actually sends, so that is
 	// what is measured. A miss degrades rather than emitting a frame the
 	// transport would reject outright.
-	size, ok := packBudget(kind, build(gs, ts, payloadTotals(totals, report)))
+	size, ok := packBudget(kind, build(gs, ts, deliveredCurrent(gs, current), payloadTotals(totals, report)))
 	if !ok || size > MaxGoroutineEventBytes {
 		return degraded()
 	}
 	report.Bytes = size
 	return gs, ts, report
+}
+
+// deliveredCurrent keeps the current goid only when that goroutine actually
+// reached the wire. The current goroutine is a required anchor, so in any
+// non-degraded result it did; this also covers a caller whose current goid names
+// a goroutine absent from the input. The resulting invariant — current is either
+// zero or present in Goroutines — is what lets a consumer validate it.
+func deliveredCurrent(gs []Goroutine, current int) int {
+	if current == 0 {
+		return 0
+	}
+	for _, g := range gs {
+		if g.ID == current {
+			return current
+		}
+	}
+	return 0
 }
 
 // packOnce runs one exact pass against a reserve that either includes Totals or
@@ -198,6 +220,7 @@ func packOnce(
 	anchorG int,
 	orderedT []Thread,
 	anchorT int,
+	current int,
 	totals SnapshotTotals,
 	withTotals bool,
 	kind EventKind,
@@ -210,7 +233,7 @@ func packOnce(
 	if withTotals {
 		reserved = &totals
 	}
-	reserve, ok := packBudget(kind, build([]Goroutine{}, []Thread{}, reserved))
+	reserve, ok := packBudget(kind, build([]Goroutine{}, []Thread{}, current, reserved))
 	if !ok || reserve > MaxGoroutineEventBytes {
 		return nil, nil, GoroutinePackReport{}, false
 	}

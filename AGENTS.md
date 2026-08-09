@@ -1662,8 +1662,17 @@ exact lie this work exists to stop. Ancestors stay ordered first either way. Cre
 non-anchor is skipped and packing continues — one pathological element must not
 hide every element after it. Threads take their ordered floor, then goroutines
 compete, then leftover budget is reclaimed for the remaining threads. If the
-anchors cannot all fit (by bytes or by the count cap), the result degrades to
-empty collections (with the deltas intact) and reports it — never a panic.
+anchors cannot all fit (by bytes or by the count cap — the anchor COUNT is
+checked before any anchor is placed, so a spawn chain longer than
+`MaxSnapshotGoroutines` degrades instead of producing a small-but-over-cap
+payload the consumer must reject), the result degrades to empty collections
+(with the deltas intact) and reports it — never a panic.
+
+**`Current` is either zero or delivered.** A degraded snapshot drops it, and a
+caller whose current goid names no goroutine in the input gets zero — naming a
+goroutine the payload does not carry is a dangling reference the consumer would
+have to guess about. Because the current goroutine is a required anchor, every
+non-degraded snapshot does carry it. The consumer validates the invariant.
 
 Whether `Totals` lands on the wire changes the reserve and is only known after
 packing, so the pass is run optimistically and retried once against the true
