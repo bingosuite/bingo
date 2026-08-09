@@ -29,8 +29,8 @@ import (
 //     so it is prevented instead, by the read ordering in allgsMetadata.
 
 const (
-	// maxGoroutineScan bounds the runtime.allgs walk so a corrupt slice header
-	// or a pathological target can't make one snapshot read unboundedly.
+	// maxGoroutineScan bounds both the rich runtime.allgs prefix and the cheap
+	// fallback anchor scan so corrupt metadata can't make a snapshot unbounded.
 	maxGoroutineScan = 8192
 	// maxThreadScan bounds the runtime.allm linked-list walk likewise.
 	maxThreadScan = 2048
@@ -242,12 +242,19 @@ type goroutineWalkResult struct {
 	Items    []protocol.Goroutine
 	Complete bool
 	Clipped  bool
+	AnchorID int
 }
 
 type threadWalkResult struct {
 	Items    []protocol.Thread
 	Complete bool
 	Clipped  bool
+}
+
+type currentGoroutineResult struct {
+	Item     protocol.Goroutine
+	Found    bool
+	Complete bool
 }
 
 // readGoroutine reads one runtime.g at gptr. Include is false for intentional
@@ -299,7 +306,7 @@ func (e *engine) readGoroutine(l *goLayout, gptr, liveSP, livePC uint64) gorouti
 		}
 	}
 
-	current := liveSP != 0 && liveSP >= lo && liveSP < hi
+	current := stackContainsSP(lo, hi, liveSP)
 	g.Current = current
 
 	if mptr, ok := e.readU64(gptr + uint64(l.gM)); ok && mptr != 0 {
@@ -321,6 +328,16 @@ func (e *engine) readGoroutine(l *goLayout, gptr, liveSP, livePC uint64) gorouti
 		Include:  true,
 		Complete: true,
 	}
+}
+
+func (e *engine) readGoroutineStackBounds(l *goLayout, gptr uint64) (lo, hi uint64, ok bool) {
+	lo, okLo := e.readU64(gptr + uint64(l.gStack) + uint64(l.stackLo))
+	hi, okHi := e.readU64(gptr + uint64(l.gStack) + uint64(l.stackHi))
+	return lo, hi, okLo && okHi
+}
+
+func stackContainsSP(lo, hi, sp uint64) bool {
+	return sp != 0 && sp >= lo && sp < hi
 }
 
 func (e *engine) readI64(addr uint64) (int64, bool) {
@@ -398,11 +415,21 @@ func (e *engine) allgsMetadata() (ptr, length uint64, ok bool) {
 	return ptr, length, true
 }
 
+func allgsEntryAddress(ptr, index uint64) (uint64, bool) {
+	const pointerSize = uint64(8)
+	if index > (^uint64(0)-ptr)/pointerSize {
+		return 0, false
+	}
+	return ptr + index*pointerSize, true
+}
+
 // buildGoroutineList enumerates runtime.allgs. Complete is false when the
-// runtime can't be read (no DWARF, bad layout, unreadable membership data, or
-// no live goroutines yet). Clipped is independent: the walk reached its safety
-// ceiling but every visited entry was readable.
-func (e *engine) buildGoroutineList(liveSP, livePC uint64) goroutineWalkResult {
+// runtime can't be read (no DWARF, bad layout, unreadable membership or
+// current-identity data, or no live goroutines yet). Clipped is independent:
+// the rich walk reached its safety ceiling but every visited entry was readable.
+func (e *engine) buildGoroutineList(
+	liveSP, livePC, currentGptr uint64,
+) goroutineWalkResult {
 	l, ok := e.getGoLayout()
 	if !ok {
 		return goroutineWalkResult{}
@@ -411,14 +438,23 @@ func (e *engine) buildGoroutineList(liveSP, livePC uint64) goroutineWalkResult {
 	if !ok || ptr == 0 || length == 0 {
 		return goroutineWalkResult{}
 	}
-	clipped := length > maxGoroutineScan
-	if length > maxGoroutineScan {
-		length = maxGoroutineScan
-	}
+	return e.buildGoroutineListFrom(l, ptr, length, liveSP, livePC, currentGptr)
+}
 
-	out := make([]protocol.Goroutine, 0, length)
-	for i := uint64(0); i < length; i++ {
-		gptr, ok := e.readU64(ptr + i*8)
+func (e *engine) buildGoroutineListFrom(
+	l *goLayout,
+	ptr, length, liveSP, livePC, currentGptr uint64,
+) goroutineWalkResult {
+	richLength := min(length, uint64(maxGoroutineScan))
+
+	out := make([]protocol.Goroutine, 0, int(richLength)+1)
+	currentFound := false
+	for i := uint64(0); i < richLength; i++ {
+		entryAddr, ok := allgsEntryAddress(ptr, i)
+		if !ok {
+			return goroutineWalkResult{}
+		}
+		gptr, ok := e.readU64(entryAddr)
 		if !ok {
 			return goroutineWalkResult{}
 		}
@@ -431,16 +467,172 @@ func (e *engine) buildGoroutineList(liveSP, livePC uint64) goroutineWalkResult {
 		}
 		if result.Include {
 			out = append(out, result.Item)
+			currentFound = currentFound || result.Item.Current
 		}
 	}
 	if len(out) == 0 {
 		return goroutineWalkResult{}
 	}
+
+	current := currentGoroutineResult{Complete: true}
+	if !currentFound && currentGptr != 0 {
+		result := e.readGoroutine(l, currentGptr, liveSP, livePC)
+		if !result.Complete {
+			return goroutineWalkResult{}
+		}
+		if result.Include && result.Item.Current {
+			current = currentGoroutineResult{
+				Item:     result.Item,
+				Found:    true,
+				Complete: true,
+			}
+		}
+	}
+	if !currentFound && !current.Found && liveSP != 0 {
+		current = e.findCurrentGoroutineFromThreads(l, liveSP, livePC)
+		if !current.Complete {
+			return goroutineWalkResult{}
+		}
+	}
+	if !currentFound && !current.Found && liveSP != 0 && richLength < length {
+		fallbackEnd := min(length, richLength+uint64(maxGoroutineScan))
+		current = e.findCurrentGoroutine(
+			l, ptr, richLength, fallbackEnd, liveSP, livePC,
+		)
+		if !current.Complete {
+			return goroutineWalkResult{}
+		}
+	}
+	anchorID := 0
+	if current.Found {
+		out = append(out, protocol.Goroutine{})
+		copy(out[1:], out)
+		out[0] = current.Item
+		anchorID = current.Item.ID
+	}
 	return goroutineWalkResult{
 		Items:    out,
 		Complete: true,
-		Clipped:  clipped,
+		Clipped:  length > richLength,
+		AnchorID: anchorID,
 	}
+}
+
+// findCurrentGoroutine is the bounded fallback when the architecture-specific
+// current-g pointer is unavailable. It reads only each pointer and stack bounds
+// until SP containment identifies the anchor, then pays the full decode cost
+// once. An unreadable pointer ends the pass because allgs is contiguous.
+func (e *engine) findCurrentGoroutine(
+	l *goLayout,
+	ptr, start, length, liveSP, livePC uint64,
+) currentGoroutineResult {
+	for i := start; i < length; i++ {
+		entryAddr, ok := allgsEntryAddress(ptr, i)
+		if !ok {
+			return currentGoroutineResult{}
+		}
+		gptr, ok := e.readU64(entryAddr)
+		if !ok {
+			return currentGoroutineResult{}
+		}
+		if gptr == 0 {
+			continue
+		}
+		lo, hi, ok := e.readGoroutineStackBounds(l, gptr)
+		if !ok {
+			return currentGoroutineResult{}
+		}
+		if !stackContainsSP(lo, hi, liveSP) {
+			continue
+		}
+		result := e.readGoroutine(l, gptr, liveSP, livePC)
+		if !result.Complete {
+			return currentGoroutineResult{}
+		}
+		if result.Include && result.Item.Current {
+			return currentGoroutineResult{
+				Item:     result.Item,
+				Found:    true,
+				Complete: true,
+			}
+		}
+		return currentGoroutineResult{Complete: true}
+	}
+	return currentGoroutineResult{Complete: true}
+}
+
+// findCurrentGoroutineFromThreads resolves the running g through runtime.allm.
+// Unlike linux FS-relative TLS, m.curg is stable across internal and external
+// linking. SP containment still decides whether the candidate is authoritative.
+func (e *engine) findCurrentGoroutineFromThreads(
+	l *goLayout,
+	liveSP, livePC uint64,
+) currentGoroutineResult {
+	if e.dw == nil {
+		return currentGoroutineResult{Complete: true}
+	}
+	base, ok := e.dw.runtimeVarAddr("runtime.allm")
+	if !ok {
+		return currentGoroutineResult{Complete: true}
+	}
+	mptr, ok := e.readU64(base)
+	if !ok {
+		return currentGoroutineResult{}
+	}
+	if mptr == 0 {
+		return currentGoroutineResult{Complete: true}
+	}
+	return e.findCurrentGoroutineInThreadList(l, mptr, liveSP, livePC)
+}
+
+func (e *engine) findCurrentGoroutineInThreadList(
+	l *goLayout,
+	mptr, liveSP, livePC uint64,
+) currentGoroutineResult {
+	for i := 0; i < maxThreadScan && mptr != 0; i++ {
+		curg, ok := e.readU64(mptr + uint64(l.mCurg))
+		if !ok {
+			return currentGoroutineResult{}
+		}
+		if curg != 0 {
+			lo, hi, ok := e.readGoroutineStackBounds(l, curg)
+			if !ok {
+				return currentGoroutineResult{}
+			}
+			if stackContainsSP(lo, hi, liveSP) {
+				result := e.readGoroutine(l, curg, liveSP, livePC)
+				if !result.Complete {
+					return currentGoroutineResult{}
+				}
+				if result.Include && result.Item.Current {
+					return currentGoroutineResult{
+						Item:     result.Item,
+						Found:    true,
+						Complete: true,
+					}
+				}
+				return currentGoroutineResult{Complete: true}
+			}
+		}
+		next, ok := e.readU64(mptr + uint64(l.mAlllink))
+		if !ok {
+			return currentGoroutineResult{}
+		}
+		mptr = next
+	}
+	return currentGoroutineResult{Complete: true}
+}
+
+func (e *engine) allmHead() (uint64, bool) {
+	if e.dw == nil {
+		return 0, false
+	}
+	base, ok := e.dw.runtimeVarAddr("runtime.allm")
+	if !ok {
+		return 0, false
+	}
+	mptr, ok := e.readU64(base)
+	return mptr, ok && mptr != 0
 }
 
 // readThreads walks runtime.allm and reports every OS thread (M). currentGoid
@@ -454,11 +646,7 @@ func (e *engine) readThreads(currentGoid int, livePC uint64) threadWalkResult {
 	if !ok {
 		return threadWalkResult{}
 	}
-	base, ok := e.dw.runtimeVarAddr("runtime.allm")
-	if !ok {
-		return threadWalkResult{}
-	}
-	mptr, ok := e.readU64(base) // runtime.allm is a *m; read the head pointer
+	mptr, ok := e.allmHead()
 	if !ok {
 		return threadWalkResult{}
 	}
@@ -502,18 +690,20 @@ func (e *engine) readThreads(currentGoid int, livePC uint64) threadWalkResult {
 	}
 }
 
-// liveRegisters reads the currently-stopped thread's SP and PC (used to locate
-// the current goroutine and to give it a live location). Zeroes on failure.
-func (e *engine) liveRegisters() (sp, pc uint64) {
+// liveRegisters reads the currently-stopped thread's SP, PC, and Go ABI
+// current-g pointer. The pointer is only a candidate: readGoroutine validates it
+// against SP containment before it can become the snapshot anchor.
+func (e *engine) liveRegisters() (sp, pc, currentGptr uint64) {
 	tid, err := e.activeTID()
 	if err != nil {
-		return 0, 0
+		return 0, 0, 0
 	}
 	regs, err := e.backend.GetRegisters(tid)
 	if err != nil {
-		return 0, 0
+		return 0, 0, 0
 	}
-	return regs.SP, regs.PC
+	currentGptr, _ = e.archCurrentGoroutinePointer(regs)
+	return regs.SP, regs.PC, currentGptr
 }
 
 // syntheticGoroutine is the legacy fallback: a single goroutine standing in for
@@ -542,8 +732,8 @@ func (e *engine) degradedSnapshot(livePC uint64) protocol.GoroutineSnapshotPaylo
 // synthetic goroutine when the runtime can't be read. This backs the on-demand
 // Goroutines() query and the DAP threads list.
 func (e *engine) readGoroutines() ([]protocol.Goroutine, error) {
-	sp, pc := e.liveRegisters()
-	result := e.buildGoroutineList(sp, pc)
+	sp, pc, currentGptr := e.liveRegisters()
+	result := e.buildGoroutineList(sp, pc, currentGptr)
 	if result.Complete {
 		return result.Items, nil
 	}
@@ -569,9 +759,9 @@ func (e *engine) goroutineSnapshotQuery() protocol.GoroutineSnapshotPayload {
 }
 
 func (e *engine) buildSnapshot(trackLifecycle bool) protocol.GoroutineSnapshotPayload {
-	sp, pc := e.liveRegisters()
+	sp, pc, currentGptr := e.liveRegisters()
 
-	goroutines := e.buildGoroutineList(sp, pc)
+	goroutines := e.buildGoroutineList(sp, pc, currentGptr)
 	if !goroutines.Complete {
 		// Degraded snapshot: still report where we're stopped, but don't touch
 		// the remembered live set — an empty read (e.g. at the entry stop before
@@ -579,7 +769,7 @@ func (e *engine) buildSnapshot(trackLifecycle bool) protocol.GoroutineSnapshotPa
 		return e.degradedSnapshot(pc)
 	}
 
-	current, live := snapshotGoroutineState(goroutines.Items)
+	live, current := snapshotGoroutineIDs(goroutines.Items, goroutines.AnchorID)
 	threads := e.readThreads(current, pc)
 	if !threads.Complete {
 		return e.degradedSnapshot(pc)
@@ -608,22 +798,30 @@ func (e *engine) snapshotFrom(
 	return snap
 }
 
-func snapshotGoroutineState(gs []protocol.Goroutine) (int, map[int]struct{}) {
-	var current int
-	live := make(map[int]struct{}, len(gs))
+// snapshotGoroutineIDs keeps lifecycle deltas tied to the stable rich prefix.
+// A beyond-cap current anchor is present for stop identity but excluded from the
+// baseline; otherwise switching between live tail goroutines would fabricate
+// created/exited deltas for goroutines that merely fell outside the next scan.
+func snapshotGoroutineIDs(
+	gs []protocol.Goroutine,
+	anchorID int,
+) (live map[int]struct{}, current int) {
+	live = make(map[int]struct{}, len(gs))
 	for _, g := range gs {
-		live[g.ID] = struct{}{}
+		if g.ID != anchorID {
+			live[g.ID] = struct{}{}
+		}
 		if g.Current {
 			current = g.ID
 		}
 	}
-	return current, live
+	return live, current
 }
 
 // diffGoids compares the current live goid set against the previous automatic
-// snapshot's and returns the created (new) and exited (gone) goids, then adopts
-// the new set. Returns nil slices on the first snapshot so a fresh session
-// doesn't report every existing goroutine as "created". Only reached from the
+// and returns the created (new) and exited (gone) goids, then adopts the new
+// set. Returns nil slices on the first snapshot so a fresh session doesn't
+// report every existing goroutine as "created". Only reached from the
 // automatic stop path — see goroutineSnapshotQuery.
 func (e *engine) diffGoids(live map[int]struct{}) (created, exited []int) {
 	if e.prevGoids != nil {

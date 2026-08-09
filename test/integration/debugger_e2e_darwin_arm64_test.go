@@ -58,6 +58,7 @@ var _ = Describe("Darwin arm64 debugger backend (Mach exceptions) E2E", Label("d
 	declareAttachSpec()
 	declareConcurrencySpec()
 	declareBaselineOwnershipSpec()
+	declareCurrentGoroutineScanSpec()
 	declareFullStackSpec()
 	declareRestartSpec()
 	declareDAPSpec()
