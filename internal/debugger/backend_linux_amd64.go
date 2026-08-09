@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -97,9 +98,17 @@ type linuxBackend struct {
 	// fields read as b.stepping / b.stepTID at every existing use site.
 	stepQueue
 
-	pid         int
-	lastStopTID int
-	tracer      *tracerThread
+	pid    int
+	tracer *tracerThread
+
+	// lastStopTID names the thread every TID-less ptrace op targets
+	// (traceTID). It is atomic because the two accessors run on different
+	// goroutines: the wait loop writes it when it delivers a stop, while the
+	// engine loop reads it for memory ops it issues concurrently — Kill clears
+	// every breakpoint (WriteMemory) with a wait loop still in flight. Both
+	// candidate TIDs are ptrace-stopped threads of the same tracee, so either
+	// is a valid POKEDATA/PEEKDATA target; only the access needed defining.
+	lastStopTID atomic.Int64
 }
 
 // drainParked returns the next held stop if one may be surfaced now, recording
@@ -456,7 +465,15 @@ func (b *linuxBackend) Threads() ([]int, error) {
 // run on different one-shot waitLoop goroutines that the engine starts with a
 // `go` statement after consuming the previous Wait's result — so each Wait
 // happens-after the previous one, along with the step-state writes the engine
-// makes in between.
+// makes in between (every ContinueProcess/SingleStep call site is immediately
+// followed by that `go`).
+//
+// lastStopTID is the one exception and IS atomic: draining publishes it without
+// blocking in wait4 first, so it can land while the engine loop is issuing a
+// memory op on a still-running tracee — Kill clears every breakpoint with a
+// wait loop in flight. Whichever of the two TIDs the op then targets is a
+// ptrace-stopped thread of the same tracee and therefore equally valid; only
+// the access itself needed defining.
 //
 // wait4 runs on the calling (waitLoop) thread, NOT the tracer thread: waiting
 // for a tracee is legal from any thread of the tracer process, and keeping it
@@ -648,19 +665,19 @@ var _ Backend = (*linuxBackend)(nil)
 
 func (b *linuxBackend) setPID(pid int) {
 	b.pid = pid
-	b.lastStopTID = pid
+	b.lastStopTID.Store(int64(pid))
 }
 
 func (b *linuxBackend) traceTID() int {
-	if b.lastStopTID != 0 {
-		return b.lastStopTID
+	if tid := b.lastStopTID.Load(); tid != 0 {
+		return int(tid)
 	}
 	return b.pid
 }
 
 func (b *linuxBackend) recordStop(tid int) {
 	if tid != 0 {
-		b.lastStopTID = tid
+		b.lastStopTID.Store(int64(tid))
 	}
 }
 

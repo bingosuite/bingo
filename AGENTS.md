@@ -480,14 +480,25 @@ that their stops are *reported later*, after the trap is back:
 - Out of scope: a user `ClearBreakpoint` of an address a parked stop refers to
   still surfaces that stop as a spurious trap when it is finally delivered.
 
-**No lock, and none is needed.** `parked` is touched only inside `Wait`.
-Successive `Wait` calls run on different one-shot `waitLoop` goroutines that the
-engine starts with `go e.waitLoop()` **after** consuming the previous `Wait`'s
-result from `stopCh`, so no two ever overlap; that channel-and-goroutine-start
-chain is also what orders the `stepping`/`stepTID` writes the engine makes in
-between (`SingleStep` sets them, `ContinueProcess` clears them) against the next
-`Wait`'s reads. Do not add a mutex, and do not call these helpers from anywhere
-but `Wait`.
+**No lock on the queue, and none is needed.** `parked` is touched only inside
+`Wait`. Successive `Wait` calls run on different one-shot `waitLoop` goroutines
+that the engine starts with `go e.waitLoop()` **after** consuming the previous
+`Wait`'s result from `stopCh`, so no two ever overlap; that
+channel-and-goroutine-start chain is also what orders the `stepping`/`stepTID`
+writes the engine makes in between (`SingleStep` sets them, `ContinueProcess`
+clears them) against the next `Wait`'s reads — every `ContinueProcess`/
+`SingleStep` call site in the engine is immediately followed by that `go`
+statement, and neither `killProcess` nor `StopProcess` touches step state. Do
+not add a mutex, and do not call these helpers from anywhere but `Wait`.
+
+**`lastStopTID` is the exception and is `atomic.Int64`.** Draining publishes it
+at the top of `Wait` *without blocking in `wait4` first*, so it can now land
+while the engine loop is issuing a memory op against a still-running tracee —
+`Kill` clears every breakpoint (`WriteMemory` → `traceTID`) with a wait loop in
+flight. `-race` catches this immediately if the field is made plain again. It is
+only the access that needed defining, not the choice: both candidate TIDs are
+ptrace-stopped threads of the same tracee, so either is a valid POKEDATA/
+PEEKDATA target.
 
 Regression gates: the classifier table **and** the queue-mechanics tests in
 [waitpark_test.go](internal/debugger/waitpark_test.go) — both host-agnostic, so
