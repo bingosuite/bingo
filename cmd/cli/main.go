@@ -4,14 +4,21 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 
+	"github.com/bingosuite/bingo/cmd/internal/repl"
 	"github.com/bingosuite/bingo/pkg/client"
 	"github.com/bingosuite/bingo/pkg/protocol"
 	"github.com/chzyer/readline"
@@ -24,8 +31,14 @@ import (
 // error. Shared between the REPL goroutine and the event printer.
 var fullSnapshotNext atomic.Bool
 
-//nolint:gocognit,gocyclo // The CLI keeps command routing in one switch while commands are still small.
 func main() {
+	os.Exit(mainExitCode())
+}
+
+func mainExitCode() int {
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
 	addr := flag.String("addr", "localhost:6060", "server address (host:port)")
 	sessionID := flag.String("session", "", "session ID to join (omit to create)")
 	flag.Parse()
@@ -35,22 +48,26 @@ func main() {
 
 	if *sessionID != "" {
 		fmt.Printf("joining session %s on %s...\n", *sessionID, *addr)
-		c, err = client.Join(*addr, *sessionID)
+		c, err = client.JoinContext(ctx, *addr, *sessionID)
 	} else {
 		fmt.Printf("creating new session on %s...\n", *addr)
-		c, err = client.Create(*addr)
+		c, err = client.CreateContext(ctx, *addr)
 	}
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return 0
+		}
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return 1
 	}
-	defer func() { _ = c.Close() }()
+	if ctx.Err() != nil {
+		_ = c.Close()
+		return 0
+	}
 
 	fmt.Printf("connected — session %s (state: %s)\n\n", c.SessionID(), c.State())
 
-	go eventPrinter(c.Events())
-
-	rl, err := readline.NewEx(&readline.Config{
+	rl, err := repl.NewEditor(&readline.Config{
 		Prompt:          "bingo> ",
 		HistoryFile:     os.ExpandEnv("$HOME/.bingo_history"),
 		InterruptPrompt: "^C",
@@ -58,291 +75,365 @@ func main() {
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error initializing readline: %v\n", err)
-		os.Exit(1)
+		_ = c.Close()
+		return 1
 	}
-	defer func() { _ = rl.Close() }()
 
 	printHelp()
-	for {
-		line, err := rl.Readline()
+	runInteractive(ctx, rl, c.Events(), c.Close, func(ctx context.Context, args []string) bool {
+		return dispatch(ctx, c, *addr, args)
+	})
+	return 0
+}
+
+type lineEditor interface {
+	repl.Reader
+	Close() error
+}
+
+func runInteractive(
+	ctx context.Context,
+	editor lineEditor,
+	events <-chan protocol.Event,
+	closeTransport func() error,
+	dispatchCommand func(context.Context, []string) bool,
+) {
+	runCtx, cancel := context.WithCancel(ctx)
+
+	var closeEditorOnce sync.Once
+	closeEditor := func() {
+		closeEditorOnce.Do(func() { _ = editor.Close() })
+	}
+	var closeTransportOnce sync.Once
+	closeClient := func() {
+		closeTransportOnce.Do(func() { _ = closeTransport() })
+	}
+	shutdown := func() {
+		closeClient()
+		closeEditor()
+	}
+	stopShutdown := context.AfterFunc(runCtx, shutdown)
+
+	disconnected := make(chan struct{})
+	eventDone := make(chan struct{})
+	go func() {
+		defer close(eventDone)
+		if eventPrinter(runCtx, events, editor.Stdout()) {
+			close(disconnected)
+			cancel()
+			closeEditor()
+		}
+	}()
+
+	repl.Loop(runCtx, editor, closeEditor, disconnected, func(args []string) bool {
+		return dispatchCommand(runCtx, args)
+	})
+
+	cancel()
+	shutdown()
+	stopShutdown()
+	<-eventDone
+}
+
+//nolint:gocognit,gocyclo // The CLI keeps command routing in one switch while commands are still small.
+func dispatch(ctx context.Context, c client.Client, addr string, args []string) bool {
+	switch cmd := args[0]; cmd {
+	case "sessions", "ls":
+		sessions, err := client.ListSessionsContext(ctx, addr)
 		if err != nil {
-			if err == readline.ErrInterrupt || err == io.EOF {
-				fmt.Println("bye")
-				return
-			}
-			break
+			printErrUnlessCanceled(ctx, err)
+			return false
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		if len(sessions) == 0 {
+			fmt.Println("  (no active sessions)")
+			return false
+		}
+		for _, s := range sessions {
+			fmt.Printf("  %s  state=%-10s clients=%d  created=%s\n",
+				s.ID, s.State, s.Clients, s.CreatedAt.Format("15:04:05"))
 		}
 
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
+	case "state":
+		fmt.Printf("  session=%s  state=%s\n", c.SessionID(), c.State())
+
+	case "launch":
+		if len(args) < 2 {
+			fmt.Println("  usage: launch <binary> [args...]")
+			return false
+		}
+		var launchArgs []string
+		if len(args) > 2 {
+			launchArgs = args[2:]
+		}
+		if err := c.Launch(args[1], launchArgs, nil); err != nil {
+			printErrUnlessCanceled(ctx, err)
 		}
 
-		args := strings.Fields(line)
-		cmd := args[0]
+	case "attach":
+		if len(args) < 2 {
+			fmt.Println("  usage: attach <pid> [binary-path]")
+			return false
+		}
+		pid, err := strconv.Atoi(args[1])
+		if err != nil {
+			fmt.Printf("  invalid pid: %s\n", args[1])
+			return false
+		}
+		var binPath string
+		if len(args) > 2 {
+			binPath = args[2]
+		}
+		if err := c.Attach(pid, binPath); err != nil {
+			printErrUnlessCanceled(ctx, err)
+		}
 
-		switch cmd {
+	case "kill":
+		if err := c.Kill(); err != nil {
+			printErrUnlessCanceled(ctx, err)
+		}
 
-		case "sessions", "ls":
-			sessions, err := client.ListSessions(*addr)
-			if err != nil {
-				printErr(err)
-				continue
-			}
-			if len(sessions) == 0 {
-				fmt.Println("  (no active sessions)")
-				continue
-			}
-			for _, s := range sessions {
-				fmt.Printf("  %s  state=%-10s clients=%d  created=%s\n",
-					s.ID, s.State, s.Clients, s.CreatedAt.Format("15:04:05"))
-			}
+	case "restart":
+		p, err := c.Restart(nil, nil)
+		if err != nil {
+			printErrUnlessCanceled(ctx, err)
+			return false
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		fmt.Printf("  restarted %s\n", p.Program)
+		for _, bp := range p.Breakpoints {
+			fmt.Printf("  breakpoint %d reinstalled at %s:%d\n", bp.ID, bp.Location.File, bp.Location.Line)
+		}
+		for _, d := range p.Discarded {
+			fmt.Printf("  breakpoint at %s:%d discarded: %s\n", d.Location.File, d.Location.Line, d.Reason)
+		}
 
-		case "state":
-			fmt.Printf("  session=%s  state=%s\n", c.SessionID(), c.State())
+	case "c", "continue":
+		if err := c.Continue(); err != nil {
+			printErrUnlessCanceled(ctx, err)
+		}
 
-		case "launch":
-			if len(args) < 2 {
-				fmt.Println("  usage: launch <binary> [args...]")
-				continue
-			}
-			var launchArgs []string
-			if len(args) > 2 {
-				launchArgs = args[2:]
-			}
-			if err := c.Launch(args[1], launchArgs, nil); err != nil {
-				printErr(err)
-			}
+	case "n", "next":
+		if err := c.StepOver(); err != nil {
+			printErrUnlessCanceled(ctx, err)
+		}
 
-		case "attach":
-			if len(args) < 2 {
-				fmt.Println("  usage: attach <pid> [binary-path]")
-				continue
-			}
-			pid, err := strconv.Atoi(args[1])
-			if err != nil {
-				fmt.Printf("  invalid pid: %s\n", args[1])
-				continue
-			}
-			var binPath string
-			if len(args) > 2 {
-				binPath = args[2]
-			}
-			if err := c.Attach(pid, binPath); err != nil {
-				printErr(err)
-			}
+	case "s", "step":
+		if err := c.StepInto(); err != nil {
+			printErrUnlessCanceled(ctx, err)
+		}
 
-		case "kill":
-			if err := c.Kill(); err != nil {
-				printErr(err)
-			}
+	case "out", "finish":
+		if err := c.StepOut(); err != nil {
+			printErrUnlessCanceled(ctx, err)
+		}
 
-		case "restart":
-			p, err := c.Restart(nil, nil)
-			if err != nil {
-				printErr(err)
-				continue
-			}
-			fmt.Printf("  restarted %s\n", p.Program)
-			for _, bp := range p.Breakpoints {
-				fmt.Printf("  breakpoint %d reinstalled at %s:%d\n", bp.ID, bp.Location.File, bp.Location.Line)
-			}
-			for _, d := range p.Discarded {
-				fmt.Printf("  breakpoint at %s:%d discarded: %s\n", d.Location.File, d.Location.Line, d.Reason)
-			}
+	case "p", "pause":
+		if err := c.Pause(); err != nil {
+			printErrUnlessCanceled(ctx, err)
+		}
 
-		case "c", "continue":
-			if err := c.Continue(); err != nil {
-				printErr(err)
-			}
+	case "b", "break":
+		if len(args) < 2 {
+			fmt.Println("  usage: break <file>:<line>")
+			return false
+		}
+		file, line, ok := parseFileLine(args[1])
+		if !ok {
+			fmt.Println("  usage: break <file>:<line>  (e.g. main.go:42)")
+			return false
+		}
+		bp, err := c.SetBreakpoint(file, line)
+		if err != nil {
+			printErrUnlessCanceled(ctx, err)
+			return false
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		fmt.Printf("  breakpoint %d set at %s:%d\n",
+			bp.ID, bp.Location.File, bp.Location.Line)
 
-		case "n", "next":
-			if err := c.StepOver(); err != nil {
-				printErr(err)
-			}
+	case "clear":
+		if len(args) < 2 {
+			fmt.Println("  usage: clear <breakpoint-id>")
+			return false
+		}
+		id, err := strconv.Atoi(args[1])
+		if err != nil {
+			fmt.Printf("  invalid breakpoint id: %s\n", args[1])
+			return false
+		}
+		if err := c.ClearBreakpoint(id); err != nil {
+			printErrUnlessCanceled(ctx, err)
+			return false
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		fmt.Printf("  breakpoint %d cleared\n", id)
 
-		case "s", "step":
-			if err := c.StepInto(); err != nil {
-				printErr(err)
-			}
+	case "locals":
+		showLocals(ctx, c, args[1:], os.Stdout)
 
-		case "out", "finish":
-			if err := c.StepOut(); err != nil {
-				printErr(err)
-			}
+	case "bt", "backtrace":
+		frames, err := c.StackFrames()
+		if err != nil {
+			printErrUnlessCanceled(ctx, err)
+			return false
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		for _, f := range frames {
+			fmt.Printf("  #%d  %s at %s:%d\n",
+				f.Index, f.Location.Function, f.Location.File, f.Location.Line)
+		}
 
-		case "p", "pause":
-			if err := c.Pause(); err != nil {
-				printErr(err)
-			}
+	case "goroutines", "grs":
+		grs, err := c.GoroutineList()
+		if err != nil {
+			printErrUnlessCanceled(ctx, err)
+			return false
+		}
+		if ctx.Err() != nil {
+			return false
+		}
+		fmt.Print(formatGoroutineList(grs))
 
-		case "b", "break":
-			if len(args) < 2 {
-				fmt.Println("  usage: break <file>:<line>")
-				continue
-			}
-			file, line, ok := parseFileLine(args[1])
+	case "snapshot", "snap":
+		// This is only a display arm: snapshot events are broadcasts and carry
+		// no requester identity, so whichever snapshot arrives next consumes it.
+		fullSnapshotNext.Store(true)
+		if err := c.RequestGoroutineSnapshot(); err != nil {
+			fullSnapshotNext.Store(false)
+			printErrUnlessCanceled(ctx, err)
+			return false
+		}
+
+	case "help", "h", "?":
+		printHelp()
+
+	case "quit", "q", "exit":
+		return true
+
+	default:
+		fmt.Printf("  unknown command: %s (type 'help' for usage)\n", cmd)
+	}
+	return false
+}
+
+type localsClient interface {
+	Locals(frameIndex int) ([]protocol.Variable, error)
+}
+
+func showLocals(ctx context.Context, c localsClient, args []string, out io.Writer) {
+	frame, err := repl.FrameIndex(args)
+	if err != nil {
+		_, _ = fmt.Fprintf(out, "  %s\n", err)
+		return
+	}
+	vars, err := c.Locals(frame)
+	if err != nil {
+		if !commandErrorSuppressed(ctx, err) {
+			_, _ = fmt.Fprintf(out, "  error: %v\n", err)
+		}
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	if len(vars) == 0 {
+		_, _ = fmt.Fprintln(out, "  (no locals)")
+		return
+	}
+	for _, v := range vars {
+		_, _ = fmt.Fprintf(out, "  %s %s = %s\n", v.Name, v.Type, v.Value)
+	}
+}
+
+func eventPrinter(ctx context.Context, events <-chan protocol.Event, out io.Writer) bool {
+	for {
+		select {
+		case <-ctx.Done():
+			return false
+		case evt, ok := <-events:
 			if !ok {
-				fmt.Println("  usage: break <file>:<line>  (e.g. main.go:42)")
-				continue
+				if ctx.Err() != nil {
+					return false
+				}
+				repl.PrintAsync(out, "disconnected")
+				return true
 			}
-			bp, err := c.SetBreakpoint(file, line)
-			if err != nil {
-				printErr(err)
-				continue
-			}
-			fmt.Printf("  breakpoint %d set at %s:%d\n",
-				bp.ID, bp.Location.File, bp.Location.Line)
-
-		case "clear":
-			if len(args) < 2 {
-				fmt.Println("  usage: clear <breakpoint-id>")
-				continue
-			}
-			id, err := strconv.Atoi(args[1])
-			if err != nil {
-				fmt.Printf("  invalid breakpoint id: %s\n", args[1])
-				continue
-			}
-			if err := c.ClearBreakpoint(id); err != nil {
-				printErr(err)
-				continue
-			}
-			fmt.Printf("  breakpoint %d cleared\n", id)
-
-		case "locals":
-			frame := 0
-			if len(args) > 1 {
-				frame, _ = strconv.Atoi(args[1])
-			}
-			vars, err := c.Locals(frame)
-			if err != nil {
-				printErr(err)
-				continue
-			}
-			if len(vars) == 0 {
-				fmt.Println("  (no locals)")
-				continue
-			}
-			for _, v := range vars {
-				fmt.Printf("  %s %s = %s\n", v.Name, v.Type, v.Value)
-			}
-
-		case "bt", "backtrace":
-			frames, err := c.StackFrames()
-			if err != nil {
-				printErr(err)
-				continue
-			}
-			for _, f := range frames {
-				fmt.Printf("  #%d  %s at %s:%d\n",
-					f.Index, f.Location.Function, f.Location.File, f.Location.Line)
-			}
-
-		case "goroutines", "grs":
-			grs, err := c.GoroutineList()
-			if err != nil {
-				printErr(err)
-				continue
-			}
-			fmt.Print(formatGoroutineList(grs))
-
-		case "snapshot", "snap":
-			// Fire-and-forget: the snapshot answers on the event stream, where
-			// automatic stop snapshots also arrive. fullSnapshotNext is a
-			// display arm only — it selects the renderer for the NEXT snapshot,
-			// whichever that turns out to be. An automatic push (or another
-			// client's requested one) can consume the arm, and any broadcast
-			// snapshot error can disarm it, so the detailed view may land on a
-			// different snapshot than the one this command asked for. No
-			// snapshot data is lost either way: every one is printed, in order,
-			// in one form or the other.
-			fullSnapshotNext.Store(true)
-			if err := c.RequestGoroutineSnapshot(); err != nil {
-				fullSnapshotNext.Store(false)
-				printErr(err)
-				continue
-			}
-
-		case "help", "h", "?":
-			printHelp()
-
-		case "quit", "q", "exit":
-			fmt.Println("bye")
-			return
-
-		default:
-			fmt.Printf("  unknown command: %s (type 'help' for usage)\n", cmd)
+			printEvent(out, evt)
 		}
 	}
 }
 
-func eventPrinter(events <-chan protocol.Event) {
-	for evt := range events {
-		printEvent(evt)
-	}
-}
-
-func printEvent(evt protocol.Event) {
+func printEvent(out io.Writer, evt protocol.Event) {
 	switch evt.Kind {
 
 	case protocol.EventSessionState:
 		var p protocol.SessionStatePayload
 		if protocol.DecodeEventPayload(evt, &p) == nil {
-			fmt.Printf("\n  [state] %s (clients: %d)\nbingo> ", p.State, p.Clients)
+			repl.PrintAsync(out, fmt.Sprintf("[state] %s (clients: %d)", p.State, p.Clients))
 		}
 
 	case protocol.EventBreakpointHit:
 		var p protocol.BreakpointHitPayload
 		if protocol.DecodeEventPayload(evt, &p) == nil {
-			fmt.Printf("\n  [hit] breakpoint %d at %s:%d\nbingo> ",
-				p.Breakpoint.ID, p.Breakpoint.Location.File, p.Breakpoint.Location.Line)
+			repl.PrintAsync(out, fmt.Sprintf("[hit] breakpoint %d at %s:%d",
+				p.Breakpoint.ID, p.Breakpoint.Location.File, p.Breakpoint.Location.Line))
 		}
 
 	case protocol.EventPanic:
 		var p protocol.PanicPayload
 		if protocol.DecodeEventPayload(evt, &p) == nil {
-			fmt.Printf("\n  [panic] %s\nbingo> ", p.Message)
+			repl.PrintAsync(out, "[panic] "+p.Message)
 		}
 
 	case protocol.EventOutput:
 		var p protocol.OutputPayload
 		if protocol.DecodeEventPayload(evt, &p) == nil {
-			fmt.Printf("\n  [%s] %s\nbingo> ", p.Stream, p.Content)
+			repl.PrintOutput(out, p.Stream, p.Content)
 		}
 
 	case protocol.EventProcessExited:
 		var p protocol.ProcessExitedPayload
 		if protocol.DecodeEventPayload(evt, &p) == nil {
-			fmt.Printf("\n  [exited] code=%d reason=%s\nbingo> ", p.ExitCode, p.Reason)
+			repl.PrintAsync(out, fmt.Sprintf("[exited] code=%d reason=%s", p.ExitCode, p.Reason))
 		}
 
 	case protocol.EventStepped:
 		var p protocol.SteppedPayload
 		if protocol.DecodeEventPayload(evt, &p) == nil {
-			fmt.Printf("\n  [stepped] %s:%d in %s\nbingo> ",
-				p.Location.File, p.Location.Line, p.Location.Function)
+			repl.PrintAsync(out, fmt.Sprintf("[stepped] %s:%d in %s",
+				p.Location.File, p.Location.Line, p.Location.Function))
 		}
 
 	case protocol.EventPaused:
 		var p protocol.PausedPayload
 		if protocol.DecodeEventPayload(evt, &p) == nil {
-			fmt.Printf("\n  [paused] %s:%d in %s\nbingo> ",
-				p.Location.File, p.Location.Line, p.Location.Function)
+			repl.PrintAsync(out, fmt.Sprintf("[paused] %s:%d in %s",
+				p.Location.File, p.Location.Line, p.Location.Function))
 		}
 
 	default:
-		printAuxEvent(evt)
+		printAuxEvent(out, evt)
 	}
 }
 
 // printAuxEvent renders the non-stop events. Split out of printEvent so neither
 // switch trips the cyclomatic-complexity linter as event kinds grow.
-func printAuxEvent(evt protocol.Event) {
+func printAuxEvent(out io.Writer, evt protocol.Event) {
 	switch evt.Kind {
 
 	case protocol.EventContinued:
-		fmt.Print("\n  [continued]\nbingo> ")
+		repl.PrintAsync(out, "[continued]")
 
 	case protocol.EventError:
 		var p protocol.ErrorPayload
@@ -353,26 +444,24 @@ func printAuxEvent(evt protocol.Event) {
 				// leaving the arm set would expand an unrelated automatic push.
 				fullSnapshotNext.Store(false)
 			}
-			fmt.Printf("\n  [error] %s: %s\nbingo> ", p.Command, p.Message)
+			repl.PrintAsync(out, fmt.Sprintf("[error] %s: %s", p.Command, p.Message))
 		}
 
 	case protocol.EventRestarted:
 		var p protocol.RestartedPayload
 		if protocol.DecodeEventPayload(evt, &p) == nil {
-			fmt.Printf("\n  [restarted] %s (%d breakpoint(s), %d discarded)\nbingo> ",
-				p.Program, len(p.Breakpoints), len(p.Discarded))
+			repl.PrintAsync(out, fmt.Sprintf("[restarted] %s (%d breakpoint(s), %d discarded)",
+				p.Program, len(p.Breakpoints), len(p.Discarded)))
 		}
 
 	case protocol.EventGoroutineSnapshot:
 		var p protocol.GoroutineSnapshotPayload
 		if protocol.DecodeEventPayload(evt, &p) == nil {
 			if fullSnapshotNext.CompareAndSwap(true, false) {
-				fmt.Println()
-				printSnapshot(p)
-				fmt.Print("bingo> ")
+				printSnapshot(out, p)
 				return
 			}
-			msg := fmt.Sprintf("\n  [goroutines] %s, %s threads, current G%d",
+			msg := fmt.Sprintf("[goroutines] %s, %s threads, current G%d",
 				countOf(len(p.Goroutines), p.Totals, totalGoroutines),
 				countOf(len(p.Threads), p.Totals, totalThreads), p.Current)
 			if len(p.Created) > 0 {
@@ -381,11 +470,11 @@ func printAuxEvent(evt protocol.Event) {
 			if len(p.Exited) > 0 {
 				msg += fmt.Sprintf(", -%v", p.Exited)
 			}
-			fmt.Print(msg + "\nbingo> ")
+			repl.PrintAsync(out, msg)
 		}
 
 	default:
-		fmt.Printf("\n  [%s] seq=%d\nbingo> ", evt.Kind, evt.Seq)
+		repl.PrintAsync(out, fmt.Sprintf("[%s] seq=%d", evt.Kind, evt.Seq))
 	}
 }
 
@@ -430,12 +519,12 @@ func formatGoroutine(g protocol.Goroutine) string {
 
 // printSnapshot renders a full concurrency snapshot: goroutines (with spawn
 // linkage), OS threads, and the created/exited lifecycle deltas.
-func printSnapshot(snap protocol.GoroutineSnapshotPayload) {
-	fmt.Printf("  goroutines: %s  threads: %s  current: G%d\n",
+func printSnapshot(out io.Writer, snap protocol.GoroutineSnapshotPayload) {
+	_, _ = fmt.Fprintf(out, "  goroutines: %s  threads: %s  current: G%d\n",
 		countOf(len(snap.Goroutines), snap.Totals, totalGoroutines),
 		countOf(len(snap.Threads), snap.Totals, totalThreads), snap.Current)
 	for _, g := range snap.Goroutines {
-		printGoroutine(g)
+		_, _ = fmt.Fprintln(out, formatGoroutine(g))
 	}
 	for _, t := range snap.Threads {
 		marker := " "
@@ -446,13 +535,13 @@ func printSnapshot(snap protocol.GoroutineSnapshotPayload) {
 		if t.Spinning {
 			spin = " spinning"
 		}
-		fmt.Printf("%s M%-4d tid=%-6d G%d%s\n", marker, t.MID, t.ID, t.GoID, spin)
+		_, _ = fmt.Fprintf(out, "%s M%-4d tid=%-6d G%d%s\n", marker, t.MID, t.ID, t.GoID, spin)
 	}
 	if len(snap.Created) > 0 {
-		fmt.Printf("  created: %v\n", snap.Created)
+		_, _ = fmt.Fprintf(out, "  created: %v\n", snap.Created)
 	}
 	if len(snap.Exited) > 0 {
-		fmt.Printf("  exited:  %v\n", snap.Exited)
+		_, _ = fmt.Fprintf(out, "  exited:  %v\n", snap.Exited)
 	}
 }
 
@@ -500,6 +589,27 @@ func parseFileLine(s string) (string, int, bool) {
 
 func printErr(err error) {
 	fmt.Printf("  error: %v\n", err)
+}
+
+func printErrUnlessCanceled(ctx context.Context, err error) {
+	if !commandErrorSuppressed(ctx, err) {
+		printErr(err)
+	}
+}
+
+func commandErrorSuppressed(ctx context.Context, err error) bool {
+	if ctx.Err() != nil ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "client closed") ||
+		strings.Contains(message, "closed network connection") ||
+		strings.Contains(message, "connection reset") ||
+		strings.Contains(message, "broken pipe") ||
+		strings.Contains(message, "websocket: close")
 }
 
 func printHelp() {

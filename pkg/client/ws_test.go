@@ -1,6 +1,9 @@
 package client_test
 
 import (
+	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +16,117 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+func TestCreateContextCancelsStalledHandshake(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr == nil {
+			accepted <- conn
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, createErr := client.CreateContext(ctx, listener.Addr().String())
+		result <- createErr
+	}()
+
+	var conn net.Conn
+	select {
+	case conn = <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("client did not start the WebSocket handshake")
+	}
+	defer func() { _ = conn.Close() }()
+
+	cancel()
+	select {
+	case createErr := <-result:
+		if !errors.Is(createErr, context.Canceled) {
+			t.Fatalf("CreateContext error = %v, want context cancellation", createErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CreateContext did not cancel the stalled WebSocket handshake")
+	}
+}
+
+func TestCreateContextCancelsWelcomeWait(t *testing.T) {
+	connected := make(chan struct{})
+	release := make(chan struct{})
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		close(connected)
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, createErr := client.CreateContext(ctx, strings.TrimPrefix(server.URL, "http://"))
+		result <- createErr
+	}()
+
+	select {
+	case <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("client did not complete the WebSocket handshake")
+	}
+	cancel()
+	select {
+	case createErr := <-result:
+		if !errors.Is(createErr, context.Canceled) {
+			t.Fatalf("CreateContext error = %v, want context cancellation", createErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CreateContext did not cancel the welcome wait")
+	}
+}
+
+func TestListSessionsContextCancelsRequest(t *testing.T) {
+	started := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, listErr := client.ListSessionsContext(ctx, strings.TrimPrefix(server.URL, "http://"))
+		result <- listErr
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("list sessions request did not start")
+	}
+	cancel()
+	select {
+	case listErr := <-result:
+		if !errors.Is(listErr, context.Canceled) {
+			t.Fatalf("ListSessionsContext error = %v, want context cancellation", listErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ListSessionsContext did not cancel the request")
+	}
+}
 
 // fakeServer is a minimal WebSocket bingo server that drives the real client
 // through its actual dial → command → confirmation flow. It records every

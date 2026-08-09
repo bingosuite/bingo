@@ -3,8 +3,12 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,14 +51,14 @@ func TestReadLoopContinuesAfterSessionAnnouncement(t *testing.T) {
 		_ = client.Close()
 	})
 
-	response := make(chan godap.Message, 1)
-	h := &dapCLI{
-		conn:      client,
-		reader:    bufio.NewReader(client),
-		pending:   map[int]chan godap.Message{7: response},
-		bpsByFile: make(map[string][]breakpoint),
-	}
+	h := newTestDAPCLI(client, io.Discard, func() {})
+	pending := make(chan pendingResult, 1)
+	h.pending[7] = pending
 	go h.readLoop()
+	t.Cleanup(func() {
+		h.close()
+		<-h.readDone
+	})
 
 	go func() {
 		writeDAPFrameTo(server, fmt.Sprintf(
@@ -73,8 +77,8 @@ func TestReadLoopContinuesAfterSessionAnnouncement(t *testing.T) {
 	}()
 
 	select {
-	case message := <-response:
-		_, ok := message.(*godap.InitializeResponse)
+	case result := <-pending:
+		_, ok := result.message.(*godap.InitializeResponse)
 		g.Expect(ok).To(BeTrue())
 	case <-time.After(time.Second):
 		t.Fatal("normal response was not delivered after custom event")
@@ -91,6 +95,214 @@ func TestSetThreadPreservesUnknownStopIdentity(t *testing.T) {
 	h.setThread(0)
 	if got := h.thread(); got != 0 {
 		t.Fatalf("thread = %d, want unknown stopped thread 0", got)
+	}
+}
+
+func TestOutputEventUsesAsyncWriter(t *testing.T) {
+	var out bytes.Buffer
+	h := &dapCLI{out: &out}
+
+	h.onEvent(&godap.OutputEvent{
+		Body: godap.OutputEventBody{
+			Category: "stderr",
+			Output:   "debuggee output\n",
+		},
+	})
+
+	if got := out.String(); got != "  [stderr] debuggee output\n" {
+		t.Fatalf("output = %q", got)
+	}
+	if strings.Contains(out.String(), prompt) {
+		t.Fatal("async output wrote a prompt instead of relying on readline redraw")
+	}
+}
+
+func TestRequestFailsWhenTransportCloses(t *testing.T) {
+	server, client := net.Pipe()
+	var out bytes.Buffer
+	var editorCloses atomic.Int32
+	h := newTestDAPCLI(client, &out, func() { editorCloses.Add(1) })
+	go h.readLoop()
+
+	serverDone := make(chan struct{})
+	go func() {
+		defer close(serverDone)
+		_, _ = readDAPMessage(bufio.NewReader(server))
+		_ = server.Close()
+	}()
+
+	_, err := h.request("threads", &godap.ThreadsRequest{})
+	if !errors.Is(err, errDAPDisconnected) {
+		t.Fatalf("request error = %v, want DAP disconnect", err)
+	}
+	select {
+	case <-h.readDone:
+	case <-time.After(time.Second):
+		t.Fatal("read loop did not stop after transport EOF")
+	}
+	<-serverDone
+
+	if got := editorCloses.Load(); got != 1 {
+		t.Fatalf("editor close calls = %d, want 1", got)
+	}
+	if got := out.String(); got != "  disconnected\n" {
+		t.Fatalf("output = %q, want one disconnect notice", got)
+	}
+}
+
+func TestIntentionalCloseDoesNotReportDisconnect(t *testing.T) {
+	server, client := net.Pipe()
+	var out bytes.Buffer
+	var editorCloses atomic.Int32
+	h := newTestDAPCLI(client, &out, func() { editorCloses.Add(1) })
+	go h.readLoop()
+
+	h.close()
+	_ = server.Close()
+	select {
+	case <-h.readDone:
+	case <-time.After(time.Second):
+		t.Fatal("read loop did not stop after intentional close")
+	}
+
+	if got := editorCloses.Load(); got != 0 {
+		t.Fatalf("editor close calls = %d, want caller-owned close", got)
+	}
+	if got := out.String(); got != "" {
+		t.Fatalf("output = %q, want no disconnect notice", got)
+	}
+}
+
+func TestReadLoopDoesNotTreatProtocolErrorContainingClosedAsDisconnect(t *testing.T) {
+	server, client := net.Pipe()
+	var out bytes.Buffer
+	h := newTestDAPCLI(client, &out, func() {})
+	go h.readLoop()
+
+	writeDAPFrameTo(server, `{"seq":1,"type":"closed"}`)
+	select {
+	case <-h.readDone:
+	case <-time.After(time.Second):
+		t.Fatal("read loop did not stop after malformed DAP message")
+	}
+	_ = server.Close()
+
+	readErr, intentional := h.readOutcome()
+	if readErr == nil || intentional {
+		t.Fatalf("read outcome = (%v, %v), want unintentional protocol failure", readErr, intentional)
+	}
+	if err := sessionEndError(readErr, intentional); err == nil {
+		t.Fatal("protocol error containing closed was treated as graceful")
+	}
+	if got := out.String(); !strings.Contains(got, "connection closed:") {
+		t.Fatalf("output = %q, want protocol failure notice", got)
+	}
+}
+
+func TestSessionEndErrorClassifiesOnlyUnexpectedFailures(t *testing.T) {
+	if err := sessionEndError(io.EOF, false); err != nil {
+		t.Fatalf("EOF error = %v, want graceful end", err)
+	}
+	if err := sessionEndError(errors.New("malformed DAP frame"), true); err != nil {
+		t.Fatalf("intentional close error = %v, want graceful end", err)
+	}
+	if err := sessionEndError(errors.New("malformed DAP frame"), false); err == nil {
+		t.Fatal("unexpected protocol failure was treated as graceful")
+	}
+}
+
+func TestRequestErrorIsSuppressedAfterConnectionEnds(t *testing.T) {
+	var out bytes.Buffer
+	h := &dapCLI{
+		out:          &out,
+		disconnected: make(chan struct{}),
+	}
+	close(h.disconnected)
+
+	h.printRequestError("threads", errDAPDisconnected)
+
+	if got := out.String(); got != "" {
+		t.Fatalf("output = %q, want disconnect notice to own the error", got)
+	}
+}
+
+func TestEndConnectionPublishesStateBeforeFailingWaiters(t *testing.T) {
+	server, client := net.Pipe()
+	t.Cleanup(func() { _ = server.Close() })
+	h := newTestDAPCLI(client, io.Discard, func() {})
+	waiter := make(chan pendingResult, 1)
+	h.pending[1] = waiter
+	failure := errors.New("malformed DAP frame")
+
+	h.endConnection(failure)
+
+	result := <-waiter
+	if !h.connectionEnded() {
+		t.Fatal("pending request woke before connection state was published")
+	}
+	if result.err == nil {
+		t.Fatal("pending request did not receive the connection failure")
+	}
+	readErr, intentional := h.readOutcome()
+	if !errors.Is(readErr, failure) || intentional {
+		t.Fatalf("read outcome = (%v, %v), want original unintentional failure", readErr, intentional)
+	}
+	if err := sessionEndError(readErr, intentional); err == nil {
+		t.Fatal("unexpected write/read failure was downgraded to graceful exit")
+	}
+}
+
+func TestRequestDoesNotRegisterAfterConnectionEnds(t *testing.T) {
+	server, client := net.Pipe()
+	t.Cleanup(func() { _ = server.Close() })
+	h := newTestDAPCLI(client, io.Discard, func() {})
+	h.endConnection(io.EOF)
+
+	start := time.Now()
+	_, err := h.request("threads", &godap.ThreadsRequest{})
+	if !errors.Is(err, errDAPDisconnected) {
+		t.Fatalf("request error = %v, want DAP disconnect", err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("request waited %v after terminal disconnect", elapsed)
+	}
+	h.mu.Lock()
+	seq := h.seq
+	h.mu.Unlock()
+	if seq != 0 {
+		t.Fatalf("request sequence = %d, want no registration", seq)
+	}
+}
+
+func TestDispatchRejectsInvalidFramesBeforeRequest(t *testing.T) {
+	for _, frame := range []string{"abc", "-1"} {
+		t.Run(frame, func(t *testing.T) {
+			h := &dapCLI{}
+
+			if h.dispatch([]string{"locals", frame}) {
+				t.Fatal("invalid locals command requested exit")
+			}
+
+			h.mu.Lock()
+			seq := h.seq
+			h.mu.Unlock()
+			if seq != 0 {
+				t.Fatalf("request sequence = %d, want no request", seq)
+			}
+		})
+	}
+}
+
+func newTestDAPCLI(conn net.Conn, out io.Writer, closeEditor func()) *dapCLI {
+	return &dapCLI{
+		conn:         conn,
+		reader:       bufio.NewReader(conn),
+		pending:      make(map[int]chan pendingResult),
+		bpsByFile:    make(map[string][]breakpoint),
+		out:          out,
+		closeEditor:  closeEditor,
+		disconnected: make(chan struct{}),
+		readDone:     make(chan struct{}),
 	}
 }
 
