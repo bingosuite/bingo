@@ -1351,8 +1351,9 @@ var _ = Describe("goroutine events go through the wire contract", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(gs.Goroutines).NotTo(BeEmpty())
 		Expect(len(gs.Goroutines)).To(BeNumerically("<=", protocol.MaxSnapshotGoroutines))
-		// The fake has no DWARF, so this is a degraded lower-bound result rather
-		// than an exact one-goroutine runtime.
+		// The fakeBackend has no DWARF, so this is the degraded path and the
+		// count is a lower bound. The "a complete result carries no totals"
+		// invariant needs a readable runtime and is pinned in pkg/protocol.
 		Expect(gs.Totals).NotTo(BeNil())
 		Expect(gs.Totals.GoroutinesClipped).To(BeTrue())
 	})
@@ -1385,6 +1386,35 @@ var _ = Describe("goroutine events go through the wire contract", func() {
 			"the packer normalises empty collections to [] rather than null")
 		Expect(eventSize(protocol.EventGoroutineSnapshot, snap)).
 			To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
+	})
+
+	It("does not present a degraded scan as an exact count", func() {
+		// The stand-in goroutine means the runtime could NOT be read. Absent
+		// totals mean "complete and exact" on the wire, so emitting them here
+		// would tell every consumer the runtime holds exactly one goroutine and
+		// no threads. This matters most where a real scan fails partway: the
+		// degraded path is where such a scan lands, and it must not launder a
+		// partial read into an exact figure.
+		snap, err := d.GoroutineSnapshot()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(snap.Totals).NotTo(BeNil(),
+			"a degraded snapshot must carry totals rather than imply exactness")
+		Expect(snap.Totals.GoroutinesClipped).To(BeTrue(),
+			"the goroutine count is a lower bound, not an exact figure")
+		Expect(snap.Totals.ThreadsClipped).To(BeTrue(),
+			"the thread count is a lower bound, not an exact figure")
+		Expect(snap.Totals.Goroutines).To(BeNumerically(">=", len(snap.Goroutines)))
+		Expect(snap.Totals.Threads).To(BeNumerically(">=", len(snap.Threads)))
+	})
+
+	It("does not present a degraded goroutine list as an exact count", func() {
+		list, err := d.Goroutines()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(list.Totals).NotTo(BeNil(),
+			"a degraded list must carry totals rather than imply exactness")
+		Expect(list.Totals.GoroutinesClipped).To(BeTrue(),
+			"the goroutine count is a lower bound, not an exact figure")
+		Expect(list.Totals.Goroutines).To(BeNumerically(">=", len(list.Goroutines)))
 	})
 
 	It("keeps current consistent with what it delivered", func() {
