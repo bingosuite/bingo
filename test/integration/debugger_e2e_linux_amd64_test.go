@@ -5,7 +5,9 @@ package integration
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -257,7 +259,16 @@ func declareStepOverlapSpec() {
 //
 // SIGUSR1 is used because ptrace intercepts it before delivery and the engine
 // resumes with signal 0, so the tracee never observes it: the storm changes the
-// debugger's workload without changing the target's behaviour.
+// debugger's workload without changing the target's behaviour. Its exact number
+// is asserted by the spec, so do not swap it for another signal.
+//
+// The storm also sends SIGCONT, which the wait loop absorbs rather than
+// reporting. That is the reachable trigger for the absorb-resume rule: when it
+// lands on the thread being single-stepped, the absorbed stop has consumed that
+// step and the wait loop must re-arm it. Continuing instead cancels the step
+// with the gate still latched and the tracee freezes. SIGCONT is safe to storm
+// here because nothing in the target is ever group-stopped, so it has no effect
+// on a thread that receives it.
 const overlapSignalTargetSrc = `package main
 
 import (
@@ -302,6 +313,12 @@ func main() {
 			time.Sleep(2 * time.Millisecond)
 		}
 	}()
+	go func() {
+		for {
+			_ = syscall.Kill(pid, syscall.SIGCONT)
+			time.Sleep(1 * time.Millisecond)
+		}
+	}()
 	for {
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -324,6 +341,12 @@ type overlapProbe struct {
 	// that no thread was stranded.
 	lateGoroutines map[int]bool
 	signalOutputs  int
+	// signalValues counts each distinct signal number the engine reported.
+	// The value matters, not just the count: the wait loop copies the signal
+	// out of the wait status when it holds a stop back, and a delivered stop
+	// that lost its number surfaces as "signal 0". Counting the numbers is what
+	// makes dropping that copy a test failure rather than an invisible change.
+	signalValues map[int]int
 }
 
 func newOverlapProbe(h *e2eHarness, file string, ids []int, lines []int) *overlapProbe {
@@ -335,6 +358,7 @@ func newOverlapProbe(h *e2eHarness, file string, ids []int, lines []int) *overla
 		h: h, file: file, lines: lines, known: known,
 		hits: map[int]int{}, goroutines: map[int]bool{},
 		lateGoroutines: map[int]bool{},
+		signalValues:   map[int]int{},
 	}
 }
 
@@ -407,6 +431,9 @@ func (p *overlapProbe) await(timeout time.Duration, kinds ...protocol.EventKind)
 				var out protocol.OutputPayload
 				if json.Unmarshal(evt.Payload, &out) == nil && strings.HasPrefix(out.Content, "signal ") {
 					p.signalOutputs++
+					if n, err := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(out.Content, "signal "))); err == nil {
+						p.signalValues[n]++
+					}
 				}
 			}
 			for _, k := range kinds {
@@ -535,6 +562,19 @@ func declareStepOverlapSignalSpec() {
 			// otherwise this ran as a plain overlap spec.
 			Expect(p.signalOutputs).To(BeNumerically(">", 0),
 				"no signal stops were reported — the foreign-signal path was never exercised")
+
+			// Integrity of the reported signal number, not just its arrival.
+			// A held stop carries its signal through the queue in the StopEvent
+			// the wait loop builds; if that copy is dropped the stop still
+			// arrives and still counts above, but the engine reports "signal 0".
+			// SIGUSR1 is the only signal that can surface here — SIGURG, SIGCONT
+			// and a new thread's SIGSTOP are absorbed before classification — so
+			// the reported set must be exactly {SIGUSR1}.
+			Expect(p.signalValues).To(HaveKeyWithValue(int(syscall.SIGUSR1), BeNumerically(">", 0)),
+				"no SIGUSR1 was reported by number; reported signals were %v", p.signalValues)
+			Expect(p.signalValues).NotTo(HaveKey(0),
+				"a stop was reported as \"signal 0\": the signal number was lost on its way through the wait loop (reported %v)", p.signalValues)
+
 			// And the parking rule itself must have run. Asserted here as well
 			// as in the step-over spec because this is the variant that carries
 			// foreign non-suspending signal stops through the queue, not just
@@ -544,6 +584,16 @@ func declareStepOverlapSignalSpec() {
 			Expect(parked).To(BeNumerically(">", 0),
 				"no foreign stop was ever parked across %d cycles: this run never "+
 					"exercised the rule under test", iters)
+			// Specifically a *signal* must have gone through the queue, not just
+			// a sibling trap. That is the precondition for the signal-number
+			// assertions above to mean anything: it is the queued path that
+			// rebuilds the StopEvent, so unless a signal was actually held back
+			// a lost signal number could not have shown up.
+			parkedSignals, ok := debugger.LinuxParkedSignalCount(p.h.d)
+			Expect(ok).To(BeTrue(), "parked-signal hook unavailable")
+			Expect(parkedSignals).To(BeNumerically(">", 0),
+				"no signal stop was ever held back across %d cycles: the queued "+
+					"signal path was not exercised", iters)
 			// Liveness: threads are still making progress at the end of the
 			// run. A thread resumed while another was left stopped would drop
 			// out permanently, since every spinner is LockOSThread'd.
@@ -554,7 +604,18 @@ func declareStepOverlapSignalSpec() {
 			AddReportEntry("overlap-signal-stops", p.signalOutputs)
 			AddReportEntry("overlap-signal-goroutines", len(p.goroutines))
 			AddReportEntry("overlap-signal-late-goroutines", len(p.lateGoroutines))
+			// The absorb-resume rule must have fired: SIGCONT lands on the
+			// stepped thread often enough over a full run, and re-arming there
+			// is what keeps the step alive. Reported rather than asserted
+			// because the landing is racy per cycle; the assertion below only
+			// requires it to have happened at all.
+			rearms, ok := debugger.LinuxStepRearmCount(p.h.d)
+			Expect(ok).To(BeTrue(), "step-rearm hook unavailable")
+
 			AddReportEntry("overlap-signal-parked-stops", parked)
+			AddReportEntry("overlap-signal-parked-signal-stops", parkedSignals)
+			AddReportEntry("overlap-signal-values", fmt.Sprintf("%v", p.signalValues))
+			AddReportEntry("overlap-signal-step-rearms", rearms)
 		})
 }
 

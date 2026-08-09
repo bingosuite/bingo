@@ -525,11 +525,41 @@ note below):
    reintroduce exactly that ordering obligation.
 5. **A dead stepped thread lifts the gate.** `clearStepIfStepped` clears
    `stepping`/`stepTID` when the stepped TID exits or dies by signal, otherwise
-   its completion never arrives and the queue is stranded.
+   its completion never arrives and the queue is stranded. It deliberately does
+   **not** reinstall the trap that step was stepping off: the thread that owned
+   the step is gone, there is no PC to resume, and the engine learns about the
+   death through the stop that follows. An accepted limit, not an oversight.
 6. **Teardown purges inside `Wait`.** `stepQueue.purge` runs on the main thread's
    `PTRACE_EVENT_EXIT`, its real exit, its signal death, and `ECHILD`. There is
    deliberately **no engine-callable purge**: the queue is not part of the
    engine's state model.
+7. **Absorbing a stop on the stepped thread must re-arm its step.** Every site
+   that handles a stop inline and resumes the thread goes through
+   `resumeAbsorbed`, which asks `stepQueue.resumeFor`: the stepped thread gets
+   `PTRACE_SINGLESTEP`, everything else `PTRACE_CONT`. The kernel delivers one
+   stop per resume, so an absorbed event on the stepped thread has **consumed**
+   the pending step. A plain continue there cancels it while `stepping`/`stepTID`
+   stay latched — no completion can ever arrive, so rule 3 holds the gate shut
+   forever, every later foreign stop parks, `Wait` never returns and the tracee
+   freezes. This generalises what the `SIGURG` branch always did; do not add an
+   absorb site that calls `continueIfTraceeExists` directly. Two consequences
+   worth knowing: the re-armed step resumes *after* the absorbed event, so the
+   stepped instruction can land one instruction further than the engine asked
+   (a cosmetic `bpResumeStep` PC difference — the reinstall address is
+   unaffected); and the absorbed signal is swallowed on that thread, because
+   re-delivering it with `PTRACE_SINGLESTEP` would step into the handler instead
+   of the instruction under test.
+8. **Two absorb cases cannot re-arm and must fail the wait instead.** On
+   `PTRACE_EVENT_EXEC` the image the stepped-over breakpoint lived in is gone, so
+   neither completing nor restoring it is meaningful; on an unrecognised
+   `PTRACE_EVENT` (unreachable with the options we set) there is nothing to
+   reason about. Both call `stepQueue.abortStep` — lift the gate *and* drop the
+   held stops, since they name threads of an image that no longer exists — and
+   return an error from `Wait`. The engine turns that into an `EventError` and
+   tears the session down (`engine.go`'s `stopCh` error branch). Un-latching and
+   running on instead would resume a tracee whose software breakpoint is still
+   absent from memory, which is the corruption this whole section exists to
+   prevent.
 
 **Explicit limits — this is NOT an atomic stop-the-world step-over.** Sibling
 threads keep running and keep trapping during a step; the fix only guarantees
@@ -569,6 +599,22 @@ that their stops are *reported later*, after the trap is back:
   following `Wait`. Once the main exit *is* observed, `purge` wins and nothing is
   delivered afterwards, so the engine never acts on a dead thread. Pinned by
   `TestLinuxBackendSteppedThreadDeathDeliversHeldStopBeforeExit`.
+- **Kill ownership is unchanged, and no second reaper is added.** Killing a
+  *suspended* tracee still reaps through `reapAfterKill`, which loops
+  `Wait4(-1, WALL)` and resumes whatever it finds ptrace-stopped: a parked thread
+  is ptrace-stopped like any other and is indistinguishable to that loop, so the
+  queue costs it iterations, nothing more. Killing a *running* tracee still
+  leaves reaping to the in-flight `waitLoop` (#111 forbids a second `wait4`
+  reaper here, and #205 is why a process-global one is dangerous in a shared
+  server). The one honest cost: because the drain runs before `wait4`, that
+  final `waitLoop` can return a held stop instead of blocking, so it absorbs
+  fewer thread deaths than it would have, leaving a few more unreaped statuses
+  until the tracer process exits. Bounded by the live thread count, the same P3
+  class as #217's unreaped leader, and it neither hangs nor wedges teardown —
+  `declareStepOverlapKillSpec` kills mid-step with stops held and requires both
+  `Kill` and the event-stream close to complete. Do not "fix" this with a purge
+  on kill: `purge` is `Wait`-owned (rule 6) and draining before blocking is what
+  makes a same-address sibling resolve after the reinstall (rule 3).
 
 **No lock, and none is needed.** `parked` is touched only inside `Wait`.
 Successive `Wait` calls run on different one-shot `waitLoop` goroutines that the
@@ -616,6 +662,27 @@ evidence that the interrupt arrived *while a single-step was outstanding*. That
 spec asserts three independent things: a `Pause` was accepted (the engine was
 running, so a step really was in flight), an interrupt was held mid-step, and at
 least one `EventPaused` actually surfaced.
+
+**The foreign-signal spec also gates the signal *number*, not just its arrival.**
+A held stop carries its signal in the `StopEvent` the wait loop builds at park
+time (rule 4), so a build that dropped that field would still deliver the stop,
+still advance every counter, and merely report `signal 0`. The spec therefore
+records the numbers the engine reported and requires `SIGUSR1` to be among them
+and `0` not to be — with a held **signal** stop asserted separately, since that
+is the population whose number travels through the queue. `SIGUSR1` is chosen
+because ptrace intercepts it and the engine resumes with signal 0, so the storm
+never changes the target's behaviour; its exact value is now asserted, so do not
+swap it.
+
+**`LinuxStepRearmCount` is the native evidence for rule 7.** The failure that
+rule prevents is a freeze, which a test can otherwise only observe as a timeout —
+indistinguishable from a slow runner. The counter records how often an absorbed
+stop landed on the stepped thread and re-armed its step, so a positive value
+proves the rule fired against a real kernel. The foreign-signal target storms
+`SIGCONT` (absorbed, and harmless because nothing there is ever group-stopped)
+specifically to make that landing happen; the spec reports the count rather than
+asserting a threshold, because which thread a process-directed signal lands on is
+racy per cycle.
 
 **A held interrupt is usually surfaced, not suppressed — but only usually.** It
 surfaces when it drains while `manualStopPending` is still set, which is the
