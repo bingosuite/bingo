@@ -150,6 +150,11 @@ repaints with the new round's workers — the plumbing, end to end.
   disturb the DAP driver. Many `wsmon` + DAP clients can share one session.
 - The graphical observer is also read-only. It sends exactly one on-demand
   snapshot request after joining and on explicit Refresh only.
+- Both observers report scale honestly. `wsmon`'s `counts:` line shows
+  `included/total` and names the two ways a picture can be incomplete —
+  `N omitted from this event` (the packer left elements off the wire) and
+  `scan hit its ceiling` with a trailing `+` (the debugger's own runtime walk
+  stopped early, so the total is itself a floor). A complete snapshot says so.
 - Snapshots stream on **breakpoint / pause / entry**, not per single-step (steps
   stay cheap). Use the driver's breakpoints/continue to advance between frames.
 - If the tracee is a stripped binary or stopped before runtime init, the snapshot
@@ -171,11 +176,15 @@ What a consumer sees:
   leads the thread set, and a floor of 32 threads is packed before goroutines
   compete for the remaining budget. Two clients observing the same stop receive
   the same bytes.
-- **Anchors and deltas are never dropped.** The current goroutine, the current
-  thread, and the created/exited lifecycle deltas always survive. If not even the
-  anchors fit, the event degrades to empty collections rather than failing; a
-  degraded result that still overflows (only possible if the deltas alone do)
-  reports `Oversized` rather than pretending to conform.
+- **Anchors and deltas are never dropped.** In the snapshot the current
+  goroutine, its entire ancestor chain, the current thread, and the
+  created/exited lifecycle deltas always survive — a spawn tree with an interior
+  ancestor missing would be a worse lie than a truncated one. The flat
+  `Goroutines` list requires only the current goroutine (it has no hierarchy to
+  break), so it never degrades to a set an IDE would replace with a fake thread. If the anchors cannot all fit, the event
+  degrades to empty collections rather than failing; a degraded result that still
+  overflows (only possible if the deltas alone do) reports `Oversized` rather
+  than pretending to conform.
 - **Deltas are not packed elements.** Because they are never trimmed,
   `created`/`exited` can legitimately exceed the element caps — the debugger's
   scan reaches 8192. A consumer must not apply its element cap to them; the byte
@@ -199,6 +208,10 @@ indistinguishable from a flaky link and drives a pointless reconnect loop.
 
 Two limits that are easy to get wrong:
 
+- **Latch only on a proven violation.** A frame above your *transport* cap was
+  never delivered, so you cannot know its kind — treat that as a transient
+  failure. Reserve terminal handling for a decoded frame that broke a rule you
+  can name, and give the user an explicit way to retry.
 - **Scope the fatal treatment to these two kinds.** Every other event is
   deliberately unbounded — `EventLocals`/`EventFrames`/`EventEvaluate` are
   broadcast to all clients and are limited only by the debugger's inspection

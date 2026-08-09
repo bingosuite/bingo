@@ -91,7 +91,7 @@ follow them so reviews stay about substance, not style.
 | [cmd/bingo](cmd/bingo/) | Server entry point — flag parsing, signal handler, calls into `internal/server`. |
 | [cmd/cli](cmd/cli/) | Interactive readline client. |
 | [cmd/dapcli](cmd/dapcli/) | Interactive readline client that drives a session over DAP (mirrors `cmd/cli`'s UX). Talks to the server's `-dap-addr` listener; can create a session or `-session` join an existing one. |
-| [cmd/wsmon](cmd/wsmon/) | Read-only terminal telemetry observer. `-session`-joins a running session over WebSocket and live-renders the goroutine spawn tree + OS threads + created/exited lifecycle deltas from the `EventGoroutineSnapshot` stream. Never drives execution — the WS-observes half of the DAP-drives/WS-observes demo. |
+| [cmd/wsmon](cmd/wsmon/) | Read-only terminal telemetry observer. `-session`-joins a running session over WebSocket and live-renders the goroutine spawn tree + OS threads + created/exited lifecycle deltas from the `EventGoroutineSnapshot` stream, reporting included/total honestly and distinguishing wire omission from a clipped runtime scan. Never drives execution — the WS-observes half of the DAP-drives/WS-observes demo. |
 | [editors/vscode](editors/vscode/) | Platform-packaged TypeScript companion extension. Owns debugger type `bingo`, manages the shared server, and hosts the read-only Bingo Concurrency Activity Bar WebSocket observer. |
 | [cmd/target](cmd/target/) | Trivial target program for manual testing. |
 | [examples/level1-loop](examples/level1-loop/) … [examples/level5-workflow](examples/level5-workflow/) | Progressive debugger targets, selected by the root VS Code launch picker and built together with `just build-examples` (see [examples/README.md](examples/README.md)). |
@@ -643,15 +643,27 @@ pass is O(n) — never a re-marshal of the whole payload per candidate, and neve
 binary search. A final exact `MarshalEvent` at max seq is the enforced contract.
 
 Selection is deterministic so every client on one stop sees the same bytes:
-current goroutine, then its ancestors nearest-first (keeping a spawn tree rooted),
-then the rest by ascending goid; current thread first, then ascending MID. The
-current goroutine and current thread are **anchors** retained in every
-non-degraded result. Created/Exited are reserved first and **never** trimmed. An
-oversized non-anchor is skipped and packing continues — one pathological element
-must not hide every element after it. Threads take their ordered floor, then
-goroutines compete, then leftover budget is reclaimed for the remaining threads.
-If the anchors alone cannot fit, the result degrades to empty collections (with
-the deltas intact) and reports it — never a panic.
+current goroutine, then its ancestors nearest-first, then the rest by ascending
+goid; current thread first, then ascending MID. In the SNAPSHOT shape the
+**anchors** — the current goroutine, its ENTIRE ancestor chain, and the current
+thread — are required in every non-degraded result: a tree missing an interior
+ancestor cannot be rendered as the hierarchy it actually is, which is misleading
+in a way a truncated tail is not. `PackGoroutines` does NOT require the chain:
+that shape is a flat list DAP renders as threads, with no hierarchy to break, and
+degrading it to empty would make `dapThreads` fabricate a synthetic `main` — the
+exact lie this work exists to stop. Ancestors stay ordered first either way. Created/Exited are reserved first and **never** trimmed. An oversized
+non-anchor is skipped and packing continues — one pathological element must not
+hide every element after it. Threads take their ordered floor, then goroutines
+compete, then leftover budget is reclaimed for the remaining threads. If the
+anchors cannot all fit (by bytes or by the count cap), the result degrades to
+empty collections (with the deltas intact) and reports it — never a panic.
+
+Whether `Totals` lands on the wire changes the reserve and is only known after
+packing, so the pass is run optimistically and retried once against the true
+reserve if it turns out to omit anything (a clipped scan forces totals up front,
+so it needs no retry). The retry can only omit more, never fewer, so it settles —
+and it is what keeps a payload that exactly fills the budget from being falsely
+degraded. Hence "each candidate marshalled at most twice".
 
 **Totals = the honesty channel.** `SnapshotTotals{Goroutines, Threads, Clipped}`
 is present **iff** the wire omits elements or the runtime scan was clipped, and
@@ -683,7 +695,9 @@ graphical consumer; it joins from the DAP discovery event without user input.
 [cmd/wsmon](cmd/wsmon/) is the terminal fallback and joins with `-session`.
 Both are read-only and render the spawn tree / thread set / lifecycle deltas
 from this stream (a UI-agnostic view of exactly the data a spawn-hierarchy
-visualization needs). The end-to-end
+visualization needs), and both report scale honestly: included/total, with wire
+omission and a clipped runtime scan named as the separate causes they are.
+The end-to-end
 DAP-drives + WS-observes walkthrough — server, VS Code (or `cmd/dapcli`) driver,
 and either observer against the [examples/spawntree](examples/spawntree/)
 target — is in [docs/ConcurrencyTelemetry.md](docs/ConcurrencyTelemetry.md).
@@ -1055,12 +1069,18 @@ violates the contract is delivered and rejected *here*, as a deterministic
 `TelemetryProtocolError`, instead of dying below the decoder where it is
 indistinguishable from a flaky link. Byte checking still happens before parse.
 
-**Fatal vs transient.** `TelemetryProtocolError` and `ws`'s
-`WS_ERR_UNSUPPORTED_MESSAGE_LENGTH` are deterministic: the same peer will produce
-the identical bad frame again, so the observer latches `connection: "error"` and
-does **not** reconnect. Genuine transport closes keep the existing reconnect
-ladder. Reconnecting on a contract violation is what used to burn 1 + 6 attempts
-and kill the view for the rest of the session.
+**Fatal vs transient — latch only on a PROVEN violation.** A
+`TelemetryProtocolError` names a specific broken rule, so the same peer will
+produce the identical frame again and the observer latches `connection: "error"`
+without reconnecting; that is what stops the 1 + 6-attempt ladder that used to
+kill the view. Everything else stays transient, including `ws`'s
+`WS_ERR_UNSUPPORTED_MESSAGE_LENGTH`: a frame above the TRANSPORT cap is never
+delivered, so its kind is unknowable, and a legal, deliberately-unbounded
+`Locals`/`Frames`/`Evaluate` broadcast can land there. Latching on it would kill
+the view over an event the observer never even reads.
+
+**Refresh is the manual recovery path.** The latch stops the *automatic* ladder;
+an explicit user Refresh is not a loop, so it clears the latch and redials.
 
 **Fatality is scoped to the bounded kinds.** The byte check must stay *before*
 the parse, but the kind is only known *after* it — so an over-budget frame gets a

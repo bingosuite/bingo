@@ -3,6 +3,7 @@ package protocol_test
 import (
 	"math"
 	"math/rand"
+	"strings"
 	"testing"
 	"unicode/utf16"
 
@@ -93,4 +94,122 @@ func eventBytesPlain(t *testing.T, kind protocol.EventKind, payload any) int {
 		t.Fatalf("MarshalEvent: %v", err)
 	}
 	return len(raw)
+}
+
+// TestPackNeverExceedsCapAcrossTheBoundary sweeps every byte size in a window
+// around the cap. Both directions matter: the packer must never return a payload
+// above the cap, and must never falsely degrade one that fits. The second is the
+// regression the two-pass exact reserve exists for — reserving space for Totals
+// that the result does not carry silently shrank the usable budget.
+func TestPackNeverExceedsCapAcrossTheBoundary(t *testing.T) {
+	for offset := -60; offset <= 60; offset++ {
+		target := protocol.MaxGoroutineEventBytes + offset
+		snap := protocol.GoroutineSnapshotPayload{
+			Goroutines: []protocol.Goroutine{{ID: 1, Status: "running", Current: true}},
+			Threads:    []protocol.Thread{},
+			Current:    1,
+		}
+		base := eventBytesPlain(t, protocol.EventGoroutineSnapshot, snap)
+		pad := target - base - len(`,"waitReason":""`)
+		if pad < 0 {
+			continue
+		}
+		snap.Goroutines[0].WaitReason = strings.Repeat("w", pad)
+		if got := eventBytesPlain(t, protocol.EventGoroutineSnapshot, snap); got != target {
+			t.Fatalf("offset %d: built %d want %d", offset, got, target)
+		}
+
+		out, rep := protocol.PackSnapshot(snap, false)
+		actual := eventBytesPlain(t, protocol.EventGoroutineSnapshot, out)
+		if actual > protocol.MaxGoroutineEventBytes {
+			t.Fatalf("offset %d: returned %d bytes, over cap", offset, actual)
+		}
+		if rep.Bytes != actual {
+			t.Fatalf("offset %d: report %d actual %d", offset, rep.Bytes, actual)
+		}
+		if offset <= 0 && rep.Degraded {
+			t.Fatalf("offset %d: falsely degraded a payload that fits", offset)
+		}
+		if offset > 0 && !rep.Degraded {
+			t.Fatalf("offset %d: kept an anchor that cannot fit", offset)
+		}
+	}
+}
+
+// TestPackTwoPassInvariantsUnderRandomInput mixes deep ancestor chains, threads,
+// lifecycle deltas, scan clipping, and near-cap element sizes. It pins the three
+// invariants that cannot be verified by inspection: the result never exceeds the
+// cap, the reported size is the real one, Totals is present exactly when the
+// result is incomplete, and every anchor survives a non-degraded pack.
+func TestPackTwoPassInvariantsUnderRandomInput(t *testing.T) {
+	rng := rand.New(rand.NewSource(99))
+	for round := 0; round < 600; round++ {
+		n := 1 + rng.Intn(60)
+		gs := make([]protocol.Goroutine, 0, n)
+		for i := 1; i <= n; i++ {
+			g := protocol.Goroutine{
+				ID: i, Status: "waiting",
+				WaitReason: strings.Repeat("w", rng.Intn(70000)),
+			}
+			if i > 1 && rng.Intn(3) > 0 {
+				g.ParentID = i - 1 // deep chain
+			}
+			gs = append(gs, g)
+		}
+		cur := 1 + rng.Intn(n)
+		ts := make([]protocol.Thread, 0, 8)
+		for i := 0; i < rng.Intn(8); i++ {
+			ts = append(ts, protocol.Thread{ID: i, MID: rng.Intn(50), Current: i == 0})
+		}
+		created := make([]int, rng.Intn(200))
+		for i := range created {
+			created[i] = math.MaxInt64 - i
+		}
+		clipped := rng.Intn(2) == 0
+
+		out, rep := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+			Goroutines: gs, Threads: ts, Current: cur, Created: created,
+		}, clipped)
+
+		actual := eventBytesPlain(t, protocol.EventGoroutineSnapshot, out)
+		if !rep.Oversized && actual > protocol.MaxGoroutineEventBytes {
+			t.Fatalf("round %d: %d bytes over cap (degraded=%v)", round, actual, rep.Degraded)
+		}
+		if rep.Bytes != actual {
+			t.Fatalf("round %d: report %d actual %d", round, rep.Bytes, actual)
+		}
+		// Totals presence must agree with reality.
+		wantTotals := rep.Omitted() || clipped
+		if wantTotals != (out.Totals != nil) {
+			t.Fatalf("round %d: totals presence %v want %v (omitted=%v clipped=%v)",
+				round, out.Totals != nil, wantTotals, rep.Omitted(), clipped)
+		}
+		// Anchors must be present in every non-degraded result.
+		if !rep.Degraded {
+			have := map[int]bool{}
+			for _, g := range out.Goroutines {
+				have[g.ID] = true
+			}
+			byID := map[int]protocol.Goroutine{}
+			for _, g := range gs {
+				if _, dup := byID[g.ID]; !dup {
+					byID[g.ID] = g
+				}
+			}
+			seen := map[int]bool{}
+			for id := cur; id != 0 && !seen[id]; {
+				seen[id] = true
+				if _, ok := byID[id]; !ok {
+					break
+				}
+				if !have[id] {
+					t.Fatalf("round %d: anchor g%d missing from non-degraded result", round, id)
+				}
+				id = byID[id].ParentID
+			}
+			if len(ts) > 0 && len(out.Threads) == 0 {
+				t.Fatalf("round %d: current thread dropped", round)
+			}
+		}
+	}
 }
