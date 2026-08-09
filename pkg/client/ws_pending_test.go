@@ -381,6 +381,53 @@ func TestUnresolvedReplyDebtMakesLaterRequestTimeout(t *testing.T) {
 	}
 }
 
+func TestTimedOutGoroutineSnapshotDoesNotConsumeAutoSnapshot(t *testing.T) {
+	useSyncTimeout(t, 100*time.Millisecond)
+	h := newLoopbackClient(t)
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := h.client.GoroutineSnapshot()
+		result <- err
+	}()
+	assertCommandKind(t, h.readCommand(t), protocol.CmdGoroutineSnapshot)
+
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "timeout") {
+			t.Fatalf("GoroutineSnapshot error = %v, want timeout", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("GoroutineSnapshot did not return")
+	}
+
+	h.writeEvent(t, protocol.MustEvent(
+		protocol.EventBreakpointHit,
+		2,
+		protocol.BreakpointHitPayload{},
+	))
+	h.writeEvent(t, protocol.MustEvent(
+		protocol.EventGoroutineSnapshot,
+		3,
+		protocol.GoroutineSnapshotPayload{Current: 42},
+	))
+
+	if evt := awaitEvent(t, h.client.Events()); evt.Kind != protocol.EventBreakpointHit {
+		t.Fatalf("first async event kind = %s, want %s", evt.Kind, protocol.EventBreakpointHit)
+	}
+	evt := awaitEvent(t, h.client.Events())
+	if evt.Kind != protocol.EventGoroutineSnapshot {
+		t.Fatalf("second async event kind = %s, want %s", evt.Kind, protocol.EventGoroutineSnapshot)
+	}
+	var snapshot protocol.GoroutineSnapshotPayload
+	if err := protocol.DecodeEventPayload(evt, &snapshot); err != nil {
+		t.Fatalf("decode auto snapshot: %v", err)
+	}
+	if snapshot.Current != 42 {
+		t.Fatalf("auto snapshot current = %d, want 42", snapshot.Current)
+	}
+}
+
 func TestRouteToPendingClaimsBeforeDelivery(t *testing.T) {
 	ch := make(chan protocol.Event, 1)
 	client := &wsClient{

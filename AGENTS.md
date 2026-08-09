@@ -297,6 +297,15 @@ continue timing out while that reply stream remains one response short. Keep the
 WebSocket open: disconnecting the last client tears down the hub/debuggee, while
 unrelated async events remain valid.
 
+`GoroutineSnapshot` is a temporary exception to timeout debt because
+`EventGoroutineSnapshot` is dual-purpose: it confirms `CmdGoroutineSnapshot`
+and is also pushed automatically after breakpoint, pause, and entry stops. A
+timed-out snapshot request is removed from the pending queue so it cannot consume
+the next unrelated telemetry snapshot. A genuinely late query reply therefore
+falls through to `Events()` too; the client cannot distinguish the two without
+wire correlation. The dependent snapshot/API cleanup removes this synchronous
+query surface rather than expanding the exception here.
+
 This is deliberately bounded by the id-less broadcast protocol. The queue
 preserves this client's ordered command stream; it cannot distinguish an
 unsolicited same-kind event or confirmation caused by another driving client.
