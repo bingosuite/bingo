@@ -1437,10 +1437,12 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   eliminated by never checking out or executing head content.
   The `pull_request_target` workflow and its own job run against the
   base SHA, so that job is deliberately NOT the merge gate. The trusted workflow
-  checks out only the exact base SHA policy script, never the PR head or merge
-  tree, and reads PR files/labels through GitHub APIs. Do not add any step that
-  executes head code, consumes head artifacts, or builds a shell command from PR
-  content in this privileged workflow. The PR-files REST endpoint hard-caps its
+  performs **no checkout at all**: it reads the single policy script from the
+  base SHA through the contents API, so no working tree exists that could hold
+  PR head or merge content, and it reads PR files/labels through GitHub APIs. Do
+  not add `actions/checkout`, or any step that executes head code, consumes head
+  artifacts, or builds a shell command from PR content, to this privileged
+  workflow. The PR-files REST endpoint hard-caps its
   response at 3,000 files, so the policy cross-checks the returned count against
   the event's `pull_request.changed_files` and fails closed on any mismatch.
   Count and path matching operate on the slurped JSON arrays, never line-oriented
@@ -1463,8 +1465,9 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   API/decision errors so an old success cannot survive a reopened/error window.
   A status counts as published only when the API accepted it, so a failed POST
   never records a decision.
-  If the base policy is missing, the trusted workflow posts failure inline.
-  Keep permissions limited to base checkout/API reads, PR-label cleanup, and
+  If the base policy cannot be fetched, the trusted workflow posts failure
+  inline.
+  Keep permissions limited to API reads, PR-label cleanup, and
   head commit statuses; never expose secrets or execute untrusted code through
   `pull_request_target`.
 

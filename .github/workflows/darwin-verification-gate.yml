@@ -2,10 +2,11 @@ name: Darwin verification gate
 
 # This workflow is the trusted enforcement path for darwin/arm64 changes that
 # cannot execute on GitHub-hosted runners. `pull_request_target` loads this YAML
-# from the base branch. It checks out only the base SHA policy script, never PR
-# head code, then posts the "Darwin E2E verified" status explicitly to the PR
-# head SHA. The workflow's own check belongs to the base SHA and is not the
-# branch-protection signal.
+# from the base branch. It performs NO repository checkout at all: it fetches the
+# single policy script from the base SHA through the contents API, so there is no
+# working tree that could ever hold PR head or merge content. It then posts the
+# "Darwin E2E verified" status explicitly to the PR head SHA. The workflow's own
+# check belongs to the base SHA and is not the branch-protection signal.
 #
 # A separate unprivileged `pull_request` workflow runs the proposed HEAD policy
 # tests. Those tests are useful review feedback but are not enforcement because
@@ -39,21 +40,32 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Check out trusted gate policy
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          sparse-checkout: .github/scripts/darwin-verification-gate.sh
-          sparse-checkout-cone-mode: false
-          persist-credentials: false
-
+      # No checkout: the only code this privileged job runs is the policy script
+      # read from the base SHA, which a pull request cannot influence. Fetching
+      # it through the contents API keeps the workspace empty, so head or merge
+      # content can never appear on disk.
       - name: Evaluate and publish Darwin verification
         env:
           GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           DARWIN_GATE_DECISION_FILE: ${{ runner.temp }}/darwin-gate-decision
         run: |
           set -euo pipefail
-          if [ ! -r .github/scripts/darwin-verification-gate.sh ]; then
+
+          case "$BASE_SHA" in
+            '' | *[!0-9a-fA-F]*)
+              echo "Refusing to fetch policy at a non-SHA base ref." >&2
+              exit 1
+              ;;
+          esac
+
+          policy="$RUNNER_TEMP/darwin-verification-gate.sh"
+          fetched=true
+          gh api \
+            "repos/$GITHUB_REPOSITORY/contents/.github/scripts/darwin-verification-gate.sh?ref=$BASE_SHA" \
+            --jq '.content' | base64 -d > "$policy" || fetched=false
+
+          if [ "$fetched" != true ] || [ ! -s "$policy" ]; then
             head_sha=$(jq -er '.pull_request.head.sha' "$GITHUB_EVENT_PATH")
             run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head_sha" \
@@ -66,7 +78,7 @@ jobs:
             exit 1
           fi
 
-          bash .github/scripts/darwin-verification-gate.sh
+          bash "$policy"
 
       # The gate posts `pending` before it can decide. If the job is interrupted
       # (cancellation, timeout, runner loss) between those points, the required

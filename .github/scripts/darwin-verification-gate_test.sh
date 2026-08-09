@@ -592,11 +592,18 @@ trusted_is_base_controlled() {
     ! grep -Eq '^[[:space:]]+pull_request:' "$trusted_workflow"
 }
 
+# The privileged job must never materialise a working tree, and the only code it
+# runs must be read from the base SHA, which a pull request cannot influence.
 # GitHub Actions '${{ }}' expressions are matched literally, not expanded.
 # shellcheck disable=SC2016
-trusted_checks_out_base_only() {
-  grep -Fq 'ref: ${{ github.event.pull_request.base.sha }}' "$trusted_workflow" &&
-    ! grep -Fq 'github.event.pull_request.head.sha }}' "$trusted_workflow"
+trusted_runs_base_policy_only() {
+  ! grep -Eq 'uses:[[:space:]]*actions/checkout' "$trusted_workflow" &&
+    grep -Fq 'BASE_SHA: ${{ github.event.pull_request.base.sha }}' \
+      "$trusted_workflow" &&
+    grep -Fq 'contents/.github/scripts/darwin-verification-gate.sh?ref=$BASE_SHA' \
+      "$trusted_workflow" &&
+    ! grep -Fq 'github.event.pull_request.head.sha }}' "$trusted_workflow" &&
+    ! grep -Fq 'github.event.pull_request.head.ref' "$trusted_workflow"
 }
 
 trusted_subscribes_to_gated_actions() {
@@ -674,8 +681,8 @@ for path in sys.argv[1:]:
 
 assert_workflow "trusted workflow is base-controlled pull_request_target only" \
   trusted_is_base_controlled
-assert_workflow "trusted workflow checks out only the base policy" \
-  trusted_checks_out_base_only
+assert_workflow "trusted workflow runs only base-SHA policy and never checks out" \
+  trusted_runs_base_policy_only
 assert_workflow "trusted workflow subscribes to every gated action" \
   trusted_subscribes_to_gated_actions
 assert_workflow "trusted workflow never cancels a run in progress" \
