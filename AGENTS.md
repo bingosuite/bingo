@@ -297,6 +297,30 @@ If `bps.reinstall` ever fails after a single-step, **suspend instead of
 resuming**. Running without the trap is a runaway process; reporting the
 error lets the operator intervene.
 
+**A step-over must be atomic with respect to the breakpoint it disarmed.**
+Between step 1 and step 3 the trap is gone from tracee memory *and* from the
+breakpoint table, and `steppingOverBP` (a single slot) is the only reference to
+it. Any other thread's stop delivered in that window is therefore poison: it
+overwrites `lastBP`, and the next resume overwrites `steppingOverBP`, silently
+orphaning a breakpoint that can then never fire or be cleared; worse, a sibling
+parked on that same address misses the table lookup, so `handleStop` takes the
+spurious-SIGTRAP path, skips `rewindToBreakpoint`, and resumes it one byte into
+the restored instruction (issue #198). Two things keep this closed, and both
+must be preserved:
+
+- **Backends must not deliver another thread's stop while a step is in flight.**
+  linux does this with a targeted `wait4` (see Backend quirks → Linux); darwin's
+  `Wait` only lets a trap on the stepping thread drive step completion.
+- **`handleStop`'s `StopBreakpoint` branch reinstalls `steppingOverBP` before
+  the table lookup** (mirroring `StopSignal`), so a backend that can still
+  deliver such a stop — darwin's `BINGO_DARWIN_ATOMIC_STEPOVER=0` ablation path
+  does — degrades to a correctly-reported sibling hit rather than a lost
+  breakpoint. Reinstalling *before* `bps.atAddr` is load-bearing: it is what
+  makes the same-address case resolve to a real hit instead of the
+  spurious-SIGTRAP path.
+
+The `overlap`-labelled E2E is the regression gate.
+
 ## Architecture-specific traps
 
 Per-arch in [trap_amd64.go](internal/debugger/trap_amd64.go) and
@@ -440,7 +464,19 @@ are detected by a `mach_msg` receive loop.
   the tracer. Each new thread's initial `SIGSTOP` is resumed **individually** —
   never a group-continue, which would let a thread parked at a breakpoint run
   away (the "parking the thread group" hazard).
-- `Wait` uses `Wait4(-1, …, WALL)` to receive events for any thread.
+- `Wait` uses `Wait4(-1, …, WALL)` to receive events for any thread — **except
+  while a single-step is in flight, when it targets `stepTID` specifically**
+  (`waitTarget`). ptrace stops are per-thread and bingo does not stop the world,
+  so siblings keep running and can be sitting in their own unreaped INT3 stops;
+  a process-wide wait would *consume* one inside the step-over window, where the
+  stepped breakpoint is disarmed and untabled and the engine cannot yet act on
+  it (issue #198 — see Software-breakpoint step-over flow). Targeting the
+  stepping thread leaves those statuses queued in the kernel: nothing is lost,
+  and they surface on the very next process-wide wait with the trap reinstalled.
+  `ECHILD` from the targeted wait means the stepping thread is gone, so it
+  clears the step state and falls back to `Wait4(-1)` rather than reporting the
+  whole tracee exited — the waitLoop must stay the sole reaper of every thread's
+  death for Kill (#111).
   `PTRACE_EVENT_*` stops are absorbed (resumed and looped) and never surface
   to the engine — except the **main thread's** `PTRACE_EVENT_EXIT`, which is the
   one exit the engine needs. Because `PTRACE_O_TRACEEXIT` stops the leader
@@ -1340,7 +1376,9 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   `pause` (async-interrupt / manual-stop round-trip), `stepping`
   (StepInto crosses into a callee, StepOut returns to the caller), `inspect`
   (StackFrames chain + Locals + Goroutines at a breakpoint), `breakpoints`
-  (a cleared breakpoint stops firing), `kill` (Kill terminates a
+  (a cleared breakpoint stops firing), `overlap` (linux-only: a sibling
+  thread's breakpoint stop must not land inside another thread's step-over and
+  orphan the disarmed breakpoint — issue #198), `kill` (Kill terminates a
   freely-running tracee), `exit` (EventProcessExited reports the tracee's real
   exit code), `attach` (attach by PID to an already-running tracee — one the
   debugger did not launch — then breakpoint it), `concurrency` (the

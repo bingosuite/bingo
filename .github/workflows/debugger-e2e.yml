@@ -9,7 +9,9 @@ name: Debugger E2E
 # suite lives in ./test/integration and is split via Ginkgo labels into `basic`
 # (correctness), `churn` (multi-thread robustness), `pause` (async interrupt /
 # manual stop), `stepping` (StepInto/StepOut), `inspect`
-# (StackFrames/Locals/Goroutines), `breakpoints` (ClearBreakpoint), `kill`
+# (StackFrames/Locals/Goroutines), `breakpoints` (ClearBreakpoint), `overlap`
+# (a sibling thread's breakpoint stop landing during another thread's
+# step-over — linux-only, see #198), `kill`
 # (kill-while-running), `exit` (process exit status), `restart`, `fullstack`
 # (operations driven through the whole client → WebSocket → hub → debugger stack),
 # and `dap` (a real Debug Adapter Protocol client driving a session over TCP,
@@ -74,6 +76,9 @@ jobs:
 
       - name: E2E breakpoints (ClearBreakpoint)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=breakpoints
+
+      - name: E2E overlap (sibling breakpoint during a step-over)
+        run: go test -tags e2e -race -count=1 -v -timeout 600s ./test/integration -ginkgo.label-filter=overlap
 
       - name: E2E kill (kill-while-running)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=kill
