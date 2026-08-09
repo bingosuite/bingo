@@ -292,7 +292,7 @@ overwritten with a trap (INT3 / BRK). To resume execution we must:
 
 1. Restore the original bytes (`bps.removeFromTable` + `WriteMemory`).
 2. Single-step that one instruction.
-3. Reinstall the trap (`bps.reinstall`).
+3. Reinstall the trap (`bps.reinstall`) if the breakpoint is still enabled.
 4. Then perform the user's intended action (`bpResumeAction`).
 
 See `engine.resumeFromBreakpoint` and the `StopSingleStep` branch of
@@ -310,6 +310,17 @@ See `engine.resumeFromBreakpoint` and the `StopSingleStep` branch of
 Internal sentinel BP files: `<stepover-next>`, `<stepout-return>`,
 `<direct-addr>` (test helper). These get auto-cleared when hit and emit
 `EventStepped`, not `EventBreakpointHit`.
+
+Clearing a breakpoint is final even when the tracee is parked on it or already
+single-stepping off it. A successful parked clear restores the bytes and
+invalidates matching `lastBP` / `lastBPTID`; the live PC was rewound when the
+trap stop arrived, so the next resume can continue directly from the original
+instruction. During an in-flight step-off the entry is intentionally absent
+from the table and its original bytes are already restored: `ClearBreakpoint`
+matches the retained entry by ID, marks it disabled, and succeeds. Completion
+then skips `reinstall` but still performs the saved `bpResumeAction`. Failed
+restoration leaves the entry enabled and all pending state intact. `clearAll`
+applies the same invalidation/cancellation rules for Kill.
 
 If `bps.reinstall` ever fails after a single-step, **suspend instead of
 resuming**. Running without the trap is a runaway process; reporting the
@@ -1187,9 +1198,8 @@ confirmation requests are affected.
 **setBreakpoints is replace-all** (`breakpoints.go`): diff the requested lines
 for a source against `bpByFile` — clear removed, set new, keep unchanged — and
 respond once every slot in the request resolves, in request order. Clearing the
-breakpoint the process is currently parked on re-arms it through the engine's
-step-off path (see the clearbp spec), so the e2e continue-to-exit uses a
-no-breakpoint target, not a clear-then-continue.
+breakpoint the process is currently parked on is supported by the engine and
+pinned by the native `breakpoints` acceptance test on both platforms.
 
 `bpByFile` keeps the stable DAP id separate from the debugger's internal id.
 After `EventRestarted`, reconcile its exact source-path/line keys from
