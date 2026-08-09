@@ -1437,10 +1437,16 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   `labeled` runs evaluate the live label and revalidate that same head. Keep
   this on the unprivileged `pull_request` trigger and execute the gate script
   from the explicitly checked-out base SHA, never the fork-modified merge tree;
-  if that trusted base predates the script, the inline bootstrap passes only
-  non-Darwin changes and fails Darwin changes closed. Do not run untrusted PR
-  code via `pull_request_target`. Mark it a required status check in branch
-  protection to actually block merges.
+  the trusted script owns the label name, path regex, event parsing, diff, and
+  live-label query rather than accepting policy or decision inputs from the
+  fork-modifiable workflow environment. If that trusted base predates the
+  script, fail the gate unconditionally. Do not run untrusted PR code via
+  `pull_request_target`. Mark it a required status check in branch protection
+  to actually block merges. Reopening a PR invalidates verification just like a
+  push, because commits can be added while the PR is closed. On Darwin-changing
+  PRs, only adding/removing `darwin-e2e-verified` may resolve a label-triggered
+  run; unrelated label events fail closed so a stale label left by denied fork
+  cleanup cannot reactivate the check.
 
 Build/test commands:
 
