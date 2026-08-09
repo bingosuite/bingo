@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -9,17 +10,23 @@ import type WebSocket from "ws";
 import { WebSocketServer } from "ws";
 
 import { toSessionViewModel, type SessionModel } from "../src/model.js";
-import { observerDependencies, TelemetryObserver } from "../src/observer.js";
+import {
+  observerDependencies,
+  TelemetryObserver,
+  type Socket,
+} from "../src/observer.js";
 import {
   decodeEvent,
   decodeGoroutineList,
   maximumEnvelopeBytes,
   maximumGoroutines,
+  maximumStringLength,
   maximumThreads,
   maximumTransportBytes,
   TelemetryProtocolError,
   transportSlackBytes,
   wireProtocolVersion,
+  type TelemetryData,
 } from "../src/telemetry.js";
 import { goroutine, snapshot, thread } from "./fixtures.js";
 
@@ -442,6 +449,241 @@ describe("oversize fatality is scoped to the bounded kinds", () => {
       !(thrown instanceof TelemetryProtocolError),
       "an unreadable prefix must not latch the view dead on a guess",
     );
+  });
+});
+
+describe("protocol violations do not consume reconnect attempts", () => {
+  // A dedicated harness: every entry pushed into `delays` is one reconnect
+  // attempt entering the ladder, so "did not consume an attempt" is directly
+  // observable rather than inferred from timing.
+  class LadderSocket extends EventEmitter implements Socket {
+    public readyState = 0;
+    public readonly sent: string[] = [];
+    public closed = false;
+
+    public onOpen(listener: () => void): void {
+      this.on("open", listener);
+    }
+    public onMessage(listener: (data: TelemetryData) => void): void {
+      this.on("message", listener);
+    }
+    public onClose(listener: () => void): void {
+      this.on("close", listener);
+    }
+    public onError(listener: (error: Error) => void): void {
+      this.on("error", listener);
+    }
+    public send(data: string): void {
+      this.sent.push(data);
+    }
+    public close(): void {
+      if (this.closed) {
+        return;
+      }
+      this.closed = true;
+      this.readyState = 3;
+      this.emit("close");
+    }
+    public open(): void {
+      this.readyState = 1;
+      this.emit("open");
+    }
+  }
+
+  function ladder(): {
+    readonly observer: TelemetryObserver;
+    readonly sockets: LadderSocket[];
+    readonly delays: { resolve: () => void }[];
+  } {
+    const sockets: LadderSocket[] = [];
+    const delays: { resolve: () => void }[] = [];
+    const observer = new TelemetryObserver(
+      {
+        debugSessionId: "debug-1",
+        debugSessionName: "ladder",
+        sessionId: "s1",
+        managementEndpoint: { host: "127.0.0.1", port: 6060 },
+      },
+      {
+        createSocket() {
+          const socket = new LadderSocket();
+          sockets.push(socket);
+          return socket;
+        },
+        delay(_milliseconds, signal) {
+          return new Promise((resolve, reject) => {
+            delays.push({ resolve });
+            signal.addEventListener("abort", () => {
+              reject(new Error("cancelled"));
+            });
+          });
+        },
+        now: () => 0,
+      },
+    );
+    return { observer, sockets, delays };
+  }
+
+  const violations: readonly (readonly [string, string])[] = [
+    ["malformed JSON", "{not json"],
+    [
+      "incompatible version",
+      JSON.stringify({ v: "1.2", kind: "GoroutineSnapshot", seq: 1, payload: {} }),
+    ],
+    [
+      "unknown kind",
+      JSON.stringify({ v: wireProtocolVersion, kind: "Nope", seq: 1, payload: {} }),
+    ],
+    [
+      "unknown envelope key",
+      JSON.stringify({
+        v: wireProtocolVersion,
+        kind: "GoroutineSnapshot",
+        seq: 1,
+        payload: {},
+        extra: 1,
+      }),
+    ],
+    [
+      "missing envelope key",
+      JSON.stringify({ v: wireProtocolVersion, kind: "GoroutineSnapshot", seq: 1 }),
+    ],
+    [
+      "non-object payload",
+      JSON.stringify({ v: wireProtocolVersion, kind: "GoroutineSnapshot", seq: 1, payload: [] }),
+    ],
+    [
+      "unknown field in a consumed snapshot",
+      frame(1, "GoroutineSnapshot", { goroutines: [], threads: [], nope: 1 }),
+    ],
+    [
+      "unknown field in consumed totals",
+      frame(1, "GoroutineSnapshot", {
+        goroutines: [],
+        threads: [],
+        totals: { goroutines: 1, surprise: true },
+      }),
+    ],
+    [
+      "duplicate goroutine id in a consumed snapshot",
+      frame(1, "GoroutineSnapshot", {
+        goroutines: [
+          { id: 7, status: "running", currentLoc: { file: "a.go", line: 1 } },
+          { id: 7, status: "waiting", currentLoc: { file: "a.go", line: 2 } },
+        ],
+        threads: [],
+      }),
+    ],
+    [
+      "deep consumed payload beyond the node budget",
+      frame(1, "BreakpointHit", { frames: richGoroutines(3000) }),
+    ],
+    [
+      "over-long string in a consumed payload",
+      frame(1, "Error", { message: "x".repeat(maximumStringLength + 1) }),
+    ],
+    [
+      "invalid sequence in a consumed payload",
+      frame(0, "GoroutineSnapshot", { goroutines: [], threads: [] }),
+    ],
+  ];
+
+  for (const [label, payload] of violations) {
+    it(`terminates without a reconnect attempt: ${label}`, () => {
+      const { observer, sockets, delays } = ladder();
+      observer.start();
+      const socket = sockets[0]!;
+      socket.open();
+      socket.emit("message", Buffer.from(payload, "utf8"));
+
+      assert.equal(observer.model.connection, "error", "the view must terminate");
+      assert.notEqual(observer.model.error, "", "and say why");
+      assert.equal(delays.length, 0, "no reconnect attempt may be consumed");
+      assert.equal(sockets.length, 1, "and no new connection may be opened");
+      assert.ok(socket.closed, "the offending connection must be closed");
+
+      // The ladder stays shut even if the socket's close is delivered late.
+      socket.emit("close");
+      assert.equal(delays.length, 0);
+      assert.equal(sockets.length, 1);
+      observer.dispose();
+    });
+  }
+
+  it("still reconnects after a genuine transport close", () => {
+    const { observer, sockets, delays } = ladder();
+    observer.start();
+    sockets[0]!.open();
+    sockets[0]!.close();
+
+    assert.equal(delays.length, 1, "a transport close consumes one attempt");
+    assert.equal(observer.model.connection, "reconnecting");
+    delays[0]!.resolve();
+    return Promise.resolve().then(() => {
+      assert.equal(sockets.length, 2, "and redials");
+      observer.dispose();
+    });
+  });
+
+  it("stops the ladder mid-flight when a violation follows a transport close", async () => {
+    const { observer, sockets, delays } = ladder();
+    observer.start();
+    sockets[0]!.open();
+    sockets[0]!.close();
+    assert.equal(delays.length, 1);
+    delays[0]!.resolve();
+    await Promise.resolve();
+
+    const second = sockets[1]!;
+    second.open();
+    second.emit("message", Buffer.from("{not json", "utf8"));
+
+    assert.equal(observer.model.connection, "error");
+    assert.equal(delays.length, 1, "the violation must not consume another attempt");
+    assert.equal(sockets.length, 2, "and must not redial");
+    observer.dispose();
+  });
+
+  it("does not treat a shallow-parsed unused kind as a violation", () => {
+    const unused = [
+      "Output",
+      "BreakpointSet",
+      "BreakpointCleared",
+      "Locals",
+      "Frames",
+      "Goroutines",
+      "Evaluate",
+      "Restarted",
+    ];
+    const { observer, sockets, delays } = ladder();
+    observer.start();
+    const socket = sockets[0]!;
+    socket.open();
+
+    let seq = 1;
+    for (const kind of unused) {
+      // Bodies that would fail deep validation outright: huge, and malformed.
+      socket.emit("message", Buffer.from(frame(seq++, kind, { goroutines: richGoroutines(3000) }), "utf8"));
+      socket.emit(
+        "message",
+        Buffer.from(
+          frame(seq++, kind, {
+            broken: [null, { nested: { deeper: "x".repeat(maximumStringLength + 1) } }],
+            "unknown-field": 1,
+          }),
+          "utf8",
+        ),
+      );
+    }
+
+    assert.equal(observer.model.connection, "connected", "unused kinds are not violations");
+    assert.equal(observer.model.error, "");
+    assert.equal(observer.model.seqGap, "");
+    assert.equal(delays.length, 0, "and consume no reconnect attempts");
+    assert.equal(sockets.length, 1);
+    assert.equal(socket.closed, false, "the connection stays open");
+    assert.equal(observer.model.lastSeq, seq - 1, "they still advance the sequence");
+    observer.dispose();
   });
 });
 
