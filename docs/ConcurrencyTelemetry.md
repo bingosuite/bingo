@@ -132,6 +132,7 @@ In another terminal, join the **same session id** read-only and watch it update:
 go run ./cmd/wsmon -addr localhost:6060 -session <session-id>
 # one-shot (print a single snapshot and exit): add -once
 # bound the one-shot wait (default 30s, 0 = wait forever): -timeout 5s
+# a negative -timeout is rejected, so a typo can't silently mean "forever"
 ```
 
 `wsmon` sends one on-demand snapshot request on join and then renders whatever
@@ -157,11 +158,12 @@ repaints with the new round's workers — the plumbing, end to end.
 - `wsmon` is a pure observer: it never sends run-control commands, so it cannot
   disturb the DAP driver. Many `wsmon` + DAP clients can share one session.
   `-once` waits for the first snapshot and is bounded by `-timeout` (default
-  30s, `0` waits forever), so a rejected request can't hang it. A broadcast
-  `EventError` naming `GoroutineSnapshot` is advisory only — it may be another
-  client's rejection, and a snapshot can still follow — so a later snapshot
-  always wins and the rejection is reported only as context if the wait times
-  out or the connection closes first.
+  30s, `0` waits forever; negatives are rejected rather than silently meaning
+  forever), so a rejected request can't hang it. A broadcast `EventError` naming
+  `GoroutineSnapshot` is advisory only — it may be another client's rejection,
+  and a snapshot can still follow — so a later snapshot always wins and the
+  rejection is reported only as context if the wait times out or the connection
+  closes first.
 - The graphical observer is also read-only. It sends exactly one on-demand
   snapshot request after joining and on explicit Refresh only. On-demand
   requests are never correlated to their answer: every snapshot — requested or

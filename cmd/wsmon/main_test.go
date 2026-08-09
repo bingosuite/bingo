@@ -1,6 +1,8 @@
 package main
 
 import (
+	"flag"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -206,5 +208,75 @@ func TestRunLiveSurvivesRejectionAndShowsReason(t *testing.T) {
 	}
 	if !m.hasSnapshot {
 		t.Fatal("live mode dropped the snapshot that followed the rejection")
+	}
+}
+
+// The flag package accepts a negative duration, and run's `timeout > 0` guard
+// would then treat it exactly like 0 — an unbounded wait, which is the opposite
+// of what -timeout documents and what -once needs. Parse through the real flag
+// definitions so this cannot drift from main.
+func TestConfigValidation(t *testing.T) {
+	cases := []struct {
+		name    string
+		args    []string
+		wantErr string
+	}{
+		{name: "defaults with a session", args: []string{"-session", "s1"}},
+		{name: "zero waits forever", args: []string{"-session", "s1", "-timeout", "0"}},
+		{name: "positive timeout", args: []string{"-session", "s1", "-timeout", "5s"}},
+		{
+			name:    "negative timeout",
+			args:    []string{"-session", "s1", "-timeout", "-30s"},
+			wantErr: "-timeout must be >= 0",
+		},
+		{
+			name:    "negative nanosecond",
+			args:    []string{"-session", "s1", "-timeout", "-1ns"},
+			wantErr: "-timeout must be >= 0",
+		},
+		{
+			name:    "missing session",
+			args:    []string{"-once"},
+			wantErr: "-session is required",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := flag.NewFlagSet("wsmon", flag.ContinueOnError)
+			fs.SetOutput(io.Discard)
+			cfg := bindFlags(fs)
+			if err := fs.Parse(tc.args); err != nil {
+				t.Fatalf("parse %v: %v", tc.args, err)
+			}
+
+			err := cfg.validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("validate() = %v, want an error containing %q", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// A negative duration must never reach run: it would disarm the deadline and
+// hang -once forever. This pins the guard the validation protects.
+func TestRunTreatsOnlyZeroAsUnbounded(t *testing.T) {
+	fs := flag.NewFlagSet("wsmon", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	cfg := bindFlags(fs)
+	if err := fs.Parse([]string{"-session", "s1", "-once", "-timeout", "-30s"}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.timeout >= 0 {
+		t.Fatalf("timeout = %s, want the negative value the flag package accepts", cfg.timeout)
+	}
+	if err := cfg.validate(); err == nil {
+		t.Fatal("validate() accepted a negative -timeout, which run would treat as unbounded")
 	}
 }
