@@ -632,7 +632,7 @@ func (e *engine) handleStop(stop StopEvent) {
 		var err error
 		stop, err = e.populateBreakpointStop(stop)
 		if err != nil {
-			e.emitError(protocol.CmdNone, err)
+			e.haltOnError(protocol.CmdNone, err, stop)
 			return
 		}
 		bp := e.bps.atAddr(stop.PC)
@@ -690,7 +690,7 @@ func (e *engine) handleStop(stop StopEvent) {
 			}
 			e.endThreadStep()
 			e.setState(stateSuspended)
-			e.emitError(protocol.CmdNone, err)
+			e.haltOnError(protocol.CmdNone, err, stop)
 			return
 		}
 		e.log.Debug("StopSingleStep", "pc", fmt.Sprintf("0x%x", stop.PC),
@@ -700,12 +700,16 @@ func (e *engine) handleStop(stop StopEvent) {
 			if sob.enabled {
 				if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
 					// Reinstall failed. Suspend instead of resuming — running
-					// without the trap would let the process loose.
+					// without the trap would let the process loose. The breakpoint
+					// stays out of the table: its trap is not guaranteed to be
+					// installed, so re-adding the entry would advertise an armed
+					// breakpoint that can never fire.
 					e.endThreadStep()
 					e.log.Error("breakpoint reinstall failed — suspending to prevent runaway process",
 						"addr", fmt.Sprintf("0x%x", sob.addr), "err", rerr)
 					e.setState(stateSuspended)
-					e.emitError(protocol.CmdNone, fmt.Errorf("reinstall breakpoint 0x%x: %w", sob.addr, rerr))
+					e.haltOnError(protocol.CmdNone, fmt.Errorf(
+						"reinstall breakpoint 0x%x (it may no longer be armed or tracked): %w", sob.addr, rerr), stop)
 					return
 				}
 				e.log.Debug("breakpoint reinstalled", "addr", fmt.Sprintf("0x%x", sob.addr))
@@ -758,7 +762,15 @@ func (e *engine) handleStop(stop StopEvent) {
 			case bpResumeStepOut:
 				_, setErr := e.bps.set(e.backend, stepOutReturnFile, 0, e.bpRetAddr)
 				if setErr != nil && !errors.Is(setErr, errBreakpointExists) {
-					e.emitError(protocol.CmdStepOut, fmt.Errorf("StepOut: set return breakpoint: %w", setErr))
+					// The tracee is halted here — the trap was reinstalled and
+					// the held threads released, but ContinueProcess is never
+					// reached. resumeFromBreakpoint left the engine running, so
+					// unlike the other failure paths this one must correct the
+					// state itself or every later command is rejected with
+					// ErrNotSuspended against a process that cannot move.
+					e.setState(stateSuspended)
+					e.haltOnError(protocol.CmdStepOut,
+						fmt.Errorf("StepOut: set return breakpoint: %w", setErr), stop)
 					return
 				}
 				_ = e.backend.ContinueProcess()
@@ -779,7 +791,9 @@ func (e *engine) handleStop(stop StopEvent) {
 				if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
 					e.endThreadStep()
 					e.setState(stateSuspended)
-					e.emitError(protocol.CmdNone, fmt.Errorf("reinstall breakpoint 0x%x after signal: %w", sob.addr, rerr))
+					e.haltOnError(protocol.CmdNone, fmt.Errorf(
+						"reinstall breakpoint 0x%x after signal (it may no longer be armed or tracked): %w",
+						sob.addr, rerr), stop)
 					return
 				}
 			}
@@ -794,7 +808,7 @@ func (e *engine) handleStop(stop StopEvent) {
 				var err error
 				if stop, err = e.populateStopPC(stop, false); err != nil {
 					e.setState(stateSuspended)
-					e.emitError(protocol.CmdNone, err)
+					e.haltOnError(protocol.CmdNone, err, stop)
 					return
 				}
 				e.setState(stateSuspended)
@@ -1291,6 +1305,60 @@ func (e *engine) emitPaused(stop StopEvent) {
 		Frames:    frames,
 	})
 	e.emit(protocol.EventGoroutineSnapshot, snap)
+}
+
+// haltOnError reports a FAILED asynchronous stop-handling operation: the
+// detailed cause first, then the suspending EventPaused that puts the hub back
+// into its suspend wait loop. Callers must already have ensured stateSuspended.
+//
+// The Paused is the load-bearing half. emit drops events when the buffer is
+// full, and losing the Paused while the Error got through would recreate
+// exactly the strand this exists to prevent (issue #183) — so when the buffer
+// cannot hold both, the cause is logged rather than emitted and the suspend is
+// kept. Only the loop thread writes e.events, so free capacity observed here
+// cannot be consumed by anyone else; a hub draining concurrently only frees
+// more.
+func (e *engine) haltOnError(cmd protocol.CommandKind, cause error, stop StopEvent) {
+	if cap(e.events)-len(e.events) >= 2 {
+		e.emitError(cmd, cause)
+	} else {
+		e.log.Error("halting: event buffer full — dropping the cause to preserve the suspend",
+			"command", cmd, "err", cause)
+	}
+	e.emitHaltedOnError(stop)
+}
+
+// emitHaltedOnError emits the suspending event for an internal halt. It exists
+// because these failures are not attributable to any command in flight: the
+// resume that led here already returned nil and already emitted EventContinued,
+// so the hub has transitioned to running and left its suspend wait loop.
+// EventError is not a suspending event, so reporting the failure alone leaves
+// the hub believing the tracee runs while it is in fact halted — and since
+// resumeCh is drained only inside that wait loop, every later resume sits
+// unread and the session is stranded for good.
+//
+// It issues NO backend calls. The caller is on a backend error path, so the
+// backend is by definition already failing or gone: a goroutineSnapshot (as
+// emitPaused does) or even a stack walk would push dozens of further reads
+// through it and could delay or prevent the one event that restores liveness.
+// A synthetic goroutine and a pure-DWARF location are all the hub needs to gate
+// on and all DAP needs to map to `stopped` reason=pause; clients that want more
+// can request frames or a snapshot now that the session is responsive again.
+func (e *engine) emitHaltedOnError(stop StopEvent) {
+	if stop.TID != 0 {
+		e.curTID = stop.TID
+	}
+	// This is a suspend like any other self-stop, so it cancels a racing Pause
+	// whose interrupt is still queued in the tracee (see emitBreakpointHit).
+	e.manualStopPending = false
+	loc := protocol.Location{}
+	if e.dw != nil {
+		loc = e.dw.locationForPC(stop.PC)
+	}
+	e.emit(protocol.EventPaused, protocol.PausedPayload{
+		Goroutine: e.syntheticGoroutine(stop.PC),
+		Location:  loc,
+	})
 }
 
 // emitContinued reports that the tracee has resumed free execution in response
