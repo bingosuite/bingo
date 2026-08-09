@@ -152,13 +152,16 @@ type GoroutinesPayload struct {
 // picture (breakpoint hit, pause, launch/attach entry) and on demand via
 // CmdGoroutineSnapshot. Unlike EventGoroutines — which answers a single DAP
 // `threads` request and carries goroutines only — this event is not tied to a
-// request, so it also carries the thread list and the lifecycle deltas.
+// request, so it also carries the thread list and the lifecycle deltas. Created
+// and Exited are populated on the automatic snapshots only; an on-demand query
+// answers with the live picture and empty deltas so it cannot consume what the
+// next automatic snapshot must report.
 type GoroutineSnapshotPayload struct {
 	Goroutines []Goroutine `json:"goroutines"`
 	Threads    []Thread    `json:"threads"`
 	Current    int         `json:"current,omitempty"` // goid of the current goroutine, 0 if unknown
-	Created    []int       `json:"created,omitempty"` // goids new since the previous snapshot
-	Exited     []int       `json:"exited,omitempty"`  // goids gone since the previous snapshot
+	Created    []int       `json:"created,omitempty"` // goids new since the previous automatic snapshot
+	Exited     []int       `json:"exited,omitempty"`  // goids gone since the previous automatic snapshot
 }
 
 type SessionStatePayload struct {

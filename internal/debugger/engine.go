@@ -579,19 +579,20 @@ func (e *engine) Goroutines() ([]protocol.Goroutine, error) {
 	return goroutines, err
 }
 
-// GoroutineSnapshot returns the full concurrency picture on demand: every
-// goroutine (with parent linkage for a spawn tree), every OS thread, the
-// current goroutine, and the created/exited lifecycle deltas since the previous
-// snapshot. Only valid while suspended (the tracee must be stopped for the
-// memory reads to be race-free). Like the auto-streamed snapshots it advances
-// the lifecycle-delta baseline.
+// GoroutineSnapshot answers an on-demand snapshot request: every goroutine
+// (with parent linkage for a spawn tree), every OS thread, and the current
+// goroutine. Only valid while suspended (the tracee must be stopped for the
+// memory reads to be race-free). Unlike the auto-streamed stop snapshots it is
+// a pure observation — it reports no created/exited deltas and does not advance
+// the lifecycle baseline, so a refresh can't consume the deltas the next
+// automatic snapshot must report.
 func (e *engine) GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error) {
 	var snap protocol.GoroutineSnapshotPayload
 	err := e.dispatch(func() error {
 		if err := e.requireSuspended(); err != nil {
 			return err
 		}
-		snap = e.goroutineSnapshot()
+		snap = e.goroutineSnapshotQuery()
 		return nil
 	})
 	return snap, err
@@ -1567,9 +1568,10 @@ func (e *engine) emitBreakpointHit(bp *breakpointEntry, stop StopEvent) {
 	e.emit(protocol.EventGoroutineSnapshot, snap)
 }
 
-// emitGoroutineSnapshot builds and streams a standalone concurrency snapshot.
-// Used at the entry stop and on the CmdGoroutineSnapshot on-demand path. It is
-// a non-suspending event, so the hub forwards it without gating.
+// emitGoroutineSnapshot builds and streams a standalone concurrency snapshot at
+// the launch/attach entry stop, which has no stop event of its own to piggyback
+// on. It is an automatic snapshot, so it seeds the lifecycle baseline. It is a
+// non-suspending event, so the hub forwards it without gating.
 func (e *engine) emitGoroutineSnapshot() {
 	e.emit(protocol.EventGoroutineSnapshot, e.goroutineSnapshot())
 }

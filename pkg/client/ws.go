@@ -252,13 +252,7 @@ func (c *wsClient) sendAndWait(cmd protocol.Command, wantKind protocol.EventKind
 		}
 		return evt, nil
 	case <-time.After(syncTimeout):
-		if cmd.Kind == protocol.CmdGoroutineSnapshot && wantKind == protocol.EventGoroutineSnapshot {
-			// Snapshot events are also unsolicited telemetry; debt would consume
-			// the next auto-pushed snapshot instead of delivering it to Events.
-			c.discardPending(req)
-		} else {
-			c.retirePending(req)
-		}
+		c.retirePending(req)
 		return protocol.Event{}, fmt.Errorf("timeout waiting for %s response", wantKind)
 	case <-c.done:
 		c.discardPending(req)
@@ -486,20 +480,18 @@ func (c *wsClient) Goroutines() ([]protocol.Goroutine, error) {
 	return p.Goroutines, nil
 }
 
-func (c *wsClient) GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error) {
+// RequestGoroutineSnapshot sends CmdGoroutineSnapshot and returns once it is on
+// the wire. It deliberately does not use sendAndWait: EventGoroutineSnapshot is
+// also pushed unsolicited on every entry/breakpoint/pause stop, so a kind-keyed
+// pending entry would let an automatic push satisfy this call (and, after a
+// timeout, let this call's reply debt swallow an automatic push). The snapshot
+// arrives on Events() like every other one.
+func (c *wsClient) RequestGoroutineSnapshot() error {
 	cmd, err := newCommand(protocol.CmdGoroutineSnapshot, struct{}{})
 	if err != nil {
-		return protocol.GoroutineSnapshotPayload{}, err
+		return err
 	}
-	evt, err := c.sendAndWait(cmd, protocol.EventGoroutineSnapshot)
-	if err != nil {
-		return protocol.GoroutineSnapshotPayload{}, err
-	}
-	var p protocol.GoroutineSnapshotPayload
-	if err := protocol.DecodeEventPayload(evt, &p); err != nil {
-		return protocol.GoroutineSnapshotPayload{}, fmt.Errorf("decode GoroutineSnapshot: %w", err)
-	}
-	return p, nil
+	return c.send(cmd)
 }
 
 // Close disconnects from the server. Safe to call multiple times.
