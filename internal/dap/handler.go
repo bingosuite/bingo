@@ -46,9 +46,9 @@ type Handler struct {
 	log      *slog.Logger
 
 	// cmdOut carries marshalled bingo Commands from the DAP read loop to the
-	// hub's read pump (via ReadMessage). ReadMessage drains it with priority
-	// over done so a command enqueued immediately before Close (e.g. Kill on
-	// disconnect) is still delivered.
+	// hub's read pump (via ReadMessage). ReadMessage checks it before waiting
+	// and once more when done wins so a command enqueued before Close (e.g.
+	// Kill on disconnect) is still delivered.
 	cmdOut chan []byte
 
 	done      chan struct{}
@@ -294,9 +294,9 @@ func isClosedConn(err error) bool {
 
 // --- hub.WSConn implementation -------------------------------------------------
 
-// ReadMessage delivers the next bingo command to the hub's read pump. It
-// prefers a buffered command over done so a command enqueued right before Close
-// (Kill on disconnect) is still handed off.
+// ReadMessage delivers the next bingo command to the hub's read pump. It checks
+// for a buffered command before waiting and again when done wins so a command
+// enqueued before Close (Kill on disconnect) is handed off before EOF.
 func (h *Handler) ReadMessage() (int, []byte, error) {
 	select {
 	case b := <-h.cmdOut:
@@ -307,7 +307,12 @@ func (h *Handler) ReadMessage() (int, []byte, error) {
 	case b := <-h.cmdOut:
 		return hub.TextMessage, b, nil
 	case <-h.done:
-		return 0, nil, io.EOF
+		select {
+		case b := <-h.cmdOut:
+			return hub.TextMessage, b, nil
+		default:
+			return 0, nil, io.EOF
+		}
 	}
 }
 

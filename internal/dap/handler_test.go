@@ -2,11 +2,14 @@ package dap
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -358,6 +361,17 @@ func newHarnessProvider(t *testing.T, prov Provider, rec *cmdRecorder) *harness 
 type nopWriter struct{}
 
 func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }
+
+type nopConn struct{}
+
+func (nopConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (nopConn) Write(p []byte) (int, error)      { return len(p), nil }
+func (nopConn) Close() error                     { return nil }
+func (nopConn) LocalAddr() net.Addr              { return nil }
+func (nopConn) RemoteAddr() net.Addr             { return nil }
+func (nopConn) SetDeadline(time.Time) error      { return nil }
+func (nopConn) SetReadDeadline(time.Time) error  { return nil }
+func (nopConn) SetWriteDeadline(time.Time) error { return nil }
 
 // sendReq writes a DAP request with an auto-incrementing seq, returning that seq.
 func (hh *harness) sendReq(command string, m godap.RequestMessage) int {
@@ -1291,6 +1305,50 @@ func TestStepEmitsStoppedStep(t *testing.T) {
 	stopped := recvType[*godap.StoppedEvent](hh)
 	if stopped.Body.Reason != "step" {
 		t.Errorf("reason = %q, want step", stopped.Body.Reason)
+	}
+}
+
+func TestReadMessageDrainsQueuedCommandAcrossClose(t *testing.T) {
+	kill, err := marshalCommand(protocol.CmdKill, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type readResult struct {
+		messageType int
+		data        []byte
+		err         error
+	}
+
+	// The unfixed method lost roughly one command per 10,000 iterations on this
+	// schedule; enough trials make a silent pass vanishingly unlikely.
+	const trials = 500_000
+	for i := 0; i < trials; i++ {
+		h := &Handler{
+			conn:   nopConn{},
+			cmdOut: make(chan []byte, cmdBufferSize),
+			done:   make(chan struct{}),
+		}
+		result := make(chan readResult, 1)
+		go func() {
+			messageType, data, err := h.ReadMessage()
+			result <- readResult{messageType: messageType, data: data, err: err}
+		}()
+
+		runtime.Gosched()
+		h.enqueue(kill)
+		_ = h.Close()
+
+		got := <-result
+		if got.err != nil {
+			t.Fatalf("trial %d: ReadMessage returned before delivering the queued command: %v", i, got.err)
+		}
+		if got.messageType != hub.TextMessage || !bytes.Equal(got.data, kill) {
+			t.Fatalf("trial %d: ReadMessage returned (%d, %q), want (%d, %q)", i, got.messageType, got.data, hub.TextMessage, kill)
+		}
+		if _, _, err := h.ReadMessage(); !errors.Is(err, io.EOF) {
+			t.Fatalf("trial %d: ReadMessage after draining command returned %v, want EOF", i, err)
+		}
 	}
 }
 
