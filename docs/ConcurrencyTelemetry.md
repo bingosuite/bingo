@@ -154,11 +154,18 @@ repaints with the new round's workers — the plumbing, end to end.
 
 - `wsmon` is a pure observer: it never sends run-control commands, so it cannot
   disturb the DAP driver. Many `wsmon` + DAP clients can share one session.
+  `-once` fails fast (nonzero) if the server rejects the snapshot request or the
+  connection closes first, rather than waiting for a snapshot that is not coming.
 - The graphical observer is also read-only. It sends exactly one on-demand
   snapshot request after joining and on explicit Refresh only. On-demand
   requests are never correlated to their answer: every snapshot — requested or
   automatic — arrives as a push on the event stream, and only automatic ones
   carry lifecycle deltas (a refresh cannot consume the next stop's).
+- A requested snapshot is **broadcast to every client** on the session, deltas
+  empty. `wsmon`'s lifecycle panel shows the latest snapshot's deltas, so another
+  client's refresh blanks it until the next stop; the VS Code timeline appends,
+  so it is unaffected. Addressing a query to its requester needs wire-level
+  correlation — out of scope for the current protocol.
 - Snapshots stream on **breakpoint / pause / entry**, not per single-step (steps
   stay cheap). Use the driver's breakpoints/continue to advance between frames.
 - If the tracee is a stripped binary or stopped before runtime init, the snapshot
