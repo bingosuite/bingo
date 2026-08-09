@@ -173,12 +173,32 @@ var _ = Describe("asynchronous halts in handleStop", func() {
 		Expect(fb.continueCount()).To(BeNumerically(">", before))
 	})
 
-	// The suspending event is the load-bearing half: emit() drops events when
-	// the buffer is full, and losing the Paused while the Error got through
-	// would recreate the strand this whole change prevents.
-	It("keeps the suspend when only one event slot is left", func() {
-		debugger.ExportedFillEventBuffer(d, 1)
-		debugger.ExportedHaltOnError(d, "injected")
+	// The suspending event is the load-bearing half: emit drops events when the
+	// buffer is full, so a saturated buffer used to lose the Paused (and, once
+	// the cause was also dropped, report nothing at all) and recreate the exact
+	// strand this change prevents. The reserved slot must make the suspend
+	// survive even with zero ordinary slots left.
+	It("keeps the suspend and stays resumable with zero free ordinary slots", func() {
+		const bpAddr = uint64(0x4700)
+		arriveAtBreakpoint(fb, d, bpAddr)
+		continueAndConsumeContinued(d)
+
+		debugger.ExportedFillEventBuffer(d, 0)
+
+		fb.failWriteAt(bpAddr, errInjected)
+		fb.pushStop(debugger.StopEvent{Reason: debugger.StopSingleStep, TID: 1, PC: bpAddr + 4})
+
+		// Continue is dispatched and requires stateSuspended, so it starts
+		// succeeding only once the halt has been fully handled. Retrying it
+		// synchronises on that without draining the buffer, and its success
+		// proves the session re-entered the suspended gate. The write fault
+		// stays armed: after the halt lastBP is nil, so the retry is a plain
+		// ContinueProcess that touches no memory.
+		before := fb.continueCount()
+		Eventually(d.Continue).Should(Succeed(),
+			"the halt never suspended the engine")
+		Expect(fb.continueCount()).To(BeNumerically(">", before),
+			"the retried Continue never reached the backend")
 
 		var kinds []protocol.EventKind
 		for {
@@ -191,7 +211,7 @@ var _ = Describe("asynchronous halts in handleStop", func() {
 			break
 		}
 		Expect(kinds).To(ContainElement(protocol.EventPaused),
-			"the last free slot must carry the suspend, not the cause")
+			"the reserved slot must carry the suspend even when the buffer is full")
 	})
 
 	// A halt whose stop never resolved a thread must not overwrite curTID with
