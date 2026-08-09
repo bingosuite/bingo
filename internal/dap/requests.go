@@ -507,7 +507,9 @@ func (h *Handler) onTerminate(req *godap.TerminateRequest) {
 
 func (h *Handler) onRestart(req *godap.RestartRequest) {
 	h.mu.Lock()
-	if h.restarting {
+	// restartReqSeq gates only the unanswered DAP request. restarting stays set
+	// longer so the subsequent entry EventStepped is still recognized.
+	if h.restartReqSeq != 0 {
 		h.mu.Unlock()
 		h.send(h.errorResponse(req.Seq, "restart", "restart already in progress"))
 		return
