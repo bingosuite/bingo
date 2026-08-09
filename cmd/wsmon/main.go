@@ -5,6 +5,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -76,27 +77,68 @@ func main() {
 	// this is fire-and-forget; the render loop below applies whichever arrives
 	// first. -once therefore waits for the first snapshot event either way.
 	if err := c.RequestGoroutineSnapshot(); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: request goroutine snapshot: %v\n", err)
+		fmt.Fprintf(os.Stderr, "error: request goroutine snapshot: %v\n", err)
+		os.Exit(1)
 	}
 	if !*once {
 		m.render()
 	}
 
-	for evt := range c.Events() {
+	if err := m.run(c.Events(), *once, m.render); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+	if !*once {
+		fmt.Println("\nconnection closed; monitor stopped")
+	}
+}
+
+// run drains events until the stream closes, -once has rendered its snapshot,
+// or the server rejects the snapshot request. render is injected so tests can
+// count redraws without terminal output.
+//
+// A rejection is only fatal under -once: that mode blocks until a snapshot
+// arrives, and after a rejection none is coming, so the old code waited
+// forever. In live mode the monitor keeps observing — the next stop pushes a
+// snapshot on its own — and surfaces the rejection on the status line.
+func (m *monitor) run(events <-chan protocol.Event, once bool, render func()) error {
+	for evt := range events {
+		if msg, ok := snapshotRejection(evt); ok && once {
+			return fmt.Errorf("server rejected the snapshot request: %s", msg)
+		}
+
 		renderedSnapshot, redraw := m.applyEvent(evt)
 		if !redraw {
 			continue
 		}
-		if *once && !renderedSnapshot {
+		if once && !renderedSnapshot {
 			continue
 		}
-		m.render()
-		if *once && renderedSnapshot {
-			return
+		render()
+		if once && renderedSnapshot {
+			return nil
 		}
 	}
 
-	fmt.Println("\nconnection closed; monitor stopped")
+	if once {
+		return errors.New("connection closed before a snapshot arrived")
+	}
+	return nil
+}
+
+// snapshotRejection reports a failed CmdGoroutineSnapshot. EventError is
+// broadcast to every client, so this cannot tell our own rejection from another
+// client's; under -once either means no snapshot is coming, which is why the
+// caller treats both the same rather than waiting for a reply it can't identify.
+func snapshotRejection(evt protocol.Event) (string, bool) {
+	if evt.Kind != protocol.EventError {
+		return "", false
+	}
+	var p protocol.ErrorPayload
+	if protocol.DecodeEventPayload(evt, &p) != nil || p.Command != protocol.CmdGoroutineSnapshot {
+		return "", false
+	}
+	return p.Message, true
 }
 
 func (m *monitor) applyEvent(evt protocol.Event) (bool, bool) {
@@ -186,6 +228,16 @@ func describeEvent(evt protocol.Event) (string, bool) {
 			return "", false
 		}
 		return fmt.Sprintf("Output %s: %s", p.Stream, oneLine(p.Content)), true
+
+	case protocol.EventError:
+		var p protocol.ErrorPayload
+		if protocol.DecodeEventPayload(evt, &p) != nil {
+			return "", false
+		}
+		if p.Command == protocol.CmdNone {
+			return fmt.Sprintf("Error: %s", oneLine(p.Message)), true
+		}
+		return fmt.Sprintf("Error %s: %s", p.Command, oneLine(p.Message)), true
 
 	default:
 		return "", false

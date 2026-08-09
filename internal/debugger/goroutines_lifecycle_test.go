@@ -27,6 +27,10 @@ func newLifecycleEngine(t *testing.T) debugger.Debugger {
 // A query between two automatic snapshots must neither consume the pending
 // deltas nor fabricate its own: the second automatic snapshot has to report
 // everything that changed since the first one.
+// The wiring — that engine.GoroutineSnapshot actually reaches the query path —
+// is pinned by the concurrency E2E (declareBaselineOwnershipSpec), which is the
+// only place a query can observe a live set the automatic baseline has not
+// adopted. These tests pin the seam's semantics; they cannot catch a rewiring.
 func TestQuerySnapshotDoesNotConsumeLifecycleDeltas(t *testing.T) {
 	d := newLifecycleEngine(t)
 
