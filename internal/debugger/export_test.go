@@ -26,6 +26,12 @@ type ExportedGoRuntimeLayout struct {
 	MAlllink uint64
 }
 
+type ExportedWalkResult struct {
+	Count    int
+	Complete bool
+	Clipped  bool
+}
+
 func ExportedTrapInstruction() []byte {
 	return archTrapInstruction()
 }
@@ -110,6 +116,54 @@ func ExportedGoroutineSnapshot(d Debugger) protocol.GoroutineSnapshotPayload {
 		panic("ExportedGoroutineSnapshot: " + err.Error())
 	}
 	return snap
+}
+
+func ExportedCurrentGoroutineFrom(snap protocol.GoroutineSnapshotPayload) protocol.Goroutine {
+	return currentGoroutineFrom(snap)
+}
+
+func ExportedThreadWalkResult(d Debugger) ExportedWalkResult {
+	e := d.(*engine)
+	var out ExportedWalkResult
+	if err := e.dispatch(func() error {
+		_, pc := e.liveRegisters()
+		result := e.readThreads(0, pc)
+		out = ExportedWalkResult{
+			Count:    len(result.Items),
+			Complete: result.Complete,
+			Clipped:  result.Clipped,
+		}
+		return nil
+	}); err != nil {
+		panic("ExportedThreadWalkResult: " + err.Error())
+	}
+	return out
+}
+
+func ExportedGoroutineWalkResult(d Debugger) ExportedWalkResult {
+	e := d.(*engine)
+	var out ExportedWalkResult
+	if err := e.dispatch(func() error {
+		sp, pc := e.liveRegisters()
+		result := e.buildGoroutineList(sp, pc)
+		out = ExportedWalkResult{
+			Count:    len(result.Items),
+			Complete: result.Complete,
+			Clipped:  result.Clipped,
+		}
+		return nil
+	}); err != nil {
+		panic("ExportedGoroutineWalkResult: " + err.Error())
+	}
+	return out
+}
+
+func ExportedMaxGoroutineScan() int {
+	return maxGoroutineScan
+}
+
+func ExportedMaxThreadScan() int {
+	return maxThreadScan
 }
 
 func ExportedFileMatches(candidate, target string) bool {
