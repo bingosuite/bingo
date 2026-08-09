@@ -1,7 +1,7 @@
 //go:build e2e && linux && amd64
 
-// Regression spec for #198: a sibling thread's software-breakpoint stop must not
-// be allowed to land in the middle of another thread's step-over.
+// Regression spec for #198: a sibling thread's software-breakpoint stop must
+// never land in the middle of another thread's step-over.
 //
 // Linux ptrace stops are PER-THREAD and bingo does not stop the world, so
 // sibling threads keep running while the engine is suspended and can be sitting
@@ -26,34 +26,46 @@
 //
 // WHAT THIS SPEC ASSERTS
 //
-// After every stop, BOTH breakpoints must still be installed. The probe
+// After EVERY stop, both breakpoints must still be installed. The probe
 // re-issues SetBreakpoint: breakpointTable.set consults byAddr BEFORE it reads
 // or writes tracee memory, so success means the entry is gone — it cannot be an
 // artifact of the probe itself. A detection is corroborated read-only by
 // ClearBreakpoint on the ORIGINAL id (clear consults byID before any write).
+// The session must also stay live: no error, no hang, and the tracee runs to a
+// clean exit with every marker thread having completed every iteration.
 //
-// NON-VACUITY. The spec parks one pinned thread on MARK_A and N pinned siblings
-// on MARK_B (so siblings also cover the same-address case), releases them
-// together so they race to their traps inside one running window, and records
-// how many threads are in ptrace tracing-stop AND parked ON a marker
-// instruction — addresses resolved from the target's own DWARF, matched at addr
-// or addr+1 since an amd64 INT3 stop leaves RIP one byte past the trap. A run
-// in which that never reached two is rejected: it never set up the race and
-// proves nothing. It is asserted once over the whole run rather than per cycle,
-// because a sibling that took an unrelated ptrace event while the engine was
-// suspended is only resumed when the next Backend.Wait absorbs it, so an
-// individual cycle can legitimately start with the siblings not yet re-parked.
+// WHAT IT DELIBERATELY DOES NOT ASSERT
 //
-// TARGET SEQUENCING. Every marker thread must exist and be parked BEFORE the
-// first suspend: a thread that clones while the engine is suspended stops at
-// PTRACE_EVENT_CLONE with no waitLoop to reap it and freezes for the whole
-// suspend. The target therefore publishes ready.<pid> only once every marker
-// thread is up.
+// Not the number of hits. While a trap is lifted for a step-over, another
+// thread can execute that very address and sail through it. That is an inherent
+// property of software breakpoints without a stop-the-world, it predates this
+// spec, and it is out of scope here — so the spec counts stops for
+// non-vacuity but never requires a particular total.
+//
+// NON-VACUITY
+//
+// One pinned thread hammers MARK_A while N pinned siblings hammer MARK_B, so
+// siblings also cover the same-address case. At every stop the spec snapshots
+// /proc/<pid>/task/*/status plus each thread's stopped PC from
+// /proc/<pid>/task/<tid>/syscall, and counts threads that are in ptrace
+// tracing-stop AND parked ON a marker instruction — addresses resolved from the
+// target's own DWARF, matched at addr or addr+1 since an amd64 INT3 stop leaves
+// RIP one byte past the trap. A run in which that never reached two never set up
+// the race and is rejected: it would prove nothing.
+//
+// TARGET SEQUENCING
+//
+// Every marker thread must exist and be parked BEFORE the first suspend: a
+// thread that clones while the engine is suspended stops at PTRACE_EVENT_CLONE
+// with no waitLoop to reap it and freezes for the whole suspend. The target
+// therefore parks every thread on a single `start` gate and publishes
+// ready.<pid> only once they are all up; the harness opens the gate while the
+// tracee is still running.
 //
 // Tuning:
 //
-//	BINGO_E2E_OVERLAP_ITERS    (default 24) cycles
-//	BINGO_E2E_OVERLAP_SIBLINGS (default 4)  sibling threads parked on MARK_B
+//	BINGO_E2E_OVERLAP_ITERS    (default 30) marker calls per thread
+//	BINGO_E2E_OVERLAP_SIBLINGS (default 4)  sibling threads on MARK_B
 
 package integration
 
@@ -78,17 +90,14 @@ import (
 
 // overlapTargetSrc runs one "A" thread and NB "B" sibling threads, each pinned
 // with runtime.LockOSThread so a marker's INT3 always faults on the same OS
-// thread. Both markers are //go:noinline and place the marked statement SECOND
-// in the function: Go 1.25.5 folds a function's first statement into the
-// prologue's func-decl line, leaving it is_stmt=false and unresolvable by
+// thread. All of them are released together and then hammer their markers in a
+// tight loop, so at any moment several are parked in unreaped INT3 stops while
+// the engine steps another one off its trap.
+//
+// Both markers are //go:noinline and place the marked statement SECOND in the
+// function: Go 1.25.5 folds a function's first statement into the prologue's
+// func-decl line, leaving it is_stmt=false and unresolvable by
 // dwarfReader.PCForFileLine.
-//
-// The harness owns all sequencing through files in a shared directory:
-//
-//	ready.<pid>  written by the target once every marker thread is parked
-//	goA.<i>      released by the harness -> thread A runs markerA
-//	gateB.<i>    released by the harness -> every sibling runs markerB
-//	finished     written by the target after all cycles complete
 const overlapTargetSrc = `package main
 
 import (
@@ -136,6 +145,7 @@ func main() {
 	// Safety net: never outlive the harness if it abandons us mid-run.
 	go func() { time.Sleep(240 * time.Second); os.Exit(0) }()
 
+	start := filepath.Join(dir, "start")
 	var wg sync.WaitGroup
 	var up int32
 
@@ -144,8 +154,8 @@ func main() {
 		defer wg.Done()
 		runtime.LockOSThread()
 		atomic.AddInt32(&up, 1)
+		waitFile(start)
 		for i := 0; i < iters; i++ {
-			waitFile(filepath.Join(dir, "goA."+strconv.Itoa(i)))
 			markerA(i)
 		}
 	}()
@@ -156,17 +166,17 @@ func main() {
 			defer wg.Done()
 			runtime.LockOSThread()
 			atomic.AddInt32(&up, 1)
+			waitFile(start)
 			for i := 0; i < iters; i++ {
-				waitFile(filepath.Join(dir, "gateB."+strconv.Itoa(i)))
 				markerB(i)
 			}
 		}()
 	}
 
 	// Publish readiness only once every marker thread exists and is parked on
-	// its first gate. A clone that happens while the debugger is suspended
-	// stops the cloning thread at PTRACE_EVENT_CLONE with no waitLoop to reap
-	// it, freezing the target for the whole suspend.
+	// the gate. A clone that happens while the debugger is suspended stops the
+	// cloning thread at PTRACE_EVENT_CLONE with no waitLoop to reap it,
+	// freezing the target for the whole suspend.
 	for atomic.LoadInt32(&up) < int32(nb+1) {
 		time.Sleep(time.Millisecond)
 	}
@@ -187,9 +197,10 @@ var _ = Describe("Linux amd64 sibling-breakpoint / step-over overlap", Label("li
 			lineB := markerLine(overlapTargetSrc, "// MARK_B")
 			srcFile := targetName + ".go"
 
-			iters := envInt("BINGO_E2E_OVERLAP_ITERS", 24)
+			iters := envInt("BINGO_E2E_OVERLAP_ITERS", 30)
 			siblings := envInt("BINGO_E2E_OVERLAP_SIBLINGS", 4)
-			perCycle := siblings + 1
+			markerThreads := siblings + 1
+			maxStops := markerThreads*iters + 50
 
 			coord := GinkgoT().TempDir()
 			bin := buildTarget(targetName, overlapTargetSrc)
@@ -202,10 +213,9 @@ var _ = Describe("Linux amd64 sibling-breakpoint / step-over overlap", Label("li
 			ev := awaitEvent(d.Events(), 20*time.Second, protocol.EventStepped)
 			j.logf("launch entry stop: %s", ev.Kind)
 
-			// Resolve the marker addresses straight from the target's own DWARF
-			// so the /proc non-vacuity check can assert that the parked threads
-			// really are sitting on the breakpoint instructions, rather than
-			// merely being in some tracing-stop.
+			// Resolve the marker addresses from the target's own DWARF so the
+			// non-vacuity check can assert the parked threads really are sitting
+			// on the breakpoint instructions, not merely in some tracing-stop.
 			addrA := elfAddrForLine(bin, srcFile, lineA)
 			addrB := elfAddrForLine(bin, srcFile, lineB)
 			trapPCs := map[uint64]string{
@@ -221,190 +231,152 @@ var _ = Describe("Linux amd64 sibling-breakpoint / step-over overlap", Label("li
 			j.logf("armed bpA id=%d line=%d, bpB id=%d line=%d",
 				bpA.ID, bpA.Location.Line, bpB.ID, bpB.Location.Line)
 
-			// Resume and let the runtime bring every marker thread up. The
-			// tracee must be RUNNING for this: clone events are only absorbed
-			// by Backend.Wait, which only runs while a waitLoop is in flight.
+			// Resume so the runtime can bring every marker thread up: clone
+			// events are only absorbed by Backend.Wait, which only runs while a
+			// waitLoop is in flight.
 			mustContinue(d, "Continue to spin up marker threads")
 			pid := waitForReady(coord, 40*time.Second)
-			j.logf("target ready, pid=%d, all %d marker threads parked", pid, perCycle)
+			j.logf("target ready, pid=%d, %d marker threads parked on the gate", pid, markerThreads)
+
+			// Open the gate while the tracee is running: every marker thread is
+			// released at once and they then hammer the two breakpoints, so
+			// several sit in unreaped INT3 stops whenever one is being stepped.
+			touch(filepath.Join(coord, "start"))
 
 			var (
-				orphanCycles int
-				maxStopped   int
+				stops        int
+				hitsA, hitsB int
 				maxAtTrap    int
-				overlapReady int // stops taken with >=2 threads parked on a marker
-				totalStops   int
+				overlapReady int
 			)
 
-			for i := 0; i < iters; i++ {
-				// Release thread A and every sibling together, so they race to
-				// their traps inside one running window. Whichever Wait4 reaps
-				// first is reported; the rest sit in unreaped INT3 stops — the
-				// precondition for the overlap.
-				touch(filepath.Join(coord, "goA."+strconv.Itoa(i)))
-				touch(filepath.Join(coord, "gateB."+strconv.Itoa(i)))
+			for {
+				ev = awaitEvent(d.Events(), 30*time.Second,
+					protocol.EventBreakpointHit, protocol.EventProcessExited,
+					protocol.EventError)
+				if ev.Kind == protocol.EventProcessExited {
+					j.logf("tracee exited after %d stops", stops)
+					break
+				}
+				Expect(ev.Kind).To(Equal(protocol.EventBreakpointHit),
+					"stop %d: expected BreakpointHit, got %s: %s\n%s",
+					stops, ev.Kind, ev.Payload, j.dump())
 
-				hitsA, hitsB := 0, 0
-				for k := 0; k < perCycle; k++ {
-					// Cycle 0 stop 0 needs no resume: the tracee is already
-					// running from the readiness Continue above.
-					if i > 0 || k > 0 {
-						mustContinue(d, "Continue cycle %d stop %d", i, k)
-					}
+				stops++
+				Expect(stops).To(BeNumerically("<=", maxStops),
+					"runaway stop count — the tracee should have exited by now\n%s", j.dump())
 
-					ev = awaitEvent(d.Events(), 30*time.Second,
-						protocol.EventBreakpointHit, protocol.EventProcessExited,
-						protocol.EventError)
-					Expect(ev.Kind).To(Equal(protocol.EventBreakpointHit),
-						"cycle %d stop %d: expected BreakpointHit, got %s: %s\n%s",
-						i, k, ev.Kind, ev.Payload, j.dump())
+				line := hitLine(ev)
+				switch line {
+				case lineA:
+					hitsA++
+				case lineB:
+					hitsB++
+				default:
+					Fail(fmt.Sprintf("stop %d: stopped at unexpected line %d\n%s",
+						stops, line, j.dump()))
+				}
 
-					line := hitLine(ev)
-					switch line {
-					case lineA:
-						hitsA++
-					case lineB:
-						hitsB++
-					default:
-						Fail(fmt.Sprintf("cycle %d stop %d: stopped at unexpected line %d\n%s",
-							i, k, line, j.dump()))
-					}
-
-					if k == 0 {
-						// NON-VACUITY MEASUREMENT. It is not enough that some
-						// threads are in tracing-stop: they must be parked ON a
-						// marker instruction. An amd64 INT3 stop leaves RIP one
-						// byte past the trap, so accept addr and addr+1.
-						//
-						// This is recorded per stop and asserted ONCE at the end
-						// rather than per cycle: a sibling that took an unrelated
-						// ptrace event while the engine was suspended is only
-						// resumed when the next Backend.Wait absorbs it, so an
-						// individual cycle can legitimately start with the
-						// siblings not yet re-parked. That is a cycle where no
-						// overlap is possible — not a failure.
-						states, stopped := waitForMarkerStops(pid, trapPCs, perCycle, 2*time.Second)
-						atTrap := countAtTrap(pid, states, trapPCs)
-						totalStops++
-						if stopped > maxStopped {
-							maxStopped = stopped
-						}
-						if atTrap > maxAtTrap {
-							maxAtTrap = atTrap
-						}
-						if atTrap >= 2 {
-							overlapReady++
-						}
-						j.logf("cycle %d: first stop at line %d; tracing-stopped=%d atMarkerPC=%d of %d marker threads\n%s",
-							i, line, stopped, atTrap, perCycle, renderStates(pid, states, trapPCs))
-					}
-
-					// THE PROBE. Every stop is a resting point at which BOTH
-					// breakpoints must still be installed. The previous resume
-					// stepped one of them over; if a sibling stop was delivered
-					// during that step-over, the stepped-over entry was dropped
-					// from the table and never reinstalled.
-					armedA := probeArmed(d, srcFile, lineA)
-					armedB := probeArmed(d, srcFile, lineB)
-					if !armedA || !armedB {
-						orphanCycles++
-						lost, lostLine, lostID := "A (MARK_A)", lineA, bpA.ID
-						if armedA {
-							lost, lostLine, lostID = "B (MARK_B)", lineB, bpB.ID
-						}
-						// Independent, strictly READ-ONLY corroboration:
-						// breakpointTable.clear looks the id up in byID before
-						// touching memory, so "not found" confirms the ORIGINAL
-						// entry is gone from the table — it is not an artifact
-						// of the SetBreakpoint probe above.
-						clearErr := d.ClearBreakpoint(lostID)
-						states, _ := procThreadStates(pid)
-						Fail(fmt.Sprintf(
-							"breakpoint %s was silently orphaned by a sibling stop during a step-over (cycle %d, stop %d of %d)\n\n"+
-								"OBSERVED\n"+
-								"  The resume that led to this stop began a step-over of a software\n"+
-								"  breakpoint: engine.resumeFromBreakpoint (internal/debugger/engine.go:1031)\n"+
-								"  set steppingOverBP, called bps.removeFromTable(bp) and restored the\n"+
-								"  original bytes, then PTRACE_SINGLESTEPped that thread.\n"+
-								"  Wait4(-1, WALL) then returned a DIFFERENT thread's pending INT3 stop\n"+
-								"  (backend_linux_amd64.go:523 classifies it StopBreakpoint because\n"+
-								"  tid != stepTID). handleStop's StopBreakpoint branch\n"+
-								"  (engine.go:589-636) has no steppingOverBP guard, so it overwrote\n"+
-								"  lastBP/lastBPTID and emitted this BreakpointHit while steppingOverBP\n"+
-								"  still held the half-stepped breakpoint. Only the StopSingleStep\n"+
-								"  branch reinstalls it, and it never ran.\n\n"+
-								"  Probe: SetBreakpoint(%s:%d) SUCCEEDED. It must return\n"+
-								"  errBreakpointExists while the entry is in breakpointTable.byAddr, so\n"+
-								"  breakpoint %s is disarmed in tracee memory and gone from the table.\n"+
-								"  Read-only corroboration: ClearBreakpoint(id=%d) on the ORIGINAL entry\n"+
-								"  returned %v (breakpointTable.clear consults byID before touching\n"+
-								"  memory, so this is independent of the SetBreakpoint probe).\n"+
-								"  The next Continue assigns steppingOverBP to this stop's breakpoint,\n"+
-								"  destroying the last reference to it: it can never fire or be cleared\n"+
-								"  again.\n\n"+
-								"EXPECTED\n"+
-								"  Both breakpoints remain installed across a step-over, regardless of\n"+
-								"  which thread Wait4 reports next.\n\n"+
-								"STATE\n"+
-								"  stop line=%d  armedA=%v armedB=%v  tracing-stopped=%d\n"+
-								"  cycle=%d/%d stop=%d/%d hitsA=%d hitsB=%d\n"+
-								"  MARK_A=0x%x MARK_B=0x%x\n"+
-								"  /proc thread states:\n%s\n"+
-								"HARNESS JOURNAL\n%s",
-							lost, i, k, perCycle,
-							srcFile, lostLine, lost, lostID, clearErr,
-							line, armedA, armedB, countStopped(states),
-							i, iters, k, perCycle, hitsA, hitsB,
-							addrA, addrB,
-							renderStates(pid, states, trapPCs), j.dump()))
+				// Non-vacuity: snapshot who else is parked ON a marker right
+				// now, i.e. whose INT3 stop is pending while the resume below
+				// steps this thread off its trap.
+				states, stopped := procThreadStates(pid)
+				atTrap := countAtTrap(pid, states, trapPCs)
+				if atTrap > maxAtTrap {
+					maxAtTrap = atTrap
+				}
+				if atTrap >= 2 {
+					overlapReady++
+					if overlapReady <= 3 || overlapReady%25 == 0 {
+						j.logf("stop %d at line %d: tracing-stopped=%d atMarkerPC=%d (overlap #%d)\n%s",
+							stops, line, stopped, atTrap, overlapReady,
+							renderStates(pid, states, trapPCs))
 					}
 				}
 
-				Expect(hitsA).To(Equal(1),
-					"cycle %d: exactly one MARK_A hit (got %d)\n%s", i, hitsA, j.dump())
-				Expect(hitsB).To(Equal(siblings),
-					"cycle %d: exactly %d MARK_B hits (got %d)\n%s",
-					i, siblings, hitsB, j.dump())
+				// THE INVARIANT. Every stop is a resting point at which BOTH
+				// breakpoints must still be installed. The resume that produced
+				// this stop stepped one of them over; if a sibling stop was
+				// delivered during that step-over, the stepped-over entry was
+				// dropped from the table and never reinstalled.
+				armedA := probeArmed(d, srcFile, lineA)
+				armedB := probeArmed(d, srcFile, lineB)
+				if !armedA || !armedB {
+					lost, lostLine, lostID := "A (MARK_A)", lineA, bpA.ID
+					if armedA {
+						lost, lostLine, lostID = "B (MARK_B)", lineB, bpB.ID
+					}
+					// Independent, strictly READ-ONLY corroboration:
+					// breakpointTable.clear looks the id up in byID before
+					// touching memory, so "not found" confirms the ORIGINAL
+					// entry is gone — not an artifact of the probe above.
+					clearErr := d.ClearBreakpoint(lostID)
+					post, _ := procThreadStates(pid)
+					Fail(fmt.Sprintf(
+						"breakpoint %s was silently orphaned by a sibling stop during a step-over "+
+							"(stop %d, at line %d)\n\n"+
+							"OBSERVED\n"+
+							"  The resume that led to this stop began a step-over:\n"+
+							"  engine.resumeFromBreakpoint set steppingOverBP, called\n"+
+							"  bps.removeFromTable(bp), restored the original bytes and\n"+
+							"  PTRACE_SINGLESTEPped that thread. A DIFFERENT thread's pending INT3\n"+
+							"  stop was then reported (Wait4 classifies it StopBreakpoint because\n"+
+							"  tid != stepTID), and handleStop's StopBreakpoint branch overwrote\n"+
+							"  lastBP/lastBPTID while steppingOverBP still held the half-stepped\n"+
+							"  breakpoint. Only StopSingleStep reinstalls it, and it never ran.\n\n"+
+							"  Probe: SetBreakpoint(%s:%d) SUCCEEDED. It must return\n"+
+							"  errBreakpointExists while the entry is in breakpointTable.byAddr, so\n"+
+							"  breakpoint %s is disarmed in tracee memory and gone from the table.\n"+
+							"  Read-only corroboration: ClearBreakpoint(id=%d) on the ORIGINAL entry\n"+
+							"  returned %v.\n"+
+							"  The next Continue assigns steppingOverBP to this stop's breakpoint,\n"+
+							"  destroying the last reference to it: it can never fire or be cleared\n"+
+							"  again.\n\n"+
+							"EXPECTED\n"+
+							"  Both breakpoints remain installed across a step-over, regardless of\n"+
+							"  which thread Wait4 reports next.\n\n"+
+							"STATE\n"+
+							"  armedA=%v armedB=%v  stops=%d hitsA=%d hitsB=%d\n"+
+							"  atMarkerPC(max)=%d overlapReady=%d\n"+
+							"  MARK_A=0x%x MARK_B=0x%x\n"+
+							"  /proc thread states:\n%s\n"+
+							"HARNESS JOURNAL\n%s",
+						lost, stops, line,
+						srcFile, lostLine, lost, lostID, clearErr,
+						armedA, armedB, stops, hitsA, hitsB,
+						maxAtTrap, overlapReady, addrA, addrB,
+						renderStates(pid, post, trapPCs), j.dump()))
+				}
+
+				mustContinue(d, "Continue after stop %d", stops)
 			}
 
-			// GLOBAL NON-VACUITY GATE: the spec is only meaningful if the
-			// scenario it claims to test actually occurred — sibling threads
-			// parked in their own INT3 stops while a step-over ran. Asserted
-			// once, over the whole run, so a single unlucky cycle cannot make
-			// the spec flaky, but a run that never set up the race cannot pass
-			// silently either.
+			// NON-VACUITY GATE: the spec only means something if the scenario it
+			// claims to test actually occurred — sibling threads parked in their
+			// own INT3 stops while a step-over ran.
 			Expect(maxAtTrap).To(BeNumerically(">=", 2),
-				"NON-VACUITY FAILED — no stop in %d cycles ever had two threads parked ON a marker "+
+				"NON-VACUITY FAILED — across %d stops no two threads were ever parked ON a marker "+
 					"instruction (MARK_A=0x%x MARK_B=0x%x), so no step-over could overlap a pending "+
 					"sibling breakpoint stop and this run proves nothing\n%s",
-				iters, addrA, addrB, j.dump())
+				stops, addrA, addrB, j.dump())
 			Expect(overlapReady).To(BeNumerically(">=", 1),
-				"NON-VACUITY FAILED — not one of %d cycles began with the overlap precondition met\n%s",
-				totalStops, j.dump())
+				"NON-VACUITY FAILED — not one of %d stops had the overlap precondition met\n%s",
+				stops, j.dump())
+			Expect(hitsA).To(BeNumerically(">=", 1), "MARK_A was hit at least once\n%s", j.dump())
+			Expect(hitsB).To(BeNumerically(">=", 1), "MARK_B was hit at least once\n%s", j.dump())
 
-			// Every cycle survived: both breakpoints still armed, target runs
-			// to a clean exit, and every marker thread completed every cycle.
-			Expect(probeArmed(d, srcFile, lineA)).To(BeTrue(), "BP A armed at end\n%s", j.dump())
-			Expect(probeArmed(d, srcFile, lineB)).To(BeTrue(), "BP B armed at end\n%s", j.dump())
-
-			mustContinue(d, "final Continue")
-			ev = awaitEvent(d.Events(), 40*time.Second,
-				protocol.EventProcessExited, protocol.EventBreakpointHit, protocol.EventError)
-			Expect(ev.Kind).To(Equal(protocol.EventProcessExited),
-				"target runs to completion after the last cycle, got %s: %s\n%s",
-				ev.Kind, ev.Payload, j.dump())
+			// Liveness: the tracee ran to completion with every marker thread
+			// finishing every iteration, and both breakpoints survived.
 			Expect(fileExists(filepath.Join(coord, "finished"))).To(BeTrue(),
-				"every marker thread completed all %d cycles", iters)
+				"every marker thread completed all %d iterations\n%s", iters, j.dump())
 
-			AddReportEntry("overlap-cycles", iters)
-			AddReportEntry("overlap-siblings", siblings)
-			AddReportEntry("overlap-orphans", orphanCycles)
-			AddReportEntry("overlap-tracing-stopped-max", maxStopped)
+			AddReportEntry("overlap-stops", stops)
+			AddReportEntry("overlap-hits", fmt.Sprintf("A=%d B=%d", hitsA, hitsB))
 			AddReportEntry("overlap-at-marker-pc-max", maxAtTrap)
-			AddReportEntry("overlap-ready-cycles", fmt.Sprintf("%d/%d", overlapReady, totalStops))
+			AddReportEntry("overlap-ready-stops", fmt.Sprintf("%d/%d", overlapReady, stops))
 			GinkgoWriter.Printf(
-				"overlap summary: cycles=%d siblings=%d orphans=%d stopped(max)=%d atMarkerPC(max)=%d overlapReady=%d/%d\n",
-				iters, siblings, orphanCycles, maxStopped, maxAtTrap, overlapReady, totalStops)
+				"overlap summary: stops=%d hitsA=%d hitsB=%d atMarkerPC(max)=%d overlapReady=%d/%d\n",
+				stops, hitsA, hitsB, maxAtTrap, overlapReady, stops)
 		})
 })
 
@@ -504,8 +476,8 @@ func fileExists(p string) bool {
 }
 
 // waitForReady blocks until the target publishes ready.<pid>, which it only
-// does once every marker thread is created, pinned and parked on its first
-// gate. Returns the tracee pid.
+// does once every marker thread is created, pinned and parked on the gate.
+// Returns the tracee pid.
 func waitForReady(dir string, timeout time.Duration) int {
 	GinkgoHelper()
 	deadline := time.Now().Add(timeout)
@@ -574,22 +546,6 @@ func countStopped(states []threadState) int {
 	return n
 }
 
-// waitForMarkerStops polls /proc until at least want threads are parked ON a
-// marker instruction, returning the final snapshot and the tracing-stop count.
-// It never fails the spec — the caller records and asserts, so the snapshot can
-// be included in a report. Bounded and early-exiting: a cycle in which the
-// siblings have not re-parked is a legitimate no-overlap cycle, not a hang.
-func waitForMarkerStops(pid int, trapPCs map[uint64]string, want int, timeout time.Duration) ([]threadState, int) {
-	deadline := time.Now().Add(timeout)
-	for {
-		states, stopped := procThreadStates(pid)
-		if countAtTrap(pid, states, trapPCs) >= want || time.Now().After(deadline) {
-			return states, stopped
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
-}
-
 // procPC reads the stopped thread's instruction pointer from
 // /proc/<pid>/task/<tid>/syscall, whose last field is the PC. It is only
 // meaningful for a stopped task; "running" or an unreadable file yields 0.
@@ -645,10 +601,10 @@ func renderStates(pid int, states []threadState, trapPCs map[uint64]string) stri
 
 // elfAddrForLine resolves file:line to a text address by reading the target
 // binary's own DWARF line table, mirroring dwarfReader.PCForFileLine (first
-// is-stmt row whose file name has the given suffix). Go test binaries and
-// targets are non-PIE, so the DWARF address is also the runtime address, which
-// is what /proc reports. Test-side only — it exists so the non-vacuity check
-// can name the exact instruction the parked threads must be sitting on.
+// is-stmt row whose file name has the given suffix). Go targets are non-PIE, so
+// the DWARF address is also the runtime address, which is what /proc reports.
+// Test-side only — it exists so the non-vacuity check can name the exact
+// instruction the parked threads must be sitting on.
 func elfAddrForLine(bin, file string, line int) uint64 {
 	GinkgoHelper()
 	f, err := elf.Open(bin)
