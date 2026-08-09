@@ -22,7 +22,7 @@ function health(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({
     service: "bingo",
     managementApiVersion: 1,
-    wireProtocolVersion: "1.4",
+    wireProtocolVersion: "1.3",
     instanceId: "instance-1",
     dap: {
       enabled: true,

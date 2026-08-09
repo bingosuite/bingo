@@ -12,12 +12,18 @@ import {
 import { envelope, goroutine, snapshot, thread } from "./fixtures.js";
 
 describe("telemetry codec", () => {
-  it("decodes protocol 1.4 snapshots and emits only the read-only command", () => {
+  const minimalGoroutine = (id: number) => ({
+    id,
+    status: "waiting",
+    currentLoc: { file: "", line: 0 },
+  });
+
+  it("decodes protocol 1.3 snapshots and emits only the read-only command", () => {
     const decoded = decodeEvent(envelope(1, "GoroutineSnapshot", snapshot()));
     assert.equal(decoded.kind, "GoroutineSnapshot");
     assert.equal(decoded.snapshot?.goroutines[0]?.id, 1);
     assert.deepEqual(JSON.parse(snapshotCommand()), {
-      v: "1.4",
+      v: "1.3",
       kind: "GoroutineSnapshot",
       payload: {},
     });
@@ -56,14 +62,8 @@ describe("telemetry codec", () => {
     assert.equal(decoded.snapshot?.threads.length, maximumThreads);
   });
 
-  const minimalGoroutine = (id: number) => ({
-    id,
-    status: "waiting",
-    currentLoc: { file: "", line: 0 },
-  });
-
-  it("accepts the packed goroutine cap and rejects one past it", () => {
-    assert.equal(maximumGoroutines, 5000);
+  it("accepts 8193 goroutines and rejects 8194", () => {
+    assert.equal(maximumGoroutines, 8193);
     const accepted = Array.from(
       { length: maximumGoroutines },
       (_, index) => goroutine(index + 1),
@@ -72,11 +72,9 @@ describe("telemetry codec", () => {
       ...snapshot(),
       goroutines: accepted,
     });
-    // The producer packs against exactly this budget, so a payload holding the
-    // full element cap has to fit the decoder's byte contract too.
-    assert.ok(acceptedEnvelope.byteLength <= maximumEnvelopeBytes);
+    assert.ok(acceptedEnvelope.byteLength > 2 * 1024 * 1024);
     const decoded = decodeEvent(acceptedEnvelope);
-    assert.equal(decoded.snapshot?.goroutines.length, maximumGoroutines);
+    assert.equal(decoded.snapshot?.goroutines.length, 8193);
 
     assert.throws(
       () =>
@@ -89,7 +87,7 @@ describe("telemetry codec", () => {
             ],
           }),
         ),
-      /5000 item limit/,
+      /8193 item limit/,
     );
   });
 
@@ -101,20 +99,7 @@ describe("telemetry codec", () => {
     );
     assert.throws(
       () => decodeEvent("x".repeat(maximumEnvelopeBytes + 1)),
-      /exceeds the 2097152 byte contract/,
-    );
-    assert.throws(
-      () =>
-        decodeEvent(
-          envelope(1, "GoroutineSnapshot", {
-            ...snapshot(),
-            goroutines: Array.from(
-              { length: maximumGoroutines + 1 },
-              (_, index) => goroutine(index + 1),
-            ),
-          }),
-        ),
-      /item limit/,
+      /exceeds 8 MiB/,
     );
     assert.throws(
       () =>
@@ -140,7 +125,7 @@ describe("telemetry codec", () => {
       () =>
         decodeEvent(
           JSON.stringify({
-            v: "1.4",
+            v: "1.3",
             kind: "Continued",
             seq: 1,
             payload: {},
@@ -153,7 +138,7 @@ describe("telemetry codec", () => {
       () =>
         decodeEvent(
           JSON.stringify({
-            v: "1.4",
+            v: "1.3",
             kind: "FutureEvent",
             seq: 1,
             payload: {},

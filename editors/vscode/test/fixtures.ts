@@ -60,7 +60,7 @@ export function envelope(
   payload: unknown,
 ): Buffer {
   return Buffer.from(
-    JSON.stringify({ v: "1.4", kind, seq, payload }),
+    JSON.stringify({ v: "1.3", kind, seq, payload }),
     "utf8",
   );
 }
