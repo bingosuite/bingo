@@ -185,9 +185,22 @@ func runChild(t *testing.T, scenario string, backstop time.Duration) childResult
 	)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
-	var out strings.Builder
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	// Capture through a real file, never an io.Writer. An io.Writer makes
+	// os/exec build a pipe whose write end is inherited by the child AND by
+	// every tracee it forks; cmd.Wait then blocks until all of them close it,
+	// so a surviving tracee would hide the child's own exit code behind the
+	// parent backstop and turn a successful proof into a harness timeout.
+	logFile, err := os.CreateTemp(t.TempDir(), "scenario-*.log")
+	if err != nil {
+		t.Fatalf("create scenario log: %v", err)
+	}
+	defer logFile.Close()
+	readOut := func() string {
+		b, _ := os.ReadFile(logFile.Name())
+		return string(b)
+	}
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start scenario %q: %v", scenario, err)
 	}
@@ -204,7 +217,7 @@ func runChild(t *testing.T, scenario string, backstop time.Duration) childResult
 		<-done
 		t.Fatalf("scenario %q exceeded the parent backstop of %s — the child failed to "+
 			"self-terminate, which its internal deadlines should always guarantee.\n%s",
-			scenario, backstop, out.String())
+			scenario, backstop, readOut())
 	}
 
 	code := 0
@@ -213,7 +226,7 @@ func runChild(t *testing.T, scenario string, backstop time.Duration) childResult
 		if errors.As(waitErr, &ee) {
 			code = ee.ExitCode()
 		} else {
-			t.Fatalf("scenario %q wait: %v\n%s", scenario, waitErr, out.String())
+			t.Fatalf("scenario %q wait: %v\n%s", scenario, waitErr, readOut())
 		}
 	}
 	// Reap any tracee the child left behind (a wedged engine's tracees are
@@ -221,8 +234,9 @@ func runChild(t *testing.T, scenario string, backstop time.Duration) childResult
 	// not; kill the group unconditionally — the child itself is already gone).
 	_ = syscall.Kill(-pgid, syscall.SIGKILL)
 
-	t.Logf("scenario %q exit=%d\n%s", scenario, code, out.String())
-	return childResult{code: code, output: out.String()}
+	out := readOut()
+	t.Logf("scenario %q exit=%d\n%s", scenario, code, out)
+	return childResult{code: code, output: out}
 }
 
 func requireCode(t *testing.T, r childResult, scenario string, want int) {
