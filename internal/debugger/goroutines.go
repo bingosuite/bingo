@@ -418,11 +418,25 @@ func (e *engine) readGoroutines() ([]protocol.Goroutine, error) {
 	return []protocol.Goroutine{e.syntheticGoroutine(pc)}, nil
 }
 
-// goroutineSnapshot builds the full concurrency picture and computes the
-// created/exited deltas against the previous snapshot. It updates the engine's
-// remembered live set, so successive snapshots report only what changed. Runs
-// on the engine loop thread; prevGoids needs no synchronization.
+// goroutineSnapshot builds the automatic stop snapshot: the full concurrency
+// picture plus the created/exited deltas against the previous automatic
+// snapshot, adopting the new live set as the next baseline. Only the automatic
+// stops (entry, breakpoint hit, pause) own that baseline. Runs on the engine
+// loop thread; prevGoids needs no synchronization.
 func (e *engine) goroutineSnapshot() protocol.GoroutineSnapshotPayload {
+	return e.buildSnapshot(true)
+}
+
+// goroutineSnapshotQuery answers an on-demand CmdGoroutineSnapshot. It reports
+// the same live picture but is a pure observation: Created/Exited stay empty and
+// prevGoids is untouched, so a refresh between two stops cannot consume the
+// deltas the next automatic snapshot must report (they are only remembered
+// once, in prevGoids, and would otherwise be lost).
+func (e *engine) goroutineSnapshotQuery() protocol.GoroutineSnapshotPayload {
+	return e.buildSnapshot(false)
+}
+
+func (e *engine) buildSnapshot(trackLifecycle bool) protocol.GoroutineSnapshotPayload {
 	sp, pc := e.liveRegisters()
 
 	gs, ok := e.buildGoroutineList(sp, pc)
@@ -434,7 +448,13 @@ func (e *engine) goroutineSnapshot() protocol.GoroutineSnapshotPayload {
 			Goroutines: []protocol.Goroutine{e.syntheticGoroutine(pc)},
 		}
 	}
+	return e.snapshotFrom(gs, pc, trackLifecycle)
+}
 
+// snapshotFrom assembles the payload around an already-built goroutine list.
+// trackLifecycle is the single point where an automatic snapshot's ownership of
+// the lifecycle baseline differs from a query's read-only view.
+func (e *engine) snapshotFrom(gs []protocol.Goroutine, livePC uint64, trackLifecycle bool) protocol.GoroutineSnapshotPayload {
 	var current int
 	live := make(map[int]struct{}, len(gs))
 	for _, g := range gs {
@@ -444,21 +464,22 @@ func (e *engine) goroutineSnapshot() protocol.GoroutineSnapshotPayload {
 		}
 	}
 
-	created, exited := e.diffGoids(live)
-
-	return protocol.GoroutineSnapshotPayload{
+	snap := protocol.GoroutineSnapshotPayload{
 		Goroutines: gs,
-		Threads:    e.readThreads(current, pc),
+		Threads:    e.readThreads(current, livePC),
 		Current:    current,
-		Created:    created,
-		Exited:     exited,
 	}
+	if trackLifecycle {
+		snap.Created, snap.Exited = e.diffGoids(live)
+	}
+	return snap
 }
 
-// diffGoids compares the current live goid set against the previous snapshot's
-// and returns the created (new) and exited (gone) goids, then adopts the new
-// set. Returns nil slices on the first snapshot so a fresh session doesn't
-// report every existing goroutine as "created".
+// diffGoids compares the current live goid set against the previous automatic
+// snapshot's and returns the created (new) and exited (gone) goids, then adopts
+// the new set. Returns nil slices on the first snapshot so a fresh session
+// doesn't report every existing goroutine as "created". Only reached from the
+// automatic stop path — see goroutineSnapshotQuery.
 func (e *engine) diffGoids(live map[int]struct{}) (created, exited []int) {
 	if e.prevGoids != nil {
 		for id := range live {

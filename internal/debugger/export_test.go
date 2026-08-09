@@ -3,7 +3,10 @@ package debugger
 
 import (
 	"fmt"
+	"sort"
 	"sync"
+
+	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
 func ExportedTrapInstruction() []byte {
@@ -301,4 +304,38 @@ func (b *ExportedGateBackend) completeStepThreadExit() error {
 		return b.Complete()
 	}
 	return nil
+}
+
+// ExportedSnapshotFrom assembles a snapshot payload around a pre-built
+// goroutine list, bypassing the runtime memory scan, so tests can pin the
+// lifecycle split: trackLifecycle=true is the automatic stop path (diffs and
+// adopts the baseline), false is the on-demand query path. Runs on the engine
+// loop thread, like the real callers.
+func ExportedSnapshotFrom(d Debugger, gs []protocol.Goroutine, trackLifecycle bool) protocol.GoroutineSnapshotPayload {
+	e := d.(*engine)
+	var snap protocol.GoroutineSnapshotPayload
+	if err := e.dispatch(func() error {
+		snap = e.snapshotFrom(gs, 0, trackLifecycle)
+		return nil
+	}); err != nil {
+		panic("ExportedSnapshotFrom: " + err.Error())
+	}
+	return snap
+}
+
+// ExportedPrevGoids returns the remembered live goid set (the lifecycle-delta
+// baseline), sorted. Nil before the first automatic snapshot.
+func ExportedPrevGoids(d Debugger) []int {
+	e := d.(*engine)
+	var ids []int
+	if err := e.dispatch(func() error {
+		for id := range e.prevGoids {
+			ids = append(ids, id)
+		}
+		sort.Ints(ids)
+		return nil
+	}); err != nil {
+		panic("ExportedPrevGoids: " + err.Error())
+	}
+	return ids
 }

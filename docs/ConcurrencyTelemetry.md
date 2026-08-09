@@ -133,12 +133,18 @@ go run ./cmd/wsmon -addr localhost:6060 -session <session-id>
 # one-shot (print a single snapshot and exit): add -once
 ```
 
+`wsmon` sends one on-demand snapshot request on join and then renders whatever
+arrives on the event stream — the request is fire-and-forget, so with `-once` it
+prints the first snapshot that lands (the requested one, or an automatic stop
+snapshot if the tracee is running and stops first).
+
 `wsmon` redraws in place on every `EventGoroutineSnapshot`, showing:
 
 - the **goroutine spawn tree** built from `ParentID` (the `go` statement that
   spawned each goroutine), with the current goroutine marked;
 - the **OS thread set** (runtime M's) and which goroutine each is running;
-- the **created / exited** goid deltas since the previous snapshot;
+- the **created / exited** goid deltas since the previous automatic snapshot
+  (an on-demand request answers with the live picture and no deltas);
 - the **last stop event** (breakpoint / pause / step / exit) and session state.
 
 Each time you Continue in the driver and hit the breakpoint again, `wsmon`
@@ -149,7 +155,10 @@ repaints with the new round's workers — the plumbing, end to end.
 - `wsmon` is a pure observer: it never sends run-control commands, so it cannot
   disturb the DAP driver. Many `wsmon` + DAP clients can share one session.
 - The graphical observer is also read-only. It sends exactly one on-demand
-  snapshot request after joining and on explicit Refresh only.
+  snapshot request after joining and on explicit Refresh only. On-demand
+  requests are never correlated to their answer: every snapshot — requested or
+  automatic — arrives as a push on the event stream, and only automatic ones
+  carry lifecycle deltas (a refresh cannot consume the next stop's).
 - Snapshots stream on **breakpoint / pause / entry**, not per single-step (steps
   stay cheap). Use the driver's breakpoints/continue to advance between frames.
 - If the tracee is a stripped binary or stopped before runtime init, the snapshot

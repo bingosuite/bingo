@@ -214,7 +214,7 @@ dropped.
 
 `pkg/client` splits methods by what they wait for. Synchronous methods
 (`Restart`, `SetBreakpoint`, `ClearBreakpoint`, `Locals`, `Evaluate`,
-`StackFrames`, `Goroutines`, `GoroutineSnapshot`) block on their confirmation
+`StackFrames`, `Goroutines`) block on their confirmation
 event **or** an `EventError` for the same command kind — see
 [`sendAndWait` / `routeToPending`](../pkg/client/ws.go). An `EventError` whose
 `Command` matches is turned back into a Go `error` for the caller:
@@ -239,15 +239,16 @@ events. The client must not close the whole connection as timeout recovery
 because a last-client disconnect tears down the session and debuggee, while
 unrelated asynchronous events remain valid.
 
-`GoroutineSnapshot` is the temporary exception. Its confirmation event is also
-unsolicited telemetry emitted after breakpoint, pause, and entry stops, so a
-timed-out snapshot request is discarded instead of retired as debt. Otherwise
-the next auto-pushed snapshot would disappear into the retired query. This
-preserves telemetry but cannot create correlation: while the legacy synchronous
-API exists, either a genuinely late query reply or an automatic push can satisfy
-a later in-flight snapshot waiter; with no waiter, either reaches `Events()`.
-Issue #187 and stacked PR #192 remove the synchronous query and that ambiguity
-rather than redesigning its semantics here.
+This model covers genuine confirmations only — events that cannot exist without
+a request. `EventGoroutineSnapshot` is not one: the server also pushes it after
+every breakpoint, pause, and entry stop. While a synchronous snapshot query
+existed it needed a per-kind carve-out in the timeout path, and neither side of
+that carve-out is sound — retiring the request as debt swallows the next
+auto-pushed snapshot, while discarding it preserves the stream but restores the
+#144 ambiguity, letting a late reply or an automatic push satisfy a later
+in-flight call. Removing the waiter removed the dilemma: the request is
+fire-and-forget and its answer is ordinary telemetry on `Events()`. Do not
+reintroduce an exemption here.
 
 This fence covers only the serialized command stream sent by that client.
 Confirmation events carry no request ID and are broadcast to every client, so
@@ -256,9 +257,13 @@ indistinguishable. That multi-driver limitation requires wire-level correlation
 IDs rather than more client-side guessing.
 
 Fire-and-forget methods (`Launch`, `Attach`, `Kill`, `Continue`, `Step*`,
-`Pause`) return once the command is on the wire; their results — including
-asynchronous `EventError`s with `Command == CmdNone` — arrive on `Events()` and
-are printed by the CLI's event loop.
+`Pause`, `RequestGoroutineSnapshot`) return once the command is on the wire;
+their results — including asynchronous `EventError`s with `Command == CmdNone` —
+arrive on `Events()` and are printed by the CLI's event loop.
+`RequestGoroutineSnapshot` belongs here because `EventGoroutineSnapshot` is also
+pushed unsolicited on every stop: correlating it by kind would let an automatic
+push answer the request, or let a timed-out request's reply debt swallow an
+automatic push (issue #187). It registers no pending entry at all.
 
 ## 8. Propagating errors to clients: typed `EventError`
 
@@ -322,4 +327,4 @@ server-side `slog` output and map to short client-facing messages there. The
 | Methods not on the `Debugger` interface          | Keep unexported on `engine`; return errors up the synchronous chain to the loop               |
 | Server → WebSocket client error                  | Broadcast a typed `EventError`; message text is intentionally surfaced (local tool)           |
 | Incompatible WebSocket envelope                  | Close only that peer with code 1002; never broadcast or allocate a hub sequence                |
-| Timed-out synchronous client command             | Retain ordered reply debt, except discard the dual-purpose snapshot query to preserve telemetry |
+| Timed-out synchronous client command             | Retain ordered reply debt; consume its late reply/error before notifying a newer waiter       |
