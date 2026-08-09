@@ -132,8 +132,9 @@ integration:
 # Runs every label (no filter): `basic` correctness, `churn` robustness, `pause`
 # async-interrupt, `stepping` (StepInto/StepOut), `inspect` (StackFrames/Locals/
 # Goroutines), `breakpoints` (ClearBreakpoint), `kill` (kill-while-running),
-# `exit` (real exit code), `attach` (attach by PID to a running process),
-# `restart`, and `fullstack` transport, all under -race.
+# `exit` (real exit code), `signals` (linux signal forwarding + Pause control),
+# `attach` (attach by PID to a running process), `restart`, and `fullstack`
+# transport, all under -race.
 e2e-linux:
 	go test -tags e2e -race -count=1 -v -timeout 600s ./test/integration
 
