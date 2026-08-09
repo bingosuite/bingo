@@ -549,13 +549,17 @@ func declareStepOverlapSignalSpec() {
 //     the main thread, which never traps in this target, and SIGURG/SIGCONT/a
 //     new thread's initial SIGSTOP are absorbed before classification, so a
 //     parked signal stop can only be this interrupt arriving mid-step.
+//   - The interrupt must SURFACE as EventPaused at least once during the race,
+//     proving it is delivered rather than swallowed.
 //   - A final quiet phase with both traps cleared requires an actual
-//     EventPaused, proving the interrupt is delivered end to end.
+//     EventPaused, proving delivery end to end even with no race at all.
 //
-// What is deliberately NOT asserted is an EventPaused from the racing loop: an
-// interrupt held across a step is always suppressed rather than surfaced,
-// because the step's own completion clears manualStopPending before the held
-// signal drains. That is the documented pending-interrupt race.
+// The EventPaused count is asserted only across the whole run, never per cycle:
+// a held interrupt surfaces when it drains while manualStopPending is still set
+// (the usual case for a source-level step-over, which releases the queue and
+// then runs on to the next line), and is legitimately suppressed when a
+// self-stop completes the step first. That is the documented pending-interrupt
+// race and it must stay tolerated.
 func declareStepOverlapPauseSpec() {
 	It("stays resumable when a Pause interrupt races an in-flight step",
 		Label("overlap"), func() {
@@ -621,18 +625,13 @@ func declareStepOverlapPauseSpec() {
 			Expect(evt.Kind).NotTo(Or(Equal(protocol.EventProcessExited), Equal(protocol.EventError)),
 				"final Continue unexpected %s: %s", evt.Kind, evt.Payload)
 
-			// Deterministic end-to-end delivery check. Everything above races,
-			// so none of it can require an EventPaused: an interrupt held
-			// across a step is ALWAYS suppressed rather than surfaced, because
-			// the step's own completion (EventStepped or a queued sibling hit)
-			// clears manualStopPending before the held signal is drained. That
-			// is the documented pending-interrupt race, not a defect.
-			//
-			// To still prove the interrupt is genuinely delivered and not
-			// silently dropped, remove the only competing stop source and pause
-			// a freely running tracee: with both traps cleared, the SIGSTOP that
-			// Pause directs at the main thread is the ONLY stop that can occur,
-			// so EventPaused is required.
+			// Deterministic end-to-end delivery check. The racing loop's
+			// EventPaused count is reliably non-zero but is not guaranteed per
+			// cycle (see below), so it cannot stand alone. Remove the only
+			// competing stop source and pause a freely running tracee: with
+			// both traps cleared, the SIGSTOP that Pause directs at the main
+			// thread is the ONLY stop that can occur, so EventPaused is
+			// required.
 			for _, id := range []int{idA, idB} {
 				Expect(p.h.d.ClearBreakpoint(id)).To(Succeed(), "clear bp %d before the quiet pause", id)
 			}
@@ -682,6 +681,21 @@ func declareStepOverlapPauseSpec() {
 				"%d Pause calls were accepted but no interrupt was ever held back mid-step: the "+
 					"signal never raced an in-flight single-step, so the park path this spec "+
 					"covers was never exercised", paused)
+
+			// 3. The interrupt was actually SURFACED as EventPaused during the
+			//    race, not merely accepted and swallowed. A held interrupt
+			//    surfaces when it drains while manualStopPending is still set —
+			//    which is the common case for a source-level step-over, because
+			//    the queue is released once the machine step is done and the
+			//    engine is running on to the next line, well before the
+			//    EventStepped that would clear the flag. It is suppressed when
+			//    a self-stop completes the step first, which is the documented
+			//    pending-interrupt race and legitimate per cycle. So this is
+			//    asserted only across the whole run, never per cycle.
+			Expect(pausedEvents).To(BeNumerically(">", 0),
+				"%d Pause calls were accepted and %d interrupts were held mid-step, but not one "+
+					"ever surfaced as EventPaused across %d cycles: the interrupt is being "+
+					"dropped rather than delivered", paused, heldInterrupts, iters)
 		})
 }
 
