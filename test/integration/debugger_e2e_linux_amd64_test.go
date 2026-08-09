@@ -4,7 +4,9 @@ package integration
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"syscall"
 	"time"
@@ -53,14 +55,42 @@ const signalTargetExitOK = 43
 const segvSignalTargetSrc = `package main
 
 import (
-	"os/signal"
+	"os"
+	"runtime"
 	"syscall"
+	"unsafe"
 )
 
 var sinkByte byte
 
+type kernelSigaction struct {
+	handler  uintptr
+	flags    uintptr
+	restorer uintptr
+	mask     uint64
+}
+
+func resetToDefault(sig syscall.Signal) {
+	// os/signal.Reset still lets Go translate synchronous faults into exit(2);
+	// this target needs kernel signal death to exercise StopKilled.
+	action := kernelSigaction{}
+	_, _, errno := syscall.RawSyscall6(
+		syscall.SYS_RT_SIGACTION,
+		uintptr(sig),
+		uintptr(unsafe.Pointer(&action)),
+		0,
+		unsafe.Sizeof(action.mask),
+		0,
+		0,
+	)
+	runtime.KeepAlive(&action)
+	if errno != 0 {
+		os.Exit(89)
+	}
+}
+
 func main() {
-	signal.Reset(syscall.SIGSEGV)
+	resetToDefault(syscall.SIGSEGV)
 	var p *byte
 	sinkByte = *p
 }
@@ -70,13 +100,39 @@ const abortSignalTargetSrc = `package main
 
 import (
 	"os"
-	"os/signal"
 	"runtime"
 	"syscall"
+	"unsafe"
 )
 
+type kernelSigaction struct {
+	handler  uintptr
+	flags    uintptr
+	restorer uintptr
+	mask     uint64
+}
+
+func resetToDefault(sig syscall.Signal) {
+	// os/signal.Reset still lets Go translate fatal signals into exit(2); this
+	// target needs kernel signal death to exercise StopKilled.
+	action := kernelSigaction{}
+	_, _, errno := syscall.RawSyscall6(
+		syscall.SYS_RT_SIGACTION,
+		uintptr(sig),
+		uintptr(unsafe.Pointer(&action)),
+		0,
+		unsafe.Sizeof(action.mask),
+		0,
+		0,
+	)
+	runtime.KeepAlive(&action)
+	if errno != 0 {
+		os.Exit(89)
+	}
+}
+
 func main() {
-	signal.Reset(syscall.SIGABRT)
+	resetToDefault(syscall.SIGABRT)
 	if err := syscall.Tgkill(os.Getpid(), syscall.Gettid(), syscall.SIGABRT); err != nil {
 		os.Exit(90)
 	}
@@ -172,6 +228,7 @@ func declareSignalForwardingSpec() {
 		for _, tc := range cases {
 			By(tc.name)
 			bin := buildTarget("signal_"+strings.ToLower(tc.name)+"_target", tc.src)
+			assertSignalDeath(bin, tc.signal)
 			h := newE2EHarness(bin)
 			h.waitFor(15*time.Second, protocol.EventStepped)
 
@@ -189,6 +246,17 @@ func declareSignalForwardingSpec() {
 			Expect(h.d.Continue()).To(Succeed(), "Continue into SIGUSR1 target")
 			awaitSignalExit(h.d.Events(), syscall.SIGUSR1, signalTargetExitOK)
 		})
+}
+
+func assertSignalDeath(bin string, signal syscall.Signal) {
+	GinkgoHelper()
+	err := exec.Command(bin).Run()
+	var exitErr *exec.ExitError
+	Expect(errors.As(err, &exitErr)).To(BeTrue(), "%s should terminate from %s, got %v", bin, signal, err)
+	status, ok := exitErr.Sys().(syscall.WaitStatus)
+	Expect(ok).To(BeTrue(), "%s returned a non-wait exit status", bin)
+	Expect(status.Signaled()).To(BeTrue(), "%s exited normally with status %d", bin, status.ExitStatus())
+	Expect(status.Signal()).To(Equal(signal), "%s terminated from the wrong signal", bin)
 }
 
 func awaitSignalExit(events <-chan protocol.Event, signal syscall.Signal, wantExit int) {
