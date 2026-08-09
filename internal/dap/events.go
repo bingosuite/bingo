@@ -42,19 +42,16 @@ func (h *Handler) translateEvent(evt protocol.Event) {
 	case protocol.EventError:
 		h.onError(evt)
 	case protocol.EventSessionState:
-		// For a JOINING connection, the hub's welcome state seeds the joiner's
-		// initial DAP state. For the normal launch/attach path it is
-		// informational (the entry stop drives the initial state instead).
+		// Joined connections use state both for their welcome and to reconcile a
+		// lifecycle event missed during admission. The normal launch/attach
+		// handshake remains driven by its entry stop.
 		h.onSessionState(evt)
 	}
 }
 
-// onSessionState consumes the hub's welcome EventSessionState for a JOINING
-// connection, reflecting the shared session's current run state as the joiner's
-// initial DAP state: a `stopped` if already suspended, `terminated` if already
-// exited, nothing while idle/running. It fires at most once (gated on
-// awaitingWelcome) and is a no-op for the normal launch/attach path, where
-// awaitingWelcome is never set.
+// onSessionState reconciles the shared lifecycle only for a connection that
+// joined an existing session. Keeping later states authoritative closes an
+// admission race without disturbing the launch/attach configuration handshake.
 func (h *Handler) onSessionState(evt protocol.Event) {
 	var p protocol.SessionStatePayload
 	if err := protocol.DecodeEventPayload(evt, &p); err != nil {
@@ -62,11 +59,13 @@ func (h *Handler) onSessionState(evt protocol.Event) {
 	}
 
 	h.mu.Lock()
-	if !h.awaitingWelcome {
+	if !h.joining {
 		h.mu.Unlock()
 		return
 	}
 	h.awaitingWelcome = false
+	previousState := h.joinedState
+	h.joinedState = p.State
 	tid := h.curThreadID
 	if tid == 0 {
 		// No stop event has been seen yet on a freshly-joined suspended session,
@@ -77,11 +76,21 @@ func (h *Handler) onSessionState(evt protocol.Event) {
 	}
 	switch p.State {
 	case protocol.StateSuspended:
+		if previousState == protocol.StateSuspended || h.terminated {
+			h.mu.Unlock()
+			return
+		}
+		h.resetVarsLocked()
 		h.suspended = true
 		h.mu.Unlock()
 		h.sendStopped("pause", tid)
 	case protocol.StateExited:
 		h.suspended = false
+		if previousState == protocol.StateExited || h.terminated {
+			h.mu.Unlock()
+			return
+		}
+		h.terminated = true
 		h.mu.Unlock()
 		h.send(&godap.TerminatedEvent{Event: h.event("terminated")})
 	default:
@@ -124,6 +133,9 @@ func (h *Handler) onStop(evt protocol.Event) {
 	restarting := h.restarting
 	stopOnEntry := h.stopOnEntry
 	h.curThreadID = tid
+	if h.joining {
+		h.joinedState = protocol.StateSuspended
+	}
 
 	// The first stop after Launch/Attach is the entry stop: fire `initialized`
 	// (breakpoints can now resolve against the loaded image) but withhold the
@@ -162,6 +174,9 @@ func (h *Handler) onStop(evt protocol.Event) {
 func (h *Handler) onContinued() {
 	h.mu.Lock()
 	tid := h.curThreadID
+	if h.joining {
+		h.joinedState = protocol.StateRunning
+	}
 	if h.pendingContinues > 0 {
 		// Our own resume — suppress; DAP already implied continuation via the
 		// continue/step response.
@@ -187,10 +202,17 @@ func (h *Handler) onProcessExited(evt protocol.Event) {
 
 	h.mu.Lock()
 	h.suspended = false
+	if h.joining {
+		h.joinedState = protocol.StateExited
+	}
+	sendTerminated := !h.terminated
+	h.terminated = true
 	h.mu.Unlock()
 
 	h.send(&godap.ExitedEvent{Event: h.event("exited"), Body: godap.ExitedEventBody{ExitCode: p.ExitCode}})
-	h.send(&godap.TerminatedEvent{Event: h.event("terminated")})
+	if sendTerminated {
+		h.send(&godap.TerminatedEvent{Event: h.event("terminated")})
+	}
 }
 
 func (h *Handler) onOutput(evt protocol.Event) {

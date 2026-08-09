@@ -85,6 +85,10 @@ type Hub struct {
 	outboundMu sync.Mutex
 	seq        uint64
 
+	// Tests use this to hold the otherwise-unobservable event/state boundary
+	// while outboundMu is locked; production leaves it nil.
+	eventTransitionHook func(protocol.EventKind, protocol.SessionState)
+
 	// shutdownOnce: Kill and registry teardown must happen exactly once,
 	// even when ctx.Done() and last-client-disconnect race.
 	shutdownOnce sync.Once
@@ -271,13 +275,13 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 		h.drainResumeCh()
 	}
 
-	h.broadcast(evt)
-
 	switch evt.Kind {
 	case protocol.EventBreakpointHit, protocol.EventPanic, protocol.EventStepped, protocol.EventPaused:
-		h.transitionState(protocol.StateSuspended)
+		h.broadcastWithStateTransition(evt, protocol.StateSuspended)
 	case protocol.EventProcessExited:
-		h.transitionState(protocol.StateExited)
+		h.broadcastWithStateTransition(evt, protocol.StateExited)
+	default:
+		h.broadcast(evt)
 	}
 
 	if !suspending {
@@ -309,11 +313,11 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 				}
 				return
 			}
-			h.broadcast(nextEvt)
 			if nextEvt.Kind == protocol.EventProcessExited {
-				h.transitionState(protocol.StateExited)
+				h.broadcastWithStateTransition(nextEvt, protocol.StateExited)
 				return
 			}
+			h.broadcast(nextEvt)
 
 		case cmd := <-h.resumeCh:
 			h.log.Info("resuming", "command", cmd.Kind)
@@ -610,28 +614,50 @@ func (h *Hub) drainResumeCh() {
 	}
 }
 
-// transitionState updates state and, for managed sessions, broadcasts.
+// transitionState updates state and, for managed sessions, broadcasts while
+// serializing the write with client admission.
 func (h *Hub) transitionState(newState protocol.SessionState) {
+	h.outboundMu.Lock()
+	old, changed := h.transitionStateLocked(newState)
+	h.outboundMu.Unlock()
+
+	if changed {
+		h.log.Info("state transition", "from", old, "to", newState)
+	}
+}
+
+// broadcastWithStateTransition prevents a join from landing after a lifecycle
+// event's fan-out but before its state becomes authoritative. The debugger
+// event stays first on the wire, followed by EventSessionState.
+func (h *Hub) broadcastWithStateTransition(evt protocol.Event, newState protocol.SessionState) {
+	h.outboundMu.Lock()
+	h.broadcastLocked(evt)
+	if h.eventTransitionHook != nil {
+		h.eventTransitionHook(evt.Kind, newState)
+	}
+	old, changed := h.transitionStateLocked(newState)
+	h.outboundMu.Unlock()
+
+	if changed {
+		h.log.Info("state transition", "from", old, "to", newState)
+	}
+}
+
+// transitionStateLocked requires outboundMu.
+func (h *Hub) transitionStateLocked(newState protocol.SessionState) (protocol.SessionState, bool) {
 	h.stateMu.Lock()
 	old := h.state
 	if old == newState {
 		h.stateMu.Unlock()
-		return
+		return old, false
 	}
 	h.state = newState
 	h.stateMu.Unlock()
 
-	h.log.Info("state transition", "from", old, "to", newState)
-
 	if h.sessionID != "" {
-		h.broadcastSessionState()
+		h.broadcastSessionStateLocked()
 	}
-}
-
-func (h *Hub) broadcastSessionState() {
-	h.outboundMu.Lock()
-	defer h.outboundMu.Unlock()
-	h.broadcastSessionStateLocked()
+	return old, true
 }
 
 func (h *Hub) broadcastSessionStateLocked() {

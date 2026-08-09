@@ -268,6 +268,17 @@ func recvType[T godap.Message](hh *harness) T {
 	return zero
 }
 
+func expectNoDAPMessage(t *testing.T, hh *harness) {
+	t.Helper()
+	_ = hh.client.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	defer func() { _ = hh.client.SetReadDeadline(time.Time{}) }()
+	if _, err := hh.reader.Peek(1); err == nil {
+		t.Fatal("unexpected DAP message")
+	} else if nerr, ok := err.(net.Error); !ok || !nerr.Timeout() {
+		t.Fatalf("peek for unexpected DAP message: %v", err)
+	}
+}
+
 // inject delivers a bingo event to the handler as the hub write pump would.
 func (hh *harness) inject(kind protocol.EventKind, payload any) {
 	hh.t.Helper()
@@ -307,6 +318,16 @@ func (hh *harness) doHandshake(t *testing.T) {
 	hh.cmds.waitForCommand(t, protocol.CmdContinue)
 	// Suppress our own continue.
 	hh.inject(protocol.EventContinued, protocol.ContinuedPayload{})
+}
+
+func startJoinWithoutWelcome(t *testing.T) *harness {
+	t.Helper()
+	hh := newHarness(t)
+	hh.sendReq("initialize", initArgs())
+	_ = recvType[*godap.InitializeResponse](hh)
+	hh.sendReq("attach", &godap.AttachRequest{Arguments: json.RawMessage(`{"session":"sess-test"}`)})
+	_ = recvType[*godap.InitializedEvent](hh)
+	return hh
 }
 
 func TestLaunchAnnouncesManagedSessionAfterClientAttach(t *testing.T) {
@@ -857,4 +878,191 @@ func TestJoinExistingSuspendedSession(t *testing.T) {
 	hh.sendReq("continue", &godap.ContinueRequest{})
 	_ = recvType[*godap.ContinueResponse](hh)
 	hh.cmds.waitForCommand(t, protocol.CmdContinue)
+}
+
+func TestJoinReconcilesRunningThenSuspended(t *testing.T) {
+	hh := startJoinWithoutWelcome(t)
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateRunning})
+	expectNoDAPMessage(t, hh)
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateSuspended})
+	stopped := recvType[*godap.StoppedEvent](hh)
+	if stopped.Body.Reason != "pause" {
+		t.Fatalf("stopped reason = %q, want pause", stopped.Body.Reason)
+	}
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateSuspended})
+	expectNoDAPMessage(t, hh)
+}
+
+func TestJoinReconcilesDuplicateSuspendedStateOnce(t *testing.T) {
+	hh := startJoinWithoutWelcome(t)
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateSuspended})
+	_ = recvType[*godap.StoppedEvent](hh)
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateSuspended})
+	expectNoDAPMessage(t, hh)
+}
+
+func TestJoinReconcilesRunningThenExited(t *testing.T) {
+	hh := startJoinWithoutWelcome(t)
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateRunning})
+	expectNoDAPMessage(t, hh)
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateExited})
+	_ = recvType[*godap.TerminatedEvent](hh)
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateExited})
+	expectNoDAPMessage(t, hh)
+}
+
+func TestJoinStateDoesNotDuplicateDebuggerStops(t *testing.T) {
+	cases := []struct {
+		name    string
+		kind    protocol.EventKind
+		payload any
+		reason  string
+	}{
+		{
+			name:    "breakpoint",
+			kind:    protocol.EventBreakpointHit,
+			payload: protocol.BreakpointHitPayload{Goroutine: protocol.Goroutine{ID: 7}},
+			reason:  "breakpoint",
+		},
+		{
+			name:    "step",
+			kind:    protocol.EventStepped,
+			payload: protocol.SteppedPayload{Goroutine: protocol.Goroutine{ID: 8}},
+			reason:  "step",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hh := startJoinWithoutWelcome(t)
+			hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateRunning})
+			expectNoDAPMessage(t, hh)
+
+			hh.inject(tc.kind, tc.payload)
+			stopped := recvType[*godap.StoppedEvent](hh)
+			if stopped.Body.Reason != tc.reason {
+				t.Fatalf("stopped reason = %q, want %s", stopped.Body.Reason, tc.reason)
+			}
+
+			hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateSuspended})
+			expectNoDAPMessage(t, hh)
+		})
+	}
+}
+
+func TestJoinStateDoesNotRestopAfterOptimisticResume(t *testing.T) {
+	cases := []struct {
+		name        string
+		commandKind protocol.CommandKind
+		send        func(*harness)
+	}{
+		{
+			name:        "continue",
+			commandKind: protocol.CmdContinue,
+			send: func(hh *harness) {
+				hh.sendReq("continue", &godap.ContinueRequest{})
+				_ = recvType[*godap.ContinueResponse](hh)
+			},
+		},
+		{
+			name:        "step",
+			commandKind: protocol.CmdStepOver,
+			send: func(hh *harness) {
+				hh.sendReq("next", &godap.NextRequest{Arguments: godap.NextArguments{ThreadId: 4}})
+				_ = recvType[*godap.NextResponse](hh)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hh := startJoinWithoutWelcome(t)
+			hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateRunning})
+			expectNoDAPMessage(t, hh)
+
+			hh.inject(protocol.EventBreakpointHit,
+				protocol.BreakpointHitPayload{Goroutine: protocol.Goroutine{ID: 4}})
+			_ = recvType[*godap.StoppedEvent](hh)
+
+			tc.send(hh)
+			hh.cmds.waitForCommand(t, tc.commandKind)
+
+			// The state frame paired with the stop can arrive after the client
+			// has already requested a resume. It confirms the stop already
+			// observed; it must not pause the adapter again.
+			hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateSuspended})
+			expectNoDAPMessage(t, hh)
+		})
+	}
+}
+
+func TestJoinStateDoesNotDuplicateProcessExit(t *testing.T) {
+	hh := startJoinWithoutWelcome(t)
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateRunning})
+	expectNoDAPMessage(t, hh)
+
+	hh.inject(protocol.EventProcessExited, protocol.ProcessExitedPayload{ExitCode: 17})
+	exited := recvType[*godap.ExitedEvent](hh)
+	if exited.Body.ExitCode != 17 {
+		t.Fatalf("exit code = %d, want 17", exited.Body.ExitCode)
+	}
+	_ = recvType[*godap.TerminatedEvent](hh)
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateExited})
+	expectNoDAPMessage(t, hh)
+}
+
+func TestJoinRunningAndIdleStatesClearSuspensionSilently(t *testing.T) {
+	for _, state := range []protocol.SessionState{protocol.StateRunning, protocol.StateIdle} {
+		t.Run(string(state), func(t *testing.T) {
+			hh := startJoinWithoutWelcome(t)
+			hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateSuspended})
+			_ = recvType[*godap.StoppedEvent](hh)
+
+			hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: state})
+			expectNoDAPMessage(t, hh)
+
+			hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateSuspended})
+			_ = recvType[*godap.StoppedEvent](hh)
+		})
+	}
+}
+
+func TestLaunchSessionStateDoesNotBypassConfigurationDone(t *testing.T) {
+	hh := newHarness(t)
+	hh.sendReq("initialize", initArgs())
+	_ = recvType[*godap.InitializeResponse](hh)
+
+	launchSeq := hh.sendReq("launch", &godap.LaunchRequest{
+		Arguments: json.RawMessage(`{"program":"/bin/x","stopOnEntry":true}`),
+	})
+	hh.cmds.waitForCommand(t, protocol.CmdLaunch)
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateRunning})
+	hh.inject(protocol.EventStepped, protocol.SteppedPayload{Goroutine: protocol.Goroutine{ID: 9}})
+	_ = recvType[*godap.InitializedEvent](hh)
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateSuspended})
+	expectNoDAPMessage(t, hh)
+
+	hh.sendReq("configurationDone", &godap.ConfigurationDoneRequest{})
+	_ = recvType[*godap.ConfigurationDoneResponse](hh)
+	launch := recvType[*godap.LaunchResponse](hh)
+	if launch.RequestSeq != launchSeq {
+		t.Fatalf("launch response seq = %d, want %d", launch.RequestSeq, launchSeq)
+	}
+	stopped := recvType[*godap.StoppedEvent](hh)
+	if stopped.Body.Reason != "entry" {
+		t.Fatalf("stopped reason = %q, want entry", stopped.Body.Reason)
+	}
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateSuspended})
+	expectNoDAPMessage(t, hh)
 }

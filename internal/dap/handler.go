@@ -74,6 +74,7 @@ type Handler struct {
 	launching   bool
 	restarting  bool
 	suspended   bool
+	terminated  bool
 	stopOnEntry bool
 	attached    bool
 
@@ -81,11 +82,14 @@ type Handler struct {
 	// attach with a `session` argument and no pid) rather than launching or
 	// attaching to a debuggee. A joiner never enqueues Launch/Attach and never
 	// auto-continues at configurationDone — it must not disturb the run state of
-	// a session other clients are already driving. awaitingWelcome is set until
-	// the hub's welcome EventSessionState is consumed to reflect the session's
-	// current state (a `stopped` if already suspended).
+	// a session other clients are already driving. awaitingWelcome tracks
+	// whether the initial state has arrived; later state frames still reconcile
+	// lifecycle gaps for joiners. joinedState tracks hub-observed lifecycle
+	// separately from suspended, which requests clear optimistically before the
+	// hub confirms a resume.
 	joining         bool
 	awaitingWelcome bool
+	joinedState     protocol.SessionState
 
 	startReqSeq   int
 	startCmd      string

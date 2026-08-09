@@ -708,8 +708,21 @@ Managed `AddClient` takes that same lock across registry admission and a
 client count without a phantom gap, and the join state is the new client's
 first frame. Do not unicast an allocated sequence, reuse `seq` without
 incrementing it, or route join state through `Run` (which may be blocked in the
-suspended wait). `shutdown` also takes `outboundMu` before registry teardown so
-admission plus its initial state enqueue cannot interleave with closure.
+suspended wait).
+
+Lifecycle events and their state transitions are one outbound critical section:
+`BreakpointHit`/`Panic`/`Stepped`/`Paused` is broadcast, state becomes
+`suspended`, then `EventSessionState` is broadcast; `ProcessExited` follows the
+same event → `exited` → state-event order, including when it arrives inside the
+suspended wait loop. `AddClient` cannot enter between those operations. A
+joiner is therefore either admitted before the lifecycle event and receives it,
+or admitted after the transition and receives the new state in its welcome —
+never a stale welcome after missing the event. The locked helpers exist to
+avoid re-entering `outboundMu`; do not split this pair back into separate
+`broadcast` and `transitionState` calls.
+
+`shutdown` also takes `outboundMu` before registry teardown so admission plus
+its initial state enqueue cannot interleave with closure.
 
 ## Restart — hub-level, not engine-level
 
@@ -1075,12 +1088,17 @@ session.
   `awaitingWelcome=true` to translate it.
 - `initialized` fires immediately (the target image is already loaded, so
   breakpoints resolve right away — there is no entry stop to wait for).
-- `onSessionState` (`events.go`) consumes that welcome **once** (gated on
-  `awaitingWelcome`): `suspended`→`suspended=true` + `stopped reason=pause` (tid
-  defaults to 1 — the engine inspects the currently-stopped goroutine regardless
-  of the DAP threadId); `exited`→`terminated`; idle/running→nothing. For the
-  normal launch/attach path `awaitingWelcome` is never set, so it is a no-op
-  there (the entry stop drives the initial state instead).
+- `onSessionState` (`events.go`) keeps reconciling state for the lifetime of a
+  **joined** connection, not just its welcome. `suspended` emits
+  `stopped reason=pause` only on a running→suspended adapter transition (tid
+  defaults to 1 before any real stop); `exited` emits `terminated` once; idle
+  and running clear the adapter's suspended flag without fabricating
+  `continued`. A real `BreakpointHit`/`Stepped`/`Paused`/`Panic` sets
+  `joinedState=suspended` before the following state frame, so reconciliation
+  does not duplicate its `stopped` even if a zero-latency client has already
+  sent Continue/Step and optimistically cleared the separate `suspended` flag.
+  Normal launch/attach connections have `joining=false`, so their
+  entry/configurationDone handshake remains the sole initial-state path.
 - `onConfigurationDone`'s `joining` branch responds to the attach but does NOT
   `pendingContinues++`, resume, or fabricate an entry stop.
 
@@ -1092,11 +1110,11 @@ reason=step; `EventBreakpointHit`→`stopped` reason=breakpoint;
 `EventProcessExited`→`exited`(code)+`terminated`; `EventOutput`→`output`;
 `EventRestarted`→delayed `restart` response; `EventEvaluate`→`evaluate` response
 (correlated via `evalQ`, NOT a stop — see below); `EventSessionState`→ignored on
-the launch/attach path, but consumed **once** as the initial state on the join
-path (see *Joining an existing session*); `EventGoroutineSnapshot`→**deliberately
-ignored** (WebSocket-only concurrency stream with no DAP equivalent; translating
-it would corrupt the `threads`→`EventGoroutines` FIFO — see the goroutine
-snapshot section).
+the launch/attach path, but continuously reconciled on the join path (see
+*Joining an existing session*); `EventGoroutineSnapshot`→**deliberately ignored**
+(WebSocket-only concurrency stream with no DAP equivalent; translating it would
+corrupt the `threads`→`EventGoroutines` FIFO — see the goroutine snapshot
+section).
 
 `EventContinued` → DAP `continued` **only for out-of-band resumes**. The Handler
 increments `pendingContinues` before enqueuing its OWN continue and decrements it

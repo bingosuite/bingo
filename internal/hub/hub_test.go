@@ -241,6 +241,28 @@ func closeFakeWS(conn *fakeWSConn) {
 	ExpectWithOffset(1, conn.Close()).To(Succeed())
 }
 
+func newRunningManagedHub() (*hub.Hub, *fakeDebugger, *fakeWSConn, context.CancelFunc) {
+	fd := newFakeDebugger()
+	managed := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
+	cancel := runHub(managed)
+	conn := newFakeWSConn()
+	mustAddClient(managed, conn)
+
+	welcome, ok := recvEvent(conn)
+	ExpectWithOffset(1, ok).To(BeTrue())
+	ExpectWithOffset(1, welcome.Kind).To(Equal(protocol.EventSessionState))
+
+	conn.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: "race"}))
+	running, ok := recvEvent(conn)
+	ExpectWithOffset(1, ok).To(BeTrue())
+	ExpectWithOffset(1, running.Kind).To(Equal(protocol.EventSessionState))
+	var state protocol.SessionStatePayload
+	ExpectWithOffset(1, protocol.DecodeEventPayload(running, &state)).To(Succeed())
+	ExpectWithOffset(1, state.State).To(Equal(protocol.StateRunning))
+
+	return managed, fd, conn, cancel
+}
+
 var _ = Describe("Hub", func() {
 
 	var (
@@ -577,6 +599,219 @@ var _ = Describe("Hub", func() {
 			Expect(protocol.DecodeEventPayload(joiningState, &payload)).To(Succeed())
 			Expect(payload.State).To(Equal(protocol.StateSuspended))
 			Expect(payload.Clients).To(Equal(2))
+		})
+
+		It("holds admission across lifecycle event and state transition", func() {
+			cases := []struct {
+				name        string
+				kind        protocol.EventKind
+				payload     any
+				targetState protocol.SessionState
+			}{
+				{
+					name:        "suspend",
+					kind:        protocol.EventBreakpointHit,
+					payload:     protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}},
+					targetState: protocol.StateSuspended,
+				},
+				{
+					name:        "exit",
+					kind:        protocol.EventProcessExited,
+					payload:     protocol.ProcessExitedPayload{ExitCode: 12},
+					targetState: protocol.StateExited,
+				},
+			}
+
+			for _, tc := range cases {
+				By(tc.name)
+				managed, managedFD, existing, cancelManaged := newRunningManagedHub()
+				reached := make(chan struct{}, 1)
+				release := make(chan struct{})
+				var releaseOnce sync.Once
+				releaseTransition := func() {
+					releaseOnce.Do(func() { close(release) })
+				}
+				defer func() {
+					releaseTransition()
+					cancelManaged()
+					Eventually(managed.Done(), "500ms", "10ms").Should(BeClosed())
+				}()
+
+				managed.ExportedSetEventTransitionHook(func(kind protocol.EventKind, state protocol.SessionState) {
+					if kind != tc.kind || state != tc.targetState {
+						return
+					}
+					reached <- struct{}{}
+					<-release
+				})
+
+				managedFD.push(protocol.MustEvent(tc.kind, 1, tc.payload))
+				Eventually(reached, "500ms", "10ms").Should(Receive())
+
+				event, ok := recvEvent(existing)
+				Expect(ok).To(BeTrue())
+				Expect(event.Kind).To(Equal(tc.kind))
+
+				joining := newFakeWSConn()
+				joinStarted := make(chan struct{})
+				joinResult := make(chan error, 1)
+				go func() {
+					close(joinStarted)
+					_, err := managed.AddClient(joining, nil)
+					joinResult <- err
+				}()
+				<-joinStarted
+				Consistently(joinResult, "100ms", "10ms").ShouldNot(Receive(),
+					"admission completed inside the event/state critical section")
+
+				releaseTransition()
+				Eventually(joinResult, "500ms", "10ms").Should(Receive(BeNil()))
+
+				stateEvent, ok := recvEvent(existing)
+				Expect(ok).To(BeTrue())
+				Expect(stateEvent.Kind).To(Equal(protocol.EventSessionState))
+				Expect(stateEvent.Seq).To(Equal(event.Seq + 1))
+				var state protocol.SessionStatePayload
+				Expect(protocol.DecodeEventPayload(stateEvent, &state)).To(Succeed())
+				Expect(state.State).To(Equal(tc.targetState))
+
+				welcome, ok := recvEvent(joining)
+				Expect(ok).To(BeTrue())
+				Expect(welcome.Kind).To(Equal(protocol.EventSessionState))
+				Expect(protocol.DecodeEventPayload(welcome, &state)).To(Succeed())
+				Expect(state.State).To(Equal(tc.targetState))
+			}
+		})
+
+		It("holds admission across ProcessExited while waiting for a resume", func() {
+			managed, managedFD, existing, cancelManaged := newRunningManagedHub()
+			defer func() {
+				cancelManaged()
+				Eventually(managed.Done(), "500ms", "10ms").Should(BeClosed())
+			}()
+
+			managedFD.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+			stop, ok := recvEvent(existing)
+			Expect(ok).To(BeTrue())
+			Expect(stop.Kind).To(Equal(protocol.EventBreakpointHit))
+			suspended, ok := recvEvent(existing)
+			Expect(ok).To(BeTrue())
+			Expect(suspended.Kind).To(Equal(protocol.EventSessionState))
+
+			reached := make(chan struct{}, 1)
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			releaseTransition := func() {
+				releaseOnce.Do(func() { close(release) })
+			}
+			defer releaseTransition()
+			managed.ExportedSetEventTransitionHook(func(kind protocol.EventKind, state protocol.SessionState) {
+				if kind != protocol.EventProcessExited || state != protocol.StateExited {
+					return
+				}
+				reached <- struct{}{}
+				<-release
+			})
+
+			managedFD.push(protocol.MustEvent(protocol.EventProcessExited, 2,
+				protocol.ProcessExitedPayload{ExitCode: 23}))
+			Eventually(reached, "500ms", "10ms").Should(Receive())
+
+			exited, ok := recvEvent(existing)
+			Expect(ok).To(BeTrue())
+			Expect(exited.Kind).To(Equal(protocol.EventProcessExited))
+
+			joining := newFakeWSConn()
+			joinStarted := make(chan struct{})
+			joinResult := make(chan error, 1)
+			go func() {
+				close(joinStarted)
+				_, err := managed.AddClient(joining, nil)
+				joinResult <- err
+			}()
+			<-joinStarted
+			Consistently(joinResult, "100ms", "10ms").ShouldNot(Receive())
+
+			releaseTransition()
+			Eventually(joinResult, "500ms", "10ms").Should(Receive(BeNil()))
+
+			stateEvent, ok := recvEvent(existing)
+			Expect(ok).To(BeTrue())
+			Expect(stateEvent.Kind).To(Equal(protocol.EventSessionState))
+			Expect(stateEvent.Seq).To(Equal(exited.Seq + 1))
+			var state protocol.SessionStatePayload
+			Expect(protocol.DecodeEventPayload(stateEvent, &state)).To(Succeed())
+			Expect(state.State).To(Equal(protocol.StateExited))
+
+			welcome, ok := recvEvent(joining)
+			Expect(ok).To(BeTrue())
+			Expect(welcome.Kind).To(Equal(protocol.EventSessionState))
+			Expect(protocol.DecodeEventPayload(welcome, &state)).To(Succeed())
+			Expect(state.State).To(Equal(protocol.StateExited))
+		})
+
+		It("never exposes a stale running welcome without the lifecycle event under racing admission", func() {
+			const iterations = 100
+
+			for i := 0; i < iterations; i++ {
+				managed, managedFD, _, cancelManaged := newRunningManagedHub()
+				joining := newFakeWSConn()
+				joinResult := make(chan error, 1)
+				start := make(chan struct{})
+
+				kind := protocol.EventBreakpointHit
+				payload := any(protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}})
+				targetState := protocol.StateSuspended
+				if i%2 == 1 {
+					kind = protocol.EventProcessExited
+					payload = protocol.ProcessExitedPayload{ExitCode: i}
+					targetState = protocol.StateExited
+				}
+
+				go func() {
+					<-start
+					_, err := managed.AddClient(joining, nil)
+					joinResult <- err
+				}()
+				go func() {
+					<-start
+					managedFD.push(protocol.MustEvent(kind, 1, payload))
+				}()
+				close(start)
+
+				Eventually(joinResult, "500ms", "10ms").Should(Receive(BeNil()))
+
+				sawRunning := false
+				sawLifecycle := false
+				sawTarget := false
+				for attempts := 0; attempts < 3 && !sawTarget; attempts++ {
+					evt, ok := recvEvent(joining)
+					Expect(ok).To(BeTrue(), "iteration %d ended before %s", i, targetState)
+					switch evt.Kind {
+					case kind:
+						sawLifecycle = true
+					case protocol.EventSessionState:
+						var state protocol.SessionStatePayload
+						Expect(protocol.DecodeEventPayload(evt, &state)).To(Succeed())
+						switch state.State {
+						case protocol.StateRunning:
+							sawRunning = true
+						case targetState:
+							sawTarget = true
+						}
+					}
+				}
+
+				Expect(sawTarget).To(BeTrue(), "iteration %d never observed %s", i, targetState)
+				if sawRunning {
+					Expect(sawLifecycle).To(BeTrue(),
+						"iteration %d received stale running state without %s", i, kind)
+				}
+
+				cancelManaged()
+				Eventually(managed.Done(), "500ms", "10ms").Should(BeClosed())
+			}
 		})
 
 		It("assigns strictly increasing hub-managed seq to all outbound events", func() {
