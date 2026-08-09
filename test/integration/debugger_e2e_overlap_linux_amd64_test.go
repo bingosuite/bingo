@@ -1,64 +1,54 @@
 //go:build e2e && linux && amd64
 
-// TEMPORARY PROOF SPEC — do not merge.
+// Regression spec for #198: a sibling thread's software-breakpoint stop must not
+// be allowed to land in the middle of another thread's step-over.
 //
-// Question: on linux/amd64, can a SIBLING thread's software-breakpoint stop,
-// delivered by Wait4(-1, WALL) while the engine is mid-step-over of ANOTHER
-// thread's breakpoint, corrupt the engine's one-slot step-over state and orphan
-// the breakpoint being stepped over?
+// Linux ptrace stops are PER-THREAD and bingo does not stop the world, so
+// sibling threads keep running while the engine is suspended and can be sitting
+// in their own unreaped INT3 stops. engine.resumeFromBreakpoint then begins a
+// step-over that is only safe if it completes atomically:
 //
-// Mechanism under test (internal/debugger @ 0509b53):
+//	bp := e.lastBP; e.lastBP = nil
+//	e.steppingOverBP = bp          <- ONE SLOT
+//	e.bps.removeFromTable(bp)      <- the entry leaves byID/byAddr
+//	WriteMemory(bp.addr, original) <- the INT3 is DISARMED in tracee memory
+//	SingleStep(tid)                <- only the resulting StopSingleStep rearms it
 //
-//	engine.resumeFromBreakpoint (engine.go:1031) begins the step-over of BP-A:
-//	    bp := e.lastBP; e.lastBP = nil
-//	    e.steppingOverBP = bp          <- ONE SLOT
-//	    e.bps.removeFromTable(bp)      <- A leaves byID/byAddr
-//	    WriteMemory(bp.addr, original) <- A's INT3 is DISARMED in tracee memory
-//	    SingleStep(tidA)               <- backend: stepping=true, stepTID=tidA
+// Before the fix, a process-wide Wait4(-1, WALL) could CONSUME a sibling's
+// already-pending INT3 status inside that window. handleStop's StopBreakpoint
+// branch then overwrote lastBP/lastBPTID while steppingOverBP still held the
+// half-stepped entry, and the next Continue overwrote that last reference: the
+// breakpoint was disarmed, absent from the table, and could never fire or be
+// cleared again. When the sibling had parked on the SAME address being stepped,
+// the table lookup missed, the "spurious SIGTRAP" path skipped
+// rewindToBreakpoint, and the thread was resumed one byte into the restored
+// multi-byte instruction.
 //
-//	Only handleStop's StopSingleStep branch (engine.go:638-727) ever reinstalls
-//	steppingOverBP. But linux ptrace stops are PER-THREAD and bingo does not stop
-//	the world, so sibling threads keep running while the engine is "suspended"
-//	and can be sitting in their own unreaped INT3 stops. The next
-//	Wait4(-1, WALL) may therefore return a sibling's StopBreakpoint BEFORE A's
-//	single-step trap; backend_linux_amd64.go:523 correctly classifies it as a
-//	breakpoint (tid != stepTID).
+// WHAT THIS SPEC ASSERTS
 //
-//	handleStop's StopBreakpoint branch (engine.go:589-636) has NO
-//	`steppingOverBP != nil` guard. It unconditionally overwrites lastBP/lastBPTID
-//	and emits BreakpointHit, leaving steppingOverBP == bpA. BP-A is now disarmed
-//	in memory AND absent from the table, reachable only via steppingOverBP —
-//	which the very next Continue (resumeFromBreakpoint for the sibling)
-//	overwrites, losing BP-A permanently.
+// After every stop, BOTH breakpoints must still be installed. The probe
+// re-issues SetBreakpoint: breakpointTable.set consults byAddr BEFORE it reads
+// or writes tracee memory, so success means the entry is gone — it cannot be an
+// artifact of the probe itself. A detection is corroborated read-only by
+// ClearBreakpoint on the ORIGINAL id (clear consults byID before any write).
 //
-// DETECTOR (no production hooks): after every stop, re-issue SetBreakpoint on
-// BOTH marker lines. breakpointTable.set returns errBreakpointExists iff the
-// address is still in byAddr.
+// NON-VACUITY. The spec parks one pinned thread on MARK_A and N pinned siblings
+// on MARK_B (so siblings also cover the same-address case), releases them
+// together so they race to their traps inside one running window, and records
+// how many threads are in ptrace tracing-stop AND parked ON a marker
+// instruction — addresses resolved from the target's own DWARF, matched at addr
+// or addr+1 since an amd64 INT3 stop leaves RIP one byte past the trap. A run
+// in which that never reached two is rejected: it never set up the race and
+// proves nothing. It is asserted once over the whole run rather than per cycle,
+// because a sibling that took an unrelated ptrace event while the engine was
+// suspended is only resumed when the next Backend.Wait absorbs it, so an
+// individual cycle can legitimately start with the siblings not yet re-parked.
 //
-//	error "already installed" => still armed  => healthy
-//	nil error                 => ORPHANED     => bug reproduced
-//
-// The probe undoes itself (ClearBreakpoint) in the orphaned case so the report
-// describes the engine's state, not the probe's.
-//
-// CORROBORATION: the engine's own debug log prints
-// `StopBreakpoint ... steppingOverBP=<bool>`; the spec runs with a debug logger
-// wired to GinkgoWriter, so an overlapping stop is visible as
-// steppingOverBP=true directly in the CI log.
-//
-// NON-VACUITY: (a) after the first stop of each cycle the spec polls
-// /proc/<pid>/task/*/status and requires at least two threads in ptrace
-// tracing-stop, logging every thread's state and stopped PC
-// (/proc/<pid>/task/<tid>/syscall); (b) every cycle must yield exactly one
-// MARK_A hit and exactly `siblings` MARK_B hits, which can only happen if all
-// of those threads genuinely reached their traps.
-//
-// TARGET SEQUENCING (learned empirically, run 31323125619/31323315712): every
-// marker thread must exist and be parked BEFORE the first suspend. A thread that
-// clones while the engine is suspended stops at PTRACE_EVENT_CLONE with no
-// waitLoop to reap it and freezes for the whole suspend, so the target publishes
-// `ready.<pid>` only once every marker thread is up, and the harness releases
-// A and all siblings together while the tracee is running.
+// TARGET SEQUENCING. Every marker thread must exist and be parked BEFORE the
+// first suspend: a thread that clones while the engine is suspended stops at
+// PTRACE_EVENT_CLONE with no waitLoop to reap it and freezes for the whole
+// suspend. The target therefore publishes ready.<pid> only once every marker
+// thread is up.
 //
 // Tuning:
 //
@@ -189,7 +179,7 @@ func main() {
 }
 `
 
-var _ = Describe("Linux amd64 sibling-breakpoint / step-over overlap (PROOF)", Label("linux"), func() {
+var _ = Describe("Linux amd64 sibling-breakpoint / step-over overlap", Label("linux"), func() {
 	It("keeps both breakpoints armed when a sibling breakpoint lands mid-step-over",
 		Label("overlap"), func() {
 			const targetName = "overlap_target"
@@ -330,7 +320,7 @@ var _ = Describe("Linux amd64 sibling-breakpoint / step-over overlap (PROOF)", L
 						clearErr := d.ClearBreakpoint(lostID)
 						states, _ := procThreadStates(pid)
 						Fail(fmt.Sprintf(
-							"BUG REPRODUCED — breakpoint %s silently orphaned (cycle %d, stop %d of %d)\n\n"+
+							"breakpoint %s was silently orphaned by a sibling stop during a step-over (cycle %d, stop %d of %d)\n\n"+
 								"OBSERVED\n"+
 								"  The resume that led to this stop began a step-over of a software\n"+
 								"  breakpoint: engine.resumeFromBreakpoint (internal/debugger/engine.go:1031)\n"+
@@ -413,7 +403,7 @@ var _ = Describe("Linux amd64 sibling-breakpoint / step-over overlap (PROOF)", L
 			AddReportEntry("overlap-at-marker-pc-max", maxAtTrap)
 			AddReportEntry("overlap-ready-cycles", fmt.Sprintf("%d/%d", overlapReady, totalStops))
 			GinkgoWriter.Printf(
-				"OVERLAP PROOF SUMMARY: cycles=%d siblings=%d orphans=%d stopped(max)=%d atMarkerPC(max)=%d overlapReady=%d/%d\n",
+				"overlap summary: cycles=%d siblings=%d orphans=%d stopped(max)=%d atMarkerPC(max)=%d overlapReady=%d/%d\n",
 				iters, siblings, orphanCycles, maxStopped, maxAtTrap, overlapReady, totalStops)
 		})
 })
