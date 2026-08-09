@@ -187,13 +187,20 @@ When multiple clients race resume commands: **first writer wins**, the rest
 are dropped (`resumeCh` has capacity 1; see [hub.go injectCommand](internal/hub/hub.go)).
 
 Rejected resumes: a resuming command only ends the suspend if the debugger
-actually resumes the process. If the resume is **rejected** — e.g. a transient
-backend error while reinstalling a software breakpoint leaves the engine
-`stateSuspended` — the hub broadcasts the `EventError` but **stays in the wait
-loop** (it checks that the session left `suspended` before returning). Bailing
-out on a failed resume would strand the client: the process is still suspended,
-but a retry resume lands in `resumeCh`, which only the wait loop drains, so the
-session could never be resumed again.
+actually resumes the process. If the resume is **rejected synchronously** —
+e.g. the dispatch returns an error and leaves the engine `stateSuspended` — the
+hub broadcasts the `EventError` but **stays in the wait loop** (it checks that
+the session left `suspended` before returning). Bailing out on a failed resume
+would strand the client: the process is still suspended, but a retry resume
+lands in `resumeCh`, which only the wait loop drains, so the session could never
+be resumed again.
+
+Resumes that are **accepted and only fail later** are a different problem, and
+the wait loop cannot catch them: `Continue`/`Step*` off a software breakpoint
+return `nil` as soon as the step-over single-step is armed, so the hub has
+already transitioned to `running` and left the wait loop by the time the
+failure happens on the engine loop. Those asynchronous halts are reported with a
+suspending `EventPaused` — see [step-over flow](#software-breakpoint-step-over-flow).
 
 ### Session state machine
 
@@ -296,6 +303,59 @@ Internal sentinel BP files: `<stepover-next>`, `<stepout-return>`,
 If `bps.reinstall` ever fails after a single-step, **suspend instead of
 resuming**. Running without the trap is a runaway process; reporting the
 error lets the operator intervene.
+
+**Every asynchronous halt in `handleStop` must be reported with a *suspending*
+event, not a bare `EventError`.** These failures happen after the resume that
+led to them already returned `nil` and emitted `EventContinued`, so the hub has
+transitioned to `running` and left its suspend wait loop. `EventError` is not
+suspending, so on its own it leaves the hub believing the tracee runs while it
+is halted — and since `resumeCh` is drained *only* inside that wait loop, every
+later `Continue`/`Step*` sits unread and the session is stranded for good
+(issue #183). The rule at each such site is:
+
+1. emit the detailed `EventError` (it carries the real cause),
+2. ensure `setState(stateSuspended)`,
+3. emit the suspending `EventPaused`.
+
+`haltOnError(cmd, cause, stop)` does all three in the right order — use it
+rather than open-coding the pair. Order matters: `Continued → Error → Paused`.
+`Paused` must be last because the hub drains `resumeCh` *before* broadcasting a
+suspending event, so a legitimate retry sent in response to `Paused`
+necessarily lands after that drain.
+
+`emitHaltedOnError` emits `EventPaused` with a **synthetic** goroutine and a
+pure-DWARF location, and issues **no backend calls at all** — not
+`emitPaused`/`goroutineSnapshot`, and not even a stack walk. The backend on this
+path is by definition already failing, so any read could delay or prevent the
+one event that restores liveness; clients can ask for frames or a snapshot once
+the session is responsive again. `haltOnError` wraps the pair and, because
+`emit` drops events when the buffer is full, gives the last free slot to the
+`Paused` rather than the `Error` — losing the suspend is what strands the
+session, losing the cause merely loses detail.
+
+`EventPaused` is the right kind: `EventStepped` is treated as the entry stop by
+the DAP restart path and can auto-continue, `EventBreakpointHit` would claim a
+trap that may not be installed, and an unsolicited `EventBreakpointCleared`
+would corrupt DAP's id-less FIFO correlation. A failed-reinstall breakpoint
+stays **out** of the table: re-adding it would advertise an armed breakpoint
+that can never fire.
+
+What a halt promises is **control**, not a pristine tracee: the operator regains
+the ability to inspect, retry, or kill. It does not guarantee the tracee's byte
+state is consistent — a write that failed partway can leave an untracked trap,
+and at the `populateBreakpointStop` site the PC was never rewound — so a
+subsequent resume is best-effort and the error text says the breakpoint may no
+longer be armed or tracked. Reconciling tracee state after a partially-applied
+breakpoint write is a separate problem; do not add disabled-breakpoint
+protocol/state here.
+
+The sites are `populateBreakpointStop` failure (`StopBreakpoint`),
+`populateStopPC` failure and `bps.reinstall` failure (`StopSingleStep`), the
+`bpResumeStepOut` return-breakpoint `set` failure (which is also the one site
+that must add the otherwise-missing `setState(stateSuspended)` — it is reached
+with the engine still `stateRunning`), and the in-flight reinstall and manual
+`populateStopPC` failures (`StopSignal`). The `bpResumeSourceStep` fallback is
+already safe: it emits a suspending `EventStepped`.
 
 ## Architecture-specific traps
 
@@ -624,7 +684,12 @@ auto-emitted on exactly the suspends that can change the concurrency picture —
 single-step/step-over path from extra per-step memory reads. `emitBreakpointHit`
 / `emitPaused` build the snapshot **once**, embed its current goroutine in the
 stop event, then stream the same snapshot — one build, no double scan, no double
-delta pass.
+delta pass. The one `EventPaused` that carries **no** snapshot is the internal
+async halt (`emitHaltedOnError`, see [step-over flow](#software-breakpoint-step-over-flow)):
+it is emitted on a backend error path, where a snapshot would push dozens of
+further reads through the backend that just failed. Observers keep their last
+good model; the halt is still reported, and `CmdGoroutineSnapshot` can refresh
+on demand.
 
 **Not a suspending event.** It follows a suspending event (or answers a query)
 and never gates the hub. DAP `translateEvent` **deliberately ignores** it:
@@ -1325,10 +1390,20 @@ side `chan error` — every debugger outcome, failures included, rides the singl
 - `pkg/protocol`: pure wire round-trip tests, no fakes needed.
 - `internal/debugger`: `fakeBackend` in [engine_test.go](internal/debugger/engine_test.go)
   replaces the OS. Tests seed mem/regs, push `StopEvent`s onto `stopCh`, and
-  inspect recorded calls. `export_test.go` exposes a few internals
+  inspect recorded calls. It also supports **fault injection**
+  (`failWriteAt` / `failReadAt` / `failRegisters` / `failThreads`, guarded by
+  `faultMu`) so the asynchronous `handleStop` error paths can be driven
+  deterministically; arm the fault *before* pushing the stop that reaches it.
+  [engine_halt_test.go](internal/debugger/engine_halt_test.go) uses this to pin
+  the suspending-halt invariant at every site, and pairs a **real `Hub` with a
+  real engine** over the fake backend — the hub's own `fakeDebugger` cannot
+  exercise asynchronous stop handling, so that spec lives here rather than in
+  `internal/hub`. `export_test.go` exposes a few internals
   (`ExportedForceSuspended`, `ExportedSetBreakpointAt`, …) so tests can
-  bypass DWARF and the OS process model. Engine tests are tagged-agnostic —
-  they avoid native code paths.
+  bypass DWARF and the OS process model. Note `ExportedForceRunning` only flips
+  the state field — it starts no `waitLoop`, so a stop pushed after it is never
+  consumed; reach `running` through a real `Continue` when a stop must be
+  delivered. Engine tests are tagged-agnostic — they avoid native code paths.
 - `internal/hub`: `fakeDebugger` + `fakeWSConn` in [hub_test.go](internal/hub/hub_test.go).
   The fake conn uses a 256-deep `incoming` buffer so `WriteMessage` never
   blocks the hub event loop.
@@ -1519,6 +1594,11 @@ through the justfile.
 - **Suspend/resume sets**: update both `suspendingEvents` and
   `resumingCommands` in [hub.go](internal/hub/hub.go), and the matching
   hub_test cases.
+- **New `handleStop` error path**: any new place where `handleStop` gives up on
+  a resume must report it with `haltOnError` (detailed `EventError` + suspending
+  `EventPaused`) with the engine in `stateSuspended`. A bare `EventError` is
+  non-suspending and strands the session permanently — see
+  [step-over flow](#software-breakpoint-step-over-flow).
 - **New `EventKind`/`CommandKind`**: if it should reach an IDE, add its
   translation to [internal/dap](internal/dap/) (`translateEvent`/event handlers
   for events, `dispatchRequest` for the reverse). Events with no DAP equivalent

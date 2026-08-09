@@ -858,3 +858,81 @@ func TestJoinExistingSuspendedSession(t *testing.T) {
 	_ = recvType[*godap.ContinueResponse](hh)
 	hh.cmds.waitForCommand(t, protocol.CmdContinue)
 }
+
+// TestAsyncHaltSurfacesAsStoppedPause pins the adapter side of the engine's
+// asynchronous-halt reporting (issue #183). handleStop failures emit a detailed
+// EventError followed by a suspending EventPaused; the error alone carries no
+// correlation for CmdNone, so it is the Paused that must restore the adapter's
+// suspended view and tell the IDE the tracee is halted.
+func TestAsyncHaltSurfacesAsStoppedPause(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	hh.inject(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{Goroutine: protocol.Goroutine{ID: 1}})
+	_ = recvType[*godap.StoppedEvent](hh)
+
+	hh.sendReq("continue", &godap.ContinueRequest{})
+	_ = recvType[*godap.ContinueResponse](hh)
+	hh.cmds.waitForCommand(t, protocol.CmdContinue)
+	hh.inject(protocol.EventContinued, protocol.ContinuedPayload{})
+
+	// The step-over fails asynchronously: no DAP request is outstanding, so the
+	// CmdNone error produces no response of its own.
+	hh.inject(protocol.EventError, protocol.ErrorPayload{
+		Command: protocol.CmdNone,
+		Message: "reinstall breakpoint 0x1000: injected",
+	})
+	hh.inject(protocol.EventPaused, protocol.PausedPayload{Goroutine: protocol.Goroutine{ID: 1}})
+
+	stopped := recvType[*godap.StoppedEvent](hh)
+	if stopped.Body.Reason != "pause" {
+		t.Errorf("reason = %q, want pause", stopped.Body.Reason)
+	}
+
+	// Being suspended again is what makes the session usable: a data request
+	// must now reach the hub instead of being answered with an empty stub.
+	hh.sendReq("stackTrace", &godap.StackTraceRequest{Arguments: godap.StackTraceArguments{ThreadId: 1}})
+	hh.cmds.waitForCommand(t, protocol.CmdFrames)
+}
+
+// TestAsyncHaltDuringRestartIsNotTreatedAsEntry is why the halt is reported as
+// EventPaused rather than EventStepped: onStop's restart branch treats the
+// first Stepped as the relaunched process's entry stop and, without
+// stopOnEntry, auto-continues past it. A halt must never do that — the tracee
+// is stopped precisely because it is not safe to resume.
+func TestAsyncHaltDuringRestartIsNotTreatedAsEntry(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	hh.inject(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{Goroutine: protocol.Goroutine{ID: 1}})
+	_ = recvType[*godap.StoppedEvent](hh)
+
+	hh.sendReq("restart", &godap.RestartRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdRestart)
+	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{})
+	_ = recvType[*godap.RestartResponse](hh)
+
+	hh.inject(protocol.EventError, protocol.ErrorPayload{
+		Command: protocol.CmdNone,
+		Message: "get stop PC for tid 1: injected",
+	})
+	continuesBefore := countKind(hh.cmds.kinds(), protocol.CmdContinue)
+	hh.inject(protocol.EventPaused, protocol.PausedPayload{Goroutine: protocol.Goroutine{ID: 1}})
+
+	stopped := recvType[*godap.StoppedEvent](hh)
+	if stopped.Body.Reason != "pause" {
+		t.Errorf("reason = %q, want pause", stopped.Body.Reason)
+	}
+	if got := countKind(hh.cmds.kinds(), protocol.CmdContinue); got != continuesBefore {
+		t.Fatalf("halt during restart auto-continued the tracee: continues %d -> %d",
+			continuesBefore, got)
+	}
+}
+
+func countKind(kinds []protocol.CommandKind, want protocol.CommandKind) int {
+	n := 0
+	for _, k := range kinds {
+		if k == want {
+			n++
+		}
+	}
+	return n
+}

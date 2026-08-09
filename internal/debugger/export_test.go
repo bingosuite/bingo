@@ -1,7 +1,12 @@
 // Exposes internal symbols to debugger_test. Compiled only during `go test`.
 package debugger
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+
+	"github.com/bingosuite/bingo/pkg/protocol"
+)
 
 func ExportedTrapInstruction() []byte {
 	return archTrapInstruction()
@@ -95,4 +100,32 @@ func ExportedSetBreakpointAtErr(d Debugger, addr uint64) error {
 		_, err := e.bps.set(e.backend, "<direct-addr>", 0, addr)
 		return err
 	})
+}
+
+// ExportedFillEventBuffer emits filler events on the loop until exactly free
+// slots remain in the engine's event buffer, so tests can drive emit() to
+// saturation. Deterministic only while nothing is draining Events().
+func ExportedFillEventBuffer(d Debugger, free int) {
+	e := d.(*engine)
+	if err := e.dispatch(func() error {
+		for cap(e.events)-len(e.events) > free {
+			e.emitOutput("stdout", "filler")
+		}
+		return nil
+	}); err != nil {
+		panic("ExportedFillEventBuffer: " + err.Error())
+	}
+}
+
+// ExportedHaltOnError runs the halt-reporting path on the loop. dispatch only
+// returns once the closure has run, so a test can observe the resulting events
+// without racing the loop.
+func ExportedHaltOnError(d Debugger, msg string) {
+	e := d.(*engine)
+	if err := e.dispatch(func() error {
+		e.haltOnError(protocol.CmdNone, errors.New(msg), StopEvent{TID: 1, PC: 0x1000})
+		return nil
+	}); err != nil {
+		panic("ExportedHaltOnError: " + err.Error())
+	}
 }
