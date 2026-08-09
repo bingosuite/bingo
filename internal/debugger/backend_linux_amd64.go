@@ -93,15 +93,33 @@ type tracerExecer interface {
 }
 
 type linuxBackend struct {
-	pid      int
-	stepping bool // true after SingleStep; classifies the next SIGTRAP
-	stepTID  int  // the exact thread SingleStep was issued against
-	tracer   *tracerThread
+	// stepQueue carries the single-step bookkeeping (stepping/stepTID) and the
+	// queue of stops held back while a step is in flight. Embedded so those
+	// fields read as b.stepping / b.stepTID at every existing use site.
+	stepQueue
+
+	pid    int
+	tracer *tracerThread
 
 	// Wait writes this from a waitLoop while running engine commands may read it
 	// for TID-less memory operations. Atomicity defines that snapshot; it does
 	// not make the selected thread stopped or suppress normal ptrace errors.
 	lastStopTID atomic.Int64
+}
+
+// drainParked returns the next held stop if one may be surfaced now, recording
+// it as the current stop.
+//
+// lastStopTID is updated here, on delivery, and never at park time — from this
+// point the delivered thread is the one the engine acts on, and the one the
+// next TID-less ContinueProcess and memory write will target.
+func (b *linuxBackend) drainParked() (StopEvent, bool) {
+	ev, ok := b.releasable()
+	if !ok {
+		return StopEvent{}, false
+	}
+	b.recordStop(ev.TID)
+	return ev, true
 }
 
 func (b *linuxBackend) execPtrace(fn func()) { b.tracer.execPtrace(fn) }
@@ -262,8 +280,7 @@ func isAlreadyExited(err error) bool {
 }
 
 func (b *linuxBackend) ContinueProcess() error {
-	b.stepping = false
-	b.stepTID = 0
+	b.endStep()
 	tid := b.traceTID()
 	var err error
 	b.execPtrace(func() { err = syscall.PtraceCont(tid, 0) })
@@ -274,8 +291,7 @@ func (b *linuxBackend) ContinueProcess() error {
 }
 
 func (b *linuxBackend) SingleStep(tid int) error {
-	b.stepping = true
-	b.stepTID = tid
+	b.beginStep(tid)
 	var err error
 	b.execPtrace(func() { err = syscall.PtraceSingleStep(tid) })
 	if err != nil {
@@ -417,12 +433,35 @@ func (b *linuxBackend) Threads() ([]int, error) {
 	return tids, nil
 }
 
-// Wait blocks until the tracee produces a meaningful debug stop. Single-step
-// vs breakpoint disambiguation uses b.stepping AND b.stepTID: only a cause==0
-// SIGTRAP on the exact thread we stepped is the step's completion; the same
-// stop on any other thread is that thread hitting a software breakpoint.
-// PTRACE_EVENT stops (clone/exec/exit) are handled internally and don't
-// surface to the engine.
+// Wait blocks until the tracee produces a meaningful debug stop.
+//
+// Single-step vs breakpoint disambiguation uses b.stepping AND b.stepTID: only
+// a cause==0 SIGTRAP on the exact thread we stepped is the step's completion.
+// PTRACE_EVENT stops (clone/exec/exit) are handled internally and don't surface
+// to the engine.
+//
+// While a single-step is in flight, a user-visible stop on ANY OTHER thread is
+// PARKED rather than returned (classifyUserStop), and delivered from a later
+// Wait once no step is outstanding. This preserves the invariant the engine has
+// always been written against but could not previously rely on: the TID of the
+// stop it is handed is b.lastStopTID, which is the thread the next
+// (TID-less) ContinueProcess and the next memory write will target. Returning a
+// sibling's stop mid-step broke that — the engine acted on the sibling while the
+// backend was still pointed at the stepped thread, losing the breakpoint being
+// stepped over (issue #199).
+//
+// This is NOT an atomic stop-the-world step-over. Threads that are not stopped
+// keep running for the duration of the step and may stream past the temporarily
+// disarmed trap without trapping at all; parking only governs stops the kernel
+// actually reported. Parked threads stay ptrace-stopped until their stop is
+// delivered, so a thread can hold at most one entry and the queue is bounded by
+// the live thread count.
+//
+// The queue needs no lock. It is touched only here, and successive Wait calls
+// run on different one-shot waitLoop goroutines that the engine starts with a
+// `go` statement after consuming the previous Wait's result — so each Wait
+// happens-after the previous one, along with the step-state writes the engine
+// makes in between.
 //
 // wait4 runs on the calling (waitLoop) thread, NOT the tracer thread: waiting
 // for a tracee is legal from any thread of the tracer process, and keeping it
@@ -433,11 +472,20 @@ func (b *linuxBackend) Threads() ([]int, error) {
 //nolint:gocognit,gocyclo // The wait loop is one serialized ptrace state machine.
 func (b *linuxBackend) Wait() (StopEvent, error) {
 	for {
+		// A parked stop may only be surfaced once no step is outstanding.
+		// Draining here — before blocking in wait4 — is what makes the parked
+		// thread the current stop as soon as the step that displaced it has
+		// completed and the engine has reinstalled the trap it stepped off.
+		if ev, ok := b.drainParked(); ok {
+			return ev, nil
+		}
+
 		var ws syscall.WaitStatus
 		// WALL includes clone()d threads.
 		tid, err := syscall.Wait4(-1, &ws, syscall.WALL, nil)
 		if err != nil {
 			if isNoChildProcess(err) {
+				b.purge()
 				return StopEvent{Reason: StopExited, TID: b.pid}, nil
 			}
 			return StopEvent{}, fmt.Errorf("wait4: %w", err)
@@ -445,16 +493,20 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 		if ws.Exited() {
 			if tid == b.pid {
+				b.purge()
 				b.recordStop(tid)
 				return StopEvent{Reason: StopExited, TID: tid, ExitCode: ws.ExitStatus()}, nil
 			}
+			b.clearStepIfStepped(tid)
 			continue
 		}
 
 		if ws.Signaled() {
 			if tid != b.pid {
+				b.clearStepIfStepped(tid)
 				continue
 			}
+			b.purge()
 			b.recordStop(tid)
 			return StopEvent{Reason: StopKilled, TID: tid}, nil
 		}
@@ -481,8 +533,12 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 					if err := b.continueIfTraceeExists(tid, 0); err != nil {
 						return StopEvent{}, fmt.Errorf("PTRACE_CONT exiting thread tid %d: %w", tid, err)
 					}
+					b.clearStepIfStepped(tid)
 					continue
 				}
+				// Main thread is about to exit: nothing parked can ever be
+				// delivered, and acting on it would target a dead thread.
+				b.purge()
 				// Main thread is about to exit. PTRACE_O_TRACEEXIT stops it here
 				// BEFORE it dies, and the engine tears down on this StopExited, so
 				// the real status never resurfaces as a later wait4 Exited()/
@@ -517,24 +573,20 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				continue
 
 			case 0:
-				b.recordStop(tid)
-
-				// Only the exact thread we single-stepped produces a
-				// single-step SIGTRAP. A cause==0 SIGTRAP on any OTHER thread
-				// while a step is in flight is that thread hitting a software
-				// breakpoint (INT3), not the step completing — classify it as a
-				// breakpoint so the engine's step-over state machine isn't fed a
-				// bogus StopSingleStep for the wrong thread.
-				if b.stepping && tid == b.stepTID {
-					b.stepping = false
-					b.stepTID = 0
-					return StopEvent{Reason: StopSingleStep, TID: tid}, nil
+				reason, disp := classifyUserStop(true, b.stepping, b.stepTID, tid)
+				if disp == parkStop {
+					// A sibling hit a software breakpoint while another thread
+					// is mid-step. It stays ptrace-stopped where it is; the
+					// engine sees it only once the step has completed and the
+					// trap being stepped over is back in place.
+					b.park(StopEvent{Reason: reason, TID: tid})
+					continue
 				}
-
-				return StopEvent{
-					Reason: StopBreakpoint,
-					TID:    tid,
-				}, nil
+				b.recordStop(tid)
+				if reason == StopSingleStep {
+					b.endStep()
+				}
+				return StopEvent{Reason: reason, TID: tid}, nil
 
 			default:
 				if err := b.continueIfTraceeExists(tid, 0); err != nil {
@@ -583,9 +635,14 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			continue
 		}
 
+		reason, disp := classifyUserStop(false, b.stepping, b.stepTID, tid)
+		if disp == parkStop {
+			b.park(StopEvent{Reason: reason, TID: tid, Signal: int(sig)})
+			continue
+		}
 		b.recordStop(tid)
 		return StopEvent{
-			Reason: StopSignal,
+			Reason: reason,
 			TID:    tid,
 			Signal: int(sig),
 		}, nil
