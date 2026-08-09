@@ -245,6 +245,23 @@ automatic — is delivered exactly once on `Events()`, where a client treats the
 uniformly as telemetry. It must stay out of the correlated set: never route it
 through `sendAndWait`. See issue #187.
 
+Two consequences a caller must handle, both inherent to an id-less broadcast
+protocol rather than to this change:
+
+- **Delivery is best-effort.** The answer rides the shared `Events()` buffer,
+  which `readPump` drops from when the consumer stops draining, and a rejected
+  request answers with `EventError`(`CmdGoroutineSnapshot`) instead of a
+  snapshot. Anything that blocks waiting for a snapshot must handle both — see
+  `cmd/wsmon`'s `-once`, which fails fast on a rejection or a closed stream
+  rather than waiting forever.
+- **The answer is broadcast.** A query is fanned out to every client on the
+  session like any other event, and it carries empty `Created`/`Exited`. An
+  observer that renders "the latest snapshot's deltas" (as `cmd/wsmon`'s
+  lifecycle panel does) therefore blanks that panel until the next automatic
+  stop; an append-only timeline (the VS Code view) is unaffected. Making a query
+  addressable to its requester needs wire-level correlation and is deliberately
+  out of scope here — a candidate for a telemetry 1.3.
+
 `syncMu` serializes synchronous commands, but a timeout does **not** cancel the
 command already sent to the server. The pending queue therefore retains a
 timed-out request as retired reply debt until its matching confirmation or
@@ -706,6 +723,16 @@ consumed the pending deltas — the following automatic snapshot diffed against
 the query, so goroutines created and exited in between appeared in neither
 (issue #187). Do not add a delta-bearing query path back: the wire payload is
 unchanged, and a client that wants deltas must read the automatic stream.
+
+The regression gate is the `concurrency`-labelled `declareBaselineOwnershipSpec`
+E2E, and it is deliberately shaped: a query at an ordinary breakpoint stop sees
+exactly the live set that stop's automatic snapshot already adopted, so adopting
+again would be a no-op and prove nothing. The spec instead **steps over a `go`
+statement** — steps are the one suspend that carries no automatic snapshot — so
+the query observes a goroutine the baseline has never seen, then asserts the
+NEXT automatic snapshot still reports it as created. It fails if the query is
+made lifecycle-tracking or the automatic path non-tracking; the unit tests
+around `snapshotFrom` pin the seam's semantics but cannot catch a rewiring.
 
 **Graceful fallback.** Every read is best-effort. `resolveGoLayout` marks the
 layout invalid if any required `g`/`gobuf`/`stack`/`m` offset is missing, and any
