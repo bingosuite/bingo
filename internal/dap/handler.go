@@ -60,6 +60,10 @@ type Handler struct {
 	writeMu sync.Mutex
 	seq     int
 
+	// flushMu serialises outbox drains so staged commands are handed to the hub
+	// in staging order. Never taken while holding mu.
+	flushMu sync.Mutex
+
 	// mu guards all coordination state below. Never held across a socket
 	// write (release mu, then take writeMu) or a cmdOut enqueue.
 	mu sync.Mutex
@@ -99,15 +103,20 @@ type Handler struct {
 	// Suspend/resume (EventContinued).
 	pendingContinues int
 
-	// Breakpoint bookkeeping. bpByFile maps file -> requested line -> DAP and
-	// debugger identities. The two diverge after Restart: DAP identity remains
-	// stable while the fresh debugger assigns a new internal id.
-	// setQ/clearQ are FIFOs of in-flight confirmations, correlated to the hub's
-	// ordered event stream (valid while the DAP client is the sole breakpoint
-	// driver).
-	bpByFile map[string]map[int]breakpointState
-	setQ     []*bpSlot
-	clearQ   []int
+	// Breakpoint bookkeeping. bpByFile maps file -> line -> that line's
+	// transaction state (see bpLine). setQ/clearQ are FIFOs of in-flight
+	// operations, correlated to the hub's ordered event stream (valid while the
+	// DAP client is the sole breakpoint driver).
+	bpByFile map[string]map[int]*bpLine
+	setQ     []*bpOp
+	clearQ   []*bpOp
+
+	// outbox stages breakpoint commands so they reach the hub in the exact
+	// order their setQ/clearQ slot was reserved. Two goroutines produce them —
+	// the DAP read loop (a new setBreakpoints) and the hub write pump (a
+	// confirmation that advances a line) — and the FIFOs are only meaningful
+	// if the wire order matches the reservation order. See flushCommands.
+	outbox [][]byte
 
 	// Data-request correlation FIFOs, one per bingo confirmation event kind.
 	threadsQ []int
@@ -137,30 +146,67 @@ const varRefBase = 1 << 16
 // (or already holding) its resolved DAP breakpoint.
 type bpSlot struct {
 	req      *bpRequest
-	file     string
 	line     int
+	source   godap.Source
 	resolved bool
 	bp       godap.Breakpoint
 }
 
-type breakpointState struct {
-	dapID      int
-	debuggerID int
+// bpOp is one in-flight debugger command for a single file:line. At most one
+// exists per line at a time, which is what keeps the id-less FIFO correlation
+// unambiguous: the head of setQ/clearQ is the operation the next confirmation
+// belongs to — and which queue it sits in is what makes it a set or a clear.
+type bpOp struct {
+	file string
+	line int
 }
 
-// bpRequest collects the slots of a single setBreakpoints request; its response
-// is sent once every slot is resolved (in request order — see AGENTS.md).
+// bpLine keeps what is INSTALLED in the debugger separate from what the client
+// last asked for, because pipelined setBreakpoints requests make the two
+// legitimately disagree. installedID is a fact — set only by a confirmed
+// SetBreakpoint, dropped only by a confirmed ClearBreakpoint — while desired is
+// the latest-wins intent of the most recent request for the source. A line with
+// the two in agreement is converged; otherwise exactly one op is in flight and
+// every waiter parks here until it completes. dapID is the stable client-facing
+// identity, which deliberately outlives a debugger id change across restart.
+type bpLine struct {
+	dapID       int
+	installedID int
+	loc         protocol.Location
+	desired     bool
+	failure     string
+
+	pending     *bpOp
+	setWaiters  []*bpSlot
+	clearOwners []*bpRequest
+}
+
+// bpRequest collects one setBreakpoints request's outstanding work: a slot per
+// requested line plus openClears, the removals it owns. Its response is sent
+// once BOTH are settled, so a request can never report success while a clear it
+// caused is still in flight (or has failed).
 type bpRequest struct {
-	reqSeq int
-	slots  []*bpSlot
+	reqSeq       int
+	slots        []*bpSlot
+	openClears   int
+	clearFailure string
+	responded    bool
 }
 
-func (r *bpRequest) done() bool {
+// ready reports whether the request may be answered now, claiming the right to
+// answer it. Slots and clear obligations settle on different goroutines and can
+// complete in either order, so the claim is what guarantees exactly one
+// response per request. Caller MUST hold h.mu.
+func (r *bpRequest) ready() bool {
+	if r.responded || r.openClears > 0 {
+		return false
+	}
 	for _, s := range r.slots {
 		if !s.resolved {
 			return false
 		}
 	}
+	r.responded = true
 	return true
 }
 
@@ -201,7 +247,7 @@ func NewHandler(conn net.Conn, provider Provider, log *slog.Logger) *Handler {
 		log:      log,
 		cmdOut:   make(chan []byte, cmdBufferSize),
 		done:     make(chan struct{}),
-		bpByFile: make(map[string]map[int]breakpointState),
+		bpByFile: make(map[string]map[int]*bpLine),
 		varCache: make(map[int][]godap.Variable),
 	}
 }
@@ -374,6 +420,37 @@ func (h *Handler) enqueue(cmd []byte) {
 	select {
 	case h.cmdOut <- cmd:
 	case <-h.done:
+	}
+}
+
+// queueCommandLocked stages a breakpoint command for the hub. Staging (rather
+// than enqueuing directly) is what keeps the wire order equal to the setQ/clearQ
+// reservation order: the reservation happens under mu, but the enqueue cannot
+// (it may block), so two producers could otherwise interleave and correlate a
+// confirmation to the wrong operation. Caller MUST hold h.mu.
+func (h *Handler) queueCommandLocked(cmd []byte) {
+	if cmd == nil {
+		return
+	}
+	h.outbox = append(h.outbox, cmd)
+}
+
+// flushCommands drains staged commands to the hub in staging order. flushMu
+// serialises concurrent drains; mu is released around each enqueue so the rule
+// against holding mu across a cmdOut send still holds.
+func (h *Handler) flushCommands() {
+	h.flushMu.Lock()
+	defer h.flushMu.Unlock()
+	for {
+		h.mu.Lock()
+		if len(h.outbox) == 0 {
+			h.mu.Unlock()
+			return
+		}
+		cmd := h.outbox[0]
+		h.outbox = h.outbox[1:]
+		h.mu.Unlock()
+		h.enqueue(cmd)
 	}
 }
 

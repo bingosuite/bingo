@@ -203,6 +203,11 @@ func (h *Handler) onOutput(evt protocol.Event) {
 	h.send(&godap.OutputEvent{Event: h.event("output"), Body: godap.OutputEventBody{Category: category, Output: p.Content}})
 }
 
+// onBreakpointSet records a confirmed install against the operation at the head
+// of setQ. The id is an installed FACT and is recorded even when a later request
+// already dropped the line — the trap IS armed, and forgetting it is how it
+// becomes unremovable. Advancing the line then immediately clears it, so a
+// superseded Set is never committed as the line's desired state.
 func (h *Handler) onBreakpointSet(evt protocol.Event) {
 	var p protocol.BreakpointSetPayload
 	if err := protocol.DecodeEventPayload(evt, &p); err != nil {
@@ -210,40 +215,70 @@ func (h *Handler) onBreakpointSet(evt protocol.Event) {
 	}
 
 	h.mu.Lock()
-	var ready *bpRequest
-	if len(h.setQ) > 0 {
-		slot := h.setQ[0]
-		h.setQ = h.setQ[1:]
-		if lines := h.bpByFile[slot.file]; lines != nil {
-			lines[slot.line] = breakpointState{
-				dapID:      p.Breakpoint.ID,
-				debuggerID: p.Breakpoint.ID,
+	var ready []*bpRequest
+	if op := h.popSetLocked(); op != nil {
+		if st := h.bpByFile[op.file][op.line]; st != nil {
+			st.pending = nil
+			st.installedID = p.Breakpoint.ID
+			st.loc = p.Breakpoint.Location
+			st.failure = ""
+			if st.dapID == 0 {
+				st.dapID = p.Breakpoint.ID
 			}
-		}
-		slot.resolved = true
-		slot.bp = godap.Breakpoint{
-			Id:       p.Breakpoint.ID,
-			Verified: true,
-			Line:     p.Breakpoint.Location.Line,
-			Source:   dapSource(p.Breakpoint.Location),
-		}
-		if slot.req.done() {
-			ready = slot.req
+			ready = h.advanceLineLocked(op.file, op.line)
 		}
 	}
 	h.mu.Unlock()
 
-	if ready != nil {
-		h.sendSetBreakpointsResponse(ready)
-	}
+	h.flushCommands()
+	h.respond(ready)
 }
 
+// onBreakpointCleared retires the operation at the head of clearQ. A line's
+// debugger id is dropped ONLY here: a confirmed removal is the only proof the
+// trap is actually gone.
 func (h *Handler) onBreakpointCleared() {
 	h.mu.Lock()
-	if len(h.clearQ) > 0 {
-		h.clearQ = h.clearQ[1:]
+	var ready []*bpRequest
+	if op := h.popClearLocked(); op != nil {
+		if st := h.bpByFile[op.file][op.line]; st != nil {
+			st.pending = nil
+			st.installedID = 0
+			st.dapID = 0
+			st.loc = protocol.Location{}
+			// The removal is complete the moment the trap is gone — even if a
+			// later request has already re-desired the line and the next Set is
+			// about to be issued for it.
+			ready = st.dischargeOwners("")
+			ready = append(ready, h.advanceLineLocked(op.file, op.line)...)
+		}
 	}
 	h.mu.Unlock()
+
+	h.flushCommands()
+	h.respond(ready)
+}
+
+// popSetLocked takes the operation the next EventBreakpointSet belongs to. A nil
+// result means the confirmation was driven by another client — there is nothing
+// of ours to correlate it to. Caller MUST hold h.mu.
+func (h *Handler) popSetLocked() *bpOp {
+	if len(h.setQ) == 0 {
+		return nil
+	}
+	op := h.setQ[0]
+	h.setQ = h.setQ[1:]
+	return op
+}
+
+// popClearLocked is popSetLocked for EventBreakpointCleared. Caller MUST hold h.mu.
+func (h *Handler) popClearLocked() *bpOp {
+	if len(h.clearQ) == 0 {
+		return nil
+	}
+	op := h.clearQ[0]
+	h.clearQ = h.clearQ[1:]
+	return op
 }
 
 func (h *Handler) onFrames(evt protocol.Event) {
@@ -357,8 +392,9 @@ func (h *Handler) onRestarted(evt protocol.Event) {
 	seq := h.restartReqSeq
 	h.restartReqSeq = 0
 	var discarded []godap.Breakpoint
+	var ready []*bpRequest
 	if decoded {
-		discarded = h.reconcileRestartBreakpointsLocked(p)
+		discarded, ready = h.reconcileRestartBreakpointsLocked(p)
 	}
 	h.mu.Unlock()
 
@@ -371,39 +407,53 @@ func (h *Handler) onRestarted(evt protocol.Event) {
 			},
 		})
 	}
+	h.respond(ready)
 	if seq != 0 {
 		h.send(&godap.RestartResponse{Response: h.response(seq, "restart")})
 	}
 }
 
-func (h *Handler) reconcileRestartBreakpointsLocked(p protocol.RestartedPayload) []godap.Breakpoint {
+// reconcileRestartBreakpointsLocked adopts the relaunched process's breakpoint
+// identities: retained lines keep their stable DAP id but take the fresh
+// debugger id, and discarded lines are dropped and reported unverified. A line
+// with an operation in flight is left alone — that operation still owns the
+// line's convergence and its confirmation is still queued in setQ/clearQ, so
+// rewriting its state here would desynchronise both. Caller MUST hold h.mu.
+func (h *Handler) reconcileRestartBreakpointsLocked(p protocol.RestartedPayload) ([]godap.Breakpoint, []*bpRequest) {
 	for _, bp := range p.Breakpoints {
-		lines := h.bpByFile[bp.Location.File]
-		state, ok := lines[bp.Location.Line]
-		if !ok || state.debuggerID == 0 {
+		st := h.bpByFile[bp.Location.File][bp.Location.Line]
+		if st == nil || st.installedID == 0 || st.pending != nil {
 			continue
 		}
-		state.debuggerID = bp.ID
-		lines[bp.Location.Line] = state
+		st.installedID = bp.ID
+		st.loc = bp.Location
 	}
 
 	discarded := make([]godap.Breakpoint, 0, len(p.Discarded))
+	var ready []*bpRequest
 	for _, dropped := range p.Discarded {
-		lines := h.bpByFile[dropped.Location.File]
-		state, ok := lines[dropped.Location.Line]
-		if !ok || state.debuggerID == 0 {
+		st := h.bpByFile[dropped.Location.File][dropped.Location.Line]
+		if st == nil || st.installedID == 0 || st.pending != nil {
 			continue
 		}
-		delete(lines, dropped.Location.Line)
+		dapID := st.dapID
+		st.installedID = 0
+		st.dapID = 0
+		st.desired = false
+		st.loc = protocol.Location{}
+		st.failure = dropped.Reason
+		// The breakpoint is gone, so anyone parked on the line — including a
+		// request still waiting for it to be removed — can be answered now.
+		ready = append(ready, h.settleLineLocked(dropped.Location.File, dropped.Location.Line)...)
 		discarded = append(discarded, godap.Breakpoint{
-			Id:       state.dapID,
+			Id:       dapID,
 			Verified: false,
 			Message:  dropped.Reason,
 			Source:   dapSource(dropped.Location),
 			Line:     dropped.Location.Line,
 		})
 	}
-	return discarded
+	return discarded, ready
 }
 
 // onError routes a bingo EventError to the DAP request it corresponds to,
@@ -418,7 +468,7 @@ func (h *Handler) onError(evt protocol.Event) {
 	case protocol.CmdSetBreakpoint:
 		h.failBreakpointSet(p.Message)
 	case protocol.CmdClearBreakpoint:
-		h.onBreakpointCleared()
+		h.failBreakpointClear(p.Message)
 	case protocol.CmdGoroutines:
 		h.mu.Lock()
 		seq, ok := 0, false
@@ -504,37 +554,40 @@ func (h *Handler) failStart(msg string) {
 	h.send(&godap.TerminatedEvent{Event: h.event("terminated")})
 }
 
-// failBreakpointSet resolves the head pending set slot as unverified, then
-// completes its request if that was the last outstanding slot.
+// failBreakpointSet reports a rejected SetBreakpoint against the operation at the
+// head of setQ: every slot parked on the line is answered unverified. The line's
+// intent is dropped so the convergence loop does not spin re-issuing a request
+// the debugger just refused — the client's next setBreakpoints drives any retry.
 func (h *Handler) failBreakpointSet(msg string) {
 	h.mu.Lock()
-	var ready *bpRequest
-	if len(h.setQ) > 0 {
-		slot := h.setQ[0]
-		h.setQ = h.setQ[1:]
-		if lines := h.bpByFile[slot.file]; lines != nil {
-			delete(lines, slot.line)
-		}
-		slot.resolved = true
-		slot.bp = godap.Breakpoint{Verified: false, Line: slot.line, Message: msg}
-		if slot.req.done() {
-			ready = slot.req
+	var ready []*bpRequest
+	if op := h.popSetLocked(); op != nil {
+		if st := h.bpByFile[op.file][op.line]; st != nil {
+			st.pending = nil
+			st.failure = msg
+			st.desired = false
+			ready = h.settleLineLocked(op.file, op.line)
 		}
 	}
 	h.mu.Unlock()
 
-	if ready != nil {
-		h.sendSetBreakpointsResponse(ready)
-	}
+	h.respond(ready)
 }
 
-func (h *Handler) sendSetBreakpointsResponse(r *bpRequest) {
-	bps := make([]godap.Breakpoint, len(r.slots))
-	for i, s := range r.slots {
-		bps[i] = s.bp
+// failBreakpointClear reports a rejected ClearBreakpoint. The line's mapping is
+// deliberately RETAINED: the trap is still armed in the debugger, so dropping
+// its id would leave a breakpoint the client could never remove. The requests
+// that asked for the removal are failed rather than answered success.
+func (h *Handler) failBreakpointClear(msg string) {
+	h.mu.Lock()
+	var ready []*bpRequest
+	if op := h.popClearLocked(); op != nil {
+		if st := h.bpByFile[op.file][op.line]; st != nil {
+			st.pending = nil
+			ready = h.failClearLocked(op.file, op.line, msg)
+		}
 	}
-	h.send(&godap.SetBreakpointsResponse{
-		Response: h.response(r.reqSeq, "setBreakpoints"),
-		Body:     godap.SetBreakpointsResponseBody{Breakpoints: bps},
-	})
+	h.mu.Unlock()
+
+	h.respond(ready)
 }

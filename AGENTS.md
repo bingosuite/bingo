@@ -1134,19 +1134,59 @@ documented caveat. Fixing it properly needs correlation ids in the bingo protoco
 need no correlation, so multi-driver continue/step is fine; only the id-less
 confirmation requests are affected.
 
-**setBreakpoints is replace-all** (`breakpoints.go`): diff the requested lines
-for a source against `bpByFile` — clear removed, set new, keep unchanged — and
-respond once every slot in the request resolves, in request order. Clearing the
-breakpoint the process is currently parked on re-arms it through the engine's
-step-off path (see the clearbp spec), so the e2e continue-to-exit uses a
+**setBreakpoints is a replace-all TRANSACTION** (`breakpoints.go`): a request
+records the source's latest-wins intent and is answered only once every operation
+it owns has been confirmed. `bpByFile` is `file → line → *bpLine`, and `bpLine`
+deliberately keeps three things apart, because pipelined requests make them
+legitimately disagree:
+
+- `installedID` — an installed FACT. Written **only** by a confirmed
+  `EventBreakpointSet` and dropped **only** by a confirmed
+  `EventBreakpointCleared`. Never on intent.
+- `desired` — the newest request's intent for that line (latest wins).
+- `pending` — the single in-flight `bpOp` for that line. One op per line at a
+  time is what keeps the id-less `setQ`/`clearQ` FIFOs unambiguous.
+
+`advanceLineLocked` is the convergence loop: it issues the one command the
+installed/desired gap calls for, or settles everyone parked on the line when the
+two already agree. Every confirmation re-enters it, which yields the invariants:
+
+- A **removal is owned by the request that caused it** (`openClears` +
+  `clearOwners`), so a response never precedes its own clears. A remove-all no
+  longer reports success while the `ClearBreakpoint` is still in flight.
+- A **rejected clear retains the mapping** and fails the originating request
+  (`clearFailure` → an error `setBreakpoints` response). Forgetting the id would
+  leave a breakpoint the client can never remove — `breakpointTable.clear` keeps
+  the entry when the memory write fails, so the trap really is still armed. The
+  failure path deliberately does not re-enter the loop; a new request retries.
+- A **pending Set superseded before it confirms** is cancelled on confirm: the id
+  is recorded as a fact (the trap IS armed) but `desired` stays false, so the
+  next advance clears it immediately. It is never committed as desired state.
+- An **overlapping request wanting an already-pending line attaches** to that op
+  (another `setWaiter`) instead of issuing a duplicate `CmdSetBreakpoint`, which
+  the engine would reject with `errBreakpointExists` — and whose failure handling
+  used to delete the entry holding the live id.
+- **Exactly one response per request** (`bpRequest.ready()` claims the right to
+  answer; slots and obligations settle on different goroutines), and requests are
+  answered in `reqSeq` order so a later request's view lands last.
+- Sources are independent; the id-less FIFO limitation is unchanged.
+
+Breakpoint commands are staged in `outbox` and drained by `flushCommands`
+(serialised by `flushMu`) rather than enqueued directly: both the DAP read loop
+and the hub write pump produce them, and the FIFOs only correlate if the wire
+order matches the order slots were reserved under `mu`.
+
+Clearing the breakpoint the process is currently parked on re-arms it through the
+engine's step-off path (see the clearbp spec), so the e2e continue-to-exit uses a
 no-breakpoint target, not a clear-then-continue.
 
-`bpByFile` keeps the stable DAP id separate from the debugger's internal id.
-After `EventRestarted`, reconcile its exact source-path/line keys from
-`RestartedPayload` before replying: retained entries adopt the fresh debugger
-id, while discarded entries are removed and emit a `breakpoint` changed event
-with their prior DAP id and `verified:false`. Do not reset `setQ`/`clearQ`;
-those FIFOs still own any in-flight confirmations.
+`bpLine` keeps the stable DAP id (`dapID`) separate from the debugger's internal
+id (`installedID`). After `EventRestarted`, reconcile its exact source-path/line
+keys from `RestartedPayload` before replying: retained entries adopt the fresh
+debugger id, while discarded entries are removed and emit a `breakpoint` changed
+event with their prior DAP id and `verified:false`. A line with an op in flight
+is skipped — that op still owns the line and its confirmation is still queued.
+Do not reset `setQ`/`clearQ`; those FIFOs still own any in-flight confirmations.
 
 ### Server wiring + multi-client discovery
 
@@ -1274,11 +1314,17 @@ translator keeps DAP entirely outside the hub — a strictly additive package.
 ### Tests
 
 - Unit: [internal/dap/translate_test.go](internal/dap/translate_test.go) (pure
-  translators) and [internal/dap/handler_test.go](internal/dap/handler_test.go)
+  translators), [internal/dap/handler_test.go](internal/dap/handler_test.go)
   (full handshake over loopback TCP + a fake `Session`/`Provider` + a command
   recorder: handshake→breakpoint, own-continue-suppressed, out-of-band-continue-
   surfaced, setBreakpoints diff/FIFO, stackTrace/variables correlation,
-  step→stopped=step, disconnect-terminates). Run with the normal
+  step→stopped=step, disconnect-terminates), and
+  [internal/dap/breakpoints_test.go](internal/dap/breakpoints_test.go) (the
+  breakpoint transaction: a rejected clear retains the id and fails its request,
+  partial clear failure, a superseded pending set clears exactly once, an
+  overlapping pending set issues one command, set→remove→re-add leaves one live
+  breakpoint, cross-source independence, restart around an in-flight op,
+  exactly-once responses). Run with the normal
   `go test -tags bingonative ./internal/dap/...`.
 - E2E: label `dap` in [test/integration](test/integration/) — a real go-dap
   client over TCP through the WHOLE stack (client → TCP →
