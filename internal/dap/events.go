@@ -471,23 +471,100 @@ func (h *Handler) onError(evt protocol.Event) {
 			h.send(h.errorResponse(seq, "evaluate", p.Message))
 		}
 	case protocol.CmdRestart:
-		h.mu.Lock()
-		seq := h.restartReqSeq
-		h.restartReqSeq = 0
-		h.restarting = false
-		h.mu.Unlock()
-		if seq != 0 {
-			h.send(h.errorResponse(seq, "restart", p.Message))
-		}
-	case protocol.CmdContinue:
-		h.mu.Lock()
-		if h.pendingContinues > 0 {
-			h.pendingContinues--
-		}
-		h.mu.Unlock()
-		h.emitConsole("continue failed: " + p.Message + "\n")
+		h.failRestart(p.Message)
+	case protocol.CmdContinue, protocol.CmdStepOver, protocol.CmdStepInto, protocol.CmdStepOut:
+		h.failResume(p.Command, p.Message)
 	default:
 		h.emitConsole("error: " + p.Message + "\n")
+	}
+}
+
+// resumeCommandName maps a rejected resuming command back to the DAP request
+// that issued it, for the console line reporting the failure.
+func resumeCommandName(kind protocol.CommandKind) string {
+	switch kind {
+	case protocol.CmdStepOver:
+		return "next"
+	case protocol.CmdStepInto:
+		return "stepIn"
+	case protocol.CmdStepOut:
+		return "stepOut"
+	default:
+		return "continue"
+	}
+}
+
+// failResume resynchronizes the adapter after the hub REJECTS a resume it has
+// already acknowledged as successful. onContinue/onStep answer optimistically
+// (DAP has no way to retract a successful continue/next response), but a
+// rejected resume leaves the engine suspended — see AGENTS.md → Suspend/resume
+// (Rejected resumes). Without this the adapter would keep suspended=false
+// forever: every later threads/stackTrace/variables/evaluate takes its
+// not-suspended branch and answers synthetically without reaching the hub, and
+// the IDE shows a running program that can never stop again. A `stopped` event
+// is the only DAP message that can walk the client back, so one is emitted with
+// the rejection text.
+//
+// Recovery deliberately does NOT go through onStop: the process never moved, so
+// the current suspension's varCache stays valid and the launching/restarting
+// latches must not be disturbed.
+func (h *Handler) failResume(kind protocol.CommandKind, msg string) {
+	h.mu.Lock()
+	if kind == protocol.CmdContinue && h.pendingContinues > 0 {
+		// The EventContinued this resume would have produced never arrives, so
+		// its suppression debt has to be settled here or the NEXT out-of-band
+		// continue would be swallowed instead of surfaced.
+		h.pendingContinues--
+	}
+	// Skip while the handshake still owns the initial state report and would
+	// send it after this: `launching` waits for the entry EventStepped (a
+	// `stopped` here would precede the launch response), and a joiner's
+	// `awaitingWelcome` waits for the hub's welcome EventSessionState, which
+	// can be raced by another client's rejection between AddClient registering
+	// this client and the welcome being delivered. Skip while already
+	// suspended: a real stop won the race, or an earlier rejection already
+	// resynced, and the client's current `stopped` already describes this
+	// suspension.
+	resync := !h.suspended && !h.launching && !h.awaitingWelcome
+	if resync {
+		h.suspended = true
+	}
+	tid := threadID(h.curThreadID)
+	h.mu.Unlock()
+
+	h.emitConsole(resumeCommandName(kind) + " failed: " + msg + "\n")
+	if !resync {
+		return
+	}
+	h.send(&godap.StoppedEvent{
+		Event: h.event("stopped"),
+		Body: godap.StoppedEventBody{
+			Reason:            "exception",
+			Description:       "runtime error",
+			Text:              msg,
+			ThreadId:          tid,
+			AllThreadsStopped: true,
+		},
+	})
+}
+
+// failRestart resolves a rejected CmdRestart: release the response gate and the
+// entry latch, and restore the suspended view onRestart optimistically cleared.
+// Unlike failResume it emits no `stopped` — the delayed error response tells the
+// client the restart failed while it was already stopped, so the client's
+// existing stopped state is still the current one.
+func (h *Handler) failRestart(msg string) {
+	h.mu.Lock()
+	seq := h.restartReqSeq
+	h.restartReqSeq = 0
+	h.restarting = false
+	if seq != 0 {
+		h.suspended = true
+	}
+	h.mu.Unlock()
+
+	if seq != 0 {
+		h.send(h.errorResponse(seq, "restart", msg))
 	}
 }
 
