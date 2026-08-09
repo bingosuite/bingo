@@ -1082,6 +1082,13 @@ the view over an event the observer never even reads.
 **Refresh is the manual recovery path.** The latch stops the *automatic* ladder;
 an explicit user Refresh is not a loop, so it clears the latch and redials.
 
+The acceptance invariant, pinned by test: a decode/protocol-contract violation —
+malformed JSON, wrong version, unknown kind, a bad envelope, or any deep failure
+in a *consumed* payload — terminates that connection and view **without consuming
+a reconnect attempt**, while a genuine socket close still consumes one and
+redials. Shallow-parsing an unused-but-valid kind is explicitly NOT a violation:
+it leaves the connection open, sets no error, and still advances the sequence.
+
 **Fatality is scoped to the bounded kinds.** The byte check must stay *before*
 the parse, but the kind is only known *after* it — so an over-budget frame gets a
 bounded scan of its envelope prefix (the server emits `v`,`kind`,`seq`,`payload`
