@@ -98,6 +98,15 @@ describe("concurrency webview DOM", () => {
     })(model());
     const first = document.querySelector<SVGGElement>('[data-goid="1"]')!;
     const second = document.querySelector<SVGGElement>('[data-goid="2"]')!;
+    const scene = document.querySelector<SVGGElement>("svg > g")!;
+    const querySelector = scene.querySelector.bind(scene);
+    let selectorCalls = 0;
+    Object.defineProperty(scene, "querySelector", {
+      value: (selector: string): Element | null => {
+        selectorCalls += 1;
+        return querySelector(selector);
+      },
+    });
     let focused = "";
     Object.defineProperty(first, "focus", {
       value: () => {
@@ -118,6 +127,7 @@ describe("concurrency webview DOM", () => {
     first.dispatchEvent(event);
 
     assert.equal(focused, "2");
+    assert.equal(selectorCalls, 1);
     assert.deepEqual(messages.at(-1), {
       type: "selectGoroutine",
       id: 2,

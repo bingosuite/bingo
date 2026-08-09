@@ -353,12 +353,7 @@ function renderGraph(
       return;
     }
     event.preventDefault();
-    const visible = session.tree.nodes.filter((node) => {
-      const element = activeScene.querySelector<SVGGElement>(
-        `[data-goid="${String(node.goroutine.id)}"]`,
-      );
-      return element?.classList.contains("filtered") !== true;
-    });
+    const visible = session.tree.nodes;
     const current = visible.findIndex(
       (node) => node.goroutine.id === session.selectedGoroutine,
     );
