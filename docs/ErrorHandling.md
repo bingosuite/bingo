@@ -239,6 +239,15 @@ events. The client must not close the whole connection as timeout recovery
 because a last-client disconnect tears down the session and debuggee, while
 unrelated asynchronous events remain valid.
 
+`GoroutineSnapshot` is the temporary exception. Its confirmation event is also
+unsolicited telemetry emitted after breakpoint, pause, and entry stops, so a
+timed-out snapshot request is discarded instead of retired as debt. Otherwise
+the next auto-pushed snapshot would disappear into the retired query. A
+genuinely late query reply consequently reaches `Events()`; the id-less protocol
+cannot distinguish it from an automatic snapshot. The dependent snapshot/API
+cleanup removes this synchronous query rather than redesigning its semantics
+here.
+
 This fence covers only the serialized command stream sent by that client.
 Confirmation events carry no request ID and are broadcast to every client, so
 an unsolicited same-kind event or another driver's confirmation remains
@@ -304,4 +313,4 @@ server-side `slog` output and map to short client-facing messages there. The
 | Goroutine → owner error propagation              | Emit a typed `protocol.Event` (`EventError` / `EventProcessExited`) on `Debugger.Events()`    |
 | Methods not on the `Debugger` interface          | Keep unexported on `engine`; return errors up the synchronous chain to the loop               |
 | Server → WebSocket client error                  | Broadcast a typed `EventError`; message text is intentionally surfaced (local tool)           |
-| Timed-out synchronous client command             | Retain ordered reply debt; consume its late reply/error before notifying a newer waiter       |
+| Timed-out synchronous client command             | Retain ordered reply debt, except discard the dual-purpose snapshot query to preserve telemetry |
