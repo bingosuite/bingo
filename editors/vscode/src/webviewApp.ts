@@ -383,7 +383,13 @@ function renderGraph(
       (node) => node.goroutine.id === session.selectedGoroutine,
     );
     const direction = event.key === "ArrowDown" || event.key === "ArrowRight" ? 1 : -1;
-    const next = visible[(current + direction + visible.length) % visible.length];
+    // A filtered-out selection leaves current at -1, which is not an index one
+    // step before the list: modulo arithmetic on it lands on len-2 in reverse
+    // and skips the last visible node. Enter the list from the matching end.
+    const next =
+      current < 0
+        ? visible[direction === 1 ? 0 : visible.length - 1]
+        : visible[(current + direction + visible.length) % visible.length];
     if (next !== undefined) {
       activeScene
         .querySelector<SVGGElement>(

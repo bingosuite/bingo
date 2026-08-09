@@ -83,6 +83,53 @@ function model(
   };
 }
 
+function pressArrow(dom: ReturnType<typeof testDOM>, key: string): void {
+  const viewport = dom.document.querySelector("#concurrency-tree");
+  assert.ok(viewport);
+  const event = new dom.window.Event("keydown", {
+    bubbles: true,
+    cancelable: true,
+  });
+  Object.defineProperty(event, "key", { value: key });
+  viewport.dispatchEvent(event);
+}
+
+function visibleGoids(document: Document): number[] {
+  return [...document.querySelectorAll<SVGGElement>(".tree-node")].map((node) =>
+    Number(node.dataset.goid),
+  );
+}
+
+/**
+ * Renders a tree whose selection (g1) is filtered out, leaving only visibleIDs
+ * rendered as roots so the ancestor chain cannot pull the selection back in.
+ */
+function filteredTree(visibleIDs: readonly number[]): {
+  readonly dom: ReturnType<typeof testDOM>;
+  readonly messages: Record<string, unknown>[];
+} {
+  const dom = testDOM();
+  const messages: Record<string, unknown>[] = [];
+  mountConcurrencyView(dom.document, {
+    postMessage: (message) => messages.push(message),
+  })(
+    model({
+      snapshot: snapshot([
+        goroutine(1, 0, { current: true }),
+        ...visibleIDs.map((id) => goroutine(id, 0, { waitReason: "needle" })),
+      ]),
+      selectedGoroutine: 1,
+    }),
+  );
+  const search = dom.document.querySelector<HTMLInputElement>(
+    "#bingo-goroutine-filter",
+  );
+  assert.ok(search);
+  search.value = "needle";
+  search.dispatchEvent(new dom.window.Event("input"));
+  return { dom, messages };
+}
+
 function multiSessionModel(
   activeDebugSessionId = "debug",
   revision = 1,
@@ -314,6 +361,78 @@ describe("concurrency webview DOM", () => {
       type: "selectGoroutine",
       id: 2,
     });
+  });
+
+  it("enters a filtered list from the matching end when the selection is hidden", () => {
+    const { dom, messages } = filteredTree([2, 3, 4]);
+    assert.deepEqual(visibleGoids(dom.document), [2, 3, 4]);
+    assert.equal(dom.document.querySelector(".tree-node.selected"), null);
+
+    for (const [key, expected] of [
+      ["ArrowUp", 4],
+      ["ArrowLeft", 4],
+      ["ArrowDown", 2],
+      ["ArrowRight", 2],
+    ] as const) {
+      pressArrow(dom, key);
+      assert.deepEqual(
+        messages.at(-1),
+        { type: "selectGoroutine", id: expected },
+        `${key} from a hidden selection should select g${String(expected)}`,
+      );
+      assert.equal(
+        dom.document.activeElement,
+        dom.document.querySelector(`[data-goid="${String(expected)}"]`),
+      );
+    }
+  });
+
+  it("enters a two-node filtered list from opposite ends", () => {
+    const { dom, messages } = filteredTree([2, 3]);
+    assert.deepEqual(visibleGoids(dom.document), [2, 3]);
+
+    pressArrow(dom, "ArrowUp");
+    assert.deepEqual(messages.at(-1), { type: "selectGoroutine", id: 3 });
+    pressArrow(dom, "ArrowDown");
+    assert.deepEqual(messages.at(-1), { type: "selectGoroutine", id: 2 });
+  });
+
+  it("enters a single-node filtered list from either end", () => {
+    const { dom, messages } = filteredTree([2]);
+    assert.deepEqual(visibleGoids(dom.document), [2]);
+
+    for (const key of ["ArrowUp", "ArrowLeft", "ArrowDown", "ArrowRight"] as const) {
+      pressArrow(dom, key);
+      assert.deepEqual(messages.at(-1), { type: "selectGoroutine", id: 2 });
+    }
+  });
+
+  it("wraps in both directions while the selection stays visible", () => {
+    const nodes = snapshot([
+      goroutine(1, 0, { current: true }),
+      goroutine(2, 0),
+      goroutine(3, 0),
+    ]);
+    for (const [selectedGoroutine, back, forward] of [
+      [1, 3, 2],
+      [2, 1, 3],
+      [3, 2, 1],
+    ] as const) {
+      const dom = testDOM();
+      const messages: Record<string, unknown>[] = [];
+      mountConcurrencyView(dom.document, {
+        postMessage: (message) => messages.push(message),
+      })(model({ snapshot: nodes, selectedGoroutine }));
+      assert.deepEqual(visibleGoids(dom.document), [1, 2, 3]);
+
+      pressArrow(dom, "ArrowUp");
+      assert.deepEqual(messages.at(-1), { type: "selectGoroutine", id: back });
+      pressArrow(dom, "ArrowDown");
+      assert.deepEqual(messages.at(-1), {
+        type: "selectGoroutine",
+        id: forward,
+      });
+    }
   });
 
   it("keeps matching descendants connected to visible ancestors", () => {

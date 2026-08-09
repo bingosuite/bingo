@@ -12,7 +12,7 @@ const manifest = requireRecord(
 const contributes = requireRecord(manifest.contributes);
 const debuggers = requireArray(contributes.debuggers);
 const debuggerContribution = requireRecord(debuggers[0]);
-const expectedExtensionVersion = "0.3.2";
+const expectedExtensionVersion = "0.3.3";
 
 describe("extension manifest", () => {
   it("versions the managed-server runtime as an installable upgrade", () => {
