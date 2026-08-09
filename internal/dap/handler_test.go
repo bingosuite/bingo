@@ -1309,10 +1309,37 @@ func TestRejectedResumeWhileSuspendedDoesNotDuplicateStopped(t *testing.T) {
 	}
 }
 
-// TestRejectedRestartRestoresSuspendedWithoutStopped pins the restart variant:
-// the delayed error response already tells the client the restart failed while
-// it was stopped, so no extra stopped event may be sent — but the suspended
-// view onRestart cleared optimistically must still be restored.
+// requireSuspendedFlag asserts the handler's internal suspended view, which is
+// what gates whether inspection requests are forwarded to the hub.
+func requireSuspendedFlag(t *testing.T, hh *harness, want bool) {
+	t.Helper()
+	hh.handler.mu.Lock()
+	got := hh.handler.suspended
+	hh.handler.mu.Unlock()
+	if got != want {
+		t.Fatalf("handler suspended = %v, want %v", got, want)
+	}
+}
+
+// requireInspectionAnsweredSynthetically is the not-suspended counterpart of
+// requireInspectionReachesHub: a stackTrace must be answered locally with an
+// empty stack and must NOT enqueue a Frames command at the hub.
+func requireInspectionAnsweredSynthetically(t *testing.T, hh *harness) {
+	t.Helper()
+	before := hh.cmds.count(protocol.CmdFrames)
+	hh.sendReq("stackTrace", &godap.StackTraceRequest{Arguments: godap.StackTraceArguments{ThreadId: 7}})
+	st := recvType[*godap.StackTraceResponse](hh)
+	if len(st.Body.StackFrames) != 0 {
+		t.Fatalf("stack frames = %+v, want an empty synthetic answer", st.Body.StackFrames)
+	}
+	hh.cmds.requireNoAdditionalCommands(t, protocol.CmdFrames, before)
+}
+
+// TestRejectedRestartRestoresSuspendedWithoutStopped pins the restart variant
+// for a restart issued WHILE SUSPENDED: the delayed error response already tells
+// the client the restart failed while it was stopped, so no extra stopped event
+// may be sent — but the suspended view onRestart cleared optimistically must
+// still be restored.
 func TestRejectedRestartRestoresSuspendedWithoutStopped(t *testing.T) {
 	hh := newHarness(t)
 	hh.doHandshake(t)
@@ -1332,7 +1359,105 @@ func TestRejectedRestartRestoresSuspendedWithoutStopped(t *testing.T) {
 		t.Fatalf("restart response = %+v, want an error for request %d", failed.Response, restartSeq)
 	}
 
+	requireSuspendedFlag(t, hh, true)
 	requireInspectionReachesHub(t, hh)
+	requireNoStoppedEvent(t, hh, 150*time.Millisecond)
+}
+
+// TestRejectedRestartWhileRunningStaysRunning covers the inverse desync: DAP
+// permits restart while the tracee is running, and the hub rejects a restart on
+// an attach-created session without touching that still-running process. The
+// adapter must restore the RUNNING view it cleared, not invent a suspension —
+// otherwise it would forward inspection requests for a process that never
+// stopped.
+func TestRejectedRestartWhileRunningStaysRunning(t *testing.T) {
+	hh := newHarness(t)
+	// doHandshake leaves the session running with no stop delivered.
+	hh.doHandshake(t)
+	requireSuspendedFlag(t, hh, false)
+
+	restartSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdRestart)
+
+	hh.inject(protocol.EventError, protocol.ErrorPayload{
+		Command: protocol.CmdRestart,
+		Message: "no launched process to restart — use Launch first",
+	})
+	failed := recvType[*godap.ErrorResponse](hh)
+	if failed.RequestSeq != restartSeq || failed.Success {
+		t.Fatalf("restart response = %+v, want an error for request %d", failed.Response, restartSeq)
+	}
+
+	requireSuspendedFlag(t, hh, false)
+	requireInspectionAnsweredSynthetically(t, hh)
+	requireNoStoppedEvent(t, hh, 150*time.Millisecond)
+}
+
+// TestRejectedRestartAfterFailedRelaunchDropsSuspended covers the hub's
+// relaunch-failure path: it kills the old process, reports the error, then
+// transitions the managed session to idle. There is no process left, so the
+// captured pre-request suspension must not be reasserted — and a retry restart
+// must still correlate to its own request.
+func TestRejectedRestartAfterFailedRelaunchDropsSuspended(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	suspendAtBreakpoint(t, hh)
+
+	firstSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdRestart)
+
+	hh.inject(protocol.EventError, protocol.ErrorPayload{
+		Command: protocol.CmdRestart,
+		Message: "restart: relaunch failed: fork/exec /bin/x: no such file or directory",
+	})
+	failed := recvType[*godap.ErrorResponse](hh)
+	if failed.RequestSeq != firstSeq || failed.Success {
+		t.Fatalf("restart response = %+v, want an error for request %d", failed.Response, firstSeq)
+	}
+	// The hub reports the teardown right after the error.
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{
+		SessionID: "sess-test", State: protocol.StateIdle, Clients: 1,
+	})
+
+	requireSuspendedFlag(t, hh, false)
+	requireInspectionAnsweredSynthetically(t, hh)
+
+	// Retry correlation survives: the gate was released, so a new restart is
+	// accepted and answered against its own request sequence.
+	secondSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	hh.cmds.waitForCommands(t, protocol.CmdRestart, 2)
+	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{})
+	restarted := recvType[*godap.RestartResponse](hh)
+	if restarted.RequestSeq != secondSeq || !restarted.Success {
+		t.Fatalf("retried restart response = %+v, want success for request %d", restarted.Response, secondSeq)
+	}
+	requireNoStoppedEvent(t, hh, 150*time.Millisecond)
+}
+
+// TestRejectedResumeAfterSessionEndedEmitsNoStopped pins the same lifecycle
+// guard for Continue/Step: once the session is idle or exited the hub answers
+// every command with "no active debugger", and fabricating a stop there would
+// leave the client stopped on a process that no longer exists.
+func TestRejectedResumeAfterSessionEndedEmitsNoStopped(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+
+	hh.inject(protocol.EventProcessExited, protocol.ProcessExitedPayload{ExitCode: 0})
+	_ = recvType[*godap.ExitedEvent](hh)
+	_ = recvType[*godap.TerminatedEvent](hh)
+
+	hh.sendReq("continue", &godap.ContinueRequest{Arguments: godap.ContinueArguments{ThreadId: 7}})
+	_ = recvType[*godap.ContinueResponse](hh)
+	hh.inject(protocol.EventError, protocol.ErrorPayload{
+		Command: protocol.CmdContinue,
+		Message: "no active debugger — send Launch or Attach first",
+	})
+	out := recvType[*godap.OutputEvent](hh)
+	if out.Body.Output != "continue failed: no active debugger — send Launch or Attach first\n" {
+		t.Errorf("console output = %q", out.Body.Output)
+	}
+
+	requireSuspendedFlag(t, hh, false)
 	requireNoStoppedEvent(t, hh, 150*time.Millisecond)
 }
 
