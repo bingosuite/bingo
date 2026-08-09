@@ -165,6 +165,16 @@ normal `running` state transition and event ordering. A rejected auto-continue
 broadcasts `EventError`, remains in the suspended wait loop, and re-arms a full
 30-minute interval so client retries stay serviceable without a hot retry loop.
 
+Ordinary-command admission is lossless while the originating client remains
+connected. When bounded `cmdCh` is full, `injectCommand` backpressures that
+client's read pump for up to five seconds while also selecting on hub shutdown
+and the client's disconnect signal. If capacity never frees, the hub removes
+and closes that client rather than silently dropping the command. This is
+load-bearing for DAP's id-less confirmation FIFOs: a logged drop would leave a
+pending request forever and shift every later confirmation, while a synthetic
+`EventError` for an unadmitted tail could resolve the wrong FIFO head. The
+lossy, capacity-one `resumeCh` is the deliberate exception described below.
+
 A successful `Continue` emits a **non-suspending** `EventContinued` from the
 engine (`engine.Continue` → `emitContinued`) before the process runs free. It is
 not in the suspending set and does not gate the hub — it's a fire-and-forget
@@ -1040,7 +1050,10 @@ slow-client eviction. There is deliberately no DAP-awareness anywhere in
   `cmdOut chan []byte` of marshalled bingo `Command`s produced by the DAP read
   loop; returns `io.EOF` on Close. **cmdOut-priority:** a non-blocking check of
   `cmdOut` precedes the `{cmdOut | done}` select, so a `Kill` enqueued right
-  before `Close` (disconnect-terminate) is still handed off before EOF.
+  before `Close` (disconnect-terminate) is still handed off before EOF. The hub
+  may backpressure this read pump while its ordinary-command queue is full;
+  `cmdOut` stays bounded, and Handler `Close` unblocks both `ReadMessage` and a
+  DAP producer waiting to enqueue.
 - `Serve()` (its own goroutine, one per connection): the DAP read loop —
   `godap.ReadProtocolMessage` → `dispatchRequest`. Runs the handshake state
   machine, enqueues bingo commands, and answers non-hub requests directly.
@@ -1213,6 +1226,12 @@ documented caveat. Fixing it properly needs correlation ids in the bingo protoco
 — deferred. Resume/step/breakpoint-hit events are broadcast to all clients and
 need no correlation, so multi-driver continue/step is fine; only the id-less
 confirmation requests are affected.
+
+The hub's reliable ordinary-command admission is a prerequisite for these
+FIFOs: it either executes each admitted command in order or closes the whole DAP
+connection on sustained overload. Never replace overload eviction with an
+uncorrelated bingo error event — the adapter cannot identify a dropped tail
+slot, so such an event could consume the wrong FIFO head.
 
 **setBreakpoints is replace-all** (`breakpoints.go`): diff the requested lines
 for a source against `bpByFile` — clear removed, set new, keep unchanged — and

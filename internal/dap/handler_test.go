@@ -2,6 +2,7 @@ package dap
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 
 	godap "github.com/google/go-dap"
 
+	"github.com/bingosuite/bingo/internal/debugger"
 	"github.com/bingosuite/bingo/internal/hub"
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
@@ -153,6 +155,92 @@ func (p *fakeProvider) CreateSession() (Session, error) {
 func (p *fakeProvider) GetSession(string) (Session, bool) {
 	return p.sess, p.sess != nil
 }
+
+type hubProvider struct {
+	session Session
+}
+
+func (p *hubProvider) CreateSession() (Session, error) {
+	return p.session, nil
+}
+
+func (p *hubProvider) GetSession(id string) (Session, bool) {
+	return p.session, p.session != nil && p.session.SessionID() == id
+}
+
+type gatedBreakpointDebugger struct {
+	events chan protocol.Event
+	gate   chan struct{}
+
+	started     chan struct{}
+	startOnce   sync.Once
+	releaseOnce sync.Once
+
+	mu       sync.Mutex
+	setLines []int
+}
+
+func newGatedBreakpointDebugger() *gatedBreakpointDebugger {
+	return &gatedBreakpointDebugger{
+		events:  make(chan protocol.Event, 1),
+		gate:    make(chan struct{}),
+		started: make(chan struct{}),
+	}
+}
+
+func (d *gatedBreakpointDebugger) release() {
+	d.releaseOnce.Do(func() { close(d.gate) })
+}
+
+func (d *gatedBreakpointDebugger) setCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.setLines)
+}
+
+func (d *gatedBreakpointDebugger) Launch(string, []string, []string) error {
+	d.events <- protocol.MustEvent(protocol.EventStepped, 1,
+		protocol.SteppedPayload{Goroutine: protocol.Goroutine{ID: 1}})
+	return nil
+}
+
+func (*gatedBreakpointDebugger) Attach(int, string) error { return nil }
+func (*gatedBreakpointDebugger) Kill() error              { return nil }
+func (d *gatedBreakpointDebugger) SetBreakpoint(file string, line int) (protocol.Breakpoint, error) {
+	d.startOnce.Do(func() { close(d.started) })
+	<-d.gate
+	d.mu.Lock()
+	d.setLines = append(d.setLines, line)
+	d.mu.Unlock()
+	return protocol.Breakpoint{
+		ID:       line,
+		Location: protocol.Location{File: file, Line: line},
+	}, nil
+}
+func (*gatedBreakpointDebugger) ClearBreakpoint(int) error { return nil }
+func (*gatedBreakpointDebugger) Continue() error           { return nil }
+func (*gatedBreakpointDebugger) StepOver() error           { return nil }
+func (*gatedBreakpointDebugger) StepInto() error           { return nil }
+func (*gatedBreakpointDebugger) StepOut() error            { return nil }
+func (*gatedBreakpointDebugger) Pause() error              { return nil }
+func (*gatedBreakpointDebugger) Locals(int) ([]protocol.Variable, error) {
+	return nil, nil
+}
+func (*gatedBreakpointDebugger) Evaluate(int, string) (protocol.Variable, error) {
+	return protocol.Variable{}, nil
+}
+func (*gatedBreakpointDebugger) StackFrames() ([]protocol.Frame, error) {
+	return nil, nil
+}
+func (*gatedBreakpointDebugger) Goroutines() ([]protocol.Goroutine, error) {
+	return nil, nil
+}
+func (*gatedBreakpointDebugger) GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error) {
+	return protocol.GoroutineSnapshotPayload{}, nil
+}
+func (d *gatedBreakpointDebugger) Events() <-chan protocol.Event { return d.events }
+
+var _ debugger.Debugger = (*gatedBreakpointDebugger)(nil)
 
 func TestStartSessionRejectsClosedHub(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
@@ -781,6 +869,108 @@ func TestRestartPreservesBreakpointCorrelationQueues(t *testing.T) {
 	if len(h.clearQ) != 1 || h.clearQ[0] != 73 {
 		t.Fatalf("clearQ changed across restart: %v", h.clearQ)
 	}
+}
+
+func TestSetBreakpointsBurstThroughHubPreservesFIFO(t *testing.T) {
+	dbg := newGatedBreakpointDebugger()
+	defer dbg.release()
+
+	session := hub.NewSession("sess-burst", func() debugger.Debugger { return dbg }, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	go session.Run(ctx)
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-session.Done():
+		case <-time.After(2 * time.Second):
+			t.Error("hub did not stop")
+		}
+	})
+
+	hh := newHarnessProvider(t, &hubProvider{session: session}, &cmdRecorder{})
+	hh.sendReq("initialize", initArgs())
+	_ = recvType[*godap.InitializeResponse](hh)
+
+	launchSeq := hh.sendReq("launch", &godap.LaunchRequest{
+		Arguments: json.RawMessage(`{"program":"/bin/x","stopOnEntry":true}`),
+	})
+	_ = recvType[*godap.InitializedEvent](hh)
+
+	const breakpointCount = 98
+	requested := make([]godap.SourceBreakpoint, breakpointCount)
+	for i := range requested {
+		requested[i] = godap.SourceBreakpoint{Line: i + 1}
+	}
+	setSeq := hh.sendReq("setBreakpoints", &godap.SetBreakpointsRequest{
+		Arguments: godap.SetBreakpointsArguments{
+			Source:      godap.Source{Path: "/x/main.go", Name: "main.go"},
+			Breakpoints: requested,
+		},
+	})
+
+	select {
+	case <-dbg.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first SetBreakpoint did not reach the debugger")
+	}
+
+	// The handler processes requests serially. With 98 commands and a 64-slot
+	// cmdOut, this response proves the hub read pump consumed enough commands to
+	// saturate its 32-slot queue while the first debugger call remained gated.
+	hh.sendReq("scopes", &godap.ScopesRequest{
+		Arguments: godap.ScopesArguments{FrameId: 1},
+	})
+	_ = recvType[*godap.ScopesResponse](hh)
+
+	dbg.release()
+
+	resp := recvType[*godap.SetBreakpointsResponse](hh)
+	if resp.RequestSeq != setSeq {
+		t.Fatalf("setBreakpoints request seq = %d, want %d", resp.RequestSeq, setSeq)
+	}
+	if len(resp.Body.Breakpoints) != breakpointCount {
+		t.Fatalf("got %d breakpoints, want %d", len(resp.Body.Breakpoints), breakpointCount)
+	}
+	for i, bp := range resp.Body.Breakpoints {
+		wantLine := i + 1
+		if !bp.Verified || bp.Id != wantLine || bp.Line != wantLine {
+			t.Fatalf("breakpoint %d = %+v, want verified line/id %d", i, bp, wantLine)
+		}
+	}
+	if got := dbg.setCount(); got != breakpointCount {
+		t.Fatalf("SetBreakpoint calls = %d, want %d", got, breakpointCount)
+	}
+
+	requested = append(requested, godap.SourceBreakpoint{Line: 1000})
+	nextSeq := hh.sendReq("setBreakpoints", &godap.SetBreakpointsRequest{
+		Arguments: godap.SetBreakpointsArguments{
+			Source:      godap.Source{Path: "/x/main.go", Name: "main.go"},
+			Breakpoints: requested,
+		},
+	})
+	next := recvType[*godap.SetBreakpointsResponse](hh)
+	if next.RequestSeq != nextSeq {
+		t.Fatalf("next setBreakpoints request seq = %d, want %d", next.RequestSeq, nextSeq)
+	}
+	last := next.Body.Breakpoints[len(next.Body.Breakpoints)-1]
+	if !last.Verified || last.Id != 1000 || last.Line != 1000 {
+		t.Fatalf("next breakpoint = %+v, want verified line/id 1000", last)
+	}
+
+	hh.handler.mu.Lock()
+	pendingSets := len(hh.handler.setQ)
+	hh.handler.mu.Unlock()
+	if pendingSets != 0 {
+		t.Fatalf("pending set FIFO entries = %d, want 0", pendingSets)
+	}
+
+	hh.sendReq("configurationDone", &godap.ConfigurationDoneRequest{})
+	_ = recvType[*godap.ConfigurationDoneResponse](hh)
+	launch := recvType[*godap.LaunchResponse](hh)
+	if launch.RequestSeq != launchSeq {
+		t.Fatalf("launch request seq = %d, want %d", launch.RequestSeq, launchSeq)
+	}
+	_ = recvType[*godap.StoppedEvent](hh)
 }
 
 func TestStackTraceAndVariablesCorrelation(t *testing.T) {

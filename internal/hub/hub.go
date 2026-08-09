@@ -19,7 +19,11 @@ import (
 
 var ErrHubClosed = errors.New("hub is shutting down")
 
-const defaultSuspendTimeout = 30 * time.Minute
+const (
+	commandQueueSize               = 32
+	defaultCommandAdmissionTimeout = 5 * time.Second
+	defaultSuspendTimeout          = 30 * time.Minute
+)
 
 // suspendingEvents pause the hub and require a resuming command before the
 // process is allowed to continue. EventPaused is included: a Pause request
@@ -71,8 +75,11 @@ type Hub struct {
 	stateMu sync.RWMutex
 	state   protocol.SessionState
 
-	// cmdCh: non-resuming commands from client read-pumps to the main loop.
-	cmdCh chan clientCommand
+	// cmdCh carries non-resuming commands from client read-pumps to the main
+	// loop. Producers apply bounded backpressure rather than dropping commands;
+	// commandAdmissionTimeout bounds how long one client may wait for capacity.
+	cmdCh                   chan clientCommand
+	commandAdmissionTimeout time.Duration
 
 	// resumeCh: capacity 1, first-write-wins. Extras dropped in injectCommand.
 	resumeCh chan protocol.Command
@@ -117,14 +124,15 @@ func newHub(log *slog.Logger) *Hub {
 		log = slog.Default()
 	}
 	return &Hub{
-		registry:           newRegistry(),
-		cmdCh:              make(chan clientCommand, 32),
-		resumeCh:           make(chan protocol.Command, 1),
-		suspendTimeout:     defaultSuspendTimeout,
-		shutdownCh:         make(chan struct{}),
-		done:               make(chan struct{}),
-		log:                log,
-		restartBreakpoints: make(map[int]protocol.Location),
+		registry:                newRegistry(),
+		cmdCh:                   make(chan clientCommand, commandQueueSize),
+		commandAdmissionTimeout: defaultCommandAdmissionTimeout,
+		resumeCh:                make(chan protocol.Command, 1),
+		suspendTimeout:          defaultSuspendTimeout,
+		shutdownCh:              make(chan struct{}),
+		done:                    make(chan struct{}),
+		log:                     log,
+		restartBreakpoints:      make(map[int]protocol.Location),
 	}
 }
 
@@ -683,22 +691,50 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 }
 
 // injectCommand is called by client read-pumps. Resuming commands (Continue,
-// Step*) go to resumeCh to directly unblock a suspended hub; everything else —
-// including Kill and Pause, which must act while the process is running — goes
-// to cmdCh, drained by Run's main loop and the suspended wait loop alike.
-func (h *Hub) injectCommand(_ *Client, cmd protocol.Command) {
+// Step*) retain their first-writer-wins semantics. Ordinary commands apply
+// bounded backpressure so a live client is never left with silently missing
+// commands; persistent overload evicts that client instead.
+func (h *Hub) injectCommand(c *Client, cmd protocol.Command) bool {
 	if resumingCommands[cmd.Kind] {
 		select {
 		case h.resumeCh <- cmd:
+		case <-h.shutdownCh:
+			return false
+		case <-c.disconnected:
+			return false
 		default:
 			// First writer wins; later resumers are dropped.
 		}
-		return
+		return true
 	}
+
+	cc := clientCommand{cmd: cmd}
 	select {
-	case h.cmdCh <- clientCommand{cmd: cmd}:
+	case h.cmdCh <- cc:
+		return true
+	case <-h.shutdownCh:
+		return false
+	case <-c.disconnected:
+		return false
 	default:
-		h.log.Warn("command queue full — dropping", "kind", cmd.Kind)
+	}
+
+	timeout := time.NewTimer(h.commandAdmissionTimeout)
+	defer timeout.Stop()
+
+	select {
+	case h.cmdCh <- cc:
+		return true
+	case <-h.shutdownCh:
+		return false
+	case <-c.disconnected:
+		return false
+	case <-timeout.C:
+		h.log.Warn("command admission timed out — evicting client",
+			"kind", cmd.Kind, "timeout", h.commandAdmissionTimeout)
+		h.removeClient(c)
+		_ = c.conn.Close()
+		return false
 	}
 }
 

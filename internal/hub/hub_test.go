@@ -31,6 +31,9 @@ type fakeDebugger struct {
 	attachErr        error
 	setBPResult      protocol.Breakpoint
 	setBPErr         error
+	setBPGate        chan struct{}
+	setBPStarted     chan struct{}
+	setBPStartOnce   sync.Once
 	clearBPErr       error
 	continueErr      error
 	emitContinued    bool
@@ -94,6 +97,12 @@ func (f *fakeDebugger) ClearBreakpoint(id int) error {
 }
 func (f *fakeDebugger) SetBreakpoint(file string, line int) (protocol.Breakpoint, error) {
 	f.record("SetBreakpoint")
+	if f.setBPStarted != nil {
+		f.setBPStartOnce.Do(func() { close(f.setBPStarted) })
+	}
+	if f.setBPGate != nil {
+		<-f.setBPGate
+	}
 	return f.setBPResult, f.setBPErr
 }
 func (f *fakeDebugger) Locals(fi int) ([]protocol.Variable, error) {
@@ -144,11 +153,15 @@ type fakeWSWrite struct {
 }
 
 func newFakeWSConn() *fakeWSConn {
+	return newFakeWSConnWithOutgoingBuffer(32)
+}
+
+func newFakeWSConnWithOutgoingBuffer(size int) *fakeWSConn {
 	return &fakeWSConn{
 		// Large buffer so WriteMessage (called from the hub's event loop)
 		// never blocks if a test doesn't drain — blocking would deadlock.
 		incoming: make(chan []byte, 256),
-		outgoing: make(chan []byte, 32),
+		outgoing: make(chan []byte, size),
 	}
 }
 
@@ -701,6 +714,61 @@ var _ = Describe("Hub", func() {
 			conn.inject(mustCommand(protocol.CmdKill, struct{}{}))
 			Eventually(fd.recordedCalls, "500ms", "10ms").
 				Should(ContainElement("Kill"))
+		})
+	})
+
+	Describe("ordinary command admission", func() {
+		It("executes a burst larger than cmdCh capacity without losing Kill", func() {
+			conn := newFakeWSConnWithOutgoingBuffer(1)
+			mustAddClient(h, conn)
+
+			fd.setBPGate = make(chan struct{})
+			fd.setBPStarted = make(chan struct{})
+			var releaseOnce sync.Once
+			release := func() {
+				releaseOnce.Do(func() { close(fd.setBPGate) })
+			}
+			DeferCleanup(release)
+
+			const breakpointCount = 48
+			conn.inject(mustCommand(protocol.CmdSetBreakpoint,
+				protocol.SetBreakpointPayload{File: "main.go", Line: 1}))
+			select {
+			case <-fd.setBPStarted:
+			case <-time.After(500 * time.Millisecond):
+				Fail("first SetBreakpoint did not reach the debugger")
+			}
+
+			burstSent := make(chan struct{})
+			go func() {
+				defer close(burstSent)
+				for line := 2; line <= breakpointCount; line++ {
+					conn.inject(mustCommand(protocol.CmdSetBreakpoint,
+						protocol.SetBreakpointPayload{File: "main.go", Line: line}))
+				}
+				conn.inject(mustCommand(protocol.CmdKill, struct{}{}))
+			}()
+
+			select {
+			case <-burstSent:
+				Fail("burst bypassed backpressure while the debugger was gated")
+			case <-time.After(100 * time.Millisecond):
+			}
+
+			release()
+			select {
+			case <-burstSent:
+			case <-time.After(2 * time.Second):
+				Fail("command producer remained blocked after debugger release")
+			}
+
+			Eventually(func() int {
+				return countCalls(fd.recordedCalls(), "SetBreakpoint")
+			}, "2s", "10ms").Should(Equal(breakpointCount))
+			Eventually(func() int {
+				return countCalls(fd.recordedCalls(), "Kill")
+			}, "2s", "10ms").Should(Equal(1))
+			Expect(h.ClientCount()).To(Equal(1))
 		})
 	})
 

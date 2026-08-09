@@ -19,9 +19,9 @@ import (
 )
 
 // cmdBufferSize bounds the queue of bingo commands awaiting the hub's read
-// pump. The pump drains it promptly (injectCommand is a channel send), so a
-// small buffer is plenty; it exists mainly so the DAP read loop never blocks
-// while a burst of setBreakpoints commands is enqueued.
+// pump. It absorbs normal setBreakpoints bursts while the hub applies its own
+// bounded backpressure; persistent hub overload closes the handler and unblocks
+// enqueue through done.
 const cmdBufferSize = 64
 
 // dapWriteTimeout bounds a single socket write so a DAP client that stops
