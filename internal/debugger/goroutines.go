@@ -15,11 +15,11 @@ import (
 // linkage for a spawn tree, the thread set, the current goroutine, and the
 // created/exited lifecycle deltas. See AGENTS.md → goroutine snapshot reading.
 //
-// Everything here runs on the serialized engine loop while the tracee is
-// suspended, so memory reads are race-free. Every read is best-effort: any
-// failure (no DWARF, an unexpected layout, an unreadable address, or a runtime
-// not yet initialized at the entry stop) degrades gracefully to the legacy
-// single-synthetic goroutine rather than erroring the stop.
+// The engine serializes the walk while the reporting thread is suspended.
+// Darwin also stops sibling threads, but Linux ptrace stops are per-thread, so
+// runtime mutations can race the walk there. Any incomplete required read
+// therefore degrades gracefully to the legacy single-synthetic goroutine rather
+// than being mistaken for a lifecycle change or erroring the stop.
 
 const (
 	// maxGoroutineScan bounds the runtime.allgs walk so a corrupt slice header
@@ -225,25 +225,28 @@ func (e *engine) locForPC(pc uint64) protocol.Location {
 	return e.dw.locationForPC(pc)
 }
 
-// readGoroutine reads one runtime.g at gptr into a protocol.Goroutine. It
-// returns ok=false when the goroutine should be skipped (freelist slot, dead,
-// or unreadable). liveSP/livePC identify the currently-stopped thread so the
-// goroutine running there is marked Current and gets its live PC as CurrentLoc.
-func (e *engine) readGoroutine(l *goLayout, gptr, liveSP, livePC uint64) (protocol.Goroutine, bool) {
+// readGoroutine reads one runtime.g at gptr into a protocol.Goroutine. include
+// is false for intentional freelist/dead entries; complete is false only when a
+// required field is unreadable. liveSP/livePC identify the currently-stopped
+// thread so the goroutine running there is marked Current and gets its live PC.
+func (e *engine) readGoroutine(l *goLayout, gptr, liveSP, livePC uint64) (g protocol.Goroutine, include, complete bool) {
 	rawStatus, ok := e.readU32(gptr + uint64(l.gAtomicstatus))
 	if !ok {
-		return protocol.Goroutine{}, false
+		return protocol.Goroutine{}, false, false
 	}
 	status := rawStatus &^ gScanBit
 
 	goid, ok := e.readI64(gptr + uint64(l.gGoid))
-	if !ok || goid <= 0 || status == gStatusDead {
+	if !ok {
+		return protocol.Goroutine{}, false, false
+	}
+	if goid <= 0 || status == gStatusDead {
 		// Freelist / dead slots carry goid 0 or a stale id; a UI wants only the
 		// live set. Their departure is reported via the exited delta.
-		return protocol.Goroutine{}, false
+		return protocol.Goroutine{}, false, true
 	}
 
-	g := protocol.Goroutine{
+	g = protocol.Goroutine{
 		ID:     int(goid),
 		Status: goStatusString(status),
 	}
@@ -281,7 +284,7 @@ func (e *engine) readGoroutine(l *goLayout, gptr, liveSP, livePC uint64) (protoc
 		g.CurrentLoc = e.locForPC(schedPC)
 	}
 
-	return g, true
+	return g, true, true
 }
 
 func (e *engine) readI64(addr uint64) (int64, bool) {
@@ -316,10 +319,17 @@ func (e *engine) buildGoroutineList(liveSP, livePC uint64) ([]protocol.Goroutine
 	out := make([]protocol.Goroutine, 0, length)
 	for i := uint64(0); i < length; i++ {
 		gptr, ok := e.readU64(ptr + i*8)
-		if !ok || gptr == 0 {
+		if !ok {
+			return nil, false
+		}
+		if gptr == 0 {
 			continue
 		}
-		if g, ok := e.readGoroutine(l, gptr, liveSP, livePC); ok {
+		g, include, complete := e.readGoroutine(l, gptr, liveSP, livePC)
+		if !complete {
+			return nil, false
+		}
+		if include {
 			out = append(out, g)
 		}
 	}
@@ -331,19 +341,20 @@ func (e *engine) buildGoroutineList(liveSP, livePC uint64) ([]protocol.Goroutine
 
 // readThreads walks runtime.allm and reports every OS thread (M). currentGoid
 // (from the goroutine list) marks the thread whose goroutine is under
-// inspection as Current and gives it the live PC. Best-effort: nil on failure.
-func (e *engine) readThreads(currentGoid int, livePC uint64) []protocol.Thread {
+// inspection as Current and gives it the live PC. complete is false only when
+// the list itself can't be traversed; individual thread metadata is optional.
+func (e *engine) readThreads(currentGoid int, livePC uint64) ([]protocol.Thread, bool) {
 	l, ok := e.getGoLayout()
 	if !ok {
-		return nil
+		return nil, false
 	}
 	base, ok := e.dw.runtimeVarAddr("runtime.allm")
 	if !ok {
-		return nil
+		return nil, false
 	}
 	mptr, ok := e.readU64(base) // runtime.allm is a *m; read the head pointer
 	if !ok {
-		return nil
+		return nil, false
 	}
 
 	var out []protocol.Thread
@@ -373,11 +384,11 @@ func (e *engine) readThreads(currentGoid int, livePC uint64) []protocol.Thread {
 
 		next, ok := e.readU64(mptr + uint64(l.mAlllink))
 		if !ok {
-			break
+			return nil, false
 		}
 		mptr = next
 	}
-	return out
+	return out, true
 }
 
 // liveRegisters reads the currently-stopped thread's SP and PC (used to locate
@@ -464,9 +475,16 @@ func (e *engine) snapshotFrom(gs []protocol.Goroutine, livePC uint64, trackLifec
 		}
 	}
 
+	threads, ok := e.readThreads(current, livePC)
+	if !ok {
+		return protocol.GoroutineSnapshotPayload{
+			Goroutines: []protocol.Goroutine{e.syntheticGoroutine(livePC)},
+		}
+	}
+
 	snap := protocol.GoroutineSnapshotPayload{
 		Goroutines: gs,
-		Threads:    e.readThreads(current, livePC),
+		Threads:    threads,
 		Current:    current,
 	}
 	if trackLifecycle {
