@@ -3,6 +3,7 @@ package debugger_test
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sync"
 	"syscall"
 	"testing"
@@ -32,6 +33,7 @@ type fakeBackend struct {
 
 	continueCalls    int
 	singleStepCalls  []int
+	opLog            []string
 	stopProcessCalls int
 	writtenAt        map[uint64][]byte
 	continueCh       chan struct{}
@@ -144,12 +146,28 @@ func (f *fakeBackend) peekMem(addr uint64, n int) []byte {
 func (f *fakeBackend) ContinueProcess() error {
 	f.faultMu.Lock()
 	f.continueCalls++
+	f.opLog = append(f.opLog, "continue")
 	f.faultMu.Unlock()
 	select {
 	case f.continueCh <- struct{}{}:
 	default:
 	}
 	return nil
+}
+
+// recordOp appends to the ordered backend-call log. Specs that pin an ordering
+// invariant (e.g. a memory write that must happen while a thread is still
+// stopped) assert on ops() rather than on counters, which cannot express it.
+func (f *fakeBackend) recordOp(op string) {
+	f.faultMu.Lock()
+	f.opLog = append(f.opLog, op)
+	f.faultMu.Unlock()
+}
+
+func (f *fakeBackend) ops() []string {
+	f.faultMu.Lock()
+	defer f.faultMu.Unlock()
+	return append([]string(nil), f.opLog...)
 }
 
 // continueCount reads the resume counter under the lock. Assertions that poll
@@ -173,6 +191,7 @@ func (f *fakeBackend) Threads() ([]int, error) {
 
 func (f *fakeBackend) SingleStep(tid int) error {
 	f.singleStepCalls = append(f.singleStepCalls, tid)
+	f.recordOp(fmt.Sprintf("step:%d", tid))
 	return nil
 }
 
@@ -198,6 +217,7 @@ func (f *fakeBackend) WriteMemory(addr uint64, src []byte) error {
 	cp := make([]byte, len(src))
 	copy(cp, src)
 	f.writtenAt[addr] = cp
+	f.recordOp(fmt.Sprintf("write:0x%x", addr))
 	for i, b := range src {
 		f.mem[addr+uint64(i)] = b
 	}
