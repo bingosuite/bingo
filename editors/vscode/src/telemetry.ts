@@ -354,16 +354,33 @@ function decodeSnapshot(payload: Record<string, unknown>): Snapshot {
     ids.add(goroutine.id);
   }
   const totals = decodeTotals(payload.totals);
+  const threads = rawThreads.map((value, index) =>
+    decodeThread(value, `threads[${String(index)}]`),
+  );
+  if (totals !== undefined) {
+    // Totals are the server's ORIGINAL counts, so they can never be below what
+    // actually arrived. A total that is smaller is not a truncation report, it
+    // is a contradiction — and silently trusting it would make the UI claim a
+    // partial view is complete, or render a negative omission count.
+    assertTotalCovers(totals.goroutines, goroutines.length, "totals.goroutines");
+    assertTotalCovers(totals.threads, threads.length, "totals.threads");
+  }
   return {
     goroutines,
-    threads: rawThreads.map((value, index) =>
-      decodeThread(value, `threads[${String(index)}]`),
-    ),
+    threads,
     current: optionalInteger(payload.current, "current"),
     created: decodeIDs(payload.created, "created"),
     exited: decodeIDs(payload.exited, "exited"),
     ...(totals === undefined ? {} : { totals }),
   };
+}
+
+function assertTotalCovers(total: number, delivered: number, label: string): void {
+  if (total < delivered) {
+    throw new TelemetryProtocolError(
+      `${label} (${String(total)}) is below the ${String(delivered)} delivered`,
+    );
+  }
 }
 
 // decodeGoroutineList decodes the 1.4 EventGoroutines shape. The observer does
@@ -375,10 +392,21 @@ export function decodeGoroutineList(
   exactKeys(payload, ["goroutines"], ["totals"], "goroutines payload");
   const raw = protocolArray(payload.goroutines, "goroutines", maximumGoroutines);
   const totals = decodeTotals(payload.totals);
+  const goroutines = raw.map((value, index) =>
+    decodeGoroutine(value, `goroutines[${String(index)}]`),
+  );
+  if (totals !== undefined) {
+    assertTotalCovers(totals.goroutines, goroutines.length, "totals.goroutines");
+    // This shape carries no threads at all, so any thread total is meaningless
+    // rather than merely partial.
+    if (totals.threads !== 0) {
+      throw new TelemetryProtocolError(
+        `totals.threads (${String(totals.threads)}) is meaningless without a thread list`,
+      );
+    }
+  }
   return {
-    goroutines: raw.map((value, index) =>
-      decodeGoroutine(value, `goroutines[${String(index)}]`),
-    ),
+    goroutines,
     ...(totals === undefined ? {} : { totals }),
   };
 }

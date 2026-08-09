@@ -1672,12 +1672,31 @@ so it needs no retry). The retry can only omit more, never fewer, so it settles 
 and it is what keeps a payload that exactly fills the budget from being falsely
 degraded. Hence "each candidate marshalled at most twice".
 
+**Producer and consumer constraints must agree EXACTLY.** The budget alone is
+not enough: `MaxGoroutineStringLength` (4096) caps every string inside a packed
+`Goroutine`/`Thread` — status, wait reason, and each `Location`'s file and
+function — because the consumer already enforces that per string. One over-long
+string is nowhere near the byte budget, so budgeting alone would emit an element
+the consumer is *obliged* to reject, killing that connection deterministically on
+every retry. The element is dropped whole (skip-and-continue for a non-anchor,
+degrade for an anchor); strings and Locations are NEVER truncated. The count is
+in **UTF-16 code units**, matching JavaScript — an astral character costs two, so
+byte- or rune-counting would disagree exactly at the boundary. Invalid UTF-8
+bytes count as one unit each, matching both Go's range loop and `encoding/json`'s
+one-U+FFFD-per-bad-byte substitution.
+
+The same rule binds anything else the two sides both validate. Goids and
+lifecycle-delta ids must stay inside JavaScript's safe-integer range (2^53−1);
+the runtime's sequential goid counter guarantees that in practice, but a
+synthetic id above it would be rejected by the consumer, not merely rounded.
+
 **Totals = the honesty channel.** `SnapshotTotals{Goroutines, Threads, Clipped}`
 is present **iff** the wire omits elements or the runtime scan was clipped, and
 absent on a complete unclipped result, so its mere presence means "this is not
 everything". `Clipped` means `maxGoroutineScan` was hit before packing started,
 which makes the goroutine count a **lower bound** — consumers must render it as
-such (the VS Code view appends `+`). Layer A owns the contract and the packers;
+such (the VS Code view appends `+`). A total below the delivered count is a
+contradiction, not a truncation report, and the consumer rejects it. Layer A owns the contract and the packers;
 producer wiring in `internal/debugger` is layer B and does not exist yet.
 
 **Streaming cadence (the load-bearing invariant).** `EventGoroutineSnapshot` is

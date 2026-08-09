@@ -687,6 +687,169 @@ describe("protocol violations do not consume reconnect attempts", () => {
   });
 });
 
+describe("per-element string limit", () => {
+  // The producer and this decoder must agree EXACTLY on what a legal element
+  // looks like. A string one unit over the limit is nowhere near the byte
+  // budget, so a producer that only budgeted bytes would happily emit an
+  // element this decoder is obliged to reject — killing the connection
+  // deterministically on every retry.
+  const ascii = (n: number): string => "a".repeat(n);
+  // U+1F600 is astral: one code point, TWO UTF-16 code units.
+  const astral = (units: number): string => "\u{1F600}".repeat(units / 2);
+
+  function snapshotWith(mutate: (g: Record<string, unknown>) => void): string {
+    const goroutine: Record<string, unknown> = {
+      id: 2,
+      status: "waiting",
+      currentLoc: { file: "a.go", line: 1 },
+    };
+    mutate(goroutine);
+    return frame(1, "GoroutineSnapshot", {
+      goroutines: [
+        { id: 1, status: "running", current: true, currentLoc: { file: "a.go", line: 1 } },
+        goroutine,
+      ],
+      threads: [],
+      current: 1,
+    });
+  }
+
+  const fields: readonly (readonly [string, (g: Record<string, unknown>, v: string) => void])[] = [
+    ["status", (g, v) => { g.status = v; }],
+    ["waitReason", (g, v) => { g.waitReason = v; }],
+    ["currentLoc.file", (g, v) => { g.currentLoc = { file: v, line: 1 }; }],
+    ["currentLoc.function", (g, v) => { g.currentLoc = { file: "a.go", line: 1, function: v }; }],
+    ["startLoc.file", (g, v) => { g.startLoc = { file: v, line: 1 }; }],
+    ["startLoc.function", (g, v) => { g.startLoc = { file: "a.go", line: 1, function: v }; }],
+    ["createdLoc.file", (g, v) => { g.createdLoc = { file: v, line: 1 }; }],
+    ["createdLoc.function", (g, v) => { g.createdLoc = { file: "a.go", line: 1, function: v }; }],
+  ];
+
+  for (const [label, set] of fields) {
+    it(`accepts ${label} exactly at the limit`, () => {
+      const decoded = decodeEvent(
+        snapshotWith((g) => { set(g, ascii(maximumStringLength)); }),
+      );
+      assert.equal(decoded.snapshot?.goroutines.length, 2);
+    });
+
+    it(`rejects ${label} one unit over the limit`, () => {
+      assert.throws(
+        () => decodeEvent(snapshotWith((g) => { set(g, ascii(maximumStringLength + 1)); })),
+        TelemetryProtocolError,
+      );
+    });
+  }
+
+  it("counts astral characters as two units, matching the producer", () => {
+    const atLimit = astral(maximumStringLength);
+    assert.equal(atLimit.length, maximumStringLength, "4096 UTF-16 units");
+    assert.equal([...atLimit].length, maximumStringLength / 2, "but only 2048 code points");
+    assert.doesNotThrow(() =>
+      decodeEvent(snapshotWith((g) => { g.currentLoc = { file: atLimit, line: 1 }; })),
+    );
+
+    assert.throws(
+      () =>
+        decodeEvent(
+          snapshotWith((g) => { g.currentLoc = { file: `${atLimit}a`, line: 1 }; }),
+        ),
+      TelemetryProtocolError,
+    );
+  });
+
+  it("rejects an over-limit string on a thread", () => {
+    const withThread = (file: string): string =>
+      frame(1, "GoroutineSnapshot", {
+        goroutines: [],
+        threads: [{ id: 7, currentLoc: { file, line: 1 } }],
+      });
+    assert.doesNotThrow(() => decodeEvent(withThread(ascii(maximumStringLength))));
+    assert.throws(
+      () => decodeEvent(withThread(ascii(maximumStringLength + 1))),
+      TelemetryProtocolError,
+    );
+  });
+
+  it("pins the limit against the Go producer constant", () => {
+    const source = goSource("pkg/protocol/protocol.go");
+    assert.match(
+      source,
+      new RegExp(`MaxGoroutineStringLength\\s*=\\s*${String(maximumStringLength)}\\b`),
+      "producer and consumer must cap element strings identically",
+    );
+  });
+});
+
+describe("totals must not contradict what arrived", () => {
+  it("rejects a goroutine total below the delivered count", () => {
+    assert.throws(
+      () =>
+        decodeEvent(
+          frame(1, "GoroutineSnapshot", {
+            goroutines: [
+              { id: 1, status: "running", currentLoc: { file: "a.go", line: 1 } },
+              { id: 2, status: "waiting", currentLoc: { file: "a.go", line: 1 } },
+            ],
+            threads: [],
+            totals: { goroutines: 1 },
+          }),
+        ),
+      /totals.goroutines \(1\) is below the 2 delivered/u,
+    );
+  });
+
+  it("rejects a thread total below the delivered count", () => {
+    assert.throws(
+      () =>
+        decodeEvent(
+          frame(1, "GoroutineSnapshot", {
+            goroutines: [],
+            threads: [{ id: 7 }, { id: 8 }],
+            totals: { goroutines: 0, threads: 1 },
+          }),
+        ),
+      /totals.threads \(1\) is below the 2 delivered/u,
+    );
+  });
+
+  it("accepts totals equal to and above the delivered counts", () => {
+    for (const goroutines of [2, 3, 41203]) {
+      const decoded = decodeEvent(
+        frame(1, "GoroutineSnapshot", {
+          goroutines: [
+            { id: 1, status: "running", currentLoc: { file: "a.go", line: 1 } },
+            { id: 2, status: "waiting", currentLoc: { file: "a.go", line: 1 } },
+          ],
+          threads: [],
+          totals: { goroutines },
+        }),
+      );
+      assert.equal(decoded.snapshot?.totals?.goroutines, goroutines);
+    }
+  });
+
+  it("rejects a contradictory total in the goroutine list shape", () => {
+    assert.throws(
+      () =>
+        decodeGoroutineList({
+          goroutines: [{ id: 1, status: "running", currentLoc: { file: "a.go", line: 1 } }],
+          totals: { goroutines: 0 },
+        }),
+      TelemetryProtocolError,
+    );
+    assert.throws(
+      () =>
+        decodeGoroutineList({
+          goroutines: [],
+          totals: { goroutines: 0, threads: 5 },
+        }),
+      TelemetryProtocolError,
+      "this shape carries no threads, so a thread total is meaningless",
+    );
+  });
+});
+
 describe("truthful omission surfacing", () => {
   it("reports server omissions separately from the view cap", () => {
     const view = toSessionViewModel(

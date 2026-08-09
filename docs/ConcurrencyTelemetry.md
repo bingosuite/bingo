@@ -210,6 +210,11 @@ What a consumer sees:
   degrades to empty collections rather than failing; a degraded result that still
   overflows (only possible if the deltas alone do) reports `Oversized` rather
   than pretending to conform.
+- **Element strings are capped at 4096 UTF-16 code units** (status, wait reason,
+  and each `Location`'s file and function). An element that breaks it is dropped
+  whole — never truncated — because a consumer that enforces the same limit would
+  otherwise be forced to reject the event. Count UTF-16 code units, not bytes or
+  runes: an astral character costs two.
 - **Deltas are not packed elements.** Because they are never trimmed,
   `created`/`exited` can legitimately exceed the element caps — the debugger's
   scan reaches 8192. A consumer must not apply its element cap to them; the byte

@@ -32,6 +32,19 @@ const (
 	// thread view is useless once it is arbitrarily truncated, so a realistic
 	// machine's worth of threads survives even a saturating goroutine set.
 	MinThreadsRetained = 32
+
+	// MaxGoroutineStringLength bounds every string inside a packed Goroutine or
+	// Thread — status, wait reason, and each Location's file and function.
+	//
+	// This is NOT a size optimisation: it is the per-element constraint the
+	// consumer already enforces, and the producer must agree with it exactly.
+	// A single over-long string is comfortably inside the byte budget, so
+	// budgeting alone would happily emit an element the consumer is obliged to
+	// reject — deterministically killing that connection on every retry. The
+	// element is dropped whole instead; strings and Locations are never
+	// truncated. Measured in UTF-16 code units to match the consumer (see
+	// utf16Len).
+	MaxGoroutineStringLength = 4096
 )
 
 // VersionError reports that a peer used a wire version other than Version.
