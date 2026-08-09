@@ -167,11 +167,15 @@ func pack(
 	// Fits-as-is fast path. A snapshot is packed on EVERY breakpoint stop, so the
 	// overwhelmingly common case — a payload already inside every limit — must
 	// not pay for the trimming machinery. Ordering is still applied (it is a
-	// sort, not a marshal, and consumers rely on it), but the size is settled
-	// with ONE whole-payload measurement instead of a marshal per element.
-	// Clipping is excluded because it forces Totals on, which changes the bytes.
-	if !totals.AnyClipped() &&
-		len(orderedG) <= MaxSnapshotGoroutines &&
+	// sort, not a marshal, and consumers rely on it), but the size is settled by
+	// a bound, or failing that a single measurement, rather than a marshal per
+	// element.
+	//
+	// A clipped scan does NOT disqualify this path. Clipping means the totals
+	// must be attached, not that anything has to be trimmed — and treating it as
+	// "must trim" made a thread-churning target, whose runtime.allm passes the
+	// scan ceiling, pay full per-element packing on every stop.
+	if len(orderedG) <= MaxSnapshotGoroutines &&
 		len(orderedT) <= MaxSnapshotThreads &&
 		elementsFitLimits(orderedG, orderedT) {
 		gs, ts := nonNilGoroutines(orderedG), nonNilThreads(orderedT)
@@ -180,14 +184,13 @@ func pack(
 			Goroutines: len(gs),
 			Threads:    len(ts),
 		}
-		// Cheapest first: a conservative upper bound needs only a pass over
-		// string lengths, no marshalling at all. A thread-churning target keeps
-		// thousands of Ms alive, so marshalling the payload just to discover it
-		// fits cost milliseconds on every single stop.
+		// Nothing is omitted here, so payloadTotals attaches Totals exactly when
+		// a scan was clipped; the bound allows for it either way.
+		attached := payloadTotals(totals, fits)
 		if boundedSize(gs, ts, deltaCount) <= MaxGoroutineEventBytes {
 			return gs, ts, fits
 		}
-		size, ok := packBudget(kind, build(gs, ts, deliveredCurrent(gs, current), nil))
+		size, ok := packBudget(kind, build(gs, ts, deliveredCurrent(gs, current), attached))
 		if ok && size <= MaxGoroutineEventBytes {
 			fits.Bytes = size
 			return gs, ts, fits
@@ -238,7 +241,7 @@ func pack(
 // measurement is needed; when it does not, the caller measures for real.
 func boundedSize(gs []Goroutine, ts []Thread, deltas int) int {
 	const (
-		envelopeAllowance  = 256 // version, kind, a 20-digit seq, payload keys
+		envelopeAllowance  = 384 // version, kind, a 20-digit seq, payload keys, totals
 		goroutineAllowance = 256 // its own keys plus every numeric field
 		threadAllowance    = 192
 		deltaAllowance     = 24 // a 20-digit goid plus its separator
