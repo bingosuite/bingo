@@ -35,7 +35,7 @@ func TestParseConfigDefaultsToPersistentServer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse defaults: %v", err)
 	}
-	if cfg.addr != ":6060" || cfg.dapAddr != "" || cfg.idleTimeout != 0 || cfg.verbose {
+	if cfg.addr != "127.0.0.1:6060" || cfg.dapAddr != "" || cfg.idleTimeout != 0 || cfg.verbose {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 }
