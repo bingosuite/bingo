@@ -568,6 +568,15 @@ when changing `BINGO_E2E_OVERLAP_ITERS` (default 90) or
 loop); prefer more rounds over a longer single round, since rounds reset the
 watchdog while iterations spend it.
 
+`BINGO_E2E_OVERLAP_PAUSE_ITERS` (default 70) is sized from the opposite
+direction: it is bounded above by the watchdog like the rest, but bounded
+*below* by statistical power. Only ~10–22% of cycles land the interrupt inside
+the machine-step window (measured 9/40, 5/40 and 4/40 across three native runs),
+so the held-interrupt assertion is the spec's own flake risk — at 40 cycles it
+would fail spuriously ~0.9^40 ≈ 1.5% of the time. 70 takes that to ~0.06% and
+still costs only ~88s at the slowest per-cycle rate yet observed. Lowering it
+re-introduces the flake; raising it much further runs into the watchdog.
+
 ## Architecture-specific traps
 
 Per-arch in [trap_amd64.go](internal/debugger/trap_amd64.go) and
