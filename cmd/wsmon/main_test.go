@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
@@ -76,38 +77,88 @@ func snapshotErrorEvent(t *testing.T, seq uint64) protocol.Event {
 	})
 }
 
-// -once used to wait forever when the server rejected the request: the reply it
-// was blocked on never came and EventError was ignored. It must now fail fast
-// with the server's reason so the caller can exit nonzero.
-func TestRunOnceFailsOnRejectedSnapshotRequest(t *testing.T) {
-	events := make(chan protocol.Event, 2)
+func snapshotPushEvent(t *testing.T, seq uint64, current int) protocol.Event {
+	t.Helper()
+
+	return protocol.MustEvent(protocol.EventGoroutineSnapshot, seq, protocol.GoroutineSnapshotPayload{
+		Goroutines: []protocol.Goroutine{{ID: current, Current: true}},
+		Current:    current,
+	})
+}
+
+// The adversarial ordering: another client's snapshot request is rejected while
+// the target runs, then the target reaches a stop and pushes a snapshot to
+// everyone. EventError carries no requester, so treating it as OUR answer would
+// be correlation by kind — the very thing this command stopped doing. A later
+// snapshot must win.
+func TestRunOnceSucceedsWhenSnapshotFollowsBroadcastRejection(t *testing.T) {
+	events := make(chan protocol.Event, 3)
 	events <- snapshotErrorEvent(t, 2)
+	events <- snapshotPushEvent(t, 3, 7)
 	close(events)
 
 	m := &monitor{clients: -1}
 	renders := 0
-	err := m.run(events, true, func() { renders++ })
-	if err == nil {
-		t.Fatal("run(-once) returned nil for a rejected snapshot request")
+	if err := m.run(events, true, time.Minute, func() { renders++ }); err != nil {
+		t.Fatalf("run(-once) failed on an unrelated broadcast rejection: %v", err)
 	}
-	if !strings.Contains(err.Error(), "process not suspended") {
-		t.Fatalf("run error = %v, want the server's reason", err)
+	if renders != 1 {
+		t.Fatalf("renders = %d, want exactly 1 (the snapshot)", renders)
 	}
-	if renders != 0 {
-		t.Fatalf("renders = %d, want 0 (nothing to draw)", renders)
+	if !m.hasSnapshot || m.snapshot.Current != 7 {
+		t.Fatalf("monitor snapshot = %+v, want the pushed one", m.snapshot)
 	}
 }
 
-// A closed stream under -once is also a failure: the promised snapshot never
+// When no snapshot follows, -once must still terminate — bounded by the
+// deadline, not by guessing that the broadcast error was ours — and report the
+// rejection as context.
+func TestRunOnceDeadlineReportsObservedRejection(t *testing.T) {
+	events := make(chan protocol.Event, 1)
+	events <- snapshotErrorEvent(t, 2)
+	// Left open: the stream stays alive, so only the deadline can end the wait.
+
+	m := &monitor{clients: -1}
+	err := m.run(events, true, 50*time.Millisecond, func() {})
+	if err == nil {
+		t.Fatal("run(-once) returned nil despite never receiving a snapshot")
+	}
+	if !strings.Contains(err.Error(), "no snapshot within") {
+		t.Fatalf("run error = %v, want a deadline failure", err)
+	}
+	if !strings.Contains(err.Error(), "process not suspended") {
+		t.Fatalf("run error = %v, want the observed rejection as context", err)
+	}
+}
+
+// The deadline also bounds a silent server, with no rejection to report.
+func TestRunOnceDeadlineWithoutRejection(t *testing.T) {
+	events := make(chan protocol.Event)
+
+	m := &monitor{clients: -1}
+	err := m.run(events, true, 50*time.Millisecond, func() {})
+	if err == nil || !strings.Contains(err.Error(), "no snapshot within") {
+		t.Fatalf("run error = %v, want a deadline failure", err)
+	}
+	if strings.Contains(err.Error(), "rejected") {
+		t.Fatalf("run error = %v, want no rejection context when none was seen", err)
+	}
+}
+
+// A closed stream under -once is a failure too: the promised snapshot never
 // arrived, so exiting 0 would report success for empty output.
 func TestRunOnceFailsWhenStreamClosesWithoutSnapshot(t *testing.T) {
-	events := make(chan protocol.Event)
+	events := make(chan protocol.Event, 1)
+	events <- snapshotErrorEvent(t, 2)
 	close(events)
 
 	m := &monitor{clients: -1}
-	err := m.run(events, true, func() {})
+	err := m.run(events, true, time.Minute, func() {})
 	if err == nil || !strings.Contains(err.Error(), "connection closed") {
 		t.Fatalf("run error = %v, want a closed-stream failure", err)
+	}
+	if !strings.Contains(err.Error(), "process not suspended") {
+		t.Fatalf("run error = %v, want the observed rejection as context", err)
 	}
 }
 
@@ -118,15 +169,12 @@ func TestRunOnceRendersFirstSnapshotThenStops(t *testing.T) {
 		SessionID: "s1",
 		State:     protocol.StateSuspended,
 	})
-	events <- protocol.MustEvent(protocol.EventGoroutineSnapshot, 3, protocol.GoroutineSnapshotPayload{
-		Goroutines: []protocol.Goroutine{{ID: 1, Current: true}},
-		Current:    1,
-	})
+	events <- snapshotPushEvent(t, 3, 1)
 	close(events)
 
 	m := &monitor{clients: -1}
 	renders := 0
-	if err := m.run(events, true, func() { renders++ }); err != nil {
+	if err := m.run(events, true, time.Minute, func() { renders++ }); err != nil {
 		t.Fatalf("run(-once): %v", err)
 	}
 	if renders != 1 {
@@ -137,20 +185,17 @@ func TestRunOnceRendersFirstSnapshotThenStops(t *testing.T) {
 	}
 }
 
-// Live mode must not die on a rejection — the next stop pushes a snapshot on its
-// own — but it must surface the reason instead of swallowing it.
+// Live mode never applies a deadline and never dies on a rejection: it displays
+// the reason and keeps observing, because the next stop pushes a snapshot.
 func TestRunLiveSurvivesRejectionAndShowsReason(t *testing.T) {
 	events := make(chan protocol.Event, 2)
 	events <- snapshotErrorEvent(t, 2)
-	events <- protocol.MustEvent(protocol.EventGoroutineSnapshot, 3, protocol.GoroutineSnapshotPayload{
-		Goroutines: []protocol.Goroutine{{ID: 1, Current: true}},
-		Current:    1,
-	})
+	events <- snapshotPushEvent(t, 3, 1)
 	close(events)
 
 	m := &monitor{clients: -1}
 	renders := 0
-	if err := m.run(events, false, func() { renders++ }); err != nil {
+	if err := m.run(events, false, time.Millisecond, func() { renders++ }); err != nil {
 		t.Fatalf("run(live): %v", err)
 	}
 	if renders != 2 {

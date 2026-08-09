@@ -1,11 +1,10 @@
 // Command wsmon joins an existing bingo WebSocket session and renders the
 // streaming goroutine/thread telemetry in a terminal.
 //
-//	wsmon -session id [-addr host:port] [-once]
+//	wsmon -session id [-addr host:port] [-once] [-timeout d]
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -36,8 +35,10 @@ func main() {
 	addr := flag.String("addr", "localhost:6060", "server address (host:port)")
 	sessionID := flag.String("session", "", "session ID to join")
 	once := flag.Bool("once", false, "print one snapshot then exit")
+	timeout := flag.Duration("timeout", 30*time.Second,
+		"with -once, how long to wait for a snapshot (0 waits forever)")
 	flag.Usage = func() {
-		_, _ = fmt.Fprintf(flag.CommandLine.Output(), "usage: wsmon -session <id> [-addr host:port] [-once]\n\n")
+		_, _ = fmt.Fprintf(flag.CommandLine.Output(), "usage: wsmon -session <id> [-addr host:port] [-once] [-timeout d]\n\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -84,7 +85,7 @@ func main() {
 		m.render()
 	}
 
-	if err := m.run(c.Events(), *once, m.render); err != nil {
+	if err := m.run(c.Events(), *once, *timeout, m.render); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
@@ -94,42 +95,63 @@ func main() {
 }
 
 // run drains events until the stream closes, -once has rendered its snapshot,
-// or the server rejects the snapshot request. render is injected so tests can
-// count redraws without terminal output.
+// or (under -once) the deadline expires. render is injected so tests can count
+// redraws without terminal output.
 //
-// A rejection is only fatal under -once: that mode blocks until a snapshot
-// arrives, and after a rejection none is coming, so the old code waited
-// forever. In live mode the monitor keeps observing — the next stop pushes a
-// snapshot on its own — and surfaces the rejection on the status line.
-func (m *monitor) run(events <-chan protocol.Event, once bool, render func()) error {
-	for evt := range events {
-		if msg, ok := snapshotRejection(evt); ok && once {
-			return fmt.Errorf("server rejected the snapshot request: %s", msg)
-		}
-
-		renderedSnapshot, redraw := m.applyEvent(evt)
-		if !redraw {
-			continue
-		}
-		if once && !renderedSnapshot {
-			continue
-		}
-		render()
-		if once && renderedSnapshot {
-			return nil
-		}
+// A snapshot rejection is ADVISORY, never fatal on its own: EventError is
+// broadcast, so an error naming CmdGoroutineSnapshot may belong to another
+// client entirely, and a valid snapshot can still arrive right after it (the
+// target reaching a stop pushes one unprompted). Attributing it to our request
+// would reintroduce exactly the correlate-by-kind mistake this command was
+// changed to avoid. So a later snapshot always wins; the last rejection seen is
+// only reported as context if the wait ends without one. The deadline is what
+// keeps -once bounded when our own request really was rejected.
+func (m *monitor) run(events <-chan protocol.Event, once bool, timeout time.Duration, render func()) error {
+	var deadline <-chan time.Time
+	if once && timeout > 0 {
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+		deadline = timer.C
 	}
 
-	if once {
-		return errors.New("connection closed before a snapshot arrived")
+	var lastRejection string
+	for {
+		select {
+		case evt, ok := <-events:
+			if !ok {
+				if once {
+					return fmt.Errorf("connection closed before a snapshot arrived%s",
+						rejectionContext(lastRejection))
+				}
+				return nil
+			}
+
+			if msg, rejected := snapshotRejection(evt); rejected {
+				lastRejection = msg
+			}
+
+			renderedSnapshot, redraw := m.applyEvent(evt)
+			if !redraw {
+				continue
+			}
+			if once && !renderedSnapshot {
+				continue
+			}
+			render()
+			if once && renderedSnapshot {
+				return nil
+			}
+
+		case <-deadline:
+			return fmt.Errorf("no snapshot within %s%s", timeout, rejectionContext(lastRejection))
+		}
 	}
-	return nil
 }
 
-// snapshotRejection reports a failed CmdGoroutineSnapshot. EventError is
-// broadcast to every client, so this cannot tell our own rejection from another
-// client's; under -once either means no snapshot is coming, which is why the
-// caller treats both the same rather than waiting for a reply it can't identify.
+// snapshotRejection reports a failed CmdGoroutineSnapshot seen on the stream.
+// EventError carries no requester, so this says only "some snapshot request was
+// rejected" — it can never be attributed to this client's request. Callers must
+// treat it as advisory context, not as an answer.
 func snapshotRejection(evt protocol.Event) (string, bool) {
 	if evt.Kind != protocol.EventError {
 		return "", false
@@ -139,6 +161,13 @@ func snapshotRejection(evt protocol.Event) (string, bool) {
 		return "", false
 	}
 	return p.Message, true
+}
+
+func rejectionContext(msg string) string {
+	if msg == "" {
+		return ""
+	}
+	return fmt.Sprintf(" (a snapshot request was rejected meanwhile: %s)", msg)
 }
 
 func (m *monitor) applyEvent(evt protocol.Event) (bool, bool) {

@@ -69,7 +69,10 @@ type Client interface {
 	// Delivery is best-effort: like every event it goes through the shared
 	// Events() buffer, which drops when a caller stops draining, and a rejected
 	// request answers with EventError (Command == CmdGoroutineSnapshot) rather
-	// than a snapshot. A caller that blocks waiting for one must handle both.
+	// than a snapshot. A caller that waits for one must handle both — and must
+	// not read that error as its own answer: it is broadcast and carries no
+	// requester, so it may be another client's rejection with a valid snapshot
+	// still coming. Bound such a wait with a deadline, not with the error.
 	// The answer is also broadcast to every client on the session, so other
 	// observers see this refresh — with empty deltas — as an ordinary snapshot.
 	RequestGoroutineSnapshot() error
