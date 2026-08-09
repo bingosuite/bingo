@@ -1138,7 +1138,7 @@ func (e *engine) nextSeq() uint64 {
 func (e *engine) emit(kind protocol.EventKind, payload any) {
 	evt, err := protocol.NewEvent(kind, e.nextSeq(), payload)
 	if err != nil {
-		slog.Error("engine.emit: marshal event failed", "kind", kind, "err", err)
+		e.log.Error("engine.emit: marshal event failed", "kind", kind, "err", err)
 		return
 	}
 	// Non-blocking on purpose: this runs on the serialized loop, so blocking
@@ -1148,7 +1148,7 @@ func (e *engine) emit(kind protocol.EventKind, payload any) {
 	select {
 	case e.events <- evt:
 	default:
-		slog.Warn("engine.emit: events buffer full — dropping", "kind", kind)
+		e.log.Warn("engine.emit: events buffer full — dropping", "kind", kind)
 	}
 }
 
