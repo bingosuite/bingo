@@ -1,6 +1,7 @@
 package protocol_test
 
 import (
+	"encoding/json"
 	"math"
 	"math/rand"
 	"strings"
@@ -338,5 +339,161 @@ func TestPackTwoPassInvariantsUnderRandomInput(t *testing.T) {
 		assertSizeIsReportedAndBounded(t, c, out, rep)
 		assertTotalsPresence(t, c, out, rep)
 		assertAnchorsRetained(t, c, out, rep)
+	}
+}
+
+// stringBytesOf sums the raw string bytes an element carries, so a test can
+// separate what boundedSize charges per-string from its fixed allowance.
+func stringBytesOf(g protocol.Goroutine) int {
+	loc := func(l protocol.Location) int { return len(l.File) + len(l.Function) }
+	return len(g.Status) + len(g.WaitReason) +
+		loc(g.CurrentLoc) + loc(g.StartLoc) + loc(g.CreatedLoc)
+}
+
+// TestPackAllowancesCoverTheRealWorstCase derives each fixed allowance from an
+// actual marshal instead of trusting the constant. Every key is present and
+// every numeric field is at its widest, so adding a field to Goroutine, Thread,
+// Location or SnapshotTotals fails here — rather than silently making
+// boundedSize under-estimate and letting the fast path emit an over-cap event.
+func TestPackAllowancesCoverTheRealWorstCase(t *testing.T) {
+	envelope, goroutine, thread, delta := protocol.PackAllowances()
+	widest := protocol.Location{File: "x", Line: math.MaxInt64, Function: "y"}
+
+	g := protocol.Goroutine{
+		ID: math.MaxInt64, ParentID: math.MaxInt64, Status: "s", WaitReason: "w",
+		CurrentLoc: widest, StartLoc: widest, CreatedLoc: widest,
+		ThreadID: math.MaxInt64, Current: true,
+	}
+	raw, err := json.Marshal(g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fixed := len(raw) - stringBytesOf(g); fixed > goroutine {
+		t.Fatalf("goroutine allowance %d is below the real worst case %d", goroutine, fixed)
+	}
+
+	th := protocol.Thread{
+		ID: math.MaxInt64, MID: math.MaxInt64, GoID: math.MaxInt64,
+		Spinning: true, CurrentLoc: widest, Current: true,
+	}
+	raw, err = json.Marshal(th)
+	if err != nil {
+		t.Fatal(err)
+	}
+	strBytes := len(widest.File) + len(widest.Function)
+	if fixed := len(raw) - strBytes; fixed > thread {
+		t.Fatalf("thread allowance %d is below the real worst case %d", thread, fixed)
+	}
+
+	totals := protocol.SnapshotTotals{
+		Goroutines: math.MaxInt64, Threads: math.MaxInt64,
+		GoroutinesClipped: true, ThreadsClipped: true,
+	}
+	skeleton := protocol.GoroutineSnapshotPayload{
+		Goroutines: []protocol.Goroutine{}, Threads: []protocol.Thread{},
+		Current: math.MaxInt64, Created: []int{}, Exited: []int{}, Totals: &totals,
+	}
+	if size := eventBytesPlain(t, protocol.EventGoroutineSnapshot, skeleton); size > envelope {
+		t.Fatalf("envelope allowance %d is below the real worst case %d", envelope, size)
+	}
+
+	// A goid is at most 19 digits plus its separator.
+	if delta < 20 {
+		t.Fatalf("delta allowance %d cannot hold a max-width goid", delta)
+	}
+}
+
+// TestBoundedSizeNeverUnderEstimates is the soundness property the fast path
+// rests on: if the bound says a payload fits, it must actually fit. An
+// under-estimate would emit an event above the cap that the consumer is obliged
+// to reject — the exact failure this contract exists to prevent.
+func TestBoundedSizeNeverUnderEstimates(t *testing.T) {
+	// Control characters are the adversarial case: each expands sixfold, which
+	// is precisely the escape factor, so the fixed allowance carries no slack.
+	strings := []string{
+		"", "a", "\x00\x01\x02", "\x1f", "<>&\"\\", "\u2028\u2029",
+		"\U0001F600", "服务", string([]byte{0xff, 0xfe}),
+	}
+	widestLoc := func(s string) protocol.Location {
+		return protocol.Location{File: s, Line: math.MaxInt64, Function: s}
+	}
+
+	for _, s := range strings {
+		for _, n := range []int{1, 50, 400} {
+			gs := make([]protocol.Goroutine, 0, n)
+			for i := 1; i <= n; i++ {
+				gs = append(gs, protocol.Goroutine{
+					ID: math.MaxInt64 - i, ParentID: math.MaxInt64 - i, ThreadID: math.MaxInt64,
+					Status: s, WaitReason: s, Current: i == 1,
+					CurrentLoc: widestLoc(s), StartLoc: widestLoc(s), CreatedLoc: widestLoc(s),
+				})
+			}
+			ts := make([]protocol.Thread, 0, 16)
+			for i := 0; i < 16; i++ {
+				ts = append(ts, protocol.Thread{
+					ID: math.MaxInt64, MID: math.MaxInt64, GoID: math.MaxInt64,
+					Spinning: true, CurrentLoc: widestLoc(s), Current: i == 0,
+				})
+			}
+			deltas := []int{math.MaxInt64, math.MaxInt64 - 1}
+
+			bound := protocol.BoundedSizeForTest(gs, ts, len(deltas)*2)
+			actual := eventBytesPlain(t, protocol.EventGoroutineSnapshot,
+				protocol.GoroutineSnapshotPayload{
+					Goroutines: gs, Threads: ts, Current: gs[0].ID,
+					Created: deltas, Exited: deltas,
+					Totals: &protocol.SnapshotTotals{
+						Goroutines: math.MaxInt64, Threads: math.MaxInt64,
+						GoroutinesClipped: true, ThreadsClipped: true,
+					},
+				})
+			if bound < actual {
+				t.Fatalf("bound %d under-estimates actual %d (n=%d, string=%q)",
+					bound, actual, n, s)
+			}
+		}
+	}
+}
+
+// TestPackMaxShapedPayload drives the packer at both element caps with the
+// widest numeric fields and minimal strings — the shape whose cost is dominated
+// by the fixed allowances rather than by content.
+func TestPackMaxShapedPayload(t *testing.T) {
+	gs := make([]protocol.Goroutine, 0, protocol.MaxSnapshotGoroutines)
+	for i := 1; i <= protocol.MaxSnapshotGoroutines; i++ {
+		gs = append(gs, protocol.Goroutine{
+			ID: math.MaxInt64 - i, ParentID: math.MaxInt64 - i, ThreadID: math.MaxInt64,
+			Status: "r", Current: i == 1,
+			CurrentLoc: protocol.Location{File: "f", Line: math.MaxInt64, Function: "n"},
+		})
+	}
+	ts := make([]protocol.Thread, 0, protocol.MaxSnapshotThreads)
+	for i := 0; i < protocol.MaxSnapshotThreads; i++ {
+		ts = append(ts, protocol.Thread{
+			ID: math.MaxInt64, MID: math.MaxInt64, GoID: math.MaxInt64,
+			Spinning: true, Current: i == 0,
+			CurrentLoc: protocol.Location{File: "f", Line: math.MaxInt64, Function: "n"},
+		})
+	}
+
+	out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+		Goroutines: gs, Threads: ts, Current: gs[0].ID,
+	}, false, false)
+
+	if report.Degraded || report.Oversized {
+		t.Fatalf("max-shaped payload degraded=%v oversized=%v", report.Degraded, report.Oversized)
+	}
+	actual := eventBytesPlain(t, protocol.EventGoroutineSnapshot, out)
+	if actual > protocol.MaxGoroutineEventBytes {
+		t.Fatalf("max-shaped payload is %d bytes, over the cap", actual)
+	}
+	// Either the bound proved it (fast path) or the measurement did; both are
+	// correct, but the bound must never have claimed a fit it could not back.
+	if bound := protocol.BoundedSizeForTest(out.Goroutines, out.Threads, 0); bound < actual {
+		t.Fatalf("bound %d under-estimates actual %d at max shape", bound, actual)
+	}
+	if len(out.Goroutines) != protocol.MaxSnapshotGoroutines || len(out.Threads) != protocol.MaxSnapshotThreads {
+		t.Fatalf("max-shaped payload lost elements: %d goroutines, %d threads",
+			len(out.Goroutines), len(out.Threads))
 	}
 }

@@ -239,15 +239,21 @@ func pack(
 // byte or an invalid one becomes \uXXXX), so six times the raw length can never
 // under-estimate. When the bound already fits, the payload provably fits and no
 // measurement is needed; when it does not, the caller measures for real.
-func boundedSize(gs []Goroutine, ts []Thread, deltas int) int {
-	const (
-		envelopeAllowance  = 384 // version, kind, a 20-digit seq, payload keys, totals
-		goroutineAllowance = 256 // its own keys plus every numeric field
-		threadAllowance    = 192
-		deltaAllowance     = 24 // a 20-digit goid plus its separator
-		escapeFactor       = 6
-	)
+// Fixed allowances for boundedSize, each at or above the real worst case: every
+// key present, every numeric field at its widest, strings excluded (they are
+// charged separately). They are derived from a real marshal in the tests, so
+// adding a field to Goroutine, Thread, Location or SnapshotTotals fails there
+// rather than silently making the bound under-estimate — which would let the
+// fast path emit an event above the cap.
+const (
+	envelopeAllowance  = 384 // version, kind, a 20-digit seq, payload keys, totals
+	goroutineAllowance = 352 // its own keys plus every numeric field
+	threadAllowance    = 224
+	deltaAllowance     = 24 // a 20-digit goid plus its separator
+	escapeFactor       = 6  // the most JSON escaping can expand one byte
+)
 
+func boundedSize(gs []Goroutine, ts []Thread, deltas int) int {
 	total := envelopeAllowance + deltas*deltaAllowance
 	for i := range gs {
 		total += goroutineAllowance + escapeFactor*goroutineStringBytes(&gs[i])
