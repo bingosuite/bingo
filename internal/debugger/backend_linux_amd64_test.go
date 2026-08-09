@@ -382,6 +382,58 @@ func TestLinuxBackendHeldSignalSurfacesOnlyWithItsOwnStop(t *testing.T) {
 	}
 }
 
+// TestLinuxBackendSteppedThreadDeathDeliversHeldStopBeforeExit pins the
+// precedence between the two events that can end a step abnormally: the stepped
+// thread dying (which lifts the gate) and the main thread exiting (which purges).
+//
+// Because the drain runs at the top of the Wait loop, *before* blocking in
+// wait4, a stop held behind a step whose thread then died is delivered on the
+// next Wait, even if the main thread's exit is already queued in the kernel
+// behind it. That ordering is deliberate and is the same property that makes a
+// same-address sibling resolve only after the reinstall; inverting it to peek at
+// the wait queue first would defeat the fix. It is safe because a parked thread
+// is still ptrace-stopped when it is delivered, and because a delivery that does
+// race a dying process degrades through the engine's halt path rather than
+// hanging. Once the main exit *is* observed, purge wins and nothing is delivered
+// afterwards, so the engine never acts on a dead thread.
+func TestLinuxBackendSteppedThreadDeathDeliversHeldStopBeforeExit(t *testing.T) {
+	const (
+		pid     = 1001
+		stepped = 1002
+		foreign = 1003
+	)
+
+	b := &linuxBackend{pid: pid}
+	b.recordStop(pid)
+	b.beginStep(stepped)
+	b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
+
+	// The stepped thread exits before its step completes. Wait observes that as
+	// a non-main thread exit and clears the step bookkeeping.
+	b.clearStepIfStepped(stepped)
+
+	// The held stop must now be delivered rather than stranded or dropped: it is
+	// a real breakpoint on a thread that is still ptrace-stopped.
+	ev, err := b.Wait()
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if ev.TID != foreign || ev.Reason != StopBreakpoint {
+		t.Fatalf("Wait() = %+v, want the held breakpoint on tid %d after the stepped thread died", ev, foreign)
+	}
+	if got := b.traceTID(); got != foreign {
+		t.Fatalf("traceTID() = %d, want the delivered thread %d", got, foreign)
+	}
+
+	// The main thread exiting afterwards purges anything still held, so no
+	// delivery can follow the exit and target a dead thread.
+	b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
+	b.purge()
+	if ev, ok := b.drainParked(); ok {
+		t.Fatalf("drainParked() released %+v after the main-thread purge", ev)
+	}
+}
+
 // TestLinuxBackendWaitDrainsBeforeBlocking pins the wiring: Wait must consult
 // the queue at the top of its loop, before blocking in wait4, so a held stop
 // becomes the engine's next stop as soon as the step it collided with is done.
