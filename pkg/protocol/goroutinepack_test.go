@@ -1153,8 +1153,9 @@ var _ = Describe("goroutine event packing", func() {
 
 		It("matches the debugger's goroutine scan ceiling", func() {
 			// The delta bound is only correct while it equals the scan that
-			// produces the deltas. If layer B retunes the scan, this fails and
-			// the wire contract (and the consumer's mirror of it) must follow.
+			// produces the deltas. Retuning the scan without retuning this fails
+			// here, and the wire contract (plus the consumer's mirror of it)
+			// must follow in the same change.
 			source, err := os.ReadFile(filepath.Join("..", "..", "internal", "debugger", "goroutines.go"))
 			Expect(err).NotTo(HaveOccurred())
 			Expect(string(source)).To(ContainSubstring(
@@ -1298,48 +1299,60 @@ func withCurrent(gs []protocol.Goroutine, id int) []protocol.Goroutine {
 	return out
 }
 
-// The bounded-event work is additive and DORMANT: the packers exist but nothing
-// calls them, so the bytes on the wire must be indistinguishable from the
-// release before them. These specs are the merge-safety gate — if any of them
-// fails, this change is no longer safe to land ahead of the producer.
-var _ = Describe("dormant until the producer packs", func() {
-	It("keeps the wire version at 1.2", func() {
-		Expect(protocol.Version).To(Equal("1.2"))
+// The mirror image of the dormancy gate the previous layer carried: that layer
+// proved the packers changed nothing, this one proves the contract is actually
+// in force. If any of these fails, the wire advertises 1.3 while behaving like
+// 1.2 — the half-active state that is worse than either.
+var _ = Describe("the activated contract", func() {
+	It("advertises the version that carries it", func() {
+		Expect(protocol.Version).To(Equal("1.3"))
 	})
 
-	It("emits no new keys on an unpacked snapshot", func() {
-		raw, err := json.Marshal(protocol.GoroutineSnapshotPayload{
-			Goroutines: []protocol.Goroutine{sampleGoroutine},
-			Threads:    []protocol.Thread{sampleThread},
-			Current:    1,
-			Created:    []int{7},
-			Exited:     []int{3},
-		})
+	It("is wired into both producers", func() {
+		// Textual rather than behavioural because the producers live behind a
+		// live tracee: the point is that no future edit can quietly restore an
+		// unbounded emit path while the version keeps promising a bounded one.
+		source, err := os.ReadFile(filepath.Join("..", "..", "internal", "debugger", "goroutines.go"))
 		Expect(err).NotTo(HaveOccurred())
-		Expect(string(raw)).NotTo(ContainSubstring("totals"),
-			"an untouched payload must serialise exactly as it did at 1.2")
+		Expect(string(source)).To(ContainSubstring("protocol.PackSnapshot("),
+			"goroutineSnapshot must bound what it produces")
+		Expect(string(source)).To(ContainSubstring("protocol.PackGoroutines("),
+			"readGoroutines must bound what it produces")
 	})
 
-	It("emits no new keys on an unpacked goroutine list", func() {
-		raw, err := json.Marshal(protocol.GoroutinesPayload{
-			Goroutines: []protocol.Goroutine{sampleGoroutine},
-		})
+	It("carries the totals through a real round trip when incomplete", func() {
+		out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+			Goroutines: withCurrent(packGoroutines(protocol.MaxSnapshotGoroutines+16), 1),
+			Threads:    packThreads(8),
+			Current:    1,
+		}, false, false)
+		Expect(report.Omitted()).To(BeTrue())
+
+		raw, err := protocol.MarshalEvent(
+			protocol.MustEvent(protocol.EventGoroutineSnapshot, 1, out))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(len(raw)).To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
+
+		decodedEvent, err := protocol.UnmarshalEvent(raw)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(decodedEvent.Version).To(Equal(protocol.Version))
+		var decoded protocol.GoroutineSnapshotPayload
+		Expect(protocol.DecodeEventPayload(decodedEvent, &decoded)).To(Succeed())
+		Expect(decoded.Totals).NotTo(BeNil())
+		Expect(decoded.Totals.Goroutines).To(Equal(protocol.MaxSnapshotGoroutines + 16))
+	})
+
+	It("still says nothing extra when the result is complete", func() {
+		// Activation must not make every event heavier: Totals is the signal
+		// that something is missing, so a complete result stays silent.
+		out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+			Goroutines: withCurrent(packGoroutines(8), 1),
+			Threads:    packThreads(4),
+			Current:    1,
+		}, false, false)
+		Expect(report.Omitted()).To(BeFalse())
+		raw, err := json.Marshal(out)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(string(raw)).NotTo(ContainSubstring("totals"))
-	})
-
-	It("still decodes a payload written without the new field", func() {
-		// Forward compatibility in the other direction: a 1.2 peer's bytes must
-		// keep decoding into the extended struct with Totals absent.
-		var snap protocol.GoroutineSnapshotPayload
-		Expect(json.Unmarshal([]byte(
-			`{"goroutines":[],"threads":[],"current":1,"created":[7],"exited":[3]}`,
-		), &snap)).To(Succeed())
-		Expect(snap.Totals).To(BeNil())
-		Expect(snap.Current).To(Equal(1))
-
-		var list protocol.GoroutinesPayload
-		Expect(json.Unmarshal([]byte(`{"goroutines":[]}`), &list)).To(Succeed())
-		Expect(list.Totals).To(BeNil())
 	})
 })

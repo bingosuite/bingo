@@ -3,6 +3,7 @@ package debugger_test
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"syscall"
 	"testing"
 	"time"
@@ -33,6 +34,14 @@ type fakeBackend struct {
 	singleStepCalls  []int
 	stopProcessCalls int
 	writtenAt        map[uint64][]byte
+
+	// failReadFrom/failReadTo make ReadMemory fail for any read overlapping a
+	// half-open address range, so a test can reach the reader's "the walk
+	// stopped early" branches. The range is bounded rather than open-ended
+	// because a real image's runtime globals live above any synthetic region.
+	// Disabled while failReadTo is zero.
+	failReadFrom uint64
+	failReadTo   uint64
 }
 
 func newFakeBackend() *fakeBackend {
@@ -83,6 +92,9 @@ func (f *fakeBackend) SingleStep(tid int) error {
 }
 
 func (f *fakeBackend) ReadMemory(addr uint64, dst []byte) error {
+	if f.failReadTo != 0 && addr < f.failReadTo && addr+uint64(len(dst)) > f.failReadFrom {
+		return fmt.Errorf("fakeBackend: unmapped address 0x%x", addr)
+	}
 	for i := range dst {
 		dst[i] = f.mem[addr+uint64(i)]
 	}
@@ -709,10 +721,10 @@ var _ = Describe("Engine", func() {
 
 			// Without DWARF, StackFrames returns nil; verify walkStack via
 			// Goroutines (same code path).
-			gs, err := d.Goroutines()
+			payload, err := d.Goroutines()
 			Expect(err).NotTo(HaveOccurred())
-			Expect(gs).To(HaveLen(1))
-			Expect(gs[0].Status).To(Equal("waiting"))
+			Expect(payload.Goroutines).To(HaveLen(1))
+			Expect(payload.Goroutines[0].Status).To(Equal("waiting"))
 		})
 	})
 
@@ -722,11 +734,13 @@ var _ = Describe("Engine", func() {
 		})
 
 		It("returns one goroutine with status 'waiting'", func() {
-			gs, err := d.Goroutines()
+			payload, err := d.Goroutines()
 			Expect(err).NotTo(HaveOccurred())
-			Expect(gs).To(HaveLen(1))
-			Expect(gs[0].ID).To(Equal(1))
-			Expect(gs[0].Status).To(Equal("waiting"))
+			Expect(payload.Goroutines).To(HaveLen(1))
+			Expect(payload.Goroutines[0].ID).To(Equal(1))
+			Expect(payload.Goroutines[0].Status).To(Equal("waiting"))
+			Expect(payload.Totals).To(BeNil(),
+				"a complete, unclipped list must stay byte-identical to the unbounded shape")
 		})
 	})
 

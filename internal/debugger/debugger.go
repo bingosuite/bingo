@@ -18,6 +18,14 @@ var (
 	ErrNotRunning     = errors.New("debugger: process is not running")
 )
 
+// errOversizedSnapshot reports that a snapshot could not be bounded to the
+// goroutine event contract even with its collections emptied, which only
+// happens when the lifecycle deltas alone overflow. They are never trimmed, so
+// there is no lever left. It is returned rather than emitted because a
+// conforming client treats a contract violation as deterministic and stops
+// observing, whereas an error resolves the caller's wait and keeps it alive.
+var errOversizedSnapshot = errors.New("debugger: goroutine snapshot exceeds the wire contract")
+
 // Debugger is the interface consumed by the hub. All methods are goroutine-safe.
 // Inspection and step methods require the process to be suspended.
 type Debugger interface {
@@ -55,7 +63,12 @@ type Debugger interface {
 	Evaluate(frameIndex int, name string) (protocol.Variable, error)
 
 	StackFrames() ([]protocol.Frame, error)
-	Goroutines() ([]protocol.Goroutine, error)
+
+	// Goroutines returns the live goroutine list bounded to the goroutine event
+	// contract. It returns the wire payload rather than a bare slice so the
+	// accompanying Totals — the only signal that the list is not the whole set —
+	// reaches the client instead of being dropped at the hub.
+	Goroutines() (protocol.GoroutinesPayload, error)
 
 	// GoroutineSnapshot returns the full concurrency picture — every goroutine
 	// (with parent linkage), every OS thread, the current goroutine, and the

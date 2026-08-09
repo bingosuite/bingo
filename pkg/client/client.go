@@ -56,7 +56,12 @@ type Client interface {
 	Evaluate(frameIndex int, name string) (protocol.Variable, error)
 
 	StackFrames() ([]protocol.Frame, error)
-	Goroutines() ([]protocol.Goroutine, error)
+
+	// Goroutines blocks until the server returns the live goroutine list. It
+	// yields the whole payload rather than a bare slice because the server
+	// bounds this event to the goroutine size contract: without the payload's
+	// Totals a caller cannot tell a truncated list from a complete one.
+	Goroutines() (protocol.GoroutinesPayload, error)
 
 	// GoroutineSnapshot blocks until the server returns the full concurrency
 	// snapshot: every goroutine (with parent linkage), every OS thread, the

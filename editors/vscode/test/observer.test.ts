@@ -104,7 +104,7 @@ describe("telemetry observer", () => {
     socket.open();
     assert.equal(socket.sent.length, 1);
     assert.deepEqual(JSON.parse(socket.sent[0]!), {
-      v: "1.2",
+      v: "1.3",
       kind: "GoroutineSnapshot",
       payload: {},
     });
@@ -173,6 +173,39 @@ describe("telemetry observer", () => {
     sockets[6]!.close();
     assert.equal(observer.model.connection, "error");
     assert.match(observer.model.error, /reconnect limit/);
+    observer.dispose();
+  });
+
+  // Exhausting the ladder is terminal but never latches `fatal`, so a Refresh
+  // that only re-sent a snapshot command would silently do nothing — there is no
+  // socket left to send it on — and the panel would stay dead for the rest of
+  // the session with no way back. Refresh must redial from EVERY terminal state.
+  it("redials on refresh after the reconnect ladder is exhausted", async () => {
+    const { observer, sockets, delays } = setup();
+    observer.start();
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const socket = sockets[attempt]!;
+      socket.open();
+      socket.close();
+      delays[attempt]!.resolve();
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    sockets[6]!.open();
+    sockets[6]!.close();
+    assert.equal(observer.model.connection, "error");
+    const exhausted = sockets.length;
+
+    observer.refresh();
+    assert.equal(sockets.length, exhausted + 1, "refresh must open a new socket");
+    assert.equal(observer.model.connection, "connecting");
+
+    sockets[exhausted]!.open();
+    assert.equal(observer.model.connection, "connected");
+    assert.equal(
+      sockets[exhausted]!.sent.length,
+      1,
+      "a recovered connection asks for a snapshot so the view repopulates",
+    );
     observer.dispose();
   });
 

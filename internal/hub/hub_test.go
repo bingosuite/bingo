@@ -101,9 +101,9 @@ func (f *fakeDebugger) StackFrames() ([]protocol.Frame, error) {
 	f.record("StackFrames")
 	return f.framesResult, nil
 }
-func (f *fakeDebugger) Goroutines() ([]protocol.Goroutine, error) {
+func (f *fakeDebugger) Goroutines() (protocol.GoroutinesPayload, error) {
 	f.record("Goroutines")
-	return f.goroutinesResult, nil
+	return protocol.GoroutinesPayload{Goroutines: f.goroutinesResult}, nil
 }
 func (f *fakeDebugger) GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error) {
 	f.record("GoroutineSnapshot")

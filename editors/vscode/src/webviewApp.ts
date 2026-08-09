@@ -1,7 +1,10 @@
 import type {
   ConcurrencyViewModel,
+  ConnectionState,
+  ServerTotals,
   SessionViewModel,
 } from "./model.js";
+import { formatServerCount } from "./model.js";
 import { filterFullTree, type TreeNode } from "./tree.js";
 
 export interface WebviewHost {
@@ -134,10 +137,10 @@ function renderSession(
     main.append(
       emptyState(
         document,
-        session.connection === "connected"
-          ? "Waiting for a suspended snapshot"
-          : "Connecting to telemetry",
-        "Snapshots arrive at entry, breakpoints, pauses, and explicit refreshes.",
+        waitingHeadline(session.connection),
+        session.connection === "error"
+          ? "Refresh retries the connection. If the error above repeats, the server and this extension are probably not compatible."
+          : "Snapshots arrive at entry, breakpoints, pauses, and explicit refreshes.",
       ),
     );
     return main;
@@ -195,9 +198,38 @@ function summaryCards(
   const cards = document.createElement("section");
   cards.className = "cards";
   cards.setAttribute("aria-label", "Concurrency summary");
+  const totals = session.serverTotals;
+  const shownGoroutines = session.snapshot?.goroutines.length ?? 0;
+  const shownThreads = session.snapshot?.threads.length ?? 0;
+  // Before the first snapshot there is no count to report. Rendering 0 states a
+  // fact about the target that nobody has measured yet, and reads as "nothing is
+  // running" rather than "nothing has arrived".
+  const pending = session.snapshot === undefined;
   const values = [
-    ["Goroutines", session.snapshot?.goroutines.length ?? 0],
-    ["Threads", session.snapshot?.threads.length ?? 0],
+    [
+      "Goroutines",
+      pending
+        ? "—"
+        : totals === undefined
+          ? shownGoroutines
+          : formatServerCount(
+              shownGoroutines,
+              totals.goroutines,
+              totals.goroutinesClipped,
+            ),
+    ],
+    // The thread statistic reports the machine's real thread count from the
+    // server totals when they are present; the list below shows only what was
+    // packed, so the two must not silently disagree. Each count is marked a
+    // lower bound only when its OWN scan clipped — the ceilings are independent.
+    [
+      "Threads",
+      pending
+        ? "—"
+        : totals === undefined
+          ? shownThreads
+          : formatServerCount(shownThreads, totals.threads, totals.threadsClipped),
+    ],
     ["Clients", session.clients],
     ["Current", session.snapshot?.current || "—"],
   ] as const;
@@ -245,13 +277,7 @@ function renderGraph(
   panel.append(controls);
 
   if (session.tree.nodes.length === 0) {
-    panel.append(
-      emptyState(
-        document,
-        "No goroutines in this snapshot",
-        "The target may be exiting or runtime inspection degraded.",
-      ),
-    );
+    panel.append(emptyTreeState(document, session, state.query));
     return panel;
   }
 
@@ -313,6 +339,13 @@ function renderGraph(
     const note = document.createElement("p");
     note.className = "omitted";
     note.textContent = `${String(session.tree.omitted)} additional goroutines omitted by the filter or visual cap`;
+    panel.append(note);
+  }
+  const serverNote = serverOmissionText(session.serverTotals);
+  if (serverNote !== undefined) {
+    const note = document.createElement("p");
+    note.className = "server-omitted";
+    note.textContent = serverNote;
     panel.append(note);
   }
   viewport.append(svg);
@@ -583,11 +616,85 @@ function renderThreads(
     item.append(label, detail);
     list.append(item);
   }
-  if (list.childElementCount === 0) {
-    list.append(emptyState(document, "No thread data", "Runtime thread inspection was unavailable."));
+  const noThreadsDelivered = list.childElementCount === 0;
+  if (noThreadsDelivered) {
+    // Same distinction as the goroutine tree: totals proving the debugger saw
+    // threads means the event dropped them, not that the read failed.
+    const totals = session.serverTotals;
+    list.append(
+      totals !== undefined && totals.threads > 0
+        ? emptyState(
+            document,
+            "Thread data was omitted from this snapshot",
+            `The debugger found ${String(totals.threads)}${totals.threadsClipped ? " or more" : ""} OS threads, but none fit within the snapshot limits.`,
+          )
+        : emptyState(document, "No thread data", "Runtime thread inspection was unavailable."),
+    );
   }
   panel.append(list);
+  const totals = session.serverTotals;
+  // An empty list already carries its own full explanation above, so the note is
+  // for a list that HAS entries but is short. Rendering both reads as two
+  // separate shortfalls rather than one described twice.
+  const threadNote =
+    totals === undefined || noThreadsDelivered
+      ? undefined
+      : omissionNotes("threads", totals.threadsOmitted, totals.threads, totals.threadsClipped);
+  if (threadNote !== undefined) {
+    const note = document.createElement("p");
+    note.className = "server-omitted";
+    note.textContent = threadNote;
+    panel.append(note);
+  }
   return panel;
+}
+
+// scannedCount states a total that may itself be a floor. Writing a clipped
+// total as a bare number reads as an exact census directly beside a note saying
+// it is not one.
+function scannedCount(count: number, clipped: boolean): string {
+  return clipped ? `at least ${String(count)}` : String(count);
+}
+
+// omissionNotes states what the DEBUGGER left out of one collection, in its own
+// words — never mixed with this view's filter or render cap. The two causes are
+// reported separately because they mean different things: an omission is this
+// event being partial, while a clipped scan means even the total is a floor.
+//
+// Each collection is reported beside its own data (goroutines under the tree,
+// threads under the thread list) and therefore exactly once. Reporting threads
+// in both places made the same fact read as two separate shortfalls.
+function omissionNotes(
+  noun: string,
+  omitted: number,
+  total: number,
+  clipped: boolean,
+): string | undefined {
+  const notes: string[] = [];
+  if (omitted > 0) {
+    notes.push(
+      `${String(omitted)} ${noun} were not sent in this event (of ${scannedCount(total, clipped)} found)`,
+    );
+  }
+  if (clipped) {
+    notes.push(
+      `the debugger stopped after finding ${String(total)} ${noun}, so more may exist`,
+    );
+  }
+  return notes.length === 0 ? undefined : notes.join(" · ");
+}
+
+export function serverOmissionText(
+  totals: ServerTotals | undefined,
+): string | undefined {
+  return totals === undefined
+    ? undefined
+    : omissionNotes(
+        "goroutines",
+        totals.goroutinesOmitted,
+        totals.goroutines,
+        totals.goroutinesClipped,
+      );
 }
 
 function renderTimeline(
@@ -615,6 +722,57 @@ function renderTimeline(
     panel.append(list);
   }
   return panel;
+}
+
+// waitingHeadline names the state the view is ACTUALLY in while no snapshot has
+// arrived. Saying "Connecting" once the observer has stopped trying is the worst
+// of both: the panel looks busy, so nobody presses Refresh — the one action that
+// would bring it back.
+function waitingHeadline(connection: ConnectionState): string {
+  switch (connection) {
+    case "connected":
+      return "Waiting for a suspended snapshot";
+    case "reconnecting":
+      return "Reconnecting to telemetry";
+    case "error":
+      return "Telemetry disconnected";
+    case "closed":
+      return "Telemetry connection closed";
+    default:
+      return "Connecting to telemetry";
+  }
+}
+
+// emptyTreeState attributes an empty tree to the cause the evidence supports.
+// A filter that matched nothing is the user's own doing and says so; blaming the
+// snapshot limits there would send someone hunting a debugger problem that does
+// not exist. Only once the snapshot itself delivered nothing do the totals
+// decide between "the event dropped it" and "the runtime could not be read".
+function emptyTreeState(
+  document: Document,
+  session: SessionViewModel,
+  query: string,
+): HTMLElement {
+  if (query.trim().length > 0 && (session.snapshot?.goroutines.length ?? 0) > 0) {
+    return emptyState(
+      document,
+      "No goroutines match this filter",
+      "Clear or change the filter to show this snapshot.",
+    );
+  }
+  const totals = session.serverTotals;
+  if (totals !== undefined && totals.goroutines > 0) {
+    return emptyState(
+      document,
+      "Goroutine data was omitted from this snapshot",
+      `The debugger found ${scannedCount(totals.goroutines, totals.goroutinesClipped)} live goroutines, but none fit within the snapshot limits.`,
+    );
+  }
+  return emptyState(
+    document,
+    "No goroutines in this snapshot",
+    "The target may be exiting or runtime inspection degraded.",
+  );
 }
 
 function emptyState(

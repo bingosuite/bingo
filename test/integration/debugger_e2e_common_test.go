@@ -610,9 +610,11 @@ func declareInspectSpec() {
 
 		grs, err := h.d.Goroutines()
 		Expect(err).NotTo(HaveOccurred(), "Goroutines")
-		Expect(len(grs)).To(BeNumerically(">=", 1), "at least one goroutine")
-		Expect(grs[0].CurrentLoc.Function).NotTo(BeEmpty(),
+		Expect(len(grs.Goroutines)).To(BeNumerically(">=", 1), "at least one goroutine")
+		Expect(grs.Goroutines[0].CurrentLoc.Function).NotTo(BeEmpty(),
 			"goroutine current location should resolve to a function")
+		Expect(len(grs.Goroutines)).To(BeNumerically("<=", protocol.MaxSnapshotGoroutines),
+			"the goroutine list must be bounded to the wire contract")
 	})
 }
 

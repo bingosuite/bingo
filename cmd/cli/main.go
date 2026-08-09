@@ -237,9 +237,10 @@ func main() {
 				printErr(err)
 				continue
 			}
-			for _, g := range grs {
+			for _, g := range grs.Goroutines {
 				printGoroutine(g)
 			}
+			printTotals(len(grs.Goroutines), 0, grs.Totals)
 
 		case "snapshot", "snap":
 			snap, err := c.GoroutineSnapshot()
@@ -345,8 +346,9 @@ func printAuxEvent(evt protocol.Event) {
 	case protocol.EventGoroutineSnapshot:
 		var p protocol.GoroutineSnapshotPayload
 		if protocol.DecodeEventPayload(evt, &p) == nil {
-			msg := fmt.Sprintf("\n  [goroutines] %d live, %d threads, current G%d",
-				len(p.Goroutines), len(p.Threads), p.Current)
+			msg := fmt.Sprintf("\n  [goroutines] %s, %s, current G%d",
+				countOf(len(p.Goroutines), "live goroutine", totalsGoroutines(p.Totals)),
+				countOf(len(p.Threads), "thread", totalsThreads(p.Totals)), p.Current)
 			if len(p.Created) > 0 {
 				msg += fmt.Sprintf(", +%v", p.Created)
 			}
@@ -407,6 +409,76 @@ func printSnapshot(snap protocol.GoroutineSnapshotPayload) {
 	if len(snap.Exited) > 0 {
 		fmt.Printf("  exited:  %v\n", snap.Exited)
 	}
+	printTotals(len(snap.Goroutines), len(snap.Threads), snap.Totals)
+}
+
+// printTotals says so when the server sent less than it had. Totals is present
+// only on an incomplete result, so silence here means the listing above is the
+// whole truth. shownThreads is 0 for the goroutine-only listing, whose payload
+// carries no thread collection.
+func printTotals(shownGoroutines, shownThreads int, totals *protocol.SnapshotTotals) {
+	if totals == nil {
+		return
+	}
+	if omitted := totals.Goroutines - shownGoroutines; omitted > 0 {
+		fmt.Printf("  ! %d of %d goroutines omitted from this event\n", omitted, totals.Goroutines)
+	}
+	if omitted := totals.Threads - shownThreads; omitted > 0 {
+		fmt.Printf("  ! %d of %d threads omitted from this event\n", omitted, totals.Threads)
+	}
+	// A clipped scan means the total itself is a floor, so a listing that looks
+	// complete against it still is not.
+	if totals.GoroutinesClipped {
+		fmt.Printf("  ! the debugger stopped after finding %d goroutines — more may exist\n",
+			totals.Goroutines)
+	}
+	if totals.ThreadsClipped {
+		fmt.Printf("  ! the debugger stopped after finding %d threads — more may exist\n",
+			totals.Threads)
+	}
+}
+
+// countOf renders a count the server may have understated, so a streamed line
+// never presents a trimmed subset as the live population. total is 0 when the
+// payload made no claim, which means nothing was omitted. The noun agrees with
+// the number the reader is actually looking at — the shown count, since that is
+// what the line is reporting.
+func countOf(shown int, singular string, total totalCount) string {
+	label := singular
+	if shown != 1 {
+		label += "s"
+	}
+	switch {
+	case total.count > shown && total.clipped:
+		return fmt.Sprintf("%d of at least %d %ss", shown, total.count, singular)
+	case total.count > shown:
+		return fmt.Sprintf("%d of %d %ss", shown, total.count, singular)
+	case total.clipped:
+		return fmt.Sprintf("%d+ %s", shown, label)
+	default:
+		return fmt.Sprintf("%d %s", shown, label)
+	}
+}
+
+// totalCount pairs an original count with whether the scan that produced it
+// stopped early, which is what makes the count a floor rather than a census.
+type totalCount struct {
+	count   int
+	clipped bool
+}
+
+func totalsGoroutines(t *protocol.SnapshotTotals) totalCount {
+	if t == nil {
+		return totalCount{}
+	}
+	return totalCount{count: t.Goroutines, clipped: t.GoroutinesClipped}
+}
+
+func totalsThreads(t *protocol.SnapshotTotals) totalCount {
+	if t == nil {
+		return totalCount{}
+	}
+	return totalCount{count: t.Threads, clipped: t.ThreadsClipped}
 }
 
 func parseFileLine(s string) (string, int, bool) {

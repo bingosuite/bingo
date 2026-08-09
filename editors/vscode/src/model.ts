@@ -35,6 +35,25 @@ export interface SessionModel {
 export interface SessionViewModel extends SessionModel {
   readonly tree: TreeLayout;
   readonly degraded: boolean;
+
+  // What the SERVER left off the wire, kept deliberately separate from
+  // tree.omitted (this view's own filter and render cap). Conflating them would
+  // let a truncated payload masquerade as a local display choice.
+  readonly serverTotals: ServerTotals | undefined;
+}
+
+// ServerTotals restates a snapshot's SnapshotTotals in terms this view renders:
+// the server's original counts and how many elements never reached us. The
+// clipped flags are per collection — the debugger's goroutine and thread scans
+// have independent ceilings — so each count is marked a lower bound only when
+// its OWN scan was cut short.
+export interface ServerTotals {
+  readonly goroutines: number;
+  readonly threads: number;
+  readonly goroutinesClipped: boolean;
+  readonly threadsClipped: boolean;
+  readonly goroutinesOmitted: number;
+  readonly threadsOmitted: number;
 }
 
 export interface ConcurrencyViewModel {
@@ -64,7 +83,45 @@ export function toSessionViewModel(model: SessionModel): SessionViewModel {
       model.selectedGoroutine,
     ]),
     degraded: snapshot === undefined ? false : isDegraded(snapshot),
+    serverTotals: serverTotals(snapshot),
   };
+}
+
+export function serverTotals(
+  snapshot: Snapshot | undefined,
+): ServerTotals | undefined {
+  const totals = snapshot?.totals;
+  if (snapshot === undefined || totals === undefined) {
+    return undefined;
+  }
+  // No clamping: the decoder already REJECTS totals below the delivered counts,
+  // because a total that contradicts what arrived is dishonest data rather than
+  // a truncation report. Normalizing it here as well would quietly repair the
+  // contradiction and hide a broken producer behind a plausible-looking view.
+  return {
+    goroutines: totals.goroutines,
+    threads: totals.threads,
+    goroutinesClipped: totals.goroutinesClipped,
+    threadsClipped: totals.threadsClipped,
+    goroutinesOmitted: totals.goroutines - snapshot.goroutines.length,
+    threadsOmitted: totals.threads - snapshot.threads.length,
+  };
+}
+
+// formatServerCount renders a count the server may have understated. A trailing
+// "+" marks a lower bound (the server's scan was clipped), and "n of m" shows
+// how much never reached the wire.
+export function formatServerCount(
+  shown: number,
+  total: number,
+  clipped: boolean,
+): string {
+  const bound = clipped ? "+" : "";
+  return shown >= total && !clipped
+    ? String(shown)
+    : shown >= total
+      ? `${String(shown)}${bound}`
+      : `${String(shown)} of ${String(total)}${bound}`;
 }
 
 export function serializeSnapshot(model: SessionModel): string {

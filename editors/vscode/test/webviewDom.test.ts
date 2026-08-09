@@ -211,7 +211,7 @@ describe("concurrency webview DOM", () => {
     assert.equal(document.querySelectorAll(".tree-node").length, 0);
     assert.match(
       document.querySelector(".graph-panel")?.textContent ?? "",
-      /No goroutines in this snapshot/,
+      /No goroutines match this filter/,
     );
     const controls = [
       ...document.querySelectorAll<HTMLButtonElement>(
@@ -240,6 +240,106 @@ describe("concurrency webview DOM", () => {
     assert.match(document.body.textContent, /socket rejected/);
   });
 
+  // A panel that says "Connecting" while the observer has permanently stopped is
+  // the worst of both worlds: it looks busy, so nobody presses the one control
+  // that would bring it back. See issue #194.
+  it("names the terminal connection state instead of claiming to be connecting", () => {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    const render = mountConcurrencyView(document, { postMessage() {} });
+
+    render(model({ connection: "connecting", snapshot: undefined, error: "" }));
+    assert.match(document.body.textContent, /Connecting to telemetry/);
+
+    render(model({ connection: "error", snapshot: undefined, error: "reconnect limit reached" }));
+    assert.match(document.body.textContent, /Telemetry disconnected/);
+    assert.match(document.body.textContent, /Refresh retries the connection/);
+    assert.doesNotMatch(document.body.textContent, /Connecting to telemetry/);
+  });
+
+  // An empty tree has two very different causes, and the totals settle which.
+  // Blaming the target or a failed runtime read when the debugger reported
+  // thousands of live goroutines is exactly the dishonesty this work removes.
+  it("attributes an empty tree to omission when the totals prove the data existed", () => {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    mountConcurrencyView(document, { postMessage() {} })(
+      model({
+        snapshot: {
+          ...snapshot([], []),
+          totals: {
+            goroutines: 41203,
+            threads: 64,
+            goroutinesClipped: false,
+            threadsClipped: false,
+          },
+        },
+      }),
+    );
+    assert.match(document.body.textContent, /Goroutine data was omitted from this snapshot/);
+    assert.match(document.body.textContent, /41203 live goroutines/);
+    assert.match(document.body.textContent, /Thread data was omitted from this snapshot/);
+    // Reported beside its own data, and exactly once: the same shortfall printed
+    // in two places reads as two separate shortfalls.
+    assert.equal(
+      document.body.textContent.match(/threads were not sent in this event/gu),
+      null,
+      "an empty thread list explains itself; it must not also carry an omission note",
+    );
+    assert.doesNotMatch(document.body.textContent, /may be exiting/);
+    assert.doesNotMatch(document.body.textContent, /thread inspection was unavailable/i);
+  });
+
+  it("still blames the runtime when there were no totals to contradict it", () => {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    mountConcurrencyView(document, { postMessage() {} })(
+      model({ snapshot: snapshot([], []) }),
+    );
+    assert.match(document.body.textContent, /No goroutines in this snapshot/);
+    assert.match(document.body.textContent, /Runtime thread inspection was unavailable/);
+  });
+
+  // A filter that matched nothing is the user's own doing. Blaming the snapshot
+  // limits there sends someone hunting a debugger problem that does not exist.
+  it("blames the filter, not the debugger, when a search matches nothing", () => {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    mountConcurrencyView(document, { postMessage() {} })(
+      model({
+        snapshot: {
+          ...snapshot([goroutine(1, 0, { current: true })], []),
+          totals: {
+            goroutines: 41203,
+            threads: 64,
+            goroutinesClipped: false,
+            threadsClipped: false,
+          },
+        },
+      }),
+    );
+    const search = document.querySelector("#bingo-goroutine-filter") as HTMLInputElement;
+    search.value = "definitely-no-such-goroutine";
+    search.dispatchEvent(new (document.defaultView as unknown as { Event: typeof Event }).Event("input"));
+
+    // Scoped to the tree panel: the thread list has its own, legitimate, empty
+    // state and must not be mistaken for the tree's attribution.
+    const graph = document.querySelector(".graph-panel")?.textContent ?? "";
+    assert.match(graph, /No goroutines match this filter/);
+    assert.doesNotMatch(graph, /none fit within the snapshot limits/);
+  });
+
+  // Zero is a measurement. Before a snapshot arrives nobody has taken one, and
+  // "0" reads as "nothing is running" rather than "nothing has arrived".
+  it("shows no counts before the first snapshot", () => {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    mountConcurrencyView(document, { postMessage() {} })(
+      model({ snapshot: undefined, connection: "connecting" }),
+    );
+    const cards = [...document.querySelectorAll(".card")].map((card) => ({
+      label: card.querySelector("span")?.textContent ?? "",
+      value: card.querySelector("strong")?.textContent ?? "",
+    }));
+    assert.equal(cards.find((c) => c.label === "Goroutines")?.value, "—");
+    assert.equal(cards.find((c) => c.label === "Threads")?.value, "—");
+  });
+
   it("keeps hostile tracee strings inert", () => {
     const { document } = parseHTML("<html><body><div id=app></div></body></html>");
     const hostile = '<img src=x onerror="globalThis.pwned=true">';
@@ -249,5 +349,84 @@ describe("concurrency webview DOM", () => {
     );
     assert.equal(document.querySelector("img"), null);
     assert.match(document.body.textContent, /<img src=x/);
+  });
+});
+
+describe("server-omission rendering", () => {
+  // Goes through the real render path, not the formatter, so a card that reads
+  // the wrong flag is caught. The debugger's goroutine and thread scans have
+  // independent ceilings, so each count must be marked a lower bound only when
+  // its OWN scan clipped.
+  function cards(
+    goroutinesClipped: boolean,
+    threadsClipped: boolean,
+  ): { readonly goroutines: string; readonly threads: string; readonly notes: string } {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    mountConcurrencyView(document, { postMessage() {} })(
+      model({
+        snapshot: {
+          ...snapshot(
+            [goroutine(1, 0, { current: true, threadId: 10 })],
+            [thread(10, 1)],
+          ),
+          totals: {
+            goroutines: 8192,
+            threads: 2048,
+            goroutinesClipped,
+            threadsClipped,
+          },
+        },
+      }),
+    );
+    const values = [...document.querySelectorAll(".card")].map((card) => ({
+      label: card.querySelector("span")?.textContent ?? "",
+      value: card.querySelector("strong")?.textContent ?? "",
+    }));
+    return {
+      goroutines: values.find((v) => v.label === "Goroutines")?.value ?? "",
+      threads: values.find((v) => v.label === "Threads")?.value ?? "",
+      notes: [...document.querySelectorAll(".server-omitted")]
+        .map((n) => n.textContent ?? "")
+        .join(" | "),
+    };
+  }
+
+  it("marks neither count when neither scan clipped", () => {
+    const rendered = cards(false, false);
+    assert.equal(rendered.goroutines.endsWith("+"), false);
+    assert.equal(rendered.threads.endsWith("+"), false);
+    assert.doesNotMatch(rendered.notes, /more may exist/u);
+  });
+
+  it("marks only goroutines when only the goroutine scan clipped", () => {
+    const rendered = cards(true, false);
+    assert.equal(rendered.goroutines.endsWith("+"), true);
+    assert.equal(
+      rendered.threads.endsWith("+"),
+      false,
+      "an exact thread count must not be shown as approximate",
+    );
+    assert.match(rendered.notes, /stopped after finding 8192 goroutines, so more may exist/u);
+    assert.doesNotMatch(rendered.notes, /threads, so more may exist/u);
+  });
+
+  it("marks only threads when only the thread scan clipped", () => {
+    const rendered = cards(false, true);
+    assert.equal(
+      rendered.goroutines.endsWith("+"),
+      false,
+      "an exact goroutine count must not be shown as approximate",
+    );
+    assert.equal(rendered.threads.endsWith("+"), true);
+    assert.match(rendered.notes, /stopped after finding 2048 threads, so more may exist/u);
+    assert.doesNotMatch(rendered.notes, /goroutines, so more may exist/u);
+  });
+
+  it("marks both counts when both scans clipped", () => {
+    const rendered = cards(true, true);
+    assert.equal(rendered.goroutines.endsWith("+"), true);
+    assert.equal(rendered.threads.endsWith("+"), true);
+    assert.match(rendered.notes, /stopped after finding 8192 goroutines, so more may exist/u);
+    assert.match(rendered.notes, /stopped after finding 2048 threads, so more may exist/u);
   });
 });

@@ -7,7 +7,7 @@ import (
 	"fmt"
 )
 
-const Version = "1.2"
+const Version = "1.3"
 
 // Size limits for the goroutine event family — EventGoroutineSnapshot and
 // EventGoroutines. They are deliberately NOT generic envelope limits: every
@@ -15,12 +15,12 @@ const Version = "1.2"
 // Go client, nor Location strings are capped. Only these two events carry an
 // unbounded runtime collection, so only they are bounded here (see issue #194).
 //
-// NOTHING PRODUCES THESE YET. This file defines the contract and the pure
-// packers that implement it; wiring the debugger to pack, and teaching clients
-// to enforce, is a follow-up. Until both land together the wire is unchanged —
-// Version stays 1.2, Totals is never populated, and no peer may assume a
-// goroutine event is bounded. Advertising a version whose producer still
-// violates it would let a conforming client reject perfectly valid output.
+// The contract is IN FORCE as of 1.3: every producer of either event packs
+// through PackSnapshot/PackGoroutines, and the binding consumer enforces these
+// limits. Producing and enforcing arrived together on purpose — a server that
+// advertises a contract it violates would have conforming clients reject valid
+// output, and a client enforcing one the server does not yet emit is the same
+// failure from the other side.
 const (
 	// MaxGoroutineEventBytes is the exact marshalled Event ceiling for the
 	// goroutine event family, matched to the binding consumer's decoder budget

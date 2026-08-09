@@ -475,17 +475,22 @@ func (e *engine) StackFrames() ([]protocol.Frame, error) {
 	return frames, err
 }
 
-func (e *engine) Goroutines() ([]protocol.Goroutine, error) {
-	var goroutines []protocol.Goroutine
+// Goroutines answers the on-demand goroutine query. It returns the wire payload
+// rather than a bare slice because the list is bounded to the goroutine event
+// contract, and the accompanying Totals is the only thing that tells a consumer
+// the list it received is not the whole set.
+func (e *engine) Goroutines() (protocol.GoroutinesPayload, error) {
+	var payload protocol.GoroutinesPayload
 	err := e.dispatch(func() error {
 		if err := e.requireSuspended(); err != nil {
 			return err
 		}
-		var err error
-		goroutines, err = e.readGoroutines()
-		return err
+		var report protocol.GoroutinePackReport
+		payload, report = e.readGoroutines()
+		e.logPackReport(protocol.EventGoroutines, report)
+		return nil
 	})
-	return goroutines, err
+	return payload, err
 }
 
 // GoroutineSnapshot returns the full concurrency picture on demand: every
@@ -493,14 +498,23 @@ func (e *engine) Goroutines() ([]protocol.Goroutine, error) {
 // current goroutine, and the created/exited lifecycle deltas since the previous
 // snapshot. Only valid while suspended (the tracee must be stopped for the
 // memory reads to be race-free). Like the auto-streamed snapshots it advances
-// the lifecycle-delta baseline.
+// the lifecycle-delta baseline, and the result is bounded to the wire contract.
 func (e *engine) GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error) {
 	var snap protocol.GoroutineSnapshotPayload
 	err := e.dispatch(func() error {
 		if err := e.requireSuspended(); err != nil {
 			return err
 		}
-		snap = e.goroutineSnapshot()
+		res := e.goroutineSnapshot()
+		e.logPackReport(protocol.EventGoroutineSnapshot, res.report)
+		if res.report.Oversized {
+			// Answering with a frame the contract forbids would make a
+			// conforming client reject it — and treat the rejection as
+			// deterministic, since a retry reproduces it. An error resolves the
+			// caller's wait instead and leaves the observer alive.
+			return errOversizedSnapshot
+		}
+		snap = res.payload
 		return nil
 	})
 	return snap, err
@@ -1165,20 +1179,60 @@ func (e *engine) emitBreakpointHit(bp *breakpointEntry, stop StopEvent) {
 	// Build the concurrency snapshot once: the current goroutine is embedded in
 	// the stop event, then the full snapshot is streamed as its own event. One
 	// build avoids a double allgs scan and a double lifecycle-delta pass.
-	snap := e.goroutineSnapshot()
+	res := e.goroutineSnapshot()
 	e.emit(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{
 		Breakpoint: bp.toProtocol(),
-		Goroutine:  currentGoroutineFrom(snap),
+		Goroutine:  res.current,
 		Frames:     frames,
 	})
-	e.emit(protocol.EventGoroutineSnapshot, snap)
+	e.emitSnapshot(res)
+}
+
+// emitSnapshot streams a packed snapshot, dropping it only when it cannot
+// conform to the wire contract. The stop event that preceded it has already been
+// broadcast, so a session never stalls on this; and since EventGoroutineSnapshot
+// is unsolicited, nothing is left waiting for a reply. Emitting a known
+// violation instead would be worse than dropping it: a conforming consumer
+// rejects it as deterministic and stops observing for the rest of the session.
+//
+// The debugger's own scan ceilings bound the lifecycle deltas well below
+// MaxLifecycleDeltaIDs (see TestLifecycleDeltasCannotOverflowTheContract), so
+// this path is unreachable in production and exists to keep a corrupt read from
+// taking the observer down with it.
+func (e *engine) emitSnapshot(res snapshotResult) {
+	e.logPackReport(protocol.EventGoroutineSnapshot, res.report)
+	if res.report.Oversized {
+		return
+	}
+	e.emit(protocol.EventGoroutineSnapshot, res.payload)
+}
+
+// logPackReport records what the wire contract cost this event. Omission is
+// normal on a large target and logged at debug; a non-conforming result is not,
+// and is logged as an error because it means an input the scan ceilings should
+// have made impossible.
+func (e *engine) logPackReport(kind protocol.EventKind, report protocol.GoroutinePackReport) {
+	if report.Oversized {
+		e.log.Error("goroutine event cannot conform to the wire contract — dropping",
+			"kind", kind, "bytes", report.Bytes,
+			"goroutinesTotal", report.Totals.Goroutines,
+			"threadsTotal", report.Totals.Threads)
+		return
+	}
+	if !report.Omitted() && !report.Degraded {
+		return
+	}
+	e.log.Debug("goroutine event trimmed to the wire contract",
+		"kind", kind, "bytes", report.Bytes, "degraded", report.Degraded,
+		"goroutines", report.Goroutines, "goroutinesTotal", report.Totals.Goroutines,
+		"threads", report.Threads, "threadsTotal", report.Totals.Threads)
 }
 
 // emitGoroutineSnapshot builds and streams a standalone concurrency snapshot.
 // Used at the entry stop and on the CmdGoroutineSnapshot on-demand path. It is
 // a non-suspending event, so the hub forwards it without gating.
 func (e *engine) emitGoroutineSnapshot() {
-	e.emit(protocol.EventGoroutineSnapshot, e.goroutineSnapshot())
+	e.emitSnapshot(e.goroutineSnapshot())
 }
 
 // emitStoppedAtCurrentPC emits EventStepped at the current PC (used after
@@ -1233,17 +1287,17 @@ func (e *engine) emitPaused(stop StopEvent) {
 		e.curTID = stop.TID
 	}
 	frames, _ := e.collectFrames(stop.TID)
-	snap := e.goroutineSnapshot()
+	res := e.goroutineSnapshot()
 	loc := protocol.Location{}
 	if e.dw != nil {
 		loc = e.dw.locationForPC(stop.PC)
 	}
 	e.emit(protocol.EventPaused, protocol.PausedPayload{
-		Goroutine: currentGoroutineFrom(snap),
+		Goroutine: res.current,
 		Location:  loc,
 		Frames:    frames,
 	})
-	e.emit(protocol.EventGoroutineSnapshot, snap)
+	e.emitSnapshot(res)
 }
 
 // emitContinued reports that the tracee has resumed free execution in response

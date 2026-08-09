@@ -292,25 +292,32 @@ func (e *engine) readI64(addr uint64) (int64, bool) {
 // buildGoroutineList enumerates runtime.allgs. ok is false when the runtime
 // can't be read (no DWARF, bad layout, unreadable slice, or no live goroutines
 // yet), so callers fall back to the synthetic goroutine.
-func (e *engine) buildGoroutineList(liveSP, livePC uint64) ([]protocol.Goroutine, bool) {
+//
+// clipped reports that the walk stopped at maxGoroutineScan with entries still
+// unvisited, which makes the returned count a lower bound rather than a census.
+// It rides all the way to the wire as SnapshotTotals.GoroutinesClipped so a
+// consumer can tell "the debugger's own scan stopped early" from "this event was
+// trimmed to fit" — two different truths that a single flag would conflate.
+func (e *engine) buildGoroutineList(liveSP, livePC uint64) (gs []protocol.Goroutine, clipped, ok bool) {
 	l, ok := e.getGoLayout()
 	if !ok {
-		return nil, false
+		return nil, false, false
 	}
 	base, ok := e.dw.runtimeVarAddr("runtime.allgs")
 	if !ok {
-		return nil, false
+		return nil, false, false
 	}
 	ptr, ok := e.readU64(base) // slice header: array pointer @ +0
 	if !ok || ptr == 0 {
-		return nil, false
+		return nil, false, false
 	}
 	length, ok := e.readU64(base + 8) // slice header: len @ +8
 	if !ok || length == 0 {
-		return nil, false
+		return nil, false, false
 	}
 	if length > maxGoroutineScan {
 		length = maxGoroutineScan
+		clipped = true
 	}
 
 	out := make([]protocol.Goroutine, 0, length)
@@ -324,26 +331,31 @@ func (e *engine) buildGoroutineList(liveSP, livePC uint64) ([]protocol.Goroutine
 		}
 	}
 	if len(out) == 0 {
-		return nil, false
+		return nil, false, false
 	}
-	return out, true
+	return out, clipped, true
 }
 
 // readThreads walks runtime.allm and reports every OS thread (M). currentGoid
 // (from the goroutine list) marks the thread whose goroutine is under
 // inspection as Current and gives it the live PC. Best-effort: nil on failure.
-func (e *engine) readThreads(currentGoid int, livePC uint64) []protocol.Thread {
+//
+// clipped reports that the walk ended with the list still going — either at
+// maxThreadScan or on an unreadable alllink — so the returned count is a lower
+// bound. It is independent of the goroutine scan's flag because the two ceilings
+// are independent (see SnapshotTotals).
+func (e *engine) readThreads(currentGoid int, livePC uint64) (ts []protocol.Thread, clipped bool) {
 	l, ok := e.getGoLayout()
 	if !ok {
-		return nil
+		return nil, false
 	}
 	base, ok := e.dw.runtimeVarAddr("runtime.allm")
 	if !ok {
-		return nil
+		return nil, false
 	}
 	mptr, ok := e.readU64(base) // runtime.allm is a *m; read the head pointer
 	if !ok {
-		return nil
+		return nil, false
 	}
 
 	var out []protocol.Thread
@@ -377,7 +389,9 @@ func (e *engine) readThreads(currentGoid int, livePC uint64) []protocol.Thread {
 		}
 		mptr = next
 	}
-	return out
+	// A completed walk ends on the terminating nil link. Anything else — the
+	// scan ceiling or an unreadable link — left threads unvisited.
+	return out, mptr != 0
 }
 
 // liveRegisters reads the currently-stopped thread's SP and PC (used to locate
@@ -407,32 +421,57 @@ func (e *engine) syntheticGoroutine(livePC uint64) protocol.Goroutine {
 	}
 }
 
-// readGoroutines returns the live goroutine set, falling back to a single
-// synthetic goroutine when the runtime can't be read. This backs the on-demand
-// Goroutines() query and the DAP threads list.
-func (e *engine) readGoroutines() ([]protocol.Goroutine, error) {
+// readGoroutines returns the live goroutine set bounded to the wire contract,
+// falling back to a single synthetic goroutine when the runtime can't be read.
+// This backs the on-demand Goroutines() query and the DAP threads list.
+//
+// The list is packed here rather than at the hub because only this layer knows
+// whether the runtime walk was clipped, and a truncated list shipped without
+// that context is indistinguishable from a complete one — the dishonesty that
+// issue #194 is about.
+func (e *engine) readGoroutines() (protocol.GoroutinesPayload, protocol.GoroutinePackReport) {
 	sp, pc := e.liveRegisters()
-	if gs, ok := e.buildGoroutineList(sp, pc); ok {
-		return gs, nil
+	gs, clipped, ok := e.buildGoroutineList(sp, pc)
+	if !ok {
+		gs, clipped = []protocol.Goroutine{e.syntheticGoroutine(pc)}, false
 	}
-	return []protocol.Goroutine{e.syntheticGoroutine(pc)}, nil
+	return protocol.PackGoroutines(gs, clipped)
 }
 
-// goroutineSnapshot builds the full concurrency picture and computes the
-// created/exited deltas against the previous snapshot. It updates the engine's
-// remembered live set, so successive snapshots report only what changed. Runs
-// on the engine loop thread; prevGoids needs no synchronization.
-func (e *engine) goroutineSnapshot() protocol.GoroutineSnapshotPayload {
+// snapshotResult is a wire-ready snapshot plus the two facts the packed payload
+// can no longer answer on its own: which goroutine the tracee is actually
+// stopped in (a stop event embeds it even when packing had to degrade the
+// collections) and what the packer left off the wire.
+type snapshotResult struct {
+	payload protocol.GoroutineSnapshotPayload
+	current protocol.Goroutine
+	report  protocol.GoroutinePackReport
+}
+
+// goroutineSnapshot builds the full concurrency picture, computes the
+// created/exited deltas against the previous snapshot, and bounds the result to
+// the wire contract. It updates the engine's remembered live set, so successive
+// snapshots report only what changed. Runs on the engine loop thread; prevGoids
+// needs no synchronization.
+//
+// Packing happens AFTER the lifecycle accounting on purpose: the deltas describe
+// the runtime, not the frame, so they must be computed against the goroutines
+// that were actually alive rather than the subset that survived the byte budget.
+// Packing first would make every trimmed goroutine look like it had exited and
+// then been created again on the next stop.
+func (e *engine) goroutineSnapshot() snapshotResult {
 	sp, pc := e.liveRegisters()
 
-	gs, ok := e.buildGoroutineList(sp, pc)
+	gs, goroutinesClipped, ok := e.buildGoroutineList(sp, pc)
 	if !ok {
 		// Degraded snapshot: still report where we're stopped, but don't touch
 		// the remembered live set — an empty read (e.g. at the entry stop before
 		// runtime init) must not look like every goroutine exited.
-		return protocol.GoroutineSnapshotPayload{
-			Goroutines: []protocol.Goroutine{e.syntheticGoroutine(pc)},
-		}
+		synthetic := e.syntheticGoroutine(pc)
+		payload, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+			Goroutines: []protocol.Goroutine{synthetic},
+		}, false, false)
+		return snapshotResult{payload: payload, current: synthetic, report: report}
 	}
 
 	var current int
@@ -445,13 +484,23 @@ func (e *engine) goroutineSnapshot() protocol.GoroutineSnapshotPayload {
 	}
 
 	created, exited := e.diffGoids(live)
+	threads, threadsClipped := e.readThreads(current, pc)
 
-	return protocol.GoroutineSnapshotPayload{
+	raw := protocol.GoroutineSnapshotPayload{
 		Goroutines: gs,
-		Threads:    e.readThreads(current, pc),
+		Threads:    threads,
 		Current:    current,
 		Created:    created,
 		Exited:     exited,
+	}
+	payload, report := protocol.PackSnapshot(raw, goroutinesClipped, threadsClipped)
+	return snapshotResult{
+		// Resolved from the unpacked set: the stop event carries a single
+		// goroutine and is not part of the bounded event family, so it stays
+		// accurate even when the snapshot event itself had to degrade.
+		payload: payload,
+		current: currentGoroutineFrom(raw),
+		report:  report,
 	}
 }
 

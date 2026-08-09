@@ -163,8 +163,9 @@ var _ = Describe("current-thread inspection", func() {
 	It("Goroutines report the stopped thread's location", func() {
 		stopOnThread2()
 
-		gs, err := d.Goroutines()
+		payload, err := d.Goroutines()
 		Expect(err).NotTo(HaveOccurred())
+		gs := payload.Goroutines
 		Expect(gs).To(HaveLen(1))
 		Expect(gs[0].CurrentLoc.Function).To(ContainSubstring("beta"),
 			"goroutine location should track the stopped thread (2), got %q", gs[0].CurrentLoc.Function)

@@ -418,14 +418,22 @@ func TestGoroutinesUnwrapsPackedPayload(t *testing.T) {
 	c := dialTestClient(t, fs)
 	defer func() { _ = c.Close() }()
 
-	gs, err := c.Goroutines()
+	got, err := c.Goroutines()
 	if err != nil {
 		t.Fatalf("Goroutines: %v", err)
 	}
-	if len(gs) != len(packed.Goroutines) {
-		t.Fatalf("Goroutines = %d; want the %d packed entries", len(gs), len(packed.Goroutines))
+	if len(got.Goroutines) != len(packed.Goroutines) {
+		t.Fatalf("Goroutines = %d; want the %d packed entries", len(got.Goroutines), len(packed.Goroutines))
 	}
-	if gs[0].ID != packed.Goroutines[0].ID {
-		t.Errorf("Goroutines[0].ID = %d; want %d", gs[0].ID, packed.Goroutines[0].ID)
+	if got.Goroutines[0].ID != packed.Goroutines[0].ID {
+		t.Errorf("Goroutines[0].ID = %d; want %d", got.Goroutines[0].ID, packed.Goroutines[0].ID)
+	}
+	// The omission signal must survive the client, or a caller renders a
+	// truncated list as if it were the whole set — the #194 failure mode.
+	if got.Totals == nil {
+		t.Fatal("Totals = nil; a truncated list must reach the caller with its original counts")
+	}
+	if got.Totals.Goroutines != len(raw) {
+		t.Errorf("Totals.Goroutines = %d; want the original %d", got.Totals.Goroutines, len(raw))
 	}
 }

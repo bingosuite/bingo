@@ -138,9 +138,10 @@ func dispatch(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, erro
 		if err != nil {
 			return dispatchResult{}, err
 		}
-		evt, err := protocol.NewEvent(protocol.EventGoroutines, 0, protocol.GoroutinesPayload{
-			Goroutines: goroutines,
-		})
+		// The debugger already bounded this to the goroutine event contract and
+		// attached its Totals; forwarding the payload whole is what keeps the
+		// omission visible to the client.
+		evt, err := protocol.NewEvent(protocol.EventGoroutines, 0, goroutines)
 		if err != nil {
 			return dispatchResult{}, err
 		}

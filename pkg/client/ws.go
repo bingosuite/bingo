@@ -427,20 +427,20 @@ func (c *wsClient) StackFrames() ([]protocol.Frame, error) {
 	return p.Frames, nil
 }
 
-func (c *wsClient) Goroutines() ([]protocol.Goroutine, error) {
+func (c *wsClient) Goroutines() (protocol.GoroutinesPayload, error) {
 	cmd, err := newCommand(protocol.CmdGoroutines, struct{}{})
 	if err != nil {
-		return nil, err
+		return protocol.GoroutinesPayload{}, err
 	}
 	evt, err := c.sendAndWait(cmd, protocol.EventGoroutines)
 	if err != nil {
-		return nil, err
+		return protocol.GoroutinesPayload{}, err
 	}
 	var p protocol.GoroutinesPayload
 	if err := protocol.DecodeEventPayload(evt, &p); err != nil {
-		return nil, fmt.Errorf("decode Goroutines: %w", err)
+		return protocol.GoroutinesPayload{}, fmt.Errorf("decode Goroutines: %w", err)
 	}
-	return p.Goroutines, nil
+	return p, nil
 }
 
 func (c *wsClient) GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error) {
