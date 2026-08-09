@@ -613,13 +613,8 @@ func TestSetBreakpointsDiffAndFIFO(t *testing.T) {
 	hh.cmds.waitForCommand(t, protocol.CmdClearBreakpoint)
 }
 
-func TestRestartReconcilesBreakpointCache(t *testing.T) {
-	hh := newHarness(t)
-	hh.doHandshake(t)
-	hh.inject(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{Goroutine: protocol.Goroutine{ID: 1}})
-	_ = recvType[*godap.StoppedEvent](hh)
-
-	source := godap.Source{Path: "/x/main.go", Name: "main.go"}
+func seedRestartBreakpointCache(t *testing.T, hh *harness, source godap.Source) {
+	t.Helper()
 	hh.sendReq("setBreakpoints", &godap.SetBreakpointsRequest{Arguments: godap.SetBreakpointsArguments{
 		Source:      source,
 		Breakpoints: []godap.SourceBreakpoint{{Line: 10}, {Line: 20}},
@@ -632,21 +627,23 @@ func TestRestartReconcilesBreakpointCache(t *testing.T) {
 		Breakpoint: protocol.Breakpoint{ID: 42, Location: protocol.Location{File: source.Path, Line: 20}},
 	})
 	initial := recvType[*godap.SetBreakpointsResponse](hh)
-	if got := []int{initial.Body.Breakpoints[0].Id, initial.Body.Breakpoints[1].Id}; got[0] != 41 || got[1] != 42 {
-		t.Fatalf("initial breakpoint ids = %v, want [41 42]", got)
+	requireBreakpointIDs(t, initial, 41, 42)
+}
+
+func requireBreakpointIDs(t *testing.T, response *godap.SetBreakpointsResponse, want ...int) {
+	t.Helper()
+	if len(response.Body.Breakpoints) != len(want) {
+		t.Fatalf("breakpoint count = %d, want %d", len(response.Body.Breakpoints), len(want))
 	}
+	for i, id := range want {
+		if response.Body.Breakpoints[i].Id != id {
+			t.Fatalf("breakpoint ids = %+v, want %v", response.Body.Breakpoints, want)
+		}
+	}
+}
 
-	restartSeq := hh.sendReq("restart", &godap.RestartRequest{})
-	hh.cmds.waitForCommand(t, protocol.CmdRestart)
-	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{
-		Breakpoints: []protocol.Breakpoint{
-			{ID: 101, Location: protocol.Location{File: source.Path, Line: 10}},
-		},
-		Discarded: []protocol.DiscardedBreakpoint{
-			{Location: protocol.Location{File: source.Path, Line: 20}, Reason: "no such line"},
-		},
-	})
-
+func receiveRestartResult(t *testing.T, hh *harness, restartSeq int) *godap.BreakpointEvent {
+	t.Helper()
 	var changed *godap.BreakpointEvent
 	var restarted *godap.RestartResponse
 	for range 2 {
@@ -663,6 +660,11 @@ func TestRestartReconcilesBreakpointCache(t *testing.T) {
 	if changed == nil {
 		t.Fatal("discarded breakpoint did not emit a breakpoint event")
 	}
+	return changed
+}
+
+func requireDiscardedBreakpointEvent(t *testing.T, changed *godap.BreakpointEvent) {
+	t.Helper()
 	if changed.Body.Reason != "changed" ||
 		changed.Body.Breakpoint.Id != 42 ||
 		changed.Body.Breakpoint.Verified ||
@@ -670,7 +672,10 @@ func TestRestartReconcilesBreakpointCache(t *testing.T) {
 		changed.Body.Breakpoint.Message != "no such line" {
 		t.Fatalf("discarded breakpoint event = %+v", changed.Body)
 	}
+}
 
+func requireRestartBreakpointCache(t *testing.T, hh *harness, source godap.Source) {
+	t.Helper()
 	hh.handler.mu.Lock()
 	retained := hh.handler.bpByFile[source.Path][10]
 	_, droppedStillCached := hh.handler.bpByFile[source.Path][20]
@@ -681,7 +686,10 @@ func TestRestartReconcilesBreakpointCache(t *testing.T) {
 	if droppedStillCached {
 		t.Fatal("discarded breakpoint remained in cache")
 	}
+}
 
+func retryDiscardedBreakpoint(t *testing.T, hh *harness, source godap.Source) {
+	t.Helper()
 	hh.sendReq("setBreakpoints", &godap.SetBreakpointsRequest{Arguments: godap.SetBreakpointsArguments{
 		Source:      source,
 		Breakpoints: []godap.SourceBreakpoint{{Line: 10}, {Line: 20}},
@@ -698,10 +706,11 @@ func TestRestartReconcilesBreakpointCache(t *testing.T) {
 		Breakpoint: protocol.Breakpoint{ID: 202, Location: protocol.Location{File: source.Path, Line: 20}},
 	})
 	retried := recvType[*godap.SetBreakpointsResponse](hh)
-	if got := []int{retried.Body.Breakpoints[0].Id, retried.Body.Breakpoints[1].Id}; got[0] != 41 || got[1] != 202 {
-		t.Fatalf("post-restart breakpoint ids = %v, want stable retained id 41 and retried id 202", got)
-	}
+	requireBreakpointIDs(t, retried, 41, 202)
+}
 
+func clearReidentifiedBreakpoint(t *testing.T, hh *harness, source godap.Source) {
+	t.Helper()
 	hh.sendReq("setBreakpoints", &godap.SetBreakpointsRequest{Arguments: godap.SetBreakpointsArguments{
 		Source:      source,
 		Breakpoints: []godap.SourceBreakpoint{{Line: 20}},
@@ -715,6 +724,33 @@ func TestRestartReconcilesBreakpointCache(t *testing.T) {
 		t.Fatalf("clear breakpoint id = %d, want fresh debugger id 101", clear.ID)
 	}
 	_ = recvType[*godap.SetBreakpointsResponse](hh)
+}
+
+func TestRestartReconcilesBreakpointCache(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	hh.inject(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{Goroutine: protocol.Goroutine{ID: 1}})
+	_ = recvType[*godap.StoppedEvent](hh)
+
+	source := godap.Source{Path: "/x/main.go", Name: "main.go"}
+	seedRestartBreakpointCache(t, hh, source)
+
+	restartSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdRestart)
+	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{
+		Breakpoints: []protocol.Breakpoint{
+			{ID: 101, Location: protocol.Location{File: source.Path, Line: 10}},
+		},
+		Discarded: []protocol.DiscardedBreakpoint{
+			{Location: protocol.Location{File: source.Path, Line: 20}, Reason: "no such line"},
+		},
+	})
+
+	changed := receiveRestartResult(t, hh, restartSeq)
+	requireDiscardedBreakpointEvent(t, changed)
+	requireRestartBreakpointCache(t, hh, source)
+	retryDiscardedBreakpoint(t, hh, source)
+	clearReidentifiedBreakpoint(t, hh, source)
 }
 
 func TestRestartedPayloadDecodeFailureStillResponds(t *testing.T) {
