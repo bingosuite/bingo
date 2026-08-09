@@ -11,12 +11,12 @@ import {
 import { envelope, goroutine, snapshot } from "./fixtures.js";
 
 describe("telemetry codec", () => {
-  it("decodes protocol 1.2 snapshots and emits only the read-only command", () => {
+  it("decodes protocol 1.3 snapshots and emits only the read-only command", () => {
     const decoded = decodeEvent(envelope(1, "GoroutineSnapshot", snapshot()));
     assert.equal(decoded.kind, "GoroutineSnapshot");
     assert.equal(decoded.snapshot?.goroutines[0]?.id, 1);
     assert.deepEqual(JSON.parse(snapshotCommand()), {
-      v: "1.2",
+      v: "1.3",
       kind: "GoroutineSnapshot",
       payload: {},
     });
@@ -41,7 +41,7 @@ describe("telemetry codec", () => {
     );
     assert.throws(
       () => decodeEvent("x".repeat(maximumEnvelopeBytes + 1)),
-      /exceeds 2 MiB/,
+      /exceeds the 2097152 byte contract/,
     );
     assert.throws(
       () =>
@@ -80,7 +80,7 @@ describe("telemetry codec", () => {
       () =>
         decodeEvent(
           JSON.stringify({
-            v: "1.2",
+            v: "1.3",
             kind: "Continued",
             seq: 1,
             payload: {},
@@ -93,7 +93,7 @@ describe("telemetry codec", () => {
       () =>
         decodeEvent(
           JSON.stringify({
-            v: "1.2",
+            v: "1.3",
             kind: "FutureEvent",
             seq: 1,
             payload: {},

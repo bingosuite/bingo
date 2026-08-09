@@ -10,7 +10,7 @@ bingo speaks two protocols against **one** debug session at the same time:
   the OS-thread set, and created/exited lifecycle deltas — streams here as
   `EventGoroutineSnapshot`.
 
-The VS Code 0.3.1 extension wires both together automatically: DAP drives while
+The VS Code 0.4.0 extension wires both together automatically: DAP drives while
 the **Bingo Concurrency** Activity Bar view observes the exact session over
 WebSocket. `cmd/wsmon` remains the terminal observer for non-VS Code workflows.
 
@@ -40,7 +40,7 @@ architecture behind this.
   just vscode-install
   ```
 
-  Automatic graphical telemetry requires **bingosuite.bingo 0.3.1 or newer**. Run
+  Automatic graphical telemetry requires **bingosuite.bingo 0.4.0 or newer**. Run
   **Developer: Reload Window** once after installation or update. The companion
   owns debugger type `"bingo"` and connects directly to bingo's DAP listener;
   it neither invokes nor validates `dlv`, and it does not replace the Go
@@ -155,3 +155,56 @@ repaints with the new round's workers — the plumbing, end to end.
 - If the tracee is a stripped binary or stopped before runtime init, the snapshot
   degrades to a single synthetic goroutine; both observers render the degraded
   state rather than failing the debug session.
+
+## Bounded goroutine events (protocol 1.3)
+
+`EventGoroutineSnapshot` and `EventGoroutines` are the only two events that carry
+an unbounded runtime collection, so they are the only two with a size contract
+(`protocol.MaxGoroutineEventBytes`, 2 MiB, measured on the real marshalled
+`Event`). There is no generic message cap, no `Location` truncation, and no
+chunking or compression — everything else on the wire is unchanged.
+
+What a consumer sees:
+
+- **Deterministic content.** The current goroutine comes first, then its
+  ancestors nearest-first, then the rest by ascending goid; the current thread
+  leads the thread set, and a floor of 32 threads is packed before goroutines
+  compete for the remaining budget. Two clients observing the same stop receive
+  the same bytes.
+- **Anchors and deltas are never dropped.** The current goroutine, the current
+  thread, and the created/exited lifecycle deltas always survive. If not even the
+  anchors fit, the event degrades to empty collections rather than failing; a
+  degraded result that still overflows (only possible if the deltas alone do)
+  reports `Oversized` rather than pretending to conform.
+- **Deltas are not packed elements.** Because they are never trimmed,
+  `created`/`exited` can legitimately exceed the element caps — the debugger's
+  scan reaches 8192. A consumer must not apply its element cap to them; the byte
+  contract is their bound.
+- **`totals` is the honesty channel.** It appears *only* when elements were left
+  off the wire or the debugger's runtime scan was clipped, carrying the
+  **original** counts. Its presence alone means "this is not everything".
+  `totals.clipped` means the scan stopped early, so `totals.goroutines` is a
+  lower bound — render it as such (VS Code appends `+`).
+
+A consumer should therefore treat the goroutine list as a bounded, ordered view
+and read `totals` for the truth about scale — not assume the list is complete.
+Element-count caps (`MaxSnapshotGoroutines` 5000, `MaxSnapshotThreads` 2048)
+apply even when the bytes would allow more.
+
+Clients that enforce their own limits should keep their transport ceiling
+strictly **above** their decoder ceiling. A frame that breaks the contract is
+then delivered and rejected as a deterministic protocol error — which must not be
+retried — instead of being killed inside the WebSocket layer, where it is
+indistinguishable from a flaky link and drives a pointless reconnect loop.
+
+Two limits that are easy to get wrong:
+
+- **Scope the fatal treatment to these two kinds.** Every other event is
+  deliberately unbounded — `EventLocals`/`EventFrames`/`EventEvaluate` are
+  broadcast to all clients and are limited only by the debugger's inspection
+  budget, so a large variable expansion can legitimately exceed the goroutine
+  budget. Treat those as transient, or an unrelated Variables-pane action will
+  permanently kill an observer.
+- **Do not apply the element caps to `created`/`exited`.** They are never
+  trimmed, so they can exceed `MaxSnapshotGoroutines`; the debugger's scan
+  reaches 8192.

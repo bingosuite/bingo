@@ -858,3 +858,78 @@ func TestJoinExistingSuspendedSession(t *testing.T) {
 	_ = recvType[*godap.ContinueResponse](hh)
 	hh.cmds.waitForCommand(t, protocol.CmdContinue)
 }
+
+// TestThreadsFromPackedGoroutines proves the DAP threads response carries the
+// real (truncated) goroutine list rather than falling back to the synthetic
+// single "main" thread. The synthetic fallback exists for a genuinely empty
+// list; a bounded list is real data and must survive translation intact.
+// See issue #194 — a producer that dropped an oversized list instead of packing
+// it would make the IDE claim a 5,000-goroutine process has one thread.
+func TestThreadsFromPackedGoroutines(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	hh.inject(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{Goroutine: protocol.Goroutine{ID: 1}})
+	_ = recvType[*godap.StoppedEvent](hh)
+
+	raw := make([]protocol.Goroutine, 0, 8192)
+	for i := 1; i <= 8192; i++ {
+		raw = append(raw, protocol.Goroutine{
+			ID:         i,
+			Status:     "waiting",
+			WaitReason: "chan receive",
+			CurrentLoc: protocol.Location{
+				File:     "/home/runner/go/src/github.com/bingosuite/bingo/internal/service/handler.go",
+				Line:     1234,
+				Function: "github.com/bingosuite/bingo/internal/service.(*Handler).Serve.func1",
+			},
+			StartLoc:   protocol.Location{File: "/home/runner/go/src/github.com/bingosuite/bingo/internal/service/handler.go", Line: 88},
+			CreatedLoc: protocol.Location{File: "/home/runner/go/src/github.com/bingosuite/bingo/internal/service/handler.go", Line: 91},
+		})
+	}
+	packed, report := protocol.PackGoroutines(raw, true)
+	if report.Degraded || len(packed.Goroutines) < 2 {
+		t.Fatalf("packed = %d goroutines, degraded=%v; want a real truncated list", len(packed.Goroutines), report.Degraded)
+	}
+	if len(packed.Goroutines) >= len(raw) {
+		t.Fatalf("packed %d of %d; the input must actually be too big", len(packed.Goroutines), len(raw))
+	}
+	if packed.Totals == nil || packed.Totals.Goroutines != len(raw) || !packed.Totals.Clipped {
+		t.Fatalf("totals = %+v; want the original count and the clipped flag", packed.Totals)
+	}
+
+	hh.sendReq("threads", &godap.ThreadsRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdGoroutines)
+	hh.inject(protocol.EventGoroutines, packed)
+
+	thr := recvType[*godap.ThreadsResponse](hh)
+	if len(thr.Body.Threads) != len(packed.Goroutines) {
+		t.Fatalf("threads = %d; want the %d packed goroutines", len(thr.Body.Threads), len(packed.Goroutines))
+	}
+	if len(thr.Body.Threads) == 1 && thr.Body.Threads[0].Name == "main" {
+		t.Fatal("threads fell back to the synthetic main thread")
+	}
+	if thr.Body.Threads[0].Id != packed.Goroutines[0].ID {
+		t.Fatalf("threads[0].Id = %d; want goid %d", thr.Body.Threads[0].Id, packed.Goroutines[0].ID)
+	}
+
+	// The DAP shape is cheap: the lean {id,status} form of the entire 8192-entry
+	// set is nowhere near the byte budget, so what bounds it is the element
+	// count cap alone — an IDE never loses threads to sheer payload size.
+	full, fullReport := protocol.PackGoroutines(dapShaped(raw), false)
+	if len(full.Goroutines) != protocol.MaxSnapshotGoroutines {
+		t.Fatalf("DAP-shaped pack kept %d; want the count cap %d", len(full.Goroutines), protocol.MaxSnapshotGoroutines)
+	}
+	if fullReport.Bytes >= protocol.MaxGoroutineEventBytes/2 {
+		t.Fatalf("DAP-shaped pack used %d bytes; the lean shape must stay far below the budget", fullReport.Bytes)
+	}
+}
+
+// dapShaped strips a goroutine down to what a DAP thread actually uses, which
+// is what makes the 8192-thread list fit comfortably inside the budget.
+func dapShaped(gs []protocol.Goroutine) []protocol.Goroutine {
+	out := make([]protocol.Goroutine, 0, len(gs))
+	for _, g := range gs {
+		out = append(out, protocol.Goroutine{ID: g.ID, Status: g.Status})
+	}
+	return out
+}

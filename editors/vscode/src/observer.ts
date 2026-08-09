@@ -4,14 +4,21 @@ import type { BingoEndpoint } from "./configuration.js";
 import { appendLifecycle, type SessionModel } from "./model.js";
 import {
   decodeEvent,
-  maximumEnvelopeBytes,
+  maximumTransportBytes,
   SequenceTracker,
   snapshotCommand,
+  TelemetryProtocolError,
   type TelemetryData,
 } from "./telemetry.js";
 
 const socketOpenState = 1;
 const reconnectDelays = [100, 250, 500, 1000, 2000, 4000] as const;
+
+// `ws` reports a frame above maxPayload with this code. Because the transport
+// ceiling sits above the decoder contract, hitting it means the peer sent
+// something far outside the contract — deterministic, not flaky, so retrying it
+// just burns the ladder. See issue #194.
+const oversizedFrameCode = "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH";
 
 export interface Socket {
   readonly readyState: number;
@@ -47,6 +54,7 @@ export class TelemetryObserver {
   #socket: Socket | undefined;
   #connectionEpoch = 0;
   #disposed = false;
+  #fatal = false;
   #model: SessionModel;
 
   public constructor(
@@ -123,7 +131,7 @@ export class TelemetryObserver {
   }
 
   #connect(attempt: number): void {
-    if (this.#disposed) {
+    if (this.#disposed || this.#fatal) {
       return;
     }
     const epoch = ++this.#connectionEpoch;
@@ -165,6 +173,12 @@ export class TelemetryObserver {
       if (!this.#isCurrent(epoch, socket)) {
         return;
       }
+      if (isOversizedFrame(error)) {
+        this.#fail(
+          `telemetry frame exceeds the ${String(maximumTransportBytes)} byte transport limit: ${error.message}`,
+        );
+        return;
+      }
       this.#update({ error: error.message });
       socket.close();
     });
@@ -173,12 +187,30 @@ export class TelemetryObserver {
         return;
       }
       this.#socket = undefined;
+      if (this.#fatal) {
+        return;
+      }
       void this.#reconnect(attempt + 1, epoch);
     });
   }
 
+  // #fail latches a deterministic protocol violation. Unlike a transport close
+  // it must NOT reconnect: the peer would send the identical bad frame again,
+  // so retrying only burns the ladder and hammers the server with snapshot
+  // requests before landing in the same terminal state.
+  #fail(message: string): void {
+    if (this.#fatal) {
+      return;
+    }
+    this.#fatal = true;
+    const socket = this.#socket;
+    this.#socket = undefined;
+    this.#update({ connection: "error", error: message });
+    socket?.close();
+  }
+
   async #reconnect(attempt: number, epoch: number): Promise<void> {
-    if (this.#disposed) {
+    if (this.#disposed || this.#fatal) {
       return;
     }
     const wait = reconnectDelays[attempt - 1];
@@ -253,6 +285,10 @@ export class TelemetryObserver {
       this.#update(sequencePatch);
       this.#applyEvent(event.kind, event.payload);
     } catch (error: unknown) {
+      if (error instanceof TelemetryProtocolError) {
+        this.#fail(error.message);
+        return;
+      }
       this.#update({ error: errorMessage(error) });
       this.#socket?.close();
     }
@@ -381,11 +417,27 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+// `ws` surfaces the oversized-frame rejection as an Error carrying a `code`
+// property rather than a distinct type, so the code is what identifies it.
+function isOversizedFrame(error: Error): boolean {
+  return (
+    (error as { readonly code?: unknown }).code === oversizedFrameCode ||
+    error.message.includes(oversizedFrameCode)
+  );
+}
+
 const defaultDependencies: ObserverDependencies = {
   createSocket: (url) => new NodeSocket(url),
   delay,
   now: Date.now,
 };
+
+// observerDependencies exposes the production socket factory so tests can drive
+// the real `ws` transport (and therefore the real maxPayload) while still
+// overriding timing.
+export function observerDependencies(): ObserverDependencies {
+  return defaultDependencies;
+}
 
 function payloadText(value: unknown, fallback: string): string {
   return typeof value === "string" || typeof value === "number"
@@ -399,7 +451,7 @@ class NodeSocket implements Socket {
   public constructor(url: string) {
     this.#socket = new WebSocket(url, {
       handshakeTimeout: 5000,
-      maxPayload: maximumEnvelopeBytes,
+      maxPayload: maximumTransportBytes,
       perMessageDeflate: false,
     });
   }
