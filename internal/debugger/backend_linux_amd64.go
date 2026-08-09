@@ -523,8 +523,8 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 			switch cause {
 			case syscall.PTRACE_EVENT_CLONE:
-				if err := b.continueIfTraceeExists(tid, 0); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_CONT clone parent tid %d: %w", tid, err)
+				if err := b.resumeAbsorbed(tid, 0); err != nil {
+					return StopEvent{}, fmt.Errorf("resume clone parent tid %d: %w", tid, err)
 				}
 				continue
 
@@ -567,6 +567,15 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				return StopEvent{Reason: StopExited, TID: tid, ExitCode: 0}, nil
 
 			case syscall.PTRACE_EVENT_EXEC:
+				// execve replaces the image the stepped-over breakpoint and its
+				// saved instruction bytes belong to, so the step can be neither
+				// re-armed nor completed. Nothing can restore the old trap
+				// because the memory it lived in is gone. Fail the wait instead:
+				// the engine reports it and tears the session down cleanly.
+				if b.resumeFor(tid) == resumeSingleStep {
+					b.abortStep()
+					return StopEvent{}, fmt.Errorf("tracee exec'd on tid %d while it was being single-stepped: the stepped-over breakpoint cannot be restored in the new image", tid)
+				}
 				if err := b.continueIfTraceeExists(tid, 0); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT exec tid %d: %w", tid, err)
 				}
@@ -589,6 +598,17 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				return StopEvent{Reason: reason, TID: tid}, nil
 
 			default:
+				// An unrecognised PTRACE_EVENT. We enable only TRACEEXIT,
+				// TRACEEXEC and TRACECLONE, so this is unreachable in practice
+				// and there is nothing to reason about if it is reached. On the
+				// stepped thread that leaves no safe move: continuing cancels
+				// the step with the trap still out of memory, and re-arming
+				// assumes a stop shape we do not understand. Fail loudly rather
+				// than guess.
+				if b.resumeFor(tid) == resumeSingleStep {
+					b.abortStep()
+					return StopEvent{}, fmt.Errorf("unhandled ptrace event %d on tid %d while it was being single-stepped", cause, tid)
+				}
 				if err := b.continueIfTraceeExists(tid, 0); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT trap cause %d tid %d: %w", cause, tid, err)
 				}
@@ -604,8 +624,11 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			// stopped at a breakpoint waiting for the engine, and a
 			// group-continue here would let it run away (the exact "parking the
 			// thread group" hazard that kept clone tracing disabled before).
-			if err := b.continueIfTraceeExists(tid, 0); err != nil {
-				return StopEvent{}, fmt.Errorf("PTRACE_CONT new thread tid %d: %w", tid, err)
+			// A brand-new thread is never the one being stepped, but route the
+			// resume through the same helper so no absorb site can drift back
+			// into an unguarded continue.
+			if err := b.resumeAbsorbed(tid, 0); err != nil {
+				return StopEvent{}, fmt.Errorf("resume new thread tid %d: %w", tid, err)
 			}
 			continue
 		}
@@ -613,24 +636,15 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		// SIGURG is Go's goroutine-preemption signal; it must be re-delivered
 		// transparently during both step and continue or scheduling breaks.
 		if sig == syscall.SIGURG {
-			// Re-issue the single-step only for the thread actually being
-			// stepped; a SIGURG on any other thread must be re-delivered and
-			// the thread continued, never single-stepped.
-			if b.stepping && tid == b.stepTID {
-				if err := b.singleStepIfTraceeExists(tid); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_SINGLESTEP after SIGURG tid %d: %w", tid, err)
-				}
-			} else {
-				if err := b.continueIfTraceeExists(tid, int(sig)); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_CONT SIGURG tid %d: %w", tid, err)
-				}
+			if err := b.resumeAbsorbed(tid, int(sig)); err != nil {
+				return StopEvent{}, fmt.Errorf("resume after SIGURG tid %d: %w", tid, err)
 			}
 			continue
 		}
 
 		if sig == syscall.SIGCONT {
-			if err := b.continueIfTraceeExists(tid, 0); err != nil {
-				return StopEvent{}, fmt.Errorf("PTRACE_CONT SIGCONT tid %d: %w", tid, err)
+			if err := b.resumeAbsorbed(tid, 0); err != nil {
+				return StopEvent{}, fmt.Errorf("resume after SIGCONT tid %d: %w", tid, err)
 			}
 			continue
 		}
@@ -699,4 +713,22 @@ func (b *linuxBackend) singleStepIfTraceeExists(tid int) error {
 		return err
 	}
 	return nil
+}
+
+// resumeAbsorbed resumes a thread whose stop Wait handled internally instead of
+// reporting it. Every absorb site must go through here: the kernel delivers one
+// stop per resume, so absorbing an event on the thread the engine is stepping
+// consumes that step, and a plain continue there would silently cancel it while
+// the step gate stays latched. See stepQueue.resumeFor.
+//
+// The signal is re-delivered only on the continue path. Re-delivering it with
+// PTRACE_SINGLESTEP would run the handler instead of the instruction the engine
+// asked to step, which is why the stepped thread swallows it — the pre-existing
+// SIGURG behaviour this generalises.
+func (b *linuxBackend) resumeAbsorbed(tid int, signal int) error {
+	if b.resumeFor(tid) == resumeSingleStep {
+		b.countStepRearm()
+		return b.singleStepIfTraceeExists(tid)
+	}
+	return b.continueIfTraceeExists(tid, signal)
 }

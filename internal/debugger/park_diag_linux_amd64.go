@@ -44,3 +44,25 @@ func LinuxParkedSignalCount(d Debugger) (int, bool) {
 	}
 	return b.parkedSignalCount(), true
 }
+
+// LinuxStepRearmCount reports how many times the wait loop absorbed a stop on
+// the thread it was single-stepping and re-armed that step instead of
+// continuing the thread.
+//
+// This is the native observable for the absorb-resume rule. A plain continue
+// there cancels the step while the step gate stays latched, after which no
+// completion can ever arrive, every later foreign stop is held forever and the
+// tracee freezes — a failure a test can otherwise only see as a timeout, which
+// is indistinguishable from ordinary slowness. A positive count proves the rule
+// ran against a real kernel. Returns (0, false) for a non-engine Debugger.
+func LinuxStepRearmCount(d Debugger) (int, bool) {
+	e, ok := d.(*engine)
+	if !ok {
+		return 0, false
+	}
+	b, ok := e.backend.(*linuxBackend)
+	if !ok {
+		return 0, false
+	}
+	return b.stepRearmCount(), true
+}
