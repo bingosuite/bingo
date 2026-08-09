@@ -828,7 +828,9 @@ gone once killed:
   Set on `CmdLaunch` success, cleared on `CmdAttach` success.
 - `h.bps *breakpointIDs` — the logical-id table (see
   [Breakpoint identity](#breakpoint-identity--hub-owned-logical-ids)). Restart
-  walks `sortedLogical()` for determinism, re-`SetBreakpoint`s each retained
+  `reset`s it, then walks the `sortedRestartTargets()` snapshot (the
+  `installedLogical()` set, sorted for determinism) taken *before* the reset,
+  re-`SetBreakpoint`s each retained
   location on the new `Debugger` (which re-resolves `file:line` through DWARF
   against the new process image — addresses aren't reused directly since a
   relaunch can shift the load address), `bind`s the logical id to the fresh
@@ -883,7 +885,8 @@ bound when the Handler generates the bytes, but injection happens after the
 Restart and would read the new epoch. So the hub owns identity instead:
 
 - `breakpointIDs.next` is monotonic for the **whole hub lifetime**. `reset()`
-  (a fresh `Launch`/`Attach`) drops the mappings but deliberately does **not**
+  (a fresh `Launch`/`Attach`, and the engine swap inside `Restart`) drops the
+  mappings but deliberately does **not**
   rewind the high-water mark; re-minting is exactly what would let a delayed
   command from a previous target alias a breakpoint in the new one.
 - `byLogical` maps logical → `{physicalID, loc}`; `byPhysical` is the reverse
@@ -905,13 +908,31 @@ Restart and would read the new epoch. So the hub owns identity instead:
   `<stepout-return>`) report `EventStepped` and carry no breakpoint id, so they
   are unaffected; the test-only `<direct-addr>` sentinel does emit
   `EventBreakpointHit` and is translated like any other.
-- A hit can **race its own clear**. The engine emits into a buffered channel and
+- A hit can **race its own clear**, and a cleared breakpoint can be **resurrected
+  by the engine**. The engine emits into a buffered channel and
   `engine.ClearBreakpoint` has no suspend guard, so `Run`'s `select` may execute
-  a queued clear before draining a hit that was generated first. `untrack`
-  therefore `retire`s the physical id, and `logicalFor` consults that record so
-  the late hit still reports the id the client held instead of a number it was
-  never told about. The record is per-engine (dropped by `reset()`) and bounded
-  by `retiredCap`; only a very recent retirement can still be in flight.
+  a queued clear before draining a hit that was generated first; separately,
+  clearing the breakpoint the tracee is *parked on* is re-armed under the **same
+  physical id** by the step-off path (`resumeFromBreakpoint` replays the
+  `e.lastBP` it stashed at hit time rather than re-reading the table, and
+  `breakpointTable.reinstall` re-adds the entry under its original id). `untrack`
+  therefore `retire`s the pair into a **bidirectional tombstone**:
+  `retiredLogical` (physical→logical) lets `logicalFor` report a late or
+  resurrected hit under the id the client held instead of a number it was never
+  told about, and `retiredPhysical` (logical→physical) lets `physicalForClear`
+  keep honouring a `CmdClearBreakpoint` for that id. Without the second
+  direction a resurrected trap is reported under a logical id that
+  `CmdClearBreakpoint` then rejects (it is no longer in `byLogical`) *and*
+  `CmdSetBreakpoint` cannot replace (the engine still holds the address, so it
+  fails `errBreakpointExists`) — a phantom breakpoint that is permanently
+  neither removable nor settable. A tombstone-clear is deliberately **not**
+  consumed (`untrack` no-ops on an already-retired id) because the tracee may
+  still be parked there and resurrect it again.
+  The record is per-engine and bounded
+  by `retiredCap`; only a very recent retirement can still be in flight. It is
+  safe precisely because `breakpointTable.set` never reuses a physical id within
+  one engine, and because `reset()` purges it on every Launch/Attach/Restart — a
+  tombstone that outlived its engine would reintroduce exactly the #200 alias.
 - A physical id that is neither live nor retired is **adopted** rather than
   passed through (`logicalFor`): passing it through could collide with a logical
   id naming a different breakpoint. This keeps raw `hub.New` hubs (tests /
@@ -919,6 +940,22 @@ Restart and would read the new epoch. So the hub owns identity instead:
   mapping is **not** `installed`, so `installedLogical` excludes it from
   `sortedRestartTargets` — the hub never armed it and must not arm it on the
   replacement process.
+- A fresh out-of-band `Launch`/`Attach` (a *second* client relaunching a session
+  another client is driving) invalidates every logical id: the mappings are
+  reset while the high-water mark advances, so an id minted against the previous
+  target can never name a breakpoint in the new one. A client still holding old
+  ids gets a clean `EventError` ("breakpoint N not found") on its next
+  `CmdClearBreakpoint` instead of silently disarming a stranger's breakpoint —
+  the pre-fix behaviour, where a raw physical id aliased whatever the fresh
+  engine had compacted into that slot. It is therefore a strict improvement, not
+  a regression, but it is **not** transparent: a DAP adapter whose `bpLine`s
+  still record the pre-Launch ids believes lines are armed that the new process
+  does not have, and only discovers it when a later removal fails. `CmdRestart`
+  is the supported way to relaunch while *preserving* ids, and it is what the
+  DAP `restart` request maps to; a client that drives `CmdLaunch` directly on a
+  shared session owns the reconciliation. An explicit invalidation event is
+  deliberately out of scope here — it is a new protocol surface, and #200 is
+  about not corrupting the ids that *do* survive.
 
 Every protocol surface carrying a breakpoint id is covered:
 `BreakpointSetPayload.Breakpoint.ID`, `BreakpointClearedPayload.ID`,
@@ -941,7 +978,13 @@ Regression coverage:
 **real** `hub.Hub` + **real** `dap.Handler` with a gating `hub.WSConn`
 interposed at the `ReadMessage` → read-pump boundary; it holds a generated
 clear, restarts via a second client, releases it, and asserts the correct
-physical breakpoint was disarmed (plus an in-order negative control).
+physical breakpoint was disarmed (plus an in-order negative control). The held
+request runs on its own goroutine and **must** be joined before the test
+returns — it reports through `t`, which panics the package once the test has
+completed. [internal/hub/breakpoints_test.go](internal/hub/breakpoints_test.go)
+covers the tombstone from both ends: a step-off-resurrected breakpoint stays
+clearable under the id the client holds, and a retired id never reaches a
+replacement engine.
 
 ## Pause — async interrupt
 
