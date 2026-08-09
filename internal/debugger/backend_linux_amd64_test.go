@@ -13,9 +13,22 @@ import (
 )
 
 type linuxResumeCall struct {
-	op     string
-	tid    int
-	signal int
+	trap    uintptr
+	request uintptr
+	tid     uintptr
+	addr    uintptr
+	signal  uintptr
+	a5      uintptr
+	a6      uintptr
+}
+
+func wantLinuxResume(request, tid, signal int) linuxResumeCall {
+	return linuxResumeCall{
+		trap:    syscall.SYS_PTRACE,
+		request: uintptr(request),
+		tid:     uintptr(tid),
+		signal:  uintptr(signal),
+	}
 }
 
 func newRecordingLinuxBackend(t *testing.T, pid int) (*linuxBackend, *[]linuxResumeCall) {
@@ -24,13 +37,11 @@ func newRecordingLinuxBackend(t *testing.T, pid int) (*linuxBackend, *[]linuxRes
 	b := &linuxBackend{
 		pid:    pid,
 		tracer: newTracerThread(),
-		ptraceContFn: func(tid, signal int) error {
-			*calls = append(*calls, linuxResumeCall{op: "continue", tid: tid, signal: signal})
-			return nil
-		},
-		ptraceSingleStepFn: func(tid, signal int) error {
-			*calls = append(*calls, linuxResumeCall{op: "step", tid: tid, signal: signal})
-			return nil
+		ptraceSyscall6Fn: func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
+			*calls = append(*calls, linuxResumeCall{
+				trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
+			})
+			return 0, 0, 0
 		},
 	}
 	t.Cleanup(b.closeTracer)
@@ -288,8 +299,8 @@ func TestLinuxBackendContinueForwardsDeliveredSignalOnce(t *testing.T) {
 	}
 
 	want := []linuxResumeCall{
-		{op: "continue", tid: tid, signal: int(syscall.SIGSEGV)},
-		{op: "continue", tid: tid, signal: 0},
+		wantLinuxResume(syscall.PTRACE_CONT, tid, int(syscall.SIGSEGV)),
+		wantLinuxResume(syscall.PTRACE_CONT, tid, 0),
 	}
 	if !reflect.DeepEqual(*calls, want) {
 		t.Fatalf("resume calls = %+v, want %+v", *calls, want)
@@ -314,8 +325,8 @@ func TestLinuxBackendPendingSignalDoesNotTransferOrGetClearedByAnotherStop(t *te
 	}
 
 	want := []linuxResumeCall{
-		{op: "continue", tid: other, signal: 0},
-		{op: "continue", tid: signalled, signal: int(syscall.SIGABRT)},
+		wantLinuxResume(syscall.PTRACE_CONT, other, 0),
+		wantLinuxResume(syscall.PTRACE_CONT, signalled, int(syscall.SIGABRT)),
 	}
 	if !reflect.DeepEqual(*calls, want) {
 		t.Fatalf("resume calls = %+v, want %+v", *calls, want)
@@ -331,7 +342,7 @@ func TestLinuxBackendPauseSignalIsNeverForwarded(t *testing.T) {
 		t.Fatalf("ContinueProcess() error = %v", err)
 	}
 
-	want := []linuxResumeCall{{op: "continue", tid: tid, signal: 0}}
+	want := []linuxResumeCall{wantLinuxResume(syscall.PTRACE_CONT, tid, 0)}
 	if !reflect.DeepEqual(*calls, want) {
 		t.Fatalf("resume calls = %+v, want %+v", *calls, want)
 	}
@@ -354,8 +365,8 @@ func TestLinuxBackendSingleStepForwardsOnlyMatchingTIDSignal(t *testing.T) {
 	}
 
 	want := []linuxResumeCall{
-		{op: "step", tid: other, signal: 0},
-		{op: "step", tid: signalled, signal: int(syscall.SIGUSR1)},
+		wantLinuxResume(syscall.PTRACE_SINGLESTEP, other, 0),
+		wantLinuxResume(syscall.PTRACE_SINGLESTEP, signalled, int(syscall.SIGUSR1)),
 	}
 	if !reflect.DeepEqual(*calls, want) {
 		t.Fatalf("resume calls = %+v, want %+v", *calls, want)
@@ -364,41 +375,53 @@ func TestLinuxBackendSingleStepForwardsOnlyMatchingTIDSignal(t *testing.T) {
 
 func TestLinuxBackendFailedResumeStillConsumesPendingSignal(t *testing.T) {
 	const tid = 5001
-	errInjected := errors.New("ptrace failed")
+	errInjected := syscall.EIO
 	b, calls := newRecordingLinuxBackend(t, tid)
 	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGSEGV)})
-	b.ptraceContFn = func(gotTID, signal int) error {
-		*calls = append(*calls, linuxResumeCall{op: "continue", tid: gotTID, signal: signal})
-		return errInjected
+	b.ptraceSyscall6Fn = func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
+		*calls = append(*calls, linuxResumeCall{
+			trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
+		})
+		return 0, 0, errInjected
 	}
 
 	if err := b.ContinueProcess(); !errors.Is(err, errInjected) {
 		t.Fatalf("ContinueProcess() error = %v, want %v", err, errInjected)
 	}
-	b.ptraceContFn = func(gotTID, signal int) error {
-		*calls = append(*calls, linuxResumeCall{op: "continue", tid: gotTID, signal: signal})
-		return nil
+	b.ptraceSyscall6Fn = func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
+		*calls = append(*calls, linuxResumeCall{
+			trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
+		})
+		return 0, 0, 0
 	}
 	if err := b.ContinueProcess(); err != nil {
 		t.Fatalf("retry ContinueProcess() error = %v", err)
 	}
 
 	want := []linuxResumeCall{
-		{op: "continue", tid: tid, signal: int(syscall.SIGSEGV)},
-		{op: "continue", tid: tid, signal: 0},
+		wantLinuxResume(syscall.PTRACE_CONT, tid, int(syscall.SIGSEGV)),
+		wantLinuxResume(syscall.PTRACE_CONT, tid, 0),
 	}
 	if !reflect.DeepEqual(*calls, want) {
 		t.Fatalf("resume calls = %+v, want %+v", *calls, want)
 	}
 }
 
-func TestLinuxBackendInternalResumesClearPendingSignal(t *testing.T) {
-	const tid = 6001
+func TestLinuxBackendInternalResumesClearOnlyTheirPendingSignal(t *testing.T) {
+	const (
+		tid             = 6001
+		unrelatedTID    = 6002
+		unrelatedSignal = int(syscall.SIGUSR2)
+	)
 	b, calls := newRecordingLinuxBackend(t, tid)
 
 	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGSEGV)})
+	b.pendingSignals.set(unrelatedTID, unrelatedSignal)
 	if err := b.continueIfTraceeExists(tid, int(syscall.SIGURG)); err != nil {
 		t.Fatalf("continueIfTraceeExists() error = %v", err)
+	}
+	if got := b.pendingSignals.take(unrelatedTID); got != unrelatedSignal {
+		t.Fatalf("internal continue changed unrelated TID's signal: got %d, want %d", got, unrelatedSignal)
 	}
 	b.recordStop(tid)
 	if err := b.ContinueProcess(); err != nil {
@@ -406,8 +429,12 @@ func TestLinuxBackendInternalResumesClearPendingSignal(t *testing.T) {
 	}
 
 	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGABRT)})
+	b.pendingSignals.set(unrelatedTID, unrelatedSignal)
 	if err := b.singleStepIfTraceeExists(tid); err != nil {
 		t.Fatalf("singleStepIfTraceeExists() error = %v", err)
+	}
+	if got := b.pendingSignals.take(unrelatedTID); got != unrelatedSignal {
+		t.Fatalf("internal single-step changed unrelated TID's signal: got %d, want %d", got, unrelatedSignal)
 	}
 	b.recordStop(tid)
 	if err := b.ContinueProcess(); err != nil {
@@ -415,10 +442,10 @@ func TestLinuxBackendInternalResumesClearPendingSignal(t *testing.T) {
 	}
 
 	want := []linuxResumeCall{
-		{op: "continue", tid: tid, signal: int(syscall.SIGURG)},
-		{op: "continue", tid: tid, signal: 0},
-		{op: "step", tid: tid, signal: 0},
-		{op: "continue", tid: tid, signal: 0},
+		wantLinuxResume(syscall.PTRACE_CONT, tid, int(syscall.SIGURG)),
+		wantLinuxResume(syscall.PTRACE_CONT, tid, 0),
+		wantLinuxResume(syscall.PTRACE_SINGLESTEP, tid, 0),
+		wantLinuxResume(syscall.PTRACE_CONT, tid, 0),
 	}
 	if !reflect.DeepEqual(*calls, want) {
 		t.Fatalf("resume calls = %+v, want %+v", *calls, want)
@@ -570,7 +597,7 @@ func TestLinuxBackendHeldSignalSurfacesOnlyWithItsOwnStop(t *testing.T) {
 	if err := b.ContinueProcess(); err != nil {
 		t.Fatalf("ContinueProcess() for delivered signal error = %v", err)
 	}
-	wantResume := []linuxResumeCall{{op: "continue", tid: signaled, signal: 11}}
+	wantResume := []linuxResumeCall{wantLinuxResume(syscall.PTRACE_CONT, signaled, 11)}
 	if !reflect.DeepEqual(*calls, wantResume) {
 		t.Fatalf("resume calls = %+v, want delivered signal on its own tid: %+v", *calls, wantResume)
 	}
