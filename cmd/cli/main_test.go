@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -162,6 +163,59 @@ func TestCountOf(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := countOf(tc.shown, tc.totals, tc.which); got != tc.want {
 				t.Errorf("countOf() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFormatGoroutineListStatesWhatItOmits pins the listing's honesty. The
+// goroutine list is bounded by the wire contract, so a caller that prints only
+// the delivered entries presents a packed subset — or a scan that stopped early
+// — as the whole runtime. The trailing count is the only thing distinguishing
+// those, so it must be present and must reflect the totals.
+func TestFormatGoroutineListStatesWhatItOmits(t *testing.T) {
+	two := []protocol.Goroutine{{ID: 1, Status: "running"}, {ID: 2, Status: "waiting"}}
+
+	tests := []struct {
+		name string
+		in   protocol.GoroutinesPayload
+		want string
+	}{
+		{
+			name: "a complete list says so",
+			in:   protocol.GoroutinesPayload{Goroutines: two},
+			want: "(2 live)",
+		},
+		{
+			name: "a packed subset reports the original count",
+			in: protocol.GoroutinesPayload{Goroutines: two,
+				Totals: &protocol.SnapshotTotals{Goroutines: 7413}},
+			want: "(2 of 7413)",
+		},
+		{
+			name: "a clipped scan marks the total a floor",
+			in: protocol.GoroutinesPayload{Goroutines: two,
+				Totals: &protocol.SnapshotTotals{Goroutines: 8192, GoroutinesClipped: true}},
+			want: "(2 of 8192+)",
+		},
+		{
+			name: "a degraded read is never presented as exact",
+			in: protocol.GoroutinesPayload{Goroutines: two[:1],
+				Totals: &protocol.SnapshotTotals{Goroutines: 1, GoroutinesClipped: true}},
+			want: "(1 of 1+)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := formatGoroutineList(tt.in)
+			if !strings.Contains(out, tt.want) {
+				t.Fatalf("listing does not state what it omits:\ngot:  %q\nwant substring: %q", out, tt.want)
+			}
+			for _, g := range tt.in.Goroutines {
+				if !strings.Contains(out, fmt.Sprintf("G%d", g.ID)) {
+					t.Fatalf("listing dropped G%d:\n%s", g.ID, out)
+				}
 			}
 		})
 	}
