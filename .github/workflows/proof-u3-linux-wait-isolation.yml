@@ -1,0 +1,83 @@
+name: Proof U3 — Linux wait4 session isolation
+
+# PROOF-ONLY, TEST-ONLY investigation workflow. It runs the harness in
+# ./test/proofu3 (build tag `proofu3`) and changes no product behaviour: it does
+# not run, gate, or alter any existing job. It exists to characterise
+# hypothesis U3 on a real linux/amd64 kernel.
+#
+# U3: bingo runs every debugger session inside ONE server process. On linux each
+# session's backend blocks in Wait4(-1, WALL) and the suspended-kill path loops
+# Wait4(-1, WALL) until ECHILD (reapAfterKill). wait4(-1) is scoped to the
+# calling PROCESS, not to the caller's own tracee, so
+#   (a) reapAfterKill can never see ECHILD while another session's tracee is a
+#       live child  → Kill wedges the engine loop forever, and
+#   (b) one session can consume another session's ptrace stop / child death.
+#
+# Reading the results: a GREEN "Proofs" step means the defects REPRODUCED
+# (the proof tests assert the buggy outcome). A RED "Proofs" step means the
+# behaviour was not reproduced on this runner. The "Controls" step must always
+# be green — it shows the same operations are well-behaved with a single session
+# and with sequential (non-overlapping) sessions, so the signal is attributable
+# to concurrent sessions rather than to the kill/exit paths themselves.
+
+on:
+  # workflow_dispatch only takes effect once a workflow file exists on the
+  # default branch, so this proof branch also triggers on push to itself.
+  push:
+    branches:
+      - "xsachax-proof-linux-wait-isolation"
+      - "proof/**"
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Repetitions for the race-based scenarios"
+        required: false
+        default: "10"
+      kill_wait_seconds:
+        description: "Seconds to wait before declaring a Kill wedged"
+        required: false
+        default: "20"
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    name: Linux amd64 wait4 isolation proof
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      BINGO_PROOF_U3_ITERS: ${{ inputs.iterations || '10' }}
+      BINGO_PROOF_U3_KILL_WAIT: ${{ inputs.kill_wait_seconds || '20' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Confirm native target
+        run: test "$(go env GOOS)/$(go env GOARCH)" = "linux/amd64"
+
+      - name: Environment facts
+        run: |
+          uname -a
+          nproc
+          cat /proc/sys/kernel/yama/ptrace_scope || true
+
+      - name: Confirm the harness is inert without its build tag
+        run: |
+          go build ./...
+          go vet ./...
+
+      - name: Controls (single session, sequential sessions, kernel wait4 scope)
+        run: |
+          go test -tags proofu3 -count=1 -v -timeout 1200s \
+            ./test/proofu3 -run 'TestControl_|TestFloor_'
+
+      - name: Proofs (green == defect reproduced)
+        if: always()
+        run: |
+          go test -tags proofu3 -count=1 -v -timeout 2400s \
+            ./test/proofu3 -run 'TestProof_'
