@@ -160,6 +160,28 @@ func pack(
 		return gs, ts, report
 	}
 
+	// Fits-as-is fast path. A snapshot is packed on EVERY breakpoint stop, so the
+	// overwhelmingly common case — a payload already inside every limit — must
+	// not pay for the trimming machinery. Ordering is still applied (it is a
+	// sort, not a marshal, and consumers rely on it), but the size is settled
+	// with ONE whole-payload measurement instead of a marshal per element.
+	// Clipping is excluded because it forces Totals on, which changes the bytes.
+	if !totals.AnyClipped() &&
+		len(orderedG) <= MaxSnapshotGoroutines &&
+		len(orderedT) <= MaxSnapshotThreads &&
+		elementsFitLimits(orderedG, orderedT) {
+		gs, ts := nonNilGoroutines(orderedG), nonNilThreads(orderedT)
+		size, ok := packBudget(kind, build(gs, ts, deliveredCurrent(gs, current), nil))
+		if ok && size <= MaxGoroutineEventBytes {
+			return gs, ts, GoroutinePackReport{
+				Totals:     totals,
+				Goroutines: len(gs),
+				Threads:    len(ts),
+				Bytes:      size,
+			}
+		}
+	}
+
 	// Whether Totals ends up on the wire changes the reserve, and it is only
 	// known after packing — except when a scan was clipped, which forces it.
 	// So pack optimistically first; if that pass turns out to omit elements,
@@ -194,6 +216,37 @@ func pack(
 	}
 	report.Bytes = size
 	return gs, ts, report
+}
+
+// elementsFitLimits reports whether every element already satisfies the
+// per-element string limit, so the fast path can skip the trimming pass without
+// risking an element the consumer would reject.
+func elementsFitLimits(gs []Goroutine, ts []Thread) bool {
+	for i := range gs {
+		if !goroutineStringsFit(gs[i]) {
+			return false
+		}
+	}
+	for i := range ts {
+		if !locationStringsFit(ts[i].CurrentLoc) {
+			return false
+		}
+	}
+	return true
+}
+
+func nonNilGoroutines(gs []Goroutine) []Goroutine {
+	if gs == nil {
+		return []Goroutine{}
+	}
+	return gs
+}
+
+func nonNilThreads(ts []Thread) []Thread {
+	if ts == nil {
+		return []Thread{}
+	}
+	return ts
 }
 
 // deliveredCurrent keeps the current goid only when that goroutine actually

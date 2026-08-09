@@ -1194,11 +1194,10 @@ var _ = Describe("goroutine event packing", func() {
 				"a per-candidate whole-payload marshal would be O(n^2)")
 		})
 
-		It("scales linearly rather than quadratically", func() {
-			// Both inputs fit whole, so each does exactly one pass and the
-			// marshal count tracks the input size directly. (A truncating input
-			// costs two passes — the exact-reserve retry — which is a constant
-			// factor, not a change of order.)
+		It("marshals no elements at all when the payload already fits", func() {
+			// A snapshot is packed on EVERY breakpoint stop, so the common case
+			// must not pay per element. Paying it there once pushed the churn
+			// e2e past its target's watchdog.
 			lean := func(n int) []protocol.Goroutine {
 				out := make([]protocol.Goroutine, 0, n)
 				for i := 1; i <= n; i++ {
@@ -1207,16 +1206,27 @@ var _ = Describe("goroutine event packing", func() {
 				return out
 			}
 
-			protocol.ResetPackMarshalCounts()
-			protocol.PackGoroutines(lean(1000), false)
-			small, _ := protocol.PackMarshalCounts()
+			for _, n := range []int{10, 1000, 4000} {
+				protocol.ResetPackMarshalCounts()
+				out, report := protocol.PackGoroutines(lean(n), false)
+				elements, envelopes := protocol.PackMarshalCounts()
 
-			protocol.ResetPackMarshalCounts()
-			protocol.PackGoroutines(lean(4000), false)
-			large, _ := protocol.PackMarshalCounts()
+				Expect(out.Goroutines).To(HaveLen(n), "nothing is dropped")
+				Expect(report.Omitted()).To(BeFalse())
+				Expect(elements).To(BeZero(), "a payload that fits needs no per-element work")
+				Expect(envelopes).To(Equal(1), "one measurement settles it")
+			}
+		})
 
-			Expect(small).To(Equal(1000), "one marshal per element on a single pass")
-			Expect(large).To(Equal(4000))
+		It("falls back to per-element packing only when trimming is needed", func() {
+			gs := packGoroutines(8192)
+			protocol.ResetPackMarshalCounts()
+			_, report := protocol.PackGoroutines(gs, false)
+			elements, _ := protocol.PackMarshalCounts()
+
+			Expect(report.Omitted()).To(BeTrue())
+			Expect(elements).To(BeNumerically(">", 0))
+			Expect(elements).To(BeNumerically("<=", 2*len(gs)))
 		})
 
 		It("costs at most one extra pass when the exact reserve must be retried", func() {
