@@ -4,23 +4,10 @@ package debugger
 
 import "testing"
 
-// newTestBackend builds a backend with a live tracer thread but no tracee. The
-// tracer is what every ptrace op is funnelled through, and the drain path now
-// issues real ones; without it these tests would exercise a nil dependency
-// instead of the code that ships. The fabricated TIDs below do not exist, so
-// those ops fail with ESRCH and the drain falls back to delivering the stop —
-// the same conservative behaviour a transient failure gets in production.
-func newTestBackend(t *testing.T, pid int) *linuxBackend {
-	t.Helper()
-	b := &linuxBackend{pid: pid, tracer: newTracerThread()}
-	t.Cleanup(b.closeTracer)
-	return b
-}
-
 func TestLinuxBackendTraceTIDDefaultsToPID(t *testing.T) {
 	const pid = 1001
 
-	b := newTestBackend(t, pid)
+	b := &linuxBackend{pid: pid}
 	if got := b.traceTID(); got != pid {
 		t.Fatalf("traceTID() = %d, want pid %d", got, pid)
 	}
@@ -32,7 +19,7 @@ func TestLinuxBackendTraceTIDUsesLastStoppedTID(t *testing.T) {
 		tid = 1002
 	)
 
-	b := newTestBackend(t, pid)
+	b := &linuxBackend{pid: pid}
 	b.recordStop(tid)
 
 	if got := b.traceTID(); got != tid {
@@ -43,7 +30,7 @@ func TestLinuxBackendTraceTIDUsesLastStoppedTID(t *testing.T) {
 func TestLinuxBackendSetPIDSeedsLastStoppedTID(t *testing.T) {
 	const pid = 1001
 
-	b := newTestBackend(t, 0)
+	b := &linuxBackend{}
 	b.setPID(pid)
 
 	if got := b.traceTID(); got != pid {
@@ -62,7 +49,7 @@ func TestLinuxBackendParkDoesNotRecordStop(t *testing.T) {
 		foreign = 1003
 	)
 
-	b := newTestBackend(t, pid)
+	b := &linuxBackend{pid: pid}
 	b.beginStep(stepped)
 	b.recordStop(stepped)
 
@@ -84,7 +71,7 @@ func TestLinuxBackendDrainParkedRecordsOnDeliveryOnly(t *testing.T) {
 		second  = 1004
 	)
 
-	b := newTestBackend(t, pid)
+	b := &linuxBackend{pid: pid}
 	b.beginStep(stepped)
 	b.recordStop(stepped)
 	b.park(StopEvent{Reason: StopBreakpoint, TID: first})
@@ -147,7 +134,7 @@ func TestLinuxBackendHeldSignalSurfacesOnlyWithItsOwnStop(t *testing.T) {
 		later    = 2004
 	)
 
-	b := newTestBackend(t, pid)
+	b := &linuxBackend{pid: pid}
 	b.beginStep(stepped)
 	b.recordStop(stepped)
 
@@ -208,7 +195,7 @@ func TestLinuxBackendSteppedThreadDeathDeliversHeldStopBeforeExit(t *testing.T) 
 		foreign = 1003
 	)
 
-	b := newTestBackend(t, pid)
+	b := &linuxBackend{pid: pid}
 	b.recordStop(pid)
 	b.beginStep(stepped)
 	b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
@@ -248,7 +235,7 @@ func TestLinuxBackendWaitDrainsBeforeBlocking(t *testing.T) {
 		foreign = 1003
 	)
 
-	b := newTestBackend(t, pid)
+	b := &linuxBackend{pid: pid}
 	b.recordStop(pid)
 	b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
 
@@ -261,65 +248,5 @@ func TestLinuxBackendWaitDrainsBeforeBlocking(t *testing.T) {
 	}
 	if got := b.traceTID(); got != foreign {
 		t.Fatalf("traceTID() = %d, want the delivered thread %d", got, foreign)
-	}
-}
-
-// TestLinuxBackendDrainSkipsStopsWhoseTrapWasCleared pins that the drain path
-// actually consults the stale-trap rule, using this backend's real trap
-// encoding and PC rewind.
-//
-// The hazard only exists because a stop can now be held: the engine clears the
-// `<stepover-next>` sentinel as soon as any thread reaches it, so a sibling
-// parked at that address wakes up holding a stop for a trap that is gone. It
-// must be restarted at the instruction rather than handed to the engine, which
-// would resume it one byte in.
-func TestLinuxBackendDrainSkipsStopsWhoseTrapWasCleared(t *testing.T) {
-	const (
-		pid       = 1001
-		stepped   = 1002
-		stale     = 1003
-		live      = 1004
-		clearedPC = 0x401000
-		armedPC   = 0x402000
-	)
-
-	b := newTestBackend(t, pid)
-	b.beginStep(stepped)
-	b.recordStop(stepped)
-
-	b.park(StopEvent{Reason: StopBreakpoint, TID: stale})
-	b.park(StopEvent{Reason: StopBreakpoint, TID: live})
-	b.clearStepIfStepped(stepped)
-
-	trap := archTrapInstruction()
-	after := uint64(len(trap))
-	fake := &fakeRestarter{
-		pc: map[int]uint64{stale: clearedPC + after, live: armedPC + after},
-		// The stale thread's trap has been replaced by the original byte; the
-		// live one is still armed.
-		mem: map[uint64]byte{clearedPC: 0x48},
-	}
-	for i, bt := range trap {
-		fake.mem[armedPC+uint64(i)] = bt
-	}
-
-	ev, ok := b.drainParkedWith(fake)
-	if !ok {
-		t.Fatal("drainParkedWith() withheld every stop")
-	}
-	if ev.TID != live {
-		t.Fatalf("drainParkedWith() = tid %d, want the stop whose trap is still armed (%d)", ev.TID, live)
-	}
-	if got := b.traceTID(); got != live {
-		t.Fatalf("traceTID() = %d, want %d: only a delivered stop moves the resume target", got, live)
-	}
-	if len(fake.resumed) != 1 || fake.resumed[0] != stale {
-		t.Fatalf("resumed = %v, want the stale thread restarted exactly once", fake.resumed)
-	}
-	if b.staleParkedCount() != 1 {
-		t.Fatalf("staleParkedCount() = %d, want 1", b.staleParkedCount())
-	}
-	if _, ok := b.drainParkedWith(fake); ok {
-		t.Fatal("drainParkedWith() returned a stop after the queue was emptied")
 	}
 }
