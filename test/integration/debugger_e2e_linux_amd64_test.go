@@ -682,7 +682,10 @@ func declareStepOverlapPauseSpec() {
 				AddReportEntry("overlap-pause-parked-signal-stops", held)
 			}
 
-			// Non-vacuity, in two independent parts.
+			// Non-vacuity, in three independent parts. Every one of them is
+			// COUNTED above and ASSERTED here — reporting a count without
+			// asserting it pins nothing about future runs, which is exactly
+			// how this spec was vacuous before.
 			//
 			// 1. Pause was accepted at all — proof the engine was still running
 			//    when the interrupt was issued, i.e. a step really was in
