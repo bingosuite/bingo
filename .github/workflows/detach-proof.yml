@@ -1,0 +1,107 @@
+name: Detach Proof (U4, linux/amd64)
+
+# PROOF-ONLY, TEST-ONLY investigation workflow. It runs the isolated
+# `test/detachproof` package, which carries its own `detachproof` build tag and
+# is therefore invisible to `go test ./...`, to the `e2e` suite, and to every
+# other CI job. It makes no production changes.
+#
+# Hypothesis U4: Debugger.Kill on an ATTACHED and RUNNING tracee performs
+# breakpoint restoration (PTRACE_POKEDATA) and PTRACE_DETACH while the tracee is
+# not in a ptrace-stop. Both fail with ESRCH, both failures are discarded, Kill
+# reports success, and the process is left still traced and still carrying the
+# INT3 trap byte.
+#
+# The proof tests assert CORRECT behaviour, so a FAILURE here is the
+# confirmation. `continue-on-error` keeps every leg running so the controls and
+# the syscall-level probe still report even when the main proof fails.
+
+on:
+  workflow_dispatch:
+    inputs:
+      iters:
+        description: "Repeat count for the main proof (BINGO_PROOF_ITERS)"
+        required: false
+        default: "3"
+  # GitHub only exposes workflow_dispatch for workflows present on the default
+  # branch, and this investigation must never touch main. The push trigger is
+  # scoped to the isolated proof branches so the run can be started at all.
+  push:
+    branches:
+      - "xsachax-prove-linux-detach"
+      - "proof/**"
+
+permissions:
+  contents: read
+
+jobs:
+  detach-proof:
+    name: U4 proof (${{ matrix.mode }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: no-race
+            raceflag: ""
+          - mode: race
+            raceflag: "-race"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Confirm native target
+        run: test "$(go env GOOS)/$(go env GOARCH)" = "linux/amd64"
+
+      - name: Environment facts
+        run: |
+          uname -a
+          echo "yama ptrace_scope: $(cat /proc/sys/kernel/yama/ptrace_scope 2>/dev/null || echo n/a)"
+          go version
+
+      - name: Harness self-check (observers are reliable on this kernel)
+        run: >
+          go test -tags detachproof ${{ matrix.raceflag }} -count=1 -v -timeout 300s
+          ./test/detachproof -run 'TestProcSelfCanObserveTracerPid'
+
+      - name: Syscall premise (POKEDATA / DETACH errno, suspended vs running)
+        continue-on-error: true
+        run: >
+          go test -tags detachproof ${{ matrix.raceflag }} -count=1 -v -timeout 300s
+          ./test/detachproof -run 'TestPtraceErrnoOnRunningTracee'
+
+      - name: Control — suspended detach (must PASS)
+        continue-on-error: true
+        run: >
+          go test -tags detachproof ${{ matrix.raceflag }} -count=1 -v -timeout 300s
+          ./test/detachproof -run 'TestControlSuspendedDetach'
+
+      - name: Control — running, no breakpoint (isolates the detach leak)
+        continue-on-error: true
+        run: >
+          go test -tags detachproof ${{ matrix.raceflag }} -count=1 -v -timeout 300s
+          ./test/detachproof -run 'TestControlRunningNoBreakpoint'
+
+      - name: PROOF — attached + running Kill must fully release the tracee
+        continue-on-error: true
+        env:
+          BINGO_PROOF_ITERS: ${{ inputs.iters || 3 }}
+        run: >
+          go test -tags detachproof ${{ matrix.raceflag }} -count=1 -v -timeout 900s
+          ./test/detachproof -run 'TestAttachedRunningKillDetaches'
+
+      - name: PROOF — the failure is silent to clients
+        continue-on-error: true
+        run: >
+          go test -tags detachproof ${{ matrix.raceflag }} -count=1 -v -timeout 300s
+          ./test/detachproof -run 'TestAttachedRunningKillEmitsNoError'
+
+      - name: Leftover target processes (strict-cleanup check)
+        if: always()
+        run: |
+          echo "--- processes matching detach_proof_target ---"
+          pgrep -a -f detach_proof_target || echo "none (clean)"
