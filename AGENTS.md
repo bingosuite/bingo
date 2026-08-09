@@ -834,6 +834,14 @@ are detected by a `mach_msg` receive loop.
   foreign breakpoint handed to the engine mid-step is still corrupting, so `Wait`
   also **parks** it until the step completes — see
   [foreign-thread stop parking](#foreign-thread-stop-parking-during-a-single-step-linux).
+- **One live tracee per process.** `Wait4(-1, …, WALL)` is scoped to the whole
+  tracer *process*, not to one tracee, so two `Debugger`s running at once in the
+  same binary steal each other's stops — observed as `PTRACE_GETREGS` `ESRCH`
+  for a foreign tid and both backends wedging in `Kill`. Nothing filters by pid,
+  and adding a filter would break the deliberate any-thread wait. Tests must
+  therefore own exactly one tracee for its whole lifetime; an e2e spec that
+  needs a differently-configured target launches it in a spec of its own, after
+  the previous `DeferCleanup` has killed the last one.
 - `g` pointer for goroutine inspection lives at `FS_BASE` on amd64.
 - `killProcess` never reaps the zombie itself while the engine's `waitLoop` is
   in flight (a *running* tracee). That waitLoop is blocked in `Wait4(-1, WALL)`
