@@ -1249,11 +1249,18 @@ func scenarioOwnershipPlainChildren() int {
 // in Wait4(-1, WALL) as the process's only waiter.
 //
 // The operator's natural rescue — SIGKILL the offending peer tracee from
-// outside — provably CANNOT work: a task in ptrace-stop takes SIGKILL into its
-// pending mask but does not act on it until its own TRACER restarts it, and its
-// tracer is session B, which is not going to. So B's tracee stays a live child
-// forever, process-wide ECHILD is unreachable forever, and A's Kill (running on
-// A's engine loop goroutine) is permanently unrecoverable.
+// outside — provably CANNOT work. reapAfterKill's own comment states the
+// assumption: "A thread frozen at a ptrace stop will not proceed to death until
+// resumed, so continue any stopped thread before waiting again; the process-wide
+// SIGKILL then kills it." That rescue continue is continueIfTraceeExists, issued
+// from the CALLING session's tracer thread — which is not the peer tracee's
+// tracer, so ptrace returns ESRCH and isNoSuchProcess swallows it. The one
+// mechanism designed to unstick a killed-but-stopped task is therefore
+// inoperative across sessions.
+//
+// So B's tracee stays a live child in ptrace-stop with SIGKILL pending forever,
+// process-wide ECHILD is unreachable forever, and A's Kill — running on A's
+// engine loop goroutine — is permanently unrecoverable.
 func scenarioPeerPtraceStopMakesWedgeUnrecoverable() int {
 	bExit := make(chan struct{}, 1)
 	b, bPID, err := launchSuspended(longBin)
