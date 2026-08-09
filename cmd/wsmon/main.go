@@ -5,6 +5,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -31,28 +32,57 @@ type monitor struct {
 	hasSnapshot bool
 }
 
-func main() {
-	addr := flag.String("addr", "localhost:6060", "server address (host:port)")
-	sessionID := flag.String("session", "", "session ID to join")
-	once := flag.Bool("once", false, "print one snapshot then exit")
-	timeout := flag.Duration("timeout", 30*time.Second,
+// config holds wsmon's parsed flags. bindFlags is shared with the tests so
+// validation runs against the real flag definitions rather than a copy.
+type config struct {
+	addr      string
+	sessionID string
+	once      bool
+	timeout   time.Duration
+}
+
+func bindFlags(fs *flag.FlagSet) *config {
+	cfg := &config{}
+	fs.StringVar(&cfg.addr, "addr", "localhost:6060", "server address (host:port)")
+	fs.StringVar(&cfg.sessionID, "session", "", "session ID to join")
+	fs.BoolVar(&cfg.once, "once", false, "print one snapshot then exit")
+	fs.DurationVar(&cfg.timeout, "timeout", 30*time.Second,
 		"with -once, how long to wait for a snapshot (0 waits forever)")
-	flag.Usage = func() {
-		_, _ = fmt.Fprintf(flag.CommandLine.Output(), "usage: wsmon -session <id> [-addr host:port] [-once] [-timeout d]\n\n")
-		flag.PrintDefaults()
+	fs.Usage = func() {
+		_, _ = fmt.Fprintf(fs.Output(), "usage: wsmon -session <id> [-addr host:port] [-once] [-timeout d]\n\n")
+		fs.PrintDefaults()
 	}
+	return cfg
+}
+
+// validate rejects usage errors that the flag package itself accepts.
+func (c *config) validate() error {
+	if strings.TrimSpace(c.sessionID) == "" {
+		return errors.New("-session is required")
+	}
+	if c.timeout < 0 {
+		// Only 0 means "wait forever". A negative duration would reach run's
+		// `timeout > 0` guard and silently do the same, so `-timeout -30s`
+		// would produce an unbounded wait while the flag documents otherwise.
+		return fmt.Errorf("-timeout must be >= 0 (0 waits forever), got %s", c.timeout)
+	}
+	return nil
+}
+
+func main() {
+	cfg := bindFlags(flag.CommandLine)
 	flag.Parse()
 
-	if strings.TrimSpace(*sessionID) == "" {
-		fmt.Fprintln(os.Stderr, "error: -session is required")
+	if err := cfg.validate(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		flag.Usage()
 		os.Exit(2)
 	}
 
-	fmt.Printf("joining session %s on %s...\n", *sessionID, *addr)
-	c, err := client.Join(*addr, *sessionID)
+	fmt.Printf("joining session %s on %s...\n", cfg.sessionID, cfg.addr)
+	c, err := client.Join(cfg.addr, cfg.sessionID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: join session %s on %s: %v\n", *sessionID, *addr, err)
+		fmt.Fprintf(os.Stderr, "error: join session %s on %s: %v\n", cfg.sessionID, cfg.addr, err)
 		os.Exit(1)
 	}
 	defer func() { _ = c.Close() }()
@@ -81,15 +111,15 @@ func main() {
 		fmt.Fprintf(os.Stderr, "error: request goroutine snapshot: %v\n", err)
 		os.Exit(1)
 	}
-	if !*once {
+	if !cfg.once {
 		m.render()
 	}
 
-	if err := m.run(c.Events(), *once, *timeout, m.render); err != nil {
+	if err := m.run(c.Events(), cfg.once, cfg.timeout, m.render); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
-	if !*once {
+	if !cfg.once {
 		fmt.Println("\nconnection closed; monitor stopped")
 	}
 }
