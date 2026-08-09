@@ -151,9 +151,9 @@ func TestStepQueueReleasesFIFO(t *testing.T) {
 // TestStepQueuePreservesEveryStopField pins that a held stop is delivered whole.
 // The signal in particular travels inside the parked StopEvent rather than in
 // backend state, which is why the queue has no pending-signal ordering problem
-// to solve (see issue #204): there is no separate signal record that could be
-// written when the stop is parked and read against a different thread later.
-// If a refactor ever moves the signal out of the event, this test fails.
+// to solve (see issue #206): the per-TID pending state is installed only after
+// this queue releases the event for delivery. If a refactor ever moves the
+// signal out of the parked event, this test fails.
 func TestStepQueuePreservesEveryStopField(t *testing.T) {
 	want := []StopEvent{
 		{Reason: StopSignal, TID: 21, Signal: 11},

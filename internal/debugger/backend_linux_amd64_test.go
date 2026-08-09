@@ -2,7 +2,37 @@
 
 package debugger
 
-import "testing"
+import (
+	"errors"
+	"reflect"
+	"syscall"
+	"testing"
+)
+
+type linuxResumeCall struct {
+	op     string
+	tid    int
+	signal int
+}
+
+func newRecordingLinuxBackend(t *testing.T, pid int) (*linuxBackend, *[]linuxResumeCall) {
+	t.Helper()
+	calls := &[]linuxResumeCall{}
+	b := &linuxBackend{
+		pid:    pid,
+		tracer: newTracerThread(),
+		ptraceContFn: func(tid, signal int) error {
+			*calls = append(*calls, linuxResumeCall{op: "continue", tid: tid, signal: signal})
+			return nil
+		},
+		ptraceSingleStepFn: func(tid, signal int) error {
+			*calls = append(*calls, linuxResumeCall{op: "step", tid: tid, signal: signal})
+			return nil
+		},
+	}
+	t.Cleanup(b.closeTracer)
+	return b, calls
+}
 
 func TestLinuxBackendTraceTIDDefaultsToPID(t *testing.T) {
 	const pid = 1001
@@ -35,6 +65,173 @@ func TestLinuxBackendSetPIDSeedsLastStoppedTID(t *testing.T) {
 
 	if got := b.traceTID(); got != pid {
 		t.Fatalf("traceTID() = %d, want pid %d", got, pid)
+	}
+}
+
+func TestLinuxBackendContinueForwardsDeliveredSignalOnce(t *testing.T) {
+	const tid = 1002
+	b, calls := newRecordingLinuxBackend(t, 1001)
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGSEGV)})
+
+	if err := b.ContinueProcess(); err != nil {
+		t.Fatalf("ContinueProcess() error = %v", err)
+	}
+	if err := b.ContinueProcess(); err != nil {
+		t.Fatalf("second ContinueProcess() error = %v", err)
+	}
+
+	want := []linuxResumeCall{
+		{op: "continue", tid: tid, signal: int(syscall.SIGSEGV)},
+		{op: "continue", tid: tid, signal: 0},
+	}
+	if !reflect.DeepEqual(*calls, want) {
+		t.Fatalf("resume calls = %+v, want %+v", *calls, want)
+	}
+}
+
+func TestLinuxBackendPendingSignalDoesNotTransferOrGetClearedByAnotherStop(t *testing.T) {
+	const (
+		signalled = 2002
+		other     = 2003
+	)
+	b, calls := newRecordingLinuxBackend(t, 2001)
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: signalled, Signal: int(syscall.SIGABRT)})
+
+	b.recordStop(other)
+	if err := b.ContinueProcess(); err != nil {
+		t.Fatalf("ContinueProcess(other) error = %v", err)
+	}
+	b.recordStop(signalled)
+	if err := b.ContinueProcess(); err != nil {
+		t.Fatalf("ContinueProcess(signalled) error = %v", err)
+	}
+
+	want := []linuxResumeCall{
+		{op: "continue", tid: other, signal: 0},
+		{op: "continue", tid: signalled, signal: int(syscall.SIGABRT)},
+	}
+	if !reflect.DeepEqual(*calls, want) {
+		t.Fatalf("resume calls = %+v, want %+v", *calls, want)
+	}
+}
+
+func TestLinuxBackendPauseSignalIsNeverForwarded(t *testing.T) {
+	const tid = 3001
+	b, calls := newRecordingLinuxBackend(t, tid)
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: b.PauseSignal()})
+
+	if err := b.ContinueProcess(); err != nil {
+		t.Fatalf("ContinueProcess() error = %v", err)
+	}
+
+	want := []linuxResumeCall{{op: "continue", tid: tid, signal: 0}}
+	if !reflect.DeepEqual(*calls, want) {
+		t.Fatalf("resume calls = %+v, want %+v", *calls, want)
+	}
+}
+
+func TestLinuxBackendSingleStepForwardsOnlyMatchingTIDSignal(t *testing.T) {
+	const (
+		signalled = 4002
+		other     = 4003
+	)
+	b, calls := newRecordingLinuxBackend(t, 4001)
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: signalled, Signal: int(syscall.SIGUSR1)})
+
+	if err := b.SingleStep(other); err != nil {
+		t.Fatalf("SingleStep(other) error = %v", err)
+	}
+	b.endStep()
+	if err := b.SingleStep(signalled); err != nil {
+		t.Fatalf("SingleStep(signalled) error = %v", err)
+	}
+
+	want := []linuxResumeCall{
+		{op: "step", tid: other, signal: 0},
+		{op: "step", tid: signalled, signal: int(syscall.SIGUSR1)},
+	}
+	if !reflect.DeepEqual(*calls, want) {
+		t.Fatalf("resume calls = %+v, want %+v", *calls, want)
+	}
+}
+
+func TestLinuxBackendFailedResumeStillConsumesPendingSignal(t *testing.T) {
+	const tid = 5001
+	errInjected := errors.New("ptrace failed")
+	b, calls := newRecordingLinuxBackend(t, tid)
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGSEGV)})
+	b.ptraceContFn = func(gotTID, signal int) error {
+		*calls = append(*calls, linuxResumeCall{op: "continue", tid: gotTID, signal: signal})
+		return errInjected
+	}
+
+	if err := b.ContinueProcess(); !errors.Is(err, errInjected) {
+		t.Fatalf("ContinueProcess() error = %v, want %v", err, errInjected)
+	}
+	b.ptraceContFn = func(gotTID, signal int) error {
+		*calls = append(*calls, linuxResumeCall{op: "continue", tid: gotTID, signal: signal})
+		return nil
+	}
+	if err := b.ContinueProcess(); err != nil {
+		t.Fatalf("retry ContinueProcess() error = %v", err)
+	}
+
+	want := []linuxResumeCall{
+		{op: "continue", tid: tid, signal: int(syscall.SIGSEGV)},
+		{op: "continue", tid: tid, signal: 0},
+	}
+	if !reflect.DeepEqual(*calls, want) {
+		t.Fatalf("resume calls = %+v, want %+v", *calls, want)
+	}
+}
+
+func TestLinuxBackendInternalResumesClearPendingSignal(t *testing.T) {
+	const tid = 6001
+	b, calls := newRecordingLinuxBackend(t, tid)
+
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGSEGV)})
+	if err := b.continueIfTraceeExists(tid, int(syscall.SIGURG)); err != nil {
+		t.Fatalf("continueIfTraceeExists() error = %v", err)
+	}
+	b.recordStop(tid)
+	if err := b.ContinueProcess(); err != nil {
+		t.Fatalf("ContinueProcess() after internal continue error = %v", err)
+	}
+
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGABRT)})
+	if err := b.singleStepIfTraceeExists(tid); err != nil {
+		t.Fatalf("singleStepIfTraceeExists() error = %v", err)
+	}
+	b.recordStop(tid)
+	if err := b.ContinueProcess(); err != nil {
+		t.Fatalf("ContinueProcess() after internal step error = %v", err)
+	}
+
+	want := []linuxResumeCall{
+		{op: "continue", tid: tid, signal: int(syscall.SIGURG)},
+		{op: "continue", tid: tid, signal: 0},
+		{op: "step", tid: tid, signal: 0},
+		{op: "continue", tid: tid, signal: 0},
+	}
+	if !reflect.DeepEqual(*calls, want) {
+		t.Fatalf("resume calls = %+v, want %+v", *calls, want)
+	}
+}
+
+func TestLinuxKillCleanupDoesNotTouchWaitOwnedQueue(t *testing.T) {
+	const tid = 7001
+	b, _ := newRecordingLinuxBackend(t, tid)
+	b.pendingSignals.set(tid, int(syscall.SIGSEGV))
+	b.park(StopEvent{Reason: StopBreakpoint, TID: tid + 1})
+
+	if err := killProcess(b, tid, nil, true); err != nil {
+		t.Fatalf("killProcess() error = %v", err)
+	}
+	if got := b.pendingSignals.take(tid); got != 0 {
+		t.Fatalf("pending signal after kill cleanup = %d, want 0", got)
+	}
+	if got := len(b.parked); got != 1 {
+		t.Fatalf("parked stops after kill cleanup = %d, want 1 retained for the wait loop", got)
 	}
 }
 
@@ -114,18 +311,15 @@ func TestLinuxBackendDrainParkedRecordsOnDeliveryOnly(t *testing.T) {
 }
 
 // TestLinuxBackendHeldSignalSurfacesOnlyWithItsOwnStop pins the ordering issue
-// #204 raises for pending signals. A held stop's signal must not become
+// #206 raises for pending signals. A held stop's signal must not become
 // observable before the stop it belongs to, and it must arrive in the same
 // operation that repoints traceTID at the signalled thread — otherwise the
 // engine would report or suppress a signal against whichever thread happened to
 // be the resume target at the time.
 //
-// The queue is immune to that class by construction rather than by ordering
-// discipline: the signal is a field of the parked StopEvent, so there is no
-// separate signal record that could be written at park time and later
-// overwritten. This test is what stops a future refactor from hoisting the
-// signal into backend state, where it would need — and could silently lose —
-// that discipline.
+// While parked, the signal stays in the StopEvent. Delivery installs it in the
+// per-TID pending map before publishing traceTID; the final resume assertion
+// pins that handoff end to end.
 func TestLinuxBackendHeldSignalSurfacesOnlyWithItsOwnStop(t *testing.T) {
 	const (
 		pid      = 2001
@@ -134,7 +328,7 @@ func TestLinuxBackendHeldSignalSurfacesOnlyWithItsOwnStop(t *testing.T) {
 		later    = 2004
 	)
 
-	b := &linuxBackend{pid: pid}
+	b, calls := newRecordingLinuxBackend(t, pid)
 	b.beginStep(stepped)
 	b.recordStop(stepped)
 
@@ -161,6 +355,13 @@ func TestLinuxBackendHeldSignalSurfacesOnlyWithItsOwnStop(t *testing.T) {
 	// but resume — or POKEDATA into — the wrong thread.
 	if got := b.traceTID(); got != signaled {
 		t.Fatalf("traceTID() = %d when delivering the signal, want the signalled thread %d", got, signaled)
+	}
+	if err := b.ContinueProcess(); err != nil {
+		t.Fatalf("ContinueProcess() for delivered signal error = %v", err)
+	}
+	wantResume := []linuxResumeCall{{op: "continue", tid: signaled, signal: 11}}
+	if !reflect.DeepEqual(*calls, wantResume) {
+		t.Fatalf("resume calls = %+v, want delivered signal on its own tid: %+v", *calls, wantResume)
 	}
 
 	// The next held stop carries no signal, and delivering it must not leave the
