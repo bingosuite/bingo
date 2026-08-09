@@ -2,6 +2,7 @@ package dap
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"sync"
@@ -33,6 +34,28 @@ type Server struct {
 	acceptRetryInitialDelay time.Duration
 	acceptRetryMaxDelay     time.Duration
 	wg                      sync.WaitGroup
+}
+
+type acceptRetry struct {
+	initial time.Duration
+	max     time.Duration
+	delay   time.Duration
+}
+
+func (r *acceptRetry) nextDelay() time.Duration {
+	if r.delay == 0 {
+		r.delay = r.initial
+	} else {
+		r.delay *= 2
+	}
+	if r.delay > r.max {
+		r.delay = r.max
+	}
+	return r.delay
+}
+
+func (r *acceptRetry) reset() {
+	r.delay = 0
 }
 
 // NewServer creates a DAP server over provider. It does not listen until Serve.
@@ -93,58 +116,69 @@ func (s *Server) ServeContext(ctx context.Context, addr string) (net.Addr, error
 
 func (s *Server) acceptLoop(ln net.Listener) {
 	defer s.wg.Done()
-	var retryDelay time.Duration
+	retry := acceptRetry{
+		initial: s.acceptRetryInitialDelay,
+		max:     s.acceptRetryMaxDelay,
+	}
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			s.mu.Lock()
-			closed := s.closed
-			s.mu.Unlock()
-			if closed {
+			if s.acceptStopped(err) || !s.waitAcceptRetry(&retry, err) {
 				return
 			}
-			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
-				if retryDelay == 0 {
-					retryDelay = s.acceptRetryInitialDelay
-				} else {
-					retryDelay *= 2
-				}
-				if retryDelay > s.acceptRetryMaxDelay {
-					retryDelay = s.acceptRetryMaxDelay
-				}
-				timer := time.NewTimer(retryDelay)
-				s.log.Warn("dap accept error; retrying", "err", err, "delay", retryDelay)
-				select {
-				case <-timer.C:
-				case <-s.closing:
-					if !timer.Stop() {
-						select {
-						case <-timer.C:
-						default:
-						}
-					}
-					return
-				}
-				continue
-			}
-			s.log.Warn("dap accept error", "err", err)
-			return
-		}
-		retryDelay = 0
-		h := NewHandler(conn, s.provider, s.log)
-		if !s.register(h) {
-			// Server closed between Accept and registration; drop the conn so
-			// its Serve goroutine never starts (and never joins wg).
-			_ = h.Close()
 			continue
 		}
-		s.wg.Add(1)
-		go func() {
-			defer s.wg.Done()
-			defer s.unregister(h)
-			h.Serve()
-		}()
+		retry.reset()
+		s.serveConn(conn)
 	}
+}
+
+func (s *Server) acceptStopped(err error) bool {
+	if errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
+}
+
+func (s *Server) waitAcceptRetry(retry *acceptRetry, err error) bool {
+	delay := retry.nextDelay()
+	timer := time.NewTimer(delay)
+	defer stopRetryTimer(timer)
+	s.log.Warn("dap accept error; retrying", "err", err, "delay", delay)
+	select {
+	case <-timer.C:
+		return true
+	case <-s.closing:
+		return false
+	}
+}
+
+func stopRetryTimer(timer *time.Timer) {
+	if timer.Stop() {
+		return
+	}
+	select {
+	case <-timer.C:
+	default:
+	}
+}
+
+func (s *Server) serveConn(conn net.Conn) {
+	h := NewHandler(conn, s.provider, s.log)
+	if !s.register(h) {
+		// Server closed between Accept and registration; drop the conn so its
+		// Serve goroutine never starts (and never joins wg).
+		_ = h.Close()
+		return
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		defer s.unregister(h)
+		h.Serve()
+	}()
 }
 
 // register adds h to the live set unless the server is already closing, in

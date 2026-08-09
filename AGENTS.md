@@ -1218,9 +1218,9 @@ lock before context-aware listener binding, and publishes the server/address
 only if shutdown has not won. Shutdown cancellation unblocks the bind and waits
 for that start attempt before closing Done, so no DAP listener can appear after
 finalization. A genuine bind failure remains retryable only while the server is
-not shutting down. Once bound, the DAP accept loop retries temporary listener
+not shutting down. Once bound, the DAP accept loop retries non-shutdown listener
 errors with capped exponential backoff and resets the delay after a successful
-accept, matching the HTTP listener's resilience. Shutdown interrupts the
+accept. A closed listener exits immediately, and Shutdown interrupts the
 backoff so listener teardown does not wait for the retry timer.
 
 Hub admission has a second, session-local gate: `registry.add`, `remove`, and

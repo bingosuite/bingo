@@ -13,24 +13,22 @@ import (
 	godap "github.com/google/go-dap"
 )
 
-type temporaryAcceptError struct{}
-
-func (temporaryAcceptError) Error() string   { return "temporary accept failure" }
-func (temporaryAcceptError) Timeout() bool   { return false }
-func (temporaryAcceptError) Temporary() bool { return true }
+var errAcceptFailure = errors.New("accept failure")
 
 type retryListener struct {
 	mu       sync.Mutex
 	attempts int
+	failures int
 	retried  chan struct{}
 	closed   chan struct{}
 	once     sync.Once
 }
 
-func newRetryListener() *retryListener {
+func newRetryListener(failures int) *retryListener {
 	return &retryListener{
-		retried: make(chan struct{}),
-		closed:  make(chan struct{}),
+		failures: failures,
+		retried:  make(chan struct{}),
+		closed:   make(chan struct{}),
 	}
 }
 
@@ -38,9 +36,10 @@ func (l *retryListener) Accept() (net.Conn, error) {
 	l.mu.Lock()
 	l.attempts++
 	attempt := l.attempts
+	failures := l.failures
 	l.mu.Unlock()
-	if attempt == 1 {
-		return nil, temporaryAcceptError{}
+	if failures < 0 || attempt <= failures {
+		return nil, errAcceptFailure
 	}
 	l.once.Do(func() { close(l.retried) })
 	<-l.closed
@@ -62,6 +61,27 @@ type retryAddr string
 
 func (a retryAddr) Network() string { return "test" }
 func (a retryAddr) String() string  { return string(a) }
+
+type closedListener struct {
+	mu       sync.Mutex
+	attempts int
+}
+
+func (l *closedListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	l.attempts++
+	l.mu.Unlock()
+	return nil, net.ErrClosed
+}
+
+func (*closedListener) Close() error   { return nil }
+func (*closedListener) Addr() net.Addr { return retryAddr("closed") }
+
+func (l *closedListener) attemptCount() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.attempts
+}
 
 type notifyingWriter struct {
 	once  sync.Once
@@ -169,9 +189,9 @@ func TestServeContextRejectsCanceledStartup(t *testing.T) {
 	}
 }
 
-func TestAcceptLoopRetriesTemporaryErrors(t *testing.T) {
+func TestAcceptLoopRetriesAcceptErrors(t *testing.T) {
 	s := quietServer(t)
-	listener := newRetryListener()
+	listener := newRetryListener(3)
 	s.mu.Lock()
 	s.listener = listener
 	s.wg.Add(1)
@@ -181,10 +201,36 @@ func TestAcceptLoopRetriesTemporaryErrors(t *testing.T) {
 	select {
 	case <-listener.retried:
 	case <-time.After(time.Second):
-		t.Fatal("accept loop did not retry a temporary error")
+		t.Fatal("accept loop did not retry repeated accept errors")
 	}
 
 	if err := s.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+func TestAcceptLoopStopsOnClosedListener(t *testing.T) {
+	s := quietServer(t)
+	listener := &closedListener{}
+	s.mu.Lock()
+	s.listener = listener
+	s.wg.Add(1)
+	s.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		s.acceptLoop(listener)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("accept loop retried a closed listener")
+	}
+	if attempts := listener.attemptCount(); attempts != 1 {
+		t.Fatalf("accept attempts = %d, want 1", attempts)
+	}
+	if err := s.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 }
@@ -196,7 +242,7 @@ func TestCloseInterruptsAcceptRetryBackoff(t *testing.T) {
 	s.acceptRetryInitialDelay = time.Hour
 	s.acceptRetryMaxDelay = time.Hour
 
-	listener := newRetryListener()
+	listener := newRetryListener(-1)
 	s.mu.Lock()
 	s.listener = listener
 	s.wg.Add(1)
