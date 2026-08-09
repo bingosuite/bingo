@@ -45,6 +45,22 @@ const (
 	// truncated. Measured in UTF-16 code units to match the consumer (see
 	// utf16Len).
 	MaxGoroutineStringLength = 4096
+
+	// MaxLifecycleDeltaIDs bounds the created/exited goid deltas.
+	//
+	// Deltas are NEVER trimmed — a truncated delta silently corrupts a
+	// consumer's lifecycle state — so unlike the element collections they carry
+	// no packing limit. What bounds them instead is the producer's own runtime
+	// walk: created and exited are set differences over the live goroutine set,
+	// which the debugger caps at its goroutine scan ceiling, so neither can
+	// exceed that. This constant restates that ceiling as a wire contract so a
+	// consumer knows exactly what to accept, and is drift-checked against
+	// internal/debugger's maxGoroutineScan.
+	//
+	// It deliberately does NOT reuse MaxSnapshotGoroutines: that caps how many
+	// elements are PACKED, while a delta reports lifecycle events the packer is
+	// forbidden to drop. Conflating them rejects legal snapshots.
+	MaxLifecycleDeltaIDs = 8192
 )
 
 // VersionError reports that a peer used a wire version other than Version.

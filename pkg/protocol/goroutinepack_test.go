@@ -3,6 +3,9 @@ package protocol_test
 import (
 	"encoding/json"
 	"math"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode/utf16"
 
@@ -11,6 +14,10 @@ import (
 
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
+
+// maxSafeGoid is JavaScript's Number.MAX_SAFE_INTEGER. Goids above it cannot be
+// represented exactly by the consumer, so a realistic worst case stops here.
+const maxSafeGoid = 1<<53 - 1
 
 // eventBytes measures a payload exactly the way the packer's contract is
 // stated: a real Event at the widest sequence number the hub can stamp.
@@ -886,12 +893,15 @@ var _ = Describe("goroutine event packing", func() {
 
 		It("packs the largest delta the runtime scan can produce", func() {
 			// created/exited are bounded by the debugger's goroutine scan
-			// ceiling, so the packer must still conform at that size.
-			created := make([]int, 8192)
-			exited := make([]int, 8192)
+			// ceiling, so the packer must still conform at exactly that size.
+			created := make([]int, protocol.MaxLifecycleDeltaIDs)
+			exited := make([]int, protocol.MaxLifecycleDeltaIDs)
 			for i := range created {
-				created[i] = math.MaxInt64 - i
-				exited[i] = math.MaxInt64 - 10000 - i
+				// Stay inside JavaScript's safe-integer range: the consumer
+				// rejects anything above it, so a "worst case" built from
+				// unrepresentable ids would not be a realistic worst case.
+				created[i] = maxSafeGoid - i
+				exited[i] = maxSafeGoid - protocol.MaxLifecycleDeltaIDs - i
 			}
 			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: packGoroutines(8192),
@@ -903,11 +913,63 @@ var _ = Describe("goroutine event packing", func() {
 
 			Expect(report.Degraded).To(BeFalse())
 			Expect(report.Oversized).To(BeFalse())
-			Expect(out.Created).To(HaveLen(8192))
-			Expect(out.Exited).To(HaveLen(8192))
-			Expect(out.Goroutines).NotTo(BeEmpty())
+			Expect(out.Created).To(HaveLen(protocol.MaxLifecycleDeltaIDs))
+			Expect(out.Exited).To(HaveLen(protocol.MaxLifecycleDeltaIDs))
+			Expect(out.Goroutines).NotTo(BeEmpty(), "deltas must not starve the elements")
 			Expect(eventBytes(protocol.EventGoroutineSnapshot, out)).
 				To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
+		})
+
+		It("leaves the worst-case deltas well inside the byte budget", func() {
+			// Both deltas at the ceiling with maximum-width ids, and no elements
+			// at all: the floor the packer can never go below.
+			created := make([]int, protocol.MaxLifecycleDeltaIDs)
+			exited := make([]int, protocol.MaxLifecycleDeltaIDs)
+			for i := range created {
+				created[i] = maxSafeGoid - i
+				exited[i] = maxSafeGoid - protocol.MaxLifecycleDeltaIDs - i
+			}
+			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+				Goroutines: []protocol.Goroutine{{ID: 1, Status: "running", Current: true}},
+				Threads:    []protocol.Thread{},
+				Current:    1,
+				Created:    created,
+				Exited:     exited,
+			}, false)
+
+			Expect(report.Oversized).To(BeFalse())
+			Expect(report.Degraded).To(BeFalse())
+			size := eventBytes(protocol.EventGoroutineSnapshot, out)
+			Expect(size).To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
+			Expect(size).To(BeNumerically("<", protocol.MaxGoroutineEventBytes/2),
+				"the worst case must leave real room for elements, not just fit")
+		})
+
+		It("reports rather than trims a delta beyond the scan ceiling", func() {
+			// Not reachable from the real producer, but the packer must never
+			// silently drop lifecycle events to make a payload conform.
+			created := make([]int, protocol.MaxLifecycleDeltaIDs+1)
+			for i := range created {
+				created[i] = i + 1
+			}
+			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+				Goroutines: []protocol.Goroutine{{ID: 1, Status: "running", Current: true}},
+				Current:    1,
+				Created:    created,
+			}, false)
+
+			Expect(report.Oversized).To(BeTrue())
+			Expect(out.Created).To(HaveLen(protocol.MaxLifecycleDeltaIDs+1), "never trimmed")
+		})
+
+		It("matches the debugger's goroutine scan ceiling", func() {
+			// The delta bound is only correct while it equals the scan that
+			// produces the deltas. If layer B retunes the scan, this fails and
+			// the wire contract (and the consumer's mirror of it) must follow.
+			source, err := os.ReadFile(filepath.Join("..", "..", "internal", "debugger", "goroutines.go"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(source)).To(ContainSubstring(
+				"maxGoroutineScan = " + strconv.Itoa(protocol.MaxLifecycleDeltaIDs)))
 		})
 
 		It("reports oversized when the deltas alone cannot fit", func() {
