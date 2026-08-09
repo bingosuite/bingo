@@ -384,16 +384,27 @@ func highPCValue(entry *dwarf.Entry, lowpc uint64) (uint64, bool) {
 	return 0, false
 }
 
-// FramesForStack resolves PCs (from the frame-pointer walk) to source frames.
+// FramesForStack resolves raw PCs from the frame-pointer walk to source frames.
 func (r *dwarfReader) FramesForStack(pcs []uint64) []protocol.Frame {
 	frames := make([]protocol.Frame, len(pcs))
 	for i, pc := range pcs {
 		frames[i] = protocol.Frame{
 			Index:    i,
-			Location: r.locationForPC(pc),
+			Location: r.locationForPC(frameLookupPC(pc, i)),
 		}
 	}
 	return frames
+}
+
+// frameLookupPC converts a saved return PC to the call instruction it belongs
+// to. DWARF ranges are byte intervals, so subtracting one works for both amd64's
+// variable-width CALL and arm64's fixed-width BL. The top frame carries a live
+// PC rather than a return address and must remain unchanged.
+func frameLookupPC(pc uint64, frameIndex int) uint64 {
+	if frameIndex > 0 && pc > 0 {
+		return pc - 1
+	}
+	return pc
 }
 
 // LocalsForFrame returns type-aware, bounded variable trees for every local and
