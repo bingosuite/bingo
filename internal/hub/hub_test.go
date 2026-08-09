@@ -562,11 +562,12 @@ var _ = Describe("Hub", func() {
 
 	Describe("deprecated Panic compatibility event", func() {
 		It("does not enter the suspend gate", func() {
+			const panicCompatibilityEvent protocol.EventKind = "Panic"
 			conn := newFakeWSConn()
 			mustAddClient(h, conn)
 
-			fd.push(protocol.MustEvent(protocol.EventPanic, 1, protocol.PanicPayload{Message: "boom"}))
-			waitForEventKind(conn, protocol.EventPanic, nil)
+			fd.push(protocol.MustEvent(panicCompatibilityEvent, 1, map[string]string{"message": "boom"}))
+			waitForEventKind(conn, panicCompatibilityEvent, nil)
 
 			Consistently(h.State, "100ms", "10ms").Should(Equal(protocol.StateRunning))
 
