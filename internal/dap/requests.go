@@ -507,17 +507,20 @@ func (h *Handler) onTerminate(req *godap.TerminateRequest) {
 
 func (h *Handler) onRestart(req *godap.RestartRequest) {
 	h.mu.Lock()
+	if h.restarting {
+		h.mu.Unlock()
+		h.send(h.errorResponse(req.Seq, "restart", "restart already in progress"))
+		return
+	}
 	hasSession := h.session != nil
-	h.restarting = true
-	h.restartReqSeq = req.Seq
-	h.suspended = false
+	if hasSession {
+		h.restarting = true
+		h.restartReqSeq = req.Seq
+		h.suspended = false
+	}
 	h.mu.Unlock()
 
 	if !hasSession {
-		h.mu.Lock()
-		h.restarting = false
-		h.restartReqSeq = 0
-		h.mu.Unlock()
 		h.send(h.errorResponse(req.Seq, "restart", "no session to restart"))
 		return
 	}

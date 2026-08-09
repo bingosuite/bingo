@@ -855,6 +855,50 @@ func TestRestartedPayloadDecodeFailureStillResponds(t *testing.T) {
 	}
 }
 
+func TestRestartRejectsOverlappingRequest(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+
+	firstSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	secondSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	rejected := recvType[*godap.ErrorResponse](hh)
+	if rejected.RequestSeq != secondSeq || rejected.Success || rejected.Message != "restart already in progress" {
+		t.Fatalf("overlapping restart response = %+v, want immediate error for request %d", rejected.Response, secondSeq)
+	}
+	if commands := hh.cmds.waitForCommands(t, protocol.CmdRestart, 1); len(commands) != 1 {
+		t.Fatalf("restart commands = %d, want exactly 1", len(commands))
+	}
+
+	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{})
+	restarted := recvType[*godap.RestartResponse](hh)
+	if restarted.RequestSeq != firstSeq || !restarted.Success {
+		t.Fatalf("restart response = %+v, want success for original request %d", restarted.Response, firstSeq)
+	}
+}
+
+func TestRestartErrorAllowsRetry(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+
+	firstSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdRestart)
+	hh.inject(protocol.EventError, protocol.ErrorPayload{Command: protocol.CmdRestart, Message: "relaunch failed"})
+	failed := recvType[*godap.ErrorResponse](hh)
+	if failed.RequestSeq != firstSeq || failed.Success {
+		t.Fatalf("failed restart response = %+v, want error for request %d", failed.Response, firstSeq)
+	}
+
+	secondSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	if commands := hh.cmds.waitForCommands(t, protocol.CmdRestart, 2); len(commands) != 2 {
+		t.Fatalf("restart commands after retry = %d, want 2", len(commands))
+	}
+	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{})
+	restarted := recvType[*godap.RestartResponse](hh)
+	if restarted.RequestSeq != secondSeq || !restarted.Success {
+		t.Fatalf("retried restart response = %+v, want success for request %d", restarted.Response, secondSeq)
+	}
+}
+
 func TestRestartPreservesBreakpointCorrelationQueues(t *testing.T) {
 	h := NewHandler(nil, nil, nil)
 	setSlot := &bpSlot{}
