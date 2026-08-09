@@ -518,6 +518,9 @@ func (h *Handler) onRestart(req *godap.RestartRequest) {
 	if hasSession {
 		h.restarting = true
 		h.restartReqSeq = req.Seq
+		// Remember the view being cleared: DAP allows restart while running, so
+		// a rejected restart must restore this exact state, not a suspension.
+		h.restartWasSuspended = h.suspended
 		h.suspended = false
 	}
 	h.mu.Unlock()

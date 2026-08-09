@@ -49,12 +49,18 @@ func (h *Handler) translateEvent(evt protocol.Event) {
 	}
 }
 
-// onSessionState consumes the hub's welcome EventSessionState for a JOINING
-// connection, reflecting the shared session's current run state as the joiner's
-// initial DAP state: a `stopped` if already suspended, `terminated` if already
-// exited, nothing while idle/running. It fires at most once (gated on
+// onSessionState records the managed session's lifecycle state and, for a
+// JOINING connection, consumes the hub's welcome EventSessionState, reflecting
+// the shared session's current run state as the joiner's initial DAP state: a
+// `stopped` if already suspended, `terminated` if already exited, nothing while
+// idle/running. The welcome translation fires at most once (gated on
 // awaitingWelcome) and is a no-op for the normal launch/attach path, where
 // awaitingWelcome is never set.
+//
+// Outside that welcome, the state is only recorded — with one exception: idle
+// and exited mean the process is gone (a failed relaunch leaves a managed
+// session idle), so a stale suspended view is dropped. Nothing is sent; process
+// death is already reported by EventProcessExited.
 func (h *Handler) onSessionState(evt protocol.Event) {
 	var p protocol.SessionStatePayload
 	if err := protocol.DecodeEventPayload(evt, &p); err != nil {
@@ -62,7 +68,11 @@ func (h *Handler) onSessionState(evt protocol.Event) {
 	}
 
 	h.mu.Lock()
+	h.sessionState = p.State
 	if !h.awaitingWelcome {
+		if h.sessionEndedLocked() {
+			h.suspended = false
+		}
 		h.mu.Unlock()
 		return
 	}
@@ -194,6 +204,7 @@ func (h *Handler) onProcessExited(evt protocol.Event) {
 
 	h.mu.Lock()
 	h.suspended = false
+	h.sessionState = protocol.StateExited
 	h.mu.Unlock()
 
 	h.send(&godap.ExitedEvent{Event: h.event("exited"), Body: godap.ExitedEventBody{ExitCode: p.ExitCode}})
@@ -363,6 +374,9 @@ func (h *Handler) onRestarted(evt protocol.Event) {
 	h.mu.Lock()
 	seq := h.restartReqSeq
 	h.restartReqSeq = 0
+	// The relaunch succeeded, so the captured pre-request view is obsolete: the
+	// new process reports its own state through its entry stop.
+	h.restartWasSuspended = false
 	var discarded []godap.Breakpoint
 	if decoded {
 		discarded = h.reconcileRestartBreakpointsLocked(p)
@@ -524,8 +538,9 @@ func (h *Handler) failResume(kind protocol.CommandKind, msg string) {
 	// this client and the welcome being delivered. Skip while already
 	// suspended: a real stop won the race, or an earlier rejection already
 	// resynced, and the client's current `stopped` already describes this
-	// suspension.
-	resync := !h.suspended && !h.launching && !h.awaitingWelcome
+	// suspension. Skip once the session is idle/exited: there is no process to
+	// be stopped at, so the rejection is just the hub reporting that.
+	resync := !h.suspended && !h.launching && !h.awaitingWelcome && !h.sessionEndedLocked()
 	if resync {
 		h.suspended = true
 	}
@@ -549,17 +564,27 @@ func (h *Handler) failResume(kind protocol.CommandKind, msg string) {
 }
 
 // failRestart resolves a rejected CmdRestart: release the response gate and the
-// entry latch, and restore the suspended view onRestart optimistically cleared.
-// Unlike failResume it emits no `stopped` — the delayed error response tells the
-// client the restart failed while it was already stopped, so the client's
-// existing stopped state is still the current one.
+// entry latch, and restore the view onRestart optimistically cleared. Unlike
+// failResume it emits no `stopped` — the delayed error response tells the client
+// the restart failed, so whatever state the client was in remains the current
+// one.
+//
+// The restore is the CAPTURED pre-request view, not an unconditional suspend:
+// DAP allows restart while the tracee is running, and the hub rejects a restart
+// on an attach-created session (no prior Launch) without touching that still-
+// running process — claiming a suspension there would desynchronize the adapter
+// the opposite way. A relaunch that fails after the old process was killed
+// leaves the session idle, which likewise must not report a suspension.
 func (h *Handler) failRestart(msg string) {
 	h.mu.Lock()
 	seq := h.restartReqSeq
 	h.restartReqSeq = 0
 	h.restarting = false
 	if seq != 0 {
-		h.suspended = true
+		if h.restartWasSuspended && !h.sessionEndedLocked() {
+			h.suspended = true
+		}
+		h.restartWasSuspended = false
 	}
 	h.mu.Unlock()
 

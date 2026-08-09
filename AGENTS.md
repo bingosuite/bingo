@@ -1169,9 +1169,11 @@ reason=step; `EventBreakpointHit`→`stopped` reason=breakpoint;
 `EventPanic`→reason=exception; `EventPaused`→reason=pause;
 `EventProcessExited`→`exited`(code)+`terminated`; `EventOutput`→`output`;
 `EventRestarted`→delayed `restart` response; `EventEvaluate`→`evaluate` response
-(correlated via `evalQ`, NOT a stop — see below); `EventSessionState`→ignored on
-the launch/attach path, but consumed **once** as the initial state on the join
-path (see *Joining an existing session*); `EventGoroutineSnapshot`→**deliberately
+(correlated via `evalQ`, NOT a stop — see below); `EventSessionState`→sends
+nothing on the launch/attach path (only recorded as the session's lifecycle
+state, which gates resume-rejection resync), but consumed **once** as the initial
+state on the join path (see *Joining an existing session*);
+`EventGoroutineSnapshot`→**deliberately
 ignored** (WebSocket-only concurrency stream with no DAP equivalent; translating
 it would corrupt the `threads`→`EventGoroutines` FIFO — see the goroutine
 snapshot section).
@@ -1202,8 +1204,27 @@ any stop).
 A rejected Continue/Step also emits ONE `stopped` (reason `exception`, the
 rejection text in `Text`, `AllThreadsStopped`, current thread) — the only DAP
 message that can walk a client back after a successful resume response. Restart
-does NOT: its delayed error response already reports the failure while the client
-is still stopped. Invariants: the `pendingContinues` debt of a rejected Continue
+does NOT: its delayed error response already reports the failure, so whatever
+state the client was in remains current. Restart's restore is the **captured
+pre-request view** (`restartWasSuspended`, taken in `onRestart` before the
+optimistic clear), never an unconditional suspend: DAP permits restart while the
+tracee is RUNNING, and the hub rejects a restart on an attach-created session
+(no prior `Launch`) without touching that still-running process — asserting a
+suspension there desynchronizes the adapter the *opposite* way, forwarding
+inspection requests for a process that never stopped. The capture is consumed by
+`failRestart` and cleared on success (`onRestarted`); an overlap rejection
+returns before touching it, so the in-flight request keeps its own.
+
+No resync happens once the session is **idle or exited** (`sessionEndedLocked`,
+fed by `EventSessionState` on every connection plus `EventProcessExited`). The
+hub's relaunch-failure path kills the old process, broadcasts the error, *then*
+transitions the managed session to idle, and answers every later command with
+"no active debugger" — reporting a stop there would leave the client stopped on
+a process that no longer exists. Outside a joiner's welcome, `onSessionState`
+only records that state (and drops a stale `suspended` on idle/exited); it sends
+nothing, since process death is already reported by `EventProcessExited`.
+
+Further invariants: the `pendingContinues` debt of a rejected Continue
 is settled exactly once (its `EventContinued` never arrives); no second `stopped`
 is emitted while the handler is already `suspended` (a real stop won the race) or
 while the handshake still owes an initial state report — `launching` (the entry
