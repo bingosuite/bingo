@@ -276,6 +276,9 @@ type packState struct {
 }
 
 func (p *packState) addGoroutine(g Goroutine) bool {
+	if !goroutineStringsFit(g) {
+		return false
+	}
 	size, ok := elementBytes(g)
 	if !ok || !p.charge(size, len(p.goroutines)) {
 		return false
@@ -285,12 +288,60 @@ func (p *packState) addGoroutine(g Goroutine) bool {
 }
 
 func (p *packState) addThread(t Thread) bool {
+	if !locationStringsFit(t.CurrentLoc) {
+		return false
+	}
 	size, ok := elementBytes(t)
 	if !ok || !p.charge(size, len(p.threads)) {
 		return false
 	}
 	p.threads = append(p.threads, t)
 	return true
+}
+
+// goroutineStringsFit and locationStringsFit reject an element the consumer
+// would refuse. Rejection is whole-element on purpose: truncating a file path or
+// symbol would silently corrupt the very data a concurrency view exists to show.
+// A non-anchor is skipped and packing continues; an anchor cannot be skipped, so
+// its rejection degrades the result rather than emitting an undecodable event.
+func goroutineStringsFit(g Goroutine) bool {
+	return stringFits(g.Status) &&
+		stringFits(g.WaitReason) &&
+		locationStringsFit(g.CurrentLoc) &&
+		locationStringsFit(g.StartLoc) &&
+		locationStringsFit(g.CreatedLoc)
+}
+
+func locationStringsFit(l Location) bool {
+	return stringFits(l.File) && stringFits(l.Function)
+}
+
+func stringFits(s string) bool {
+	// Fast path: a string can never exceed the limit in UTF-16 code units with
+	// fewer bytes than that, since every code unit costs at least one byte.
+	if len(s) <= MaxGoroutineStringLength {
+		return true
+	}
+	return utf16Len(s) <= MaxGoroutineStringLength
+}
+
+// utf16Len counts a string the way the JavaScript consumer does: in UTF-16 code
+// units, so an astral character (U+10000 and above) counts as two, not one.
+// Counting bytes or runes instead would disagree with the consumer at the
+// boundary, and a disagreement there is exactly the bug this guards — the
+// producer emits something it believes legal and the consumer must reject it.
+//
+// Bytes that are not valid UTF-8 are counted as one unit each, matching both
+// Go's range loop and encoding/json, which substitutes one U+FFFD per bad byte.
+func utf16Len(s string) int {
+	n := 0
+	for _, r := range s {
+		n++
+		if r > 0xFFFF {
+			n++
+		}
+	}
+	return n
 }
 
 func (p *packState) charge(size, placed int) bool {

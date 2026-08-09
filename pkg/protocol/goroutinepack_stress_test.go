@@ -102,22 +102,47 @@ func eventBytesPlain(t *testing.T, kind protocol.EventKind, payload any) int {
 // regression the two-pass exact reserve exists for — reserving space for Totals
 // that the result does not carry silently shrank the usable budget.
 func TestPackNeverExceedsCapAcrossTheBoundary(t *testing.T) {
+	// Every element string is separately capped, so a payload can only approach
+	// the byte budget through many elements. buildSized assembles one of exactly
+	// the requested size out of legal elements: an anchor, fixed-size fillers,
+	// and a tail tuned to land on the byte.
+	fillerText := strings.Repeat("w", 4000)
+	build := func(fillers int, tail string) protocol.GoroutineSnapshotPayload {
+		gs := []protocol.Goroutine{{ID: 1, Status: "running", Current: true}}
+		for i := 2; i <= fillers+1; i++ {
+			gs = append(gs, protocol.Goroutine{ID: i, Status: "waiting", WaitReason: fillerText})
+		}
+		if tail != "" {
+			gs = append(gs, protocol.Goroutine{ID: 900000, Status: "waiting", WaitReason: tail})
+		}
+		return protocol.GoroutineSnapshotPayload{
+			Goroutines: gs, Threads: []protocol.Thread{}, Current: 1,
+		}
+	}
+	sized := func(t *testing.T, size int) protocol.GoroutineSnapshotPayload {
+		t.Helper()
+		anchorOnly := eventBytesPlain(t, protocol.EventGoroutineSnapshot, build(0, ""))
+		perFiller := eventBytesPlain(t, protocol.EventGoroutineSnapshot, build(1, "")) - anchorOnly
+		for fillers := (size - anchorOnly) / perFiller; fillers >= 0; fillers-- {
+			body := eventBytesPlain(t, protocol.EventGoroutineSnapshot, build(fillers, ""))
+			oneChar := eventBytesPlain(t, protocol.EventGoroutineSnapshot, build(fillers, "x")) - body
+			length := size - body - oneChar + 1
+			if length < 1 || length > protocol.MaxGoroutineStringLength {
+				continue
+			}
+			snap := build(fillers, strings.Repeat("t", length))
+			if got := eventBytesPlain(t, protocol.EventGoroutineSnapshot, snap); got != size {
+				t.Fatalf("built %d bytes, want %d", got, size)
+			}
+			return snap
+		}
+		t.Fatalf("could not build a payload of exactly %d bytes", size)
+		return protocol.GoroutineSnapshotPayload{}
+	}
+
 	for offset := -60; offset <= 60; offset++ {
 		target := protocol.MaxGoroutineEventBytes + offset
-		snap := protocol.GoroutineSnapshotPayload{
-			Goroutines: []protocol.Goroutine{{ID: 1, Status: "running", Current: true}},
-			Threads:    []protocol.Thread{},
-			Current:    1,
-		}
-		base := eventBytesPlain(t, protocol.EventGoroutineSnapshot, snap)
-		pad := target - base - len(`,"waitReason":""`)
-		if pad < 0 {
-			continue
-		}
-		snap.Goroutines[0].WaitReason = strings.Repeat("w", pad)
-		if got := eventBytesPlain(t, protocol.EventGoroutineSnapshot, snap); got != target {
-			t.Fatalf("offset %d: built %d want %d", offset, got, target)
-		}
+		snap := sized(t, target)
 
 		out, rep := protocol.PackSnapshot(snap, false)
 		actual := eventBytesPlain(t, protocol.EventGoroutineSnapshot, out)
@@ -127,11 +152,18 @@ func TestPackNeverExceedsCapAcrossTheBoundary(t *testing.T) {
 		if rep.Bytes != actual {
 			t.Fatalf("offset %d: report %d actual %d", offset, rep.Bytes, actual)
 		}
-		if offset <= 0 && rep.Degraded {
-			t.Fatalf("offset %d: falsely degraded a payload that fits", offset)
+		if rep.Degraded {
+			t.Fatalf("offset %d: degraded a payload whose anchor fits", offset)
 		}
-		if offset > 0 && !rep.Degraded {
-			t.Fatalf("offset %d: kept an anchor that cannot fit", offset)
+		if offset <= 0 {
+			if rep.Omitted() {
+				t.Fatalf("offset %d: dropped an element from a payload that fits", offset)
+			}
+			if len(out.Goroutines) != len(snap.Goroutines) {
+				t.Fatalf("offset %d: kept %d of %d", offset, len(out.Goroutines), len(snap.Goroutines))
+			}
+		} else if !rep.Omitted() {
+			t.Fatalf("offset %d: kept an over-budget payload whole", offset)
 		}
 	}
 }
