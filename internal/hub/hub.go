@@ -19,6 +19,8 @@ import (
 
 var ErrHubClosed = errors.New("hub is shutting down")
 
+const defaultSuspendTimeout = 30 * time.Minute
+
 // suspendingEvents pause the hub and require a resuming command before the
 // process is allowed to continue. EventPaused is included: a Pause request
 // halts the tracee and suspends it exactly like a breakpoint hit, just
@@ -80,6 +82,10 @@ type Hub struct {
 	// resumeCh: capacity 1, first-write-wins. Extras dropped in injectCommand.
 	resumeCh chan protocol.Command
 
+	// Immutable after Run starts; tests shorten it per hub to exercise the
+	// safety-resume path without a mutable process-wide setting.
+	suspendTimeout time.Duration
+
 	// seq is the single counter for ALL outbound events. The hub re-stamps
 	// debugger events with this counter, so clients see one monotonic stream
 	// and can detect gaps. The engine has its own seq.
@@ -119,6 +125,7 @@ func newHub(log *slog.Logger) *Hub {
 		registry:           newRegistry(),
 		cmdCh:              make(chan clientCommand, 32),
 		resumeCh:           make(chan protocol.Command, 1),
+		suspendTimeout:     defaultSuspendTimeout,
 		shutdownCh:         make(chan struct{}),
 		done:               make(chan struct{}),
 		log:                log,
@@ -283,7 +290,7 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 
 	h.log.Info("suspended — waiting for resuming command", "event", evt.Kind)
 
-	timeout := time.NewTimer(30 * time.Minute)
+	timeout := time.NewTimer(h.suspendTimeout)
 	defer timeout.Stop()
 
 	for {
@@ -344,13 +351,18 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 			}
 
 		case <-timeout.C:
-			h.log.Warn("30-minute suspend timeout — auto-continuing")
-			if h.dbg != nil {
-				if err := h.dbg.Continue(); err != nil {
-					h.log.Warn("auto-continue failed", "err", err)
-				}
+			h.log.Warn("suspend timeout — auto-continuing", "timeout", h.suspendTimeout)
+			h.executeCommand(protocol.Command{
+				Version: protocol.Version,
+				Kind:    protocol.CmdContinue,
+			})
+			if h.State() != protocol.StateSuspended {
+				return
 			}
-			return
+			// A rejected safety resume must leave the same retry path available
+			// as a rejected client resume. Re-arm from now so failures do not
+			// collapse into a hot retry loop.
+			timeout.Reset(h.suspendTimeout)
 		}
 	}
 }
