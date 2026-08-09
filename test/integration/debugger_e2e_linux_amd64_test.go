@@ -569,7 +569,9 @@ func declareStepOverlapSignalSpec() {
 			// arrives and still counts above, but the engine reports "signal 0".
 			// SIGUSR1 is the only signal that can surface here — SIGURG, SIGCONT
 			// and a new thread's SIGSTOP are absorbed before classification — so
-			// the reported set must be exactly {SIGUSR1}.
+			// SIGUSR1 must be present and a zero-valued signal must not be. An
+			// exact HaveLen(1) is deliberately avoided: it would flake on any
+			// incidental signal without catching anything these two miss.
 			Expect(p.signalValues).To(HaveKeyWithValue(int(syscall.SIGUSR1), BeNumerically(">", 0)),
 				"no SIGUSR1 was reported by number; reported signals were %v", p.signalValues)
 			Expect(p.signalValues).NotTo(HaveKey(0),
@@ -604,11 +606,14 @@ func declareStepOverlapSignalSpec() {
 			AddReportEntry("overlap-signal-stops", p.signalOutputs)
 			AddReportEntry("overlap-signal-goroutines", len(p.goroutines))
 			AddReportEntry("overlap-signal-late-goroutines", len(p.lateGoroutines))
-			// The absorb-resume rule must have fired: SIGCONT lands on the
-			// stepped thread often enough over a full run, and re-arming there
-			// is what keeps the step alive. Reported rather than asserted
-			// because the landing is racy per cycle; the assertion below only
-			// requires it to have happened at all.
+			// Evidence for the absorb-resume rule: the count of times an
+			// absorbed stop landed on the thread being single-stepped and its
+			// step had to be re-armed. Reported rather than asserted because
+			// which thread a process-directed signal lands on is racy — the
+			// storm makes it likely over a full run, not guaranteed. The
+			// failure this rule prevents is a freeze, which a spec can only
+			// observe as a timeout, so this counter is the only direct
+			// evidence available that the rule fired against a real kernel.
 			rearms, ok := debugger.LinuxStepRearmCount(p.h.d)
 			Expect(ok).To(BeTrue(), "step-rearm hook unavailable")
 
