@@ -19,6 +19,23 @@ import (
 // represented exactly by the consumer, so a realistic worst case stops here.
 const maxSafeGoid = 1<<53 - 1
 
+// expectReportedSize checks the payload against the contract and, when the
+// packer measured (rather than proving the fit by bound), that the size it
+// reported is the real one. A wrong non-zero size still fails.
+func expectReportedSize(
+	kind protocol.EventKind,
+	payload any,
+	report protocol.GoroutinePackReport,
+) int {
+	GinkgoHelper()
+	actual := eventBytes(kind, payload)
+	Expect(actual).To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
+	if report.Bytes != 0 {
+		Expect(report.Bytes).To(Equal(actual))
+	}
+	return actual
+}
+
 // eventBytes measures a payload exactly the way the packer's contract is
 // stated: a real Event at the widest sequence number the hub can stamp.
 func eventBytes(kind protocol.EventKind, payload any) int {
@@ -186,7 +203,7 @@ var _ = Describe("goroutine event packing", func() {
 				out, report := protocol.PackGoroutines(gs, false)
 
 				Expect(out.Goroutines).To(HaveLen(64))
-				Expect(report.Bytes).To(Equal(eventBytes(protocol.EventGoroutines, out)))
+				expectReportedSize(protocol.EventGoroutines, out, report)
 			},
 			Entry("plain ascii", "internal/service/handler.go"),
 			Entry("html-escaped runes", "chan<-recv & send > done <T>"),
@@ -209,7 +226,7 @@ var _ = Describe("goroutine event packing", func() {
 				gs = append(gs, g)
 			}
 			out, report := protocol.PackGoroutines(gs, false)
-			Expect(report.Bytes).To(Equal(eventBytes(protocol.EventGoroutines, out)))
+			expectReportedSize(protocol.EventGoroutines, out, report)
 		})
 	})
 
@@ -1214,7 +1231,9 @@ var _ = Describe("goroutine event packing", func() {
 				Expect(out.Goroutines).To(HaveLen(n), "nothing is dropped")
 				Expect(report.Omitted()).To(BeFalse())
 				Expect(elements).To(BeZero(), "a payload that fits needs no per-element work")
-				Expect(envelopes).To(Equal(1), "one measurement settles it")
+				Expect(envelopes).To(BeZero(),
+					"and no marshalling at all — the cheap bound already proved it fits")
+				Expect(report.Bytes).To(BeZero(), "nothing was measured, so nothing is reported")
 			}
 		})
 

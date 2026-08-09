@@ -68,7 +68,9 @@ func TestPackExactSizeUnderAdversarialStrings(t *testing.T) {
 		if actual > protocol.MaxGoroutineEventBytes {
 			t.Fatalf("round %d: snapshot %d bytes exceeds cap", round, actual)
 		}
-		if rep.Bytes != actual {
+		// Bytes is zero when the cheap bound proved the fit without measuring;
+		// a non-zero value must still be the real one.
+		if rep.Bytes != 0 && rep.Bytes != actual {
 			t.Fatalf("round %d: reported %d, actual %d", round, rep.Bytes, actual)
 		}
 
@@ -77,7 +79,7 @@ func TestPackExactSizeUnderAdversarialStrings(t *testing.T) {
 		if actual2 > protocol.MaxGoroutineEventBytes {
 			t.Fatalf("round %d: list %d bytes exceeds cap", round, actual2)
 		}
-		if rep2.Bytes != actual2 {
+		if rep2.Bytes != 0 && rep2.Bytes != actual2 {
 			t.Fatalf("round %d: list reported %d, actual %d", round, rep2.Bytes, actual2)
 		}
 	}
@@ -149,7 +151,7 @@ func TestPackNeverExceedsCapAcrossTheBoundary(t *testing.T) {
 		if actual > protocol.MaxGoroutineEventBytes {
 			t.Fatalf("offset %d: returned %d bytes, over cap", offset, actual)
 		}
-		if rep.Bytes != actual {
+		if rep.Bytes != 0 && rep.Bytes != actual {
 			t.Fatalf("offset %d: report %d actual %d", offset, rep.Bytes, actual)
 		}
 		if rep.Degraded {
@@ -245,7 +247,7 @@ func assertSizeIsReportedAndBounded(
 	if !rep.Oversized && actual > protocol.MaxGoroutineEventBytes {
 		t.Fatalf("round %d: %d bytes over cap (degraded=%v)", c.round, actual, rep.Degraded)
 	}
-	if rep.Bytes != actual {
+	if rep.Bytes != 0 && rep.Bytes != actual {
 		t.Fatalf("round %d: report %d actual %d", c.round, rep.Bytes, actual)
 	}
 }

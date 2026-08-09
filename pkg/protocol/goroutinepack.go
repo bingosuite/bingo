@@ -19,7 +19,9 @@ type GoroutinePackReport struct {
 	Threads    int
 
 	// Bytes is the exact marshalled Event size measured at the widest possible
-	// sequence number (see packBudget).
+	// sequence number (see packBudget), or ZERO when the result was proven to
+	// fit by the cheap upper bound and never needed measuring. It is a
+	// diagnostic, not a contract: a zero means "provably fine", not "empty".
 	Bytes int
 
 	// Degraded is true when not even the anchor elements fit, so the wire
@@ -80,7 +82,8 @@ func PackSnapshot(snap GoroutineSnapshotPayload, goroutinesClipped, threadsClipp
 	}
 
 	// The snapshot shape IS a tree, so the whole spawn chain is required.
-	gs, ts, report := pack(snap.Goroutines, snap.Threads, snap.Current, totals, EventGoroutineSnapshot, build, true)
+	gs, ts, report := pack(snap.Goroutines, snap.Threads, snap.Current, totals, EventGoroutineSnapshot, build, true,
+		len(snap.Created)+len(snap.Exited))
 	// Deltas are passed through untouched, so an over-long one is reported
 	// rather than trimmed: silently dropping lifecycle events would leave every
 	// consumer's created/exited tracking permanently wrong.
@@ -107,7 +110,7 @@ func PackGoroutines(gs []Goroutine, goroutinesClipped bool) (GoroutinesPayload, 
 	// break — so ancestors are ordered first but not required. Degrading it to
 	// empty would make the DAP translator fabricate a synthetic "main" thread,
 	// which is precisely the lie issue #194 exists to stop.
-	packed, _, report := pack(gs, nil, 0, totals, EventGoroutines, build, false)
+	packed, _, report := pack(gs, nil, 0, totals, EventGoroutines, build, false, 0)
 	return shape(packed, payloadTotals(totals, report)), report
 }
 
@@ -139,6 +142,7 @@ func pack(
 	kind EventKind,
 	build payloadBuilder,
 	requireAncestors bool,
+	deltaCount int,
 ) ([]Goroutine, []Thread, GoroutinePackReport) {
 	orderedG, anchorG := orderGoroutines(goroutines, current)
 	orderedT, anchorT := orderThreads(threads)
@@ -171,14 +175,22 @@ func pack(
 		len(orderedT) <= MaxSnapshotThreads &&
 		elementsFitLimits(orderedG, orderedT) {
 		gs, ts := nonNilGoroutines(orderedG), nonNilThreads(orderedT)
+		fits := GoroutinePackReport{
+			Totals:     totals,
+			Goroutines: len(gs),
+			Threads:    len(ts),
+		}
+		// Cheapest first: a conservative upper bound needs only a pass over
+		// string lengths, no marshalling at all. A thread-churning target keeps
+		// thousands of Ms alive, so marshalling the payload just to discover it
+		// fits cost milliseconds on every single stop.
+		if boundedSize(gs, ts, deltaCount) <= MaxGoroutineEventBytes {
+			return gs, ts, fits
+		}
 		size, ok := packBudget(kind, build(gs, ts, deliveredCurrent(gs, current), nil))
 		if ok && size <= MaxGoroutineEventBytes {
-			return gs, ts, GoroutinePackReport{
-				Totals:     totals,
-				Goroutines: len(gs),
-				Threads:    len(ts),
-				Bytes:      size,
-			}
+			fits.Bytes = size
+			return gs, ts, fits
 		}
 	}
 
@@ -216,6 +228,48 @@ func pack(
 	}
 	report.Bytes = size
 	return gs, ts, report
+}
+
+// boundedSize is a conservative upper bound on the marshalled Event, computed
+// without marshalling anything: a fixed per-element allowance plus the worst
+// case for each string. JSON escaping expands a byte by at most six (a control
+// byte or an invalid one becomes \uXXXX), so six times the raw length can never
+// under-estimate. When the bound already fits, the payload provably fits and no
+// measurement is needed; when it does not, the caller measures for real.
+func boundedSize(gs []Goroutine, ts []Thread, deltas int) int {
+	const (
+		envelopeAllowance  = 256 // version, kind, a 20-digit seq, payload keys
+		goroutineAllowance = 256 // its own keys plus every numeric field
+		threadAllowance    = 192
+		deltaAllowance     = 24 // a 20-digit goid plus its separator
+		escapeFactor       = 6
+	)
+
+	total := envelopeAllowance + deltas*deltaAllowance
+	for i := range gs {
+		total += goroutineAllowance + escapeFactor*goroutineStringBytes(&gs[i])
+		if total > MaxGoroutineEventBytes {
+			return total // already inconclusive; stop counting
+		}
+	}
+	for i := range ts {
+		total += threadAllowance + escapeFactor*locationStringBytes(&ts[i].CurrentLoc)
+		if total > MaxGoroutineEventBytes {
+			return total
+		}
+	}
+	return total
+}
+
+func goroutineStringBytes(g *Goroutine) int {
+	return len(g.Status) + len(g.WaitReason) +
+		locationStringBytes(&g.CurrentLoc) +
+		locationStringBytes(&g.StartLoc) +
+		locationStringBytes(&g.CreatedLoc)
+}
+
+func locationStringBytes(l *Location) int {
+	return len(l.File) + len(l.Function)
 }
 
 // elementsFitLimits reports whether every element already satisfies the
