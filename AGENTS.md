@@ -919,7 +919,7 @@ target metadata, architecture, mode, and entitlements.
 The extension package version is the installed-runtime upgrade boundary:
 material shipped behavior changes must bump both `package.json` and the lockfile
 or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.3.1**) in source and VSIX
+and package verifier pin the current version (**0.3.2**) in source and VSIX
 metadata.
 The root Run and Debug dropdown exposes exactly two `"type":"bingo"` choices:
 launch one of five progressive examples through a `pickString`, and join a
@@ -1010,7 +1010,14 @@ the 500-node rendering cap, re-lays out each match with at most four ancestors,
 and resets fit so a deep or previously capped match cannot remain invisible.
 Empty results keep Fit/zoom callbacks safe even without an SVG scene. SVG
 treeitems carry `aria-level`, sibling position/size, selection, and parent
-context; arrow navigation moves DOM focus with selection.
+context; arrow navigation moves DOM focus with selection. Full-root model
+rerenders preserve focus through bounded literal identities for the session
+selector and controls, the two static element IDs, and numeric goroutine IDs,
+but only when `document.hasFocus()` was true before replacement; a blurred
+webview must never reclaim focus from the editor, and an identity absent from
+the new render is a no-op. Rebuilding the selector can still close its native
+open popup; preserving that transient browser UI would require an incremental
+renderer and is intentionally outside this invariant.
 
 ### Handshake (Delve-style, VS Code-compatible)
 

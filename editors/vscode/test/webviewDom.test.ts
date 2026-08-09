@@ -7,6 +7,50 @@ import { toSessionViewModel } from "../src/model.js";
 import { mountConcurrencyView } from "../src/webviewApp.js";
 import { goroutine, snapshot, thread } from "./fixtures.js";
 
+const activeElements = new WeakMap<Document, Element>();
+const focusedDocuments = new WeakMap<Document, boolean>();
+
+function testDOM() {
+  const { document, window } = parseHTML(
+    "<html><body><div id=app></div></body></html>",
+  );
+  const focus = function (this: HTMLElement | SVGElement): void {
+    activeElements.set(this.ownerDocument, this);
+    focusedDocuments.set(this.ownerDocument, true);
+  };
+  for (const prototype of [
+    window.HTMLElement.prototype,
+    window.SVGElement.prototype,
+  ]) {
+    Object.defineProperty(prototype, "focus", {
+      configurable: true,
+      value: focus,
+    });
+  }
+
+  const documentPrototype = Object.getPrototypeOf(document) as object;
+  Object.defineProperty(documentPrototype, "activeElement", {
+    configurable: true,
+    get(this: Document): Element | null {
+      return activeElements.get(this) ?? null;
+    },
+  });
+  Object.defineProperty(documentPrototype, "hasFocus", {
+    configurable: true,
+    value(this: Document): boolean {
+      return focusedDocuments.get(this) ?? false;
+    },
+  });
+
+  return {
+    document,
+    window,
+    setDocumentFocused: (focused: boolean): void => {
+      focusedDocuments.set(document, focused);
+    },
+  };
+}
+
 function model(
   patch: Partial<SessionModel> = {},
 ): ConcurrencyViewModel {
@@ -39,9 +83,34 @@ function model(
   };
 }
 
+function multiSessionModel(
+  activeDebugSessionId = "debug",
+  revision = 1,
+): ConcurrencyViewModel {
+  const base = model();
+  const first = base.sessions[0];
+  if (first === undefined) {
+    throw new Error("test model requires a session");
+  }
+  return {
+    ...base,
+    revision,
+    activeDebugSessionId,
+    sessions: [
+      first,
+      {
+        ...first,
+        debugSessionId: "debug-2",
+        debugSessionName: "Level 2",
+        sessionId: "session-2",
+      },
+    ],
+  };
+}
+
 describe("concurrency webview DOM", () => {
   it("renders nodes, edges, threads, inspector, lifecycle, and accessibility", () => {
-    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    const { document } = testDOM();
     const messages: Record<string, unknown>[] = [];
     const render = mountConcurrencyView(document, {
       postMessage(message) {
@@ -77,7 +146,7 @@ describe("concurrency webview DOM", () => {
   });
 
   it("filters and selects through DOM events", () => {
-    const { document, window } = parseHTML("<html><body><div id=app></div></body></html>");
+    const { document, window } = testDOM();
     const messages: Record<string, unknown>[] = [];
     mountConcurrencyView(document, { postMessage: (message) => messages.push(message) })(model());
     const search = document.querySelector<HTMLInputElement>('input[type="search"]')!;
@@ -88,10 +157,134 @@ describe("concurrency webview DOM", () => {
     assert.deepEqual(messages.at(-1), { type: "selectGoroutine", id: 2 });
   });
 
-  it("moves DOM focus with keyboard tree selection", () => {
-    const { document, window } = parseHTML(
-      "<html><body><div id=app></div></body></html>",
+  it("preserves session selector focus across selection rerenders", () => {
+    const { document, window } = testDOM();
+    const messages: Record<string, unknown>[] = [];
+    const render = mountConcurrencyView(document, {
+      postMessage: (message) => messages.push(message),
+    });
+    render(multiSessionModel());
+    const before = document.querySelector<HTMLSelectElement>(
+      '[data-focus="session-selector"]',
     );
+    assert.ok(before);
+    before.focus();
+    const options = before.querySelectorAll<HTMLOptionElement>("option");
+    const firstOption = options[0];
+    const secondOption = options[1];
+    assert.ok(firstOption);
+    assert.ok(secondOption);
+    firstOption.selected = false;
+    secondOption.selected = true;
+    before.dispatchEvent(new window.Event("change"));
+    assert.deepEqual(messages.at(-1), {
+      type: "selectSession",
+      id: "debug-2",
+    });
+
+    render(multiSessionModel("debug-2", 2));
+    const after = document.querySelector<HTMLSelectElement>(
+      '[data-focus="session-selector"]',
+    );
+    assert.ok(after);
+    assert.notEqual(after, before);
+    assert.equal(document.activeElement, after);
+  });
+
+  it("preserves every toolbar control across model revisions", () => {
+    const { document } = testDOM();
+    const render = mountConcurrencyView(document, { postMessage() {} });
+    render(model());
+    const tokens = [
+      "refresh",
+      "copy-snapshot",
+      "fit",
+      "zoom-out",
+      "zoom-in",
+    ] as const;
+
+    let revision = 2;
+    for (const token of tokens) {
+      const before = document.querySelector<HTMLButtonElement>(
+        `[data-focus="${token}"]`,
+      );
+      assert.ok(before);
+      before.focus();
+      render({ ...model(), revision });
+      revision += 1;
+      const after = document.querySelector<HTMLButtonElement>(
+        `[data-focus="${token}"]`,
+      );
+      assert.ok(after);
+      assert.notEqual(after, before);
+      assert.equal(document.activeElement, after);
+    }
+  });
+
+  it("retains search, viewport, and tree-node focus behavior", () => {
+    const { document } = testDOM();
+    const render = mountConcurrencyView(document, { postMessage() {} });
+    render(model());
+    const selectors = [
+      "#bingo-goroutine-filter",
+      "#concurrency-tree",
+      '[data-goid="1"]',
+    ] as const;
+
+    let revision = 2;
+    for (const selector of selectors) {
+      const before = document.querySelector<HTMLElement | SVGElement>(selector);
+      assert.ok(before);
+      before.focus();
+      render({ ...model(), revision });
+      revision += 1;
+      const after = document.querySelector<HTMLElement | SVGElement>(selector);
+      assert.ok(after);
+      assert.notEqual(after, before);
+      assert.equal(document.activeElement, after);
+    }
+  });
+
+  it("does not restore focus when the webview document is blurred", () => {
+    const { document, setDocumentFocused } = testDOM();
+    const render = mountConcurrencyView(document, { postMessage() {} });
+    render(model());
+    const before = document.querySelector<HTMLInputElement>(
+      "#bingo-goroutine-filter",
+    );
+    assert.ok(before);
+    before.focus();
+    setDocumentFocused(false);
+
+    render({ ...model(), revision: 2 });
+    const after = document.querySelector<HTMLInputElement>(
+      "#bingo-goroutine-filter",
+    );
+    assert.ok(after);
+    assert.notEqual(after, before);
+    assert.equal(document.activeElement, before);
+  });
+
+  it("does nothing when the focused control is absent after rendering", () => {
+    const { document } = testDOM();
+    const render = mountConcurrencyView(document, { postMessage() {} });
+    render(multiSessionModel());
+    const before = document.querySelector<HTMLSelectElement>(
+      '[data-focus="session-selector"]',
+    );
+    assert.ok(before);
+    before.focus();
+
+    render({ revision: 2, activeDebugSessionId: "", sessions: [] });
+    assert.equal(
+      document.querySelector('[data-focus="session-selector"]'),
+      null,
+    );
+    assert.equal(document.activeElement, before);
+  });
+
+  it("moves DOM focus with keyboard tree selection", () => {
+    const { document, window } = testDOM();
     const messages: Record<string, unknown>[] = [];
     mountConcurrencyView(document, {
       postMessage: (message) => messages.push(message),
@@ -107,17 +300,6 @@ describe("concurrency webview DOM", () => {
         return querySelector(selector);
       },
     });
-    let focused = "";
-    Object.defineProperty(first, "focus", {
-      value: () => {
-        focused = "1";
-      },
-    });
-    Object.defineProperty(second, "focus", {
-      value: () => {
-        focused = "2";
-      },
-    });
     first.focus();
     const event = new window.Event("keydown", {
       bubbles: true,
@@ -126,7 +308,7 @@ describe("concurrency webview DOM", () => {
     Object.defineProperty(event, "key", { value: "ArrowDown" });
     first.dispatchEvent(event);
 
-    assert.equal(focused, "2");
+    assert.equal(document.activeElement, second);
     assert.equal(selectorCalls, 1);
     assert.deepEqual(messages.at(-1), {
       type: "selectGoroutine",
@@ -135,7 +317,7 @@ describe("concurrency webview DOM", () => {
   });
 
   it("keeps matching descendants connected to visible ancestors", () => {
-    const { document, window } = parseHTML("<html><body><div id=app></div></body></html>");
+    const { document, window } = testDOM();
     const nested = snapshot([
       goroutine(1, 0, { current: true }),
       goroutine(2, 1),
@@ -152,7 +334,7 @@ describe("concurrency webview DOM", () => {
   });
 
   it("describes cycle-normalized roots without claiming their parent is absent", () => {
-    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    const { document } = testDOM();
     mountConcurrencyView(document, { postMessage() {} })(
       model({
         snapshot: snapshot([
@@ -170,7 +352,7 @@ describe("concurrency webview DOM", () => {
   });
 
   it("finds, compacts, and fits matches beyond the rendering cap", () => {
-    const { document, window } = parseHTML("<html><body><div id=app></div></body></html>");
+    const { document, window } = testDOM();
     const goroutines = [goroutine(1, 0, { current: true })];
     for (let id = 2; id <= 1000; id += 1) {
       goroutines.push(
@@ -208,9 +390,7 @@ describe("concurrency webview DOM", () => {
   });
 
   it("keeps fit and zoom controls safe for an empty filter result", () => {
-    const { document, window } = parseHTML(
-      "<html><body><div id=app></div></body></html>",
-    );
+    const { document, window } = testDOM();
     mountConcurrencyView(document, { postMessage() {} })(model());
     const search = document.querySelector<HTMLInputElement>(
       'input[type="search"]',
@@ -241,7 +421,7 @@ describe("concurrency webview DOM", () => {
   });
 
   it("renders empty and error states", () => {
-    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    const { document } = testDOM();
     const render = mountConcurrencyView(document, { postMessage() {} });
     render({ revision: 1, activeDebugSessionId: "", sessions: [] });
     assert.match(document.body.textContent, /Start a bingo debug session/);
@@ -251,7 +431,7 @@ describe("concurrency webview DOM", () => {
   });
 
   it("keeps hostile tracee strings inert", () => {
-    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    const { document } = testDOM();
     const hostile = '<img src=x onerror="globalThis.pwned=true">';
     const snap = snapshot([goroutine(1, 0, { waitReason: hostile, current: true })]);
     mountConcurrencyView(document, { postMessage() {} })(

@@ -20,8 +20,9 @@ just vscode-install
 ```
 
 This builds, verifies, and installs `dist/bingo-<platform>.vsix`. The graphical
-concurrency view debuted in 0.3.0; **0.3.1** adds capability-safe managed-server
-reuse and is the minimum supported version. Rerun the command to update, then run
+concurrency view debuted in 0.3.0; 0.3.1 added capability-safe managed-server
+reuse, and **0.3.2** preserves keyboard focus across telemetry rerenders without
+pulling focus back from the editor. Rerun the command to update, then run
 **Developer: Reload Window** once so the active extension host loads the new
 bundle. Package without installing with `just vscode-package`. Uninstall with:
 

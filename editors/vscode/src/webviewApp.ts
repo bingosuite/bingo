@@ -9,6 +9,25 @@ export interface WebviewHost {
 }
 
 const svgNamespace = "http://www.w3.org/2000/svg";
+const focusSelectors = {
+  "session-selector": '[data-focus="session-selector"]',
+  refresh: '[data-focus="refresh"]',
+  "copy-snapshot": '[data-focus="copy-snapshot"]',
+  fit: '[data-focus="fit"]',
+  "zoom-out": '[data-focus="zoom-out"]',
+  "zoom-in": '[data-focus="zoom-in"]',
+} as const;
+const focusIDSelectors = {
+  "bingo-goroutine-filter": "#bingo-goroutine-filter",
+  "concurrency-tree": "#concurrency-tree",
+} as const;
+
+type FocusToken = keyof typeof focusSelectors;
+type FocusID = keyof typeof focusIDSelectors;
+type FocusIdentity =
+  | { readonly kind: "control"; readonly token: FocusToken }
+  | { readonly kind: "id"; readonly id: FocusID }
+  | { readonly kind: "goroutine"; readonly id: number };
 
 export function mountConcurrencyView(
   document: Document,
@@ -22,7 +41,10 @@ export function mountConcurrencyView(
   let transform = { x: 20, y: 20, scale: 1 };
 
   return (model, generation = 1) => {
-    const focused = focusIdentity(document.activeElement);
+    const documentWasFocused = document.hasFocus();
+    const focused = documentWasFocused
+      ? focusIdentity(document.activeElement)
+      : undefined;
     root.replaceChildren();
     root.className = "app";
     root.setAttribute("aria-live", "polite");
@@ -49,7 +71,9 @@ export function mountConcurrencyView(
             },
           }),
     );
-    restoreFocus(root, focused);
+    if (documentWasFocused) {
+      restoreFocus(root, focused);
+    }
     host.postMessage({
       type: "rendered",
       generation,
@@ -80,6 +104,7 @@ function header(
   if (model.sessions.length > 0) {
     const selector = document.createElement("select");
     selector.className = "session-selector";
+    selector.dataset.focus = "session-selector";
     selector.setAttribute("aria-label", "Active bingo debug session");
     for (const item of model.sessions) {
       const option = document.createElement("option");
@@ -151,10 +176,10 @@ function renderSession(
   search.placeholder = "Filter goroutines";
   search.value = state.query;
   search.setAttribute("aria-label", "Filter goroutines");
-  const refresh = button(document, "Refresh", () => {
+  const refresh = button(document, "Refresh", "refresh", () => {
     host.postMessage({ type: "refresh" });
   });
-  const copy = button(document, "Copy snapshot", () => {
+  const copy = button(document, "Copy snapshot", "copy-snapshot", () => {
     host.postMessage({ type: "copySnapshot" });
   });
   toolbar.append(search, refresh, copy);
@@ -232,14 +257,14 @@ function renderGraph(
   const scene = document.createElementNS(svgNamespace, "g");
   const controls = document.createElement("div");
   controls.className = "graph-controls";
-  const fit = button(document, "Fit", () => {
+  const fit = button(document, "Fit", "fit", () => {
     currentTransform = { x: 20, y: 20, scale: 1 };
     state.setTransform(currentTransform);
     updateTransform();
   });
-  const zoomIn = button(document, "+", () => zoom(1.15));
+  const zoomIn = button(document, "+", "zoom-in", () => zoom(1.15));
   zoomIn.setAttribute("aria-label", "Zoom in");
-  const zoomOut = button(document, "−", () => zoom(0.85));
+  const zoomOut = button(document, "−", "zoom-out", () => zoom(0.85));
   zoomOut.setAttribute("aria-label", "Zoom out");
   controls.append(fit, zoomOut, zoomIn);
   panel.append(controls);
@@ -647,11 +672,13 @@ function callout(
 function button(
   document: Document,
   label: string,
+  focusToken: FocusToken,
   action: () => void,
 ): HTMLButtonElement {
   const element = document.createElement("button");
   element.type = "button";
   element.textContent = label;
+  element.dataset.focus = focusToken;
   element.addEventListener("click", action);
   return element;
 }
@@ -696,22 +723,49 @@ function goroutineLabel(goroutine: {
     .join(" ");
 }
 
-function focusIdentity(element: Element | null | undefined): string {
+function focusIdentity(
+  element: Element | null | undefined,
+): FocusIdentity | undefined {
   if (element === null || element === undefined) {
-    return "";
+    return undefined;
   }
-  if (element.id.length > 0) {
-    return `#${element.id}`;
+  const token = element.getAttribute("data-focus");
+  if (token !== null && isFocusToken(token)) {
+    return { kind: "control", token };
   }
-  const goid = (element as HTMLElement | SVGElement).dataset.goid;
-  if (goid !== undefined) {
-    return `[data-goid="${goid}"]`;
+  if (isFocusID(element.id)) {
+    return { kind: "id", id: element.id };
   }
-  return "";
+  const goid = element.getAttribute("data-goid");
+  if (goid !== null) {
+    const id = Number(goid);
+    if (Number.isSafeInteger(id) && id > 0) {
+      return { kind: "goroutine", id };
+    }
+  }
+  return undefined;
 }
 
-function restoreFocus(root: HTMLElement, identity: string): void {
-  if (identity.length > 0) {
-    root.querySelector<HTMLElement | SVGElement>(identity)?.focus();
+function restoreFocus(
+  root: HTMLElement,
+  identity: FocusIdentity | undefined,
+): void {
+  if (identity === undefined) {
+    return;
   }
+  const selector =
+    identity.kind === "control"
+      ? focusSelectors[identity.token]
+      : identity.kind === "id"
+        ? focusIDSelectors[identity.id]
+        : `[data-goid="${String(identity.id)}"]`;
+  root.querySelector<HTMLElement | SVGElement>(selector)?.focus();
+}
+
+function isFocusToken(value: string): value is FocusToken {
+  return Object.prototype.hasOwnProperty.call(focusSelectors, value);
+}
+
+function isFocusID(value: string): value is FocusID {
+  return Object.prototype.hasOwnProperty.call(focusIDSelectors, value);
 }
