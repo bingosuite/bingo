@@ -1631,8 +1631,10 @@ new `Thread`, new `GoroutineSnapshotPayload`, new `EventGoroutineSnapshot` +
 auto-emitted on exactly the suspends that can change the concurrency picture —
 **breakpoint hit, pause, and the launch/attach entry stop** — and on demand via
 `CmdGoroutineSnapshot`. It is **NOT** emitted per step: `emitStepped` stays cheap
-(embeds an ID-0 synthetic unknown goroutine, no `allgs` scan) to protect the fragile
-single-step/step-over path from extra per-step memory reads. `emitBreakpointHit`
+(uses only the bounded register/stopped-M current lookup, never an `allgs` scan)
+to protect the fragile single-step/step-over path from a rich per-step walk while
+still reporting a precise stopped goroutine whenever targeted identity is
+available. `emitBreakpointHit`
 / `emitPaused` build the snapshot **once**, embed its current goroutine in the
 stop event, then stream the same snapshot — one build, no double scan, no double
 delta pass. Because the event is dual-purpose (push *and* query answer), the
