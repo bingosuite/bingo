@@ -398,7 +398,7 @@ func declareChurnSpec() {
 // couldn't be cleanly discarded), the next Pause's signal would never surface
 // and waitFor would time out.
 func declarePauseSpec() {
-	It("interrupts a running process on demand and resumes, repeatedly", Label("pause"), func() {
+	It("interrupts a running process on demand and resumes, repeatedly", Label("pause", "signals"), func() {
 		bin := buildTarget("pause_target", basicTargetSrc)
 
 		h := newE2EHarness(bin)
@@ -414,13 +414,36 @@ func declarePauseSpec() {
 			time.Sleep(20 * time.Millisecond)
 
 			Expect(h.d.Pause()).To(Succeed(), "Pause #%d", i)
-			evt := h.waitFor(15*time.Second,
-				protocol.EventPaused, protocol.EventProcessExited, protocol.EventError)
+			evt := awaitPauseWithoutSignalOutput(h.d.Events(), 15*time.Second)
 			Expect(evt.Kind).To(Equal(protocol.EventPaused),
 				"Pause #%d expected Paused, got %s: %s", i, evt.Kind, evt.Payload)
 		}
 		AddReportEntry("pause-iterations", iters)
 	})
+}
+
+func awaitPauseWithoutSignalOutput(events <-chan protocol.Event, timeout time.Duration) protocol.Event {
+	GinkgoHelper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case evt, ok := <-events:
+			if !ok {
+				Fail("events channel closed while waiting for Paused")
+			}
+			switch evt.Kind {
+			case protocol.EventPaused, protocol.EventProcessExited, protocol.EventError:
+				return evt
+			case protocol.EventOutput:
+				var out protocol.OutputPayload
+				if json.Unmarshal(evt.Payload, &out) == nil && strings.HasPrefix(out.Content, "signal ") {
+					Fail(fmt.Sprintf("Pause control signal surfaced as output: %q", out.Content))
+				}
+			}
+		case <-deadline:
+			Fail(fmt.Sprintf("TIMEOUT after %s waiting for Paused (possible hang)", timeout))
+		}
+	}
 }
 
 // --- new operation specs (stepping / inspect / breakpoints / kill) ---
