@@ -254,9 +254,18 @@ func (h *Hub) beginShutdown() debugger.Debugger {
 	return dbg
 }
 
-func discardDebugger(dbg debugger.Debugger) {
-	if dbg != nil {
-		_ = dbg.Kill()
+// discardDebugger tears down a debugger this hub does not own — a candidate
+// rejected during startup, or the instance claimed by shutdown. Kill is
+// idempotent and the hub is the last owner of a discarded debugger, so its
+// failure is logged here (the owning top level, per docs/ErrorHandling.md)
+// rather than returned: every caller is already on a failure path whose
+// original cause must reach the client unchanged.
+func (h *Hub) discardDebugger(dbg debugger.Debugger, reason string) {
+	if dbg == nil {
+		return
+	}
+	if err := dbg.Kill(); err != nil {
+		h.log.Warn("discarded debugger did not shut down cleanly", "reason", reason, "err", err)
 	}
 }
 
@@ -462,7 +471,7 @@ func (h *Hub) prepareCommandDebugger(cmd protocol.Command) (dbg debugger.Debugge
 
 	dbg = h.newDebugger()
 	if h.isClosing() {
-		discardDebugger(dbg)
+		h.discardDebugger(dbg, "start: hub closed before startup")
 		return nil, false, false
 	}
 	// Keep the candidate caller-owned through startup. Installing it first
@@ -473,7 +482,7 @@ func (h *Hub) prepareCommandDebugger(cmd protocol.Command) (dbg debugger.Debugge
 
 func (h *Hub) transferStartedDebugger(dbg debugger.Debugger, cmd protocol.Command, startErr error) bool {
 	if startErr != nil {
-		discardDebugger(dbg)
+		h.discardDebugger(dbg, "start: startup failed")
 		if h.isClosing() {
 			return false
 		}
@@ -482,7 +491,7 @@ func (h *Hub) transferStartedDebugger(dbg debugger.Debugger, cmd protocol.Comman
 		return false
 	}
 	if !h.installDebugger(dbg) {
-		discardDebugger(dbg)
+		h.discardDebugger(dbg, "start: hub closed before install")
 		return false
 	}
 	return true
@@ -653,28 +662,39 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 	if !open {
 		return
 	}
-	discardDebugger(oldDbg)
+	h.discardDebugger(oldDbg, "restart: replaced debugger")
 
 	if h.isClosing() {
 		return
 	}
 	newDbg := h.newDebugger()
+
+	// The replacement is caller-owned from construction until installDebugger
+	// accepts it: it is not in h.dbg, so neither shutdown's snapshot nor Run's
+	// event select can reach it. Dropping it instead of killing it strands a
+	// LockOSThread'd engine loop (and on linux its tracer thread) forever —
+	// only Kill drives that loop to exit. The deferred disposal makes that
+	// obligation structural, so no later early return can reintroduce the leak;
+	// clearing candidate is the single ownership-transfer point.
+	candidate := newDbg
+	defer func() { h.discardDebugger(candidate, "restart: abandoned replacement") }()
+
 	if h.isClosing() {
-		discardDebugger(newDbg)
 		return
 	}
 	if err := newDbg.Launch(program, args, env); err != nil {
 		if h.isClosing() {
 			return
 		}
+		h.log.Warn("command failed", "kind", cmd.Kind, "err", err)
 		h.broadcastError(cmd.Kind, fmt.Errorf("restart: relaunch failed: %w", err))
 		h.transitionState(protocol.StateIdle)
 		return
 	}
 	if !h.installDebugger(newDbg) {
-		discardDebugger(newDbg)
 		return
 	}
+	candidate = nil
 	h.lastLaunch = &protocol.LaunchPayload{Program: program, Args: args, Env: env}
 	if !h.transitionState(protocol.StateRunning) {
 		return
@@ -871,6 +891,6 @@ func (h *Hub) shutdown() {
 		dbg := h.beginShutdown()
 		close(h.shutdownCh)
 		h.registry.closeAll()
-		discardDebugger(dbg)
+		h.discardDebugger(dbg, "hub shutdown")
 	})
 }
