@@ -1328,8 +1328,18 @@ legitimately disagree:
   `EventBreakpointSet` and dropped **only** by a confirmed
   `EventBreakpointCleared`. Never on intent.
 - `desired` — the newest request's intent for that line (latest wins).
-- `pending` — the single in-flight `bpOp` for that line. One op per line at a
+- `pending` — the single LIVE `bpOp` for that line. One live op per line at a
   time is what keeps the id-less `setQ`/`clearQ` FIFOs unambiguous.
+
+An operation is **abandoned** when a restart discards its line: it stops being
+that line's `pending` op (so the line can converge again immediately instead of
+latching behind a removal that already happened), but it keeps its place in the
+FIFO, because the debugger will still answer it and that answer must pop the head
+it reserved or every later confirmation correlates to the wrong request.
+`liveLineLocked` is the gate — it matches the popped op against the line's
+current `pending`, so an abandoned (or superseded, or forgotten) op's answer does
+exactly one thing: pop. It never settles waiters, fails owners, or writes state
+that now belongs to a re-identified line.
 
 `advanceLineLocked` is the convergence loop: it issues the one command the
 installed/desired gap calls for, or settles everyone parked on the line when the
@@ -1343,6 +1353,9 @@ two already agree. Every confirmation re-enters it, which yields the invariants:
   leave a breakpoint the client can never remove — `breakpointTable.clear` keeps
   the entry when the memory write fails, so the trap really is still armed. The
   failure path deliberately does not re-enter the loop; a new request retries.
+  That no-retry rule is justified **only** while the line is still armed: with
+  nothing armed there is nothing to retry and nothing to report, so the removal
+  completes successfully and the line resumes converging rather than stalling.
 - A **pending Set superseded before it confirms** is cancelled on confirm: the id
   is recorded as a fact (the trap IS armed) but `desired` stays false, so the
   next advance clears it immediately. It is never committed as desired state.
@@ -1375,8 +1388,12 @@ keeping the pre-restart id would strand the line on an identifier the new engine
 never issued (the already-marshalled clear fails, retain-on-failure reissues that
 dead id forever, and the real new breakpoint becomes unremovable). Only a line
 with `installedID == 0` is skipped: it owns no identity yet, so a payload entry
-for it describes another driver's breakpoint. Do not reset `setQ`/`clearQ`; those
-FIFOs still own any in-flight confirmations.
+for it describes another driver's breakpoint. A **discarded** line goes further:
+it abandons its in-flight operation (see above) — the command was addressed to a
+breakpoint the relaunched process no longer has, so its answer can only be stale,
+and leaving it live would latch the line behind a removal that already happened.
+Do not reset `setQ`/`clearQ`; those FIFOs still own any in-flight confirmations,
+abandoned ones included.
 
 **This transaction depends on reliable ordinary-command delivery** (#160 / #162).
 There are deliberately no adapter-side timeouts — inventing one would mask
@@ -1529,8 +1546,9 @@ translator keeps DAP entirely outside the hub — a strictly additive package.
   partial clear failure, a superseded pending set clears exactly once, an
   overlapping pending set issues one command, set→remove→re-add leaves one live
   breakpoint, cross-source independence, restart re-identification with an
-  in-flight operation, no-drop/in-order command delivery, exactly-once
-  responses). Run with the normal
+  in-flight operation, a discarded line abandoning its operation (later set,
+  already-satisfied removal, late stale success), no-drop/in-order command
+  delivery, exactly-once responses). Run with the normal
   `go test -tags bingonative ./internal/dap/...`.
 - E2E: label `dap` in [test/integration](test/integration/) — a real go-dap
   client over TCP through the WHOLE stack (client → TCP →

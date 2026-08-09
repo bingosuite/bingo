@@ -235,7 +235,7 @@ func (h *Handler) onBreakpointSet(evt protocol.Event) {
 	h.mu.Lock()
 	var ready []*bpRequest
 	if op := h.popSetLocked(); op != nil {
-		if st := h.bpByFile[op.file][op.line]; st != nil {
+		if st := h.liveLineLocked(op); st != nil {
 			st.pending = nil
 			st.installedID = p.Breakpoint.ID
 			st.loc = p.Breakpoint.Location
@@ -259,7 +259,7 @@ func (h *Handler) onBreakpointCleared() {
 	h.mu.Lock()
 	var ready []*bpRequest
 	if op := h.popClearLocked(); op != nil {
-		if st := h.bpByFile[op.file][op.line]; st != nil {
+		if st := h.liveLineLocked(op); st != nil {
 			st.pending = nil
 			st.installedID = 0
 			st.dapID = 0
@@ -297,6 +297,25 @@ func (h *Handler) popClearLocked() *bpOp {
 	op := h.clearQ[0]
 	h.clearQ = h.clearQ[1:]
 	return op
+}
+
+// liveLineLocked returns the line an operation still speaks for, or nil if the
+// operation has been abandoned — its line was discarded by a restart, forgotten,
+// or has since moved on to a different operation.
+//
+// An abandoned operation keeps its place in setQ/clearQ, because the debugger
+// will still answer it and that answer has to pop the queue head it reserved or
+// every later confirmation correlates to the wrong request. But it must not
+// settle waiters, fail owners, or write state: the removal it was performing was
+// already accounted for when it was abandoned, and the line's identity now
+// belongs to whatever replaced it. So its answer does exactly one thing — pop.
+// Caller MUST hold h.mu.
+func (h *Handler) liveLineLocked(op *bpOp) *bpLine {
+	st := h.bpByFile[op.file][op.line]
+	if st == nil || st.pending != op {
+		return nil
+	}
+	return st
 }
 
 func (h *Handler) onFrames(evt protocol.Event) {
@@ -474,10 +493,16 @@ func (h *Handler) reconcileRestartBreakpointsLocked(p protocol.RestartedPayload)
 		st.desired = false
 		st.loc = protocol.Location{}
 		st.failure = dropped.Reason
+		// Abandon any operation still in flight against the dropped line. Its
+		// command was addressed to a breakpoint the relaunched process no longer
+		// has, so its answer can only be stale — leaving it as the line's live
+		// operation would latch the line, blocking every later request behind a
+		// removal that has already happened. The op stays queued in
+		// setQ/clearQ purely so its answer pops the right head (see
+		// liveLineLocked).
+		st.pending = nil
 		// The breakpoint is gone, so anyone parked on the line — including a
-		// request still waiting for it to be removed — can be answered now. Any
-		// in-flight operation is left to run its course; its confirmation finds
-		// a line that no longer has anything to converge.
+		// request still waiting for it to be removed — can be answered now.
 		ready = append(ready, h.settleLineLocked(dropped.Location.File, dropped.Location.Line)...)
 		discarded = append(discarded, godap.Breakpoint{
 			Id:       dapID,
@@ -684,7 +709,7 @@ func (h *Handler) failBreakpointSet(msg string) {
 	h.mu.Lock()
 	var ready []*bpRequest
 	if op := h.popSetLocked(); op != nil {
-		if st := h.bpByFile[op.file][op.line]; st != nil {
+		if st := h.liveLineLocked(op); st != nil {
 			st.pending = nil
 			st.failure = msg
 			st.desired = false
@@ -704,12 +729,13 @@ func (h *Handler) failBreakpointClear(msg string) {
 	h.mu.Lock()
 	var ready []*bpRequest
 	if op := h.popClearLocked(); op != nil {
-		if st := h.bpByFile[op.file][op.line]; st != nil {
+		if st := h.liveLineLocked(op); st != nil {
 			st.pending = nil
 			ready = h.failClearLocked(op.file, op.line, msg)
 		}
 	}
 	h.mu.Unlock()
 
+	h.flushCommands()
 	h.respond(ready)
 }
