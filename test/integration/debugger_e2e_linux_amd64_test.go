@@ -371,6 +371,29 @@ func (p *overlapProbe) record(evt protocol.Event, where string, late bool) {
 	}
 }
 
+// awaitFrom drains a harness's event channel until one of kinds arrives. It
+// takes the harness rather than a probe so a spec can wait on a tracee it holds
+// no breakpoint bookkeeping for.
+func awaitFrom(h *e2eHarness, timeout time.Duration, kinds ...protocol.EventKind) protocol.Event {
+	GinkgoHelper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case evt, ok := <-h.d.Events():
+			if !ok {
+				Fail(fmt.Sprintf("events channel closed while waiting for %v", kinds))
+			}
+			for _, k := range kinds {
+				if evt.Kind == k {
+					return evt
+				}
+			}
+		case <-deadline:
+			Fail(fmt.Sprintf("TIMEOUT after %s waiting for %v (possible hang)", timeout, kinds))
+		}
+	}
+}
+
 // await drains until one of kinds arrives, tallying the engine's signal reports
 // so a spec can prove the foreign-signal path was actually exercised.
 func (p *overlapProbe) await(timeout time.Duration, kinds ...protocol.EventKind) protocol.Event {
@@ -560,8 +583,11 @@ func declareStepOverlapSignalSpec() {
 //     parked signal stop can only be this interrupt arriving mid-step.
 //   - The interrupt must SURFACE as EventPaused at least once during the race,
 //     proving it is delivered rather than swallowed.
-//   - A final quiet phase with both traps cleared requires an actual
-//     EventPaused, proving delivery end to end even with no race at all.
+//   - A final quiet phase against a SECOND, breakpoint-free tracee requires an
+//     actual EventPaused, proving delivery end to end with no race at all.
+//     Clearing this tracee's breakpoints instead is not sufficient: the engine
+//     is parked on one, and Continue-from-a-breakpoint re-arms it through the
+//     step-off path's reinstall, restoring a competing stop source.
 //
 // The EventPaused count is asserted only across the whole run, never per cycle:
 // a held interrupt surfaces when it drains while manualStopPending is still set
@@ -642,21 +668,34 @@ func declareStepOverlapPauseSpec() {
 			Expect(evt.Kind).NotTo(Or(Equal(protocol.EventProcessExited), Equal(protocol.EventError)),
 				"final Continue unexpected %s: %s", evt.Kind, evt.Payload)
 
+			// Both logical breakpoints survived the whole race and are still
+			// clearable by their original id — the integrity invariant issue
+			// #199 broke, checked here as everywhere else in this label.
+			for _, id := range []int{idA, idB} {
+				Expect(p.h.d.ClearBreakpoint(id)).To(Succeed(), "clear bp %d after the race", id)
+			}
+
 			// Deterministic end-to-end delivery check. The racing loop's
 			// EventPaused count is reliably non-zero but is not guaranteed per
-			// cycle (see below), so it cannot stand alone. Remove the only
-			// competing stop source and pause a freely running tracee: with
-			// both traps cleared, the SIGSTOP that Pause directs at the main
-			// thread is the ONLY stop that can occur, so EventPaused is
-			// required.
-			for _, id := range []int{idA, idB} {
-				Expect(p.h.d.ClearBreakpoint(id)).To(Succeed(), "clear bp %d before the quiet pause", id)
-			}
-			Expect(p.h.d.Continue()).To(Succeed(), "quiet Continue")
+			// cycle (see below), so it cannot stand alone.
+			//
+			// It runs against a SECOND, breakpoint-free tracee rather than
+			// against this one with its breakpoints cleared. Clearing is not
+			// enough: the engine reaches this point parked on a breakpoint, and
+			// a Continue from a breakpoint goes through the step-off path,
+			// whose reinstall re-arms the trap and re-adds it to the table
+			// under the same id — the documented clear-while-parked behaviour.
+			// A spinner then hits it and the pause has a competing stop source
+			// again. A tracee that never had a breakpoint has no such path, so
+			// the SIGSTOP Pause directs at the main thread is the only stop
+			// that can occur and EventPaused is strictly required.
+			quiet := newE2EHarness(buildTarget("overlap_pause_quiet", overlapTargetSrc))
+			quiet.waitFor(20*time.Second, protocol.EventStepped)
+			Expect(quiet.d.Continue()).To(Succeed(), "quiet Continue")
 
-			Eventually(func() error { return p.h.d.Pause() }, 30*time.Second, 50*time.Millisecond).
+			Eventually(func() error { return quiet.d.Pause() }, 30*time.Second, 50*time.Millisecond).
 				Should(Succeed(), "Pause was never accepted against a freely running tracee with no breakpoints set")
-			evt = p.await(30*time.Second,
+			evt = awaitFrom(quiet, 30*time.Second,
 				protocol.EventPaused, protocol.EventBreakpointHit, protocol.EventStepped,
 				protocol.EventProcessExited, protocol.EventError)
 			Expect(evt.Kind).To(Equal(protocol.EventPaused),
