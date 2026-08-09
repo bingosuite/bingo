@@ -737,6 +737,25 @@ confirmations like `BreakpointSet`). If clients saw both streams interleaved,
 they'd see two overlapping monotonic sequences and couldn't detect drops.
 **Always go through `h.seq.Add(1)` before broadcasting.**
 
+## Hub debugger ownership — shutdown is a linearization point
+
+`internal/hub.Hub` guards both `dbg` and `closing` with `dbgMu`. A factory-created
+debugger is not owned by the hub until `installDebugger` accepts it under that
+lock. Shutdown takes the same lock, marks ownership closed, and removes the
+currently installed debugger atomically; it calls `Kill` only after releasing
+the lock. If shutdown wins, installation is rejected and the command path must
+discard the candidate debugger itself, then return without changing session
+state or broadcasting. If installation wins, shutdown removes and tears down
+that debugger. This covers both the initial Launch/Attach factory gap and
+Restart's longer constructor/relaunch gap, so no live tracee can appear after
+the hub and session have already exited.
+
+Never hold `dbgMu` across a `Debugger` method or socket I/O. Run-loop reads take
+a short snapshot via `currentDebugger`; teardown paths detach ownership under
+the lock and perform the idempotent `Kill` outside it. State transitions also
+check `closing` under `dbgMu`, preventing a command already in flight from
+resurrecting a session after registry teardown begins.
+
 ## Restart — hub-level, not engine-level
 
 `CmdRestart` (`internal/hub/hub.go` → `handleRestart`) kills the current
