@@ -957,6 +957,55 @@ describe("totals must not contradict what arrived", () => {
   });
 });
 
+describe("current goroutine must be delivered", () => {
+  // The producer's invariant: current is either 0 or names a goroutine in the
+  // payload. A degraded result drops it rather than pointing at nothing.
+  it("rejects a current goid that was not delivered", () => {
+    assert.throws(
+      () =>
+        decodeEvent(
+          frame(1, "GoroutineSnapshot", {
+            goroutines: [
+              { id: 1, status: "running", currentLoc: { file: "a.go", line: 1 } },
+            ],
+            threads: [],
+            current: 999,
+          }),
+        ),
+      /current goroutine 999 is not among the delivered goroutines/u,
+    );
+  });
+
+  it("accepts a degraded snapshot that reports no current", () => {
+    const decoded = decodeEvent(
+      frame(1, "GoroutineSnapshot", {
+        goroutines: [],
+        threads: [],
+        created: [7, 8],
+        exited: [3],
+        totals: { goroutines: 6000 },
+      }),
+    );
+    assert.equal(decoded.snapshot?.current, 0);
+    assert.deepEqual(decoded.snapshot?.created, [7, 8]);
+    assert.deepEqual(decoded.snapshot?.exited, [3]);
+    assert.equal(decoded.snapshot?.totals?.goroutines, 6000);
+  });
+
+  it("accepts a current goid that is present", () => {
+    const decoded = decodeEvent(
+      frame(1, "GoroutineSnapshot", {
+        goroutines: [
+          { id: 4, status: "running", current: true, currentLoc: { file: "a.go", line: 1 } },
+        ],
+        threads: [],
+        current: 4,
+      }),
+    );
+    assert.equal(decoded.snapshot?.current, 4);
+  });
+});
+
 describe("truthful omission surfacing", () => {
   it("reports server omissions separately from the view cap", () => {
     const view = toSessionViewModel(
