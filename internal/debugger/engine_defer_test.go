@@ -1,6 +1,7 @@
 package debugger_test
 
 import (
+	"fmt"
 	"syscall"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -23,6 +24,14 @@ import (
 //
 // These specs drive the engine's stop machine directly through the fake
 // backend, so they are deterministic and platform-independent.
+// opsFrom returns the backend calls recorded after index n.
+func opsFrom(all []string, n int) []string {
+	if n > len(all) {
+		return nil
+	}
+	return all[n:]
+}
+
 var _ = Describe("Engine foreign-thread stop deferral", func() {
 	const (
 		addrA = uint64(0x4000)
@@ -213,6 +222,71 @@ var _ = Describe("Engine foreign-thread stop deferral", func() {
 		})
 	})
 
+	// Releasing the parked thread spends the TID-less continue, so the thread
+	// the deferred stop belongs to can only be resumed with SingleStep. If that
+	// thread is sitting ON an armed trap the step EXECUTES it, and the backend
+	// reports the resulting SIGTRAP as the step's own completion (it keys on
+	// stepping && tid == stepTID and cannot tell the two apart) — which would
+	// swallow the hit and resume the thread from mid-instruction. The resume
+	// must therefore step the thread OVER the trap instead of through it.
+	Describe("resuming a deferred thread that is parked on an armed trap", func() {
+		It("steps it over the trap rather than through it, and never swallows the hit", func() {
+			idA, extra := parkAtBreakpointA(addrB)
+			idB := extra[0]
+			startStepOver()
+
+			// tidB takes an ordinary signal while sitting exactly on addrB's
+			// trap. This is the auto-resume path, which does not go through
+			// resumeFromBreakpoint.
+			fb.pushStop(debugger.StopEvent{
+				Reason: debugger.StopSignal, TID: tidB, PC: addrB, Signal: int(syscall.SIGCHLD),
+			})
+			Eventually(func() int { return debugger.ExportedDeferral(d).Deferred }).Should(Equal(1))
+
+			opsBefore := len(fb.ops())
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopSingleStep, TID: tidA, PC: addrA + 1})
+			Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventOutput))
+
+			st := debugger.ExportedDeferral(d)
+			Expect(st.InternalStepTID).To(BeZero(),
+				"a thread on an armed trap must not be resumed by the raw internal step")
+			Expect(st.StepTID).To(Equal(tidB), "it must be stepped over its own breakpoint")
+			Expect(fb.peekMem(addrB, len(trap))).NotTo(Equal(trap),
+				"the trap under the resumed thread must be disarmed for the step")
+			Expect(fb.peekMem(addrA, len(trap))).To(Equal(trap),
+				"the stepped-over breakpoint stays armed throughout")
+
+			// Ordering is load-bearing at two points: the stepped-over trap goes
+			// back before anything else runs, and the disarming write for the
+			// resumed thread targets the backend's current stop thread — still
+			// the parked one. Releasing first would aim that write at a live
+			// thread (ESRCH on linux).
+			Expect(opsFrom(fb.ops(), opsBefore)).To(Equal([]string{
+				fmt.Sprintf("write:0x%x", addrA),
+				fmt.Sprintf("write:0x%x", addrB),
+				"continue",
+				fmt.Sprintf("step:%d", tidB),
+			}), "reinstall, then disarm, then release the parked thread, then step")
+
+			resumesBefore := fb.continueCount()
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopSingleStep, TID: tidB, PC: addrB + 1})
+
+			_, ok := nextEvent(d)
+			Expect(ok).To(BeFalse(), "an internal resume must stay invisible to clients")
+
+			st = debugger.ExportedDeferral(d)
+			Expect(st.StepTID).To(BeZero())
+			Expect(st.InternalStepTID).To(BeZero())
+			Expect(fb.continueCount()).To(Equal(resumesBefore+1),
+				"the thread is continued only after its trap is back")
+			Expect(fb.peekMem(addrB, len(trap))).To(Equal(trap),
+				"the trap must be reinstalled before the thread runs on")
+			Expect(debugger.ExportedBreakpointArmedAt(d, addrA)).To(BeTrue())
+			Expect(debugger.ExportedBreakpointArmedAt(d, addrB)).To(BeTrue())
+			Expect(debugger.ExportedBreakpointIDs(d)).To(ConsistOf(idA, idB))
+		})
+	})
+
 	Describe("a foreign breakpoint arriving during a plain StepInto", func() {
 		It("still completes exactly one step, then reports the sibling on the next resume", func() {
 			idB := debugger.ExportedSetBreakpointAt(d, addrB)
@@ -247,6 +321,44 @@ var _ = Describe("Engine foreign-thread stop deferral", func() {
 			Expect(fb.continueCount()).To(Equal(resumesBefore),
 				"a resume with stops still parked must deliver them instead of running the world on")
 			Expect(debugger.ExportedDeferral(d).ParkedTID).To(Equal(tidA))
+		})
+	})
+
+	Describe("a Pause interrupt surfacing on a foreign thread mid-step", func() {
+		It("is withheld until the step completes, then still reports EventPaused", func() {
+			parkAtBreakpointA()
+			startStepOver()
+
+			Expect(d.Pause()).To(Succeed())
+			fb.pushStop(debugger.StopEvent{
+				Reason: debugger.StopSignal, TID: tidB, PC: addrB, Signal: fb.PauseSignal(),
+			})
+
+			_, ok := nextEvent(d)
+			Expect(ok).To(BeFalse(), "a Pause must not be reported while a step is in flight")
+			Expect(debugger.ExportedDeferral(d).Deferred).To(Equal(1))
+			Expect(fb.peekMem(addrA, len(trap))).NotTo(Equal(trap),
+				"a deferred Pause must not trigger an early reinstall")
+
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopSingleStep, TID: tidA, PC: addrA + 1})
+
+			evt := mustNextEvent(d)
+			Expect(evt.Kind).To(Equal(protocol.EventPaused),
+				"the pending Pause must still be honoured after the step completes")
+			Expect(fb.peekMem(addrA, len(trap))).To(Equal(trap))
+			Expect(debugger.ExportedBreakpointArmedAt(d, addrA)).To(BeTrue())
+
+			// The stepped thread is still parked; the resume that ends the
+			// pause has to discharge it rather than strand it.
+			st := debugger.ExportedDeferral(d)
+			Expect(st.Deferred).To(BeZero())
+			Expect(st.ParkedTID).To(Equal(tidA))
+
+			resumesBefore := fb.continueCount()
+			Expect(d.Continue()).To(Succeed())
+			Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventContinued))
+			Eventually(fb.continueCount).Should(BeNumerically(">", resumesBefore))
+			Expect(debugger.ExportedDeferral(d).ParkedTID).To(BeZero())
 		})
 	})
 

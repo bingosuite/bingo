@@ -513,6 +513,28 @@ when stops are still queued, and otherwise releases the parked one and re-points
 `traceTID` at the current thread with a marker single-step (`internalStepTID`,
 swallowed without a user event).
 
+**That marker single-step must never be issued on a thread sitting on an armed
+trap.** `ContinueProcess` onto a trap is safe (it reports an ordinary
+`StopBreakpoint`), but `SingleStep(tid)` *executes* the trap, and the linux
+backend classifies the resulting `cause==0` SIGTRAP purely by
+`stepping && tid == stepTID` — so a trap hit is indistinguishable from a step
+completion. The `internalStepTID` branch would then swallow a real breakpoint hit
+and continue from `bpaddr+1`, i.e. mid-instruction on amd64. So when
+`resumeTracee` is about to spend the TID-less continue on the parked thread, it
+first checks `armedBreakpointAt(current)` and, if a trap is armed there, disarms
+it and routes the resume through the ordinary step-over machinery
+(`steppingOverBP` + `bpResumeContinue` + `stepThreadOverBP`) instead: the
+existing `StopSingleStep` handler reinstalls the trap and then continues without
+emitting anything. `internalStepTID` is deliberately **not** set on that path, or
+the swallow branch — which runs before the reinstall block — would pre-empt the
+reinstall. The disarming `WriteMemory` must precede `releaseParked` for the same
+`traceTID` reason as everywhere else, and every failure after it rolls back via
+`rearmInternalStepOver`. A register-read failure degrades to "assume no trap"
+(logged) rather than erroring the stop. Landing *on* a trap after the marker step
+is fine — the following `ContinueProcess` executes it and reports a normal hit.
+`internalStepTID` is also cleared if its step ever ends by a non-`StopSingleStep`
+route, so a stale marker cannot swallow an unrelated later stop.
+
 **Explicit limits — this is NOT an atomic stop-the-world step-over.** Sibling
 threads keep running and keep trapping during a step; the fix only guarantees
 that their stops are *reported later*, after the trap is back. Consequences to
@@ -543,7 +565,8 @@ keep in mind:
 Regression gates: the deterministic `fakeBackend` specs in
 [engine_defer_test.go](internal/debugger/engine_defer_test.go) (distinct
 sibling, same-address sibling, foreign signal, foreign stop during a plain
-`StepInto`, teardown with a non-empty queue) and the linux-only `overlap`
+`StepInto`, a foreign `Pause` interrupt, a deferred thread parked on an armed
+trap, teardown with a non-empty queue) and the linux-only `overlap`
 E2E label in
 [debugger_e2e_linux_amd64_test.go](test/integration/debugger_e2e_linux_amd64_test.go),
 which asserts only invariants the fix guarantees — both logical breakpoints
