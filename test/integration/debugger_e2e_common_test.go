@@ -20,6 +20,7 @@
 //
 //	BINGO_E2E_ITERS        (default 25)   basic continue+stepover iterations
 //	BINGO_E2E_CHURN_ITERS  (default 200)  churn iterations and target watchdog budget
+//	BINGO_E2E_CURRENT_GOROUTINES           opt-in over-cap current-g proof size
 //	BINGO_E2E_DEBUG        (unset)        route engine debug logs + every event to stderr
 
 package integration
@@ -422,6 +423,51 @@ func declareBaselineOwnershipSpec() {
 			"the automatic snapshot still owns the delta the query observed but must not consume")
 	})
 }
+
+const currentGoroutineTargetTemplate = `package main
+
+import (
+	"os"
+	"runtime"
+	"time"
+)
+
+var sink int
+
+//go:noinline
+func breakpointWorker(index int) {
+	sink = index // BP_CURRENT
+	select {}
+}
+
+func worker(index int, release <-chan struct{}, ready chan<- struct{}) {
+	ready <- struct{}{}
+	<-release
+	breakpointWorker(index)
+}
+
+func main() {
+	go func() {
+		time.Sleep(180 * time.Second)
+		os.Exit(0)
+	}()
+	runtime.GOMAXPROCS(4)
+
+	const goroutines = %d
+	releases := make([]chan struct{}, goroutines)
+	ready := make(chan struct{}, goroutines)
+	for i := range releases {
+		releases[i] = make(chan struct{})
+		go worker(i, releases[i], ready)
+	}
+	for range goroutines {
+		<-ready
+	}
+
+	close(releases[%d])
+	select {}
+}
+`
 
 // declareBasicStepOverSpec adds the continue+step-over acceptance spec to the
 // enclosing Ginkgo container. It is the correctness gate: set a breakpoint on a
@@ -1138,6 +1184,87 @@ func declareConcurrencySpec() {
 		Expect(findByStart(exited.Goroutines, "main.leaf")).To(BeNil(),
 			"leaf gone from the live set")
 	})
+}
+
+func declareCurrentGoroutineScanSpec() {
+	Describe("current goroutine discovery", Label("current-goroutine"), func() {
+		It("keeps the stopped goroutine coherent for a small target", func() {
+			assertCurrentGoroutineScan(64)
+		})
+
+		It("keeps the stopped goroutine coherent beyond the rich scan cap", func() {
+			count := envInt("BINGO_E2E_CURRENT_GOROUTINES", 0)
+			if count == 0 {
+				Skip("set BINGO_E2E_CURRENT_GOROUTINES to at least 20000 to run the heavy native proof")
+			}
+			Expect(count).To(BeNumerically(">=", 20_000),
+				"heavy proof must place its released tail worker beyond both bounded allgs windows")
+			assertCurrentGoroutineScan(count)
+		})
+	})
+}
+
+func assertCurrentGoroutineScan(count int) {
+	GinkgoHelper()
+	Expect(count).To(BeNumerically(">", 0), "target count must be positive")
+
+	releaseIndex := count - 1
+	if count > 1024 {
+		releaseIndex = count - 1024
+	}
+	src := fmt.Sprintf(currentGoroutineTargetTemplate, count, releaseIndex)
+	line := markerLine(src, "// BP_CURRENT")
+	bin := buildTarget(fmt.Sprintf("current_goroutine_%d_target", count), src)
+
+	h := newE2EHarness(bin)
+	h.waitFor(15*time.Second, protocol.EventStepped)
+
+	_, err := h.d.SetBreakpoint(filepath.Base(bin)+".go", line)
+	Expect(err).NotTo(HaveOccurred(), "SetBreakpoint on current-goroutine worker")
+	Expect(h.d.Continue()).To(Succeed(), "Continue to current-goroutine worker")
+
+	stopTimeout := 30 * time.Second
+	if count > 8192 {
+		stopTimeout = 8 * time.Minute
+	}
+	evt := h.waitFor(stopTimeout,
+		protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+	Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit),
+		"expected BreakpointHit, got %s: %s", evt.Kind, evt.Payload)
+	var hit protocol.BreakpointHitPayload
+	Expect(json.Unmarshal(evt.Payload, &hit)).To(Succeed(), "decode BreakpointHit")
+	Expect(hit.Frames).NotTo(BeEmpty(), "BreakpointHit carries the stopped thread's frames")
+
+	evt = h.waitFor(stopTimeout, protocol.EventGoroutineSnapshot)
+	var snap protocol.GoroutineSnapshotPayload
+	Expect(json.Unmarshal(evt.Payload, &snap)).To(Succeed(), "decode GoroutineSnapshot")
+
+	currentGoroutines := 0
+	for _, g := range snap.Goroutines {
+		if g.Current {
+			currentGoroutines++
+		}
+	}
+	currentThreads := 0
+	for _, thread := range snap.Threads {
+		if thread.Current {
+			currentThreads++
+		}
+	}
+	GinkgoWriter.Printf(
+		"current-goroutine proof: live=%d delivered=%d hit={id:%d current:%t loc:%+v} frame0=%+v snapshot={current:%d marked:%d} currentThreads=%d\n",
+		count, len(snap.Goroutines), hit.Goroutine.ID, hit.Goroutine.Current,
+		hit.Goroutine.CurrentLoc, hit.Frames[0].Location, snap.Current,
+		currentGoroutines, currentThreads,
+	)
+
+	Expect(hit.Goroutine.Current).To(BeTrue(), "BreakpointHit must identify the stopped goroutine")
+	Expect(hit.Goroutine.CurrentLoc).To(Equal(hit.Frames[0].Location),
+		"BreakpointHit goroutine location must match the real stopped thread's innermost frame")
+	Expect(snap.Current).To(Equal(hit.Goroutine.ID),
+		"snapshot Current must identify the goroutine embedded in BreakpointHit")
+	Expect(currentGoroutines).To(Equal(1), "exactly one snapshot goroutine is current")
+	Expect(currentThreads).To(Equal(1), "exactly one runtime thread is current")
 }
 
 // findByStart returns the first goroutine whose start function matches fn, or

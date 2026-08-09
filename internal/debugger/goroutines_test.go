@@ -321,7 +321,7 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 		clipped := debugger.ExportedGoroutineWalkResult(d)
 
 		Expect(clipped).To(Equal(debugger.ExportedWalkResult{
-			Count:    debugger.ExportedMaxGoroutineScan(),
+			Count:    debugger.ExportedMaxGoroutineScan() + 1,
 			Complete: true,
 			Clipped:  true,
 		}))

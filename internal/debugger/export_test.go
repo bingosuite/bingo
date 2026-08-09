@@ -138,7 +138,7 @@ func ExportedThreadWalkResult(d Debugger) ExportedWalkResult {
 	e := d.(*engine)
 	var out ExportedWalkResult
 	if err := e.dispatch(func() error {
-		_, pc := e.liveRegisters()
+		_, pc, _ := e.liveRegisters()
 		result := e.readThreads(0, pc)
 		out = ExportedWalkResult{
 			Count:    len(result.Items),
@@ -156,8 +156,8 @@ func ExportedGoroutineWalkResult(d Debugger) ExportedWalkResult {
 	e := d.(*engine)
 	var out ExportedWalkResult
 	if err := e.dispatch(func() error {
-		sp, pc := e.liveRegisters()
-		result := e.buildGoroutineList(sp, pc)
+		sp, pc, currentGptr := e.liveRegisters()
+		result := e.buildGoroutineList(sp, pc, currentGptr)
 		out = ExportedWalkResult{
 			Count:    len(result.Items),
 			Complete: result.Complete,
@@ -449,7 +449,7 @@ func ExportedSnapshotFrom(d Debugger, gs []protocol.Goroutine, trackLifecycle bo
 	e := d.(*engine)
 	var snap protocol.GoroutineSnapshotPayload
 	if err := e.dispatch(func() error {
-		current, live := snapshotGoroutineState(gs)
+		live, current := snapshotGoroutineIDs(gs, 0)
 		snap = e.snapshotFrom(gs, nil, current, live, trackLifecycle)
 		return nil
 	}); err != nil {
