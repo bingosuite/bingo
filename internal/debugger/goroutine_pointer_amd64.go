@@ -8,3 +8,11 @@ package debugger
 func (e *engine) archCurrentGoroutinePointer(regs Registers) (uint64, bool) {
 	return 0, false
 }
+
+// Linux reports kernel TIDs in both ptrace stops and runtime.m.procid.
+func (e *engine) archRuntimeMProcID(tid int) (uint64, bool) {
+	if tid <= 0 {
+		return 0, false
+	}
+	return uint64(tid), true
+}

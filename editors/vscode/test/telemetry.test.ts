@@ -5,18 +5,19 @@ import {
   decodeEvent,
   maximumEnvelopeBytes,
   maximumGoroutines,
+  maximumThreads,
   SequenceTracker,
   snapshotCommand,
 } from "../src/telemetry.js";
-import { envelope, goroutine, snapshot } from "./fixtures.js";
+import { envelope, goroutine, snapshot, thread } from "./fixtures.js";
 
 describe("telemetry codec", () => {
-  it("decodes protocol 1.2 snapshots and emits only the read-only command", () => {
+  it("decodes protocol 1.3 snapshots and emits only the read-only command", () => {
     const decoded = decodeEvent(envelope(1, "GoroutineSnapshot", snapshot()));
     assert.equal(decoded.kind, "GoroutineSnapshot");
     assert.equal(decoded.snapshot?.goroutines[0]?.id, 1);
     assert.deepEqual(JSON.parse(snapshotCommand()), {
-      v: "1.2",
+      v: "1.3",
       kind: "GoroutineSnapshot",
       payload: {},
     });
@@ -31,6 +32,28 @@ describe("telemetry codec", () => {
     );
     assert.deepEqual(decoded.snapshot?.goroutines, []);
     assert.deepEqual(decoded.snapshot?.threads, []);
+  });
+
+  it("accepts the synthetic unknown goroutine id", () => {
+    const decoded = decodeEvent(
+      envelope(
+        1,
+        "GoroutineSnapshot",
+        snapshot([goroutine(0, 0, { status: "unknown", current: true })], []),
+      ),
+    );
+    assert.equal(decoded.snapshot?.goroutines[0]?.id, 0);
+    assert.equal(decoded.snapshot?.goroutines[0]?.status, "unknown");
+  });
+
+  it("accepts the bounded rich thread prefix plus current anchor", () => {
+    const threads = Array.from({ length: maximumThreads }, (_, index) =>
+      thread(index + 1),
+    );
+    const decoded = decodeEvent(
+      envelope(1, "GoroutineSnapshot", snapshot(undefined, threads)),
+    );
+    assert.equal(decoded.snapshot?.threads.length, maximumThreads);
   });
 
   it("rejects malformed, incompatible, oversized, and hostile payloads", () => {
@@ -80,7 +103,7 @@ describe("telemetry codec", () => {
       () =>
         decodeEvent(
           JSON.stringify({
-            v: "1.2",
+            v: "1.3",
             kind: "Continued",
             seq: 1,
             payload: {},
@@ -93,7 +116,7 @@ describe("telemetry codec", () => {
       () =>
         decodeEvent(
           JSON.stringify({
-            v: "1.2",
+            v: "1.3",
             kind: "FutureEvent",
             seq: 1,
             payload: {},

@@ -15,6 +15,10 @@ describe("webview message codec", () => {
       { type: "selectGoroutine", id: 42 },
     );
     assert.deepEqual(
+      decodeWebviewMessage({ type: "selectGoroutine", id: 0 }),
+      { type: "selectGoroutine", id: 0 },
+    );
+    assert.deepEqual(
       decodeWebviewMessage({
         type: "rendered",
         generation: 3,
