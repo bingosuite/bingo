@@ -104,6 +104,14 @@ export class TelemetryObserver {
   }
 
   public refresh(): void {
+    // Refresh doubles as the manual recovery path. A fatal latch stops the
+    // AUTOMATIC reconnect ladder (which would replay the same bad frame), but an
+    // explicit user action is not a loop, so it clears the latch and redials.
+    if (this.#fatal && !this.#disposed) {
+      this.#fatal = false;
+      this.#connect(0);
+      return;
+    }
     this.#sendSnapshot();
   }
 
@@ -174,9 +182,14 @@ export class TelemetryObserver {
         return;
       }
       if (isOversizedFrame(error)) {
-        this.#fail(
-          `telemetry frame exceeds the ${String(maximumTransportBytes)} byte transport limit: ${error.message}`,
-        );
+        // A frame above the TRANSPORT cap is never delivered, so its kind is
+        // unknowable — and the contract only covers two kinds. A large but
+        // perfectly legal Locals/Frames/Evaluate broadcast can land here, so
+        // this stays transient: latch only when a violation is proven.
+        this.#update({
+          error: `telemetry frame exceeds the ${String(maximumTransportBytes)} byte transport limit: ${error.message}`,
+        });
+        socket.close();
         return;
       }
       this.#update({ error: error.message });
