@@ -69,13 +69,23 @@ func (c *config) validate() error {
 	return nil
 }
 
+// usageError reports a validation failure the same way the flag package reports
+// a parse failure: the message, then the flag SET's usage. It must be fs.Usage,
+// not the package-level flag.Usage — those are different functions, and
+// bindFlags installs the custom header on the set, so calling flag.Usage() here
+// would print the stock "Usage of <binary>:" instead and diverge from what a
+// parse error prints.
+func usageError(fs *flag.FlagSet, err error) {
+	_, _ = fmt.Fprintf(fs.Output(), "error: %v\n", err)
+	fs.Usage()
+}
+
 func main() {
 	cfg := bindFlags(flag.CommandLine)
 	flag.Parse()
 
 	if err := cfg.validate(); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		flag.Usage()
+		usageError(flag.CommandLine, err)
 		os.Exit(2)
 	}
 
