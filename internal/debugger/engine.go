@@ -788,7 +788,8 @@ func (e *engine) handleStop(stop StopEvent) {
 			// raced a self-stop (breakpoint/step won and cleared
 			// manualStopPending), leaving the signal queued. Suppress it
 			// silently — surfacing it as output or EventPaused would be bogus.
-			// Continue discards it (ContinueProcess resumes with signal 0).
+			// The linux backend excludes PauseSignal from pending delivery, so
+			// ContinueProcess resumes with signal 0.
 			_ = e.backend.ContinueProcess()
 			e.setState(stateRunning)
 			go e.waitLoop()

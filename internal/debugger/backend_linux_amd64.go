@@ -105,10 +105,17 @@ type linuxBackend struct {
 	// for TID-less memory operations. Atomicity defines that snapshot; it does
 	// not make the selected thread stopped or suppress normal ptrace errors.
 	lastStopTID atomic.Int64
+
+	pendingSignals pendingSignals
+
+	// Nil in production; tests inject these to pin the exact TID/signal pair
+	// passed to ptrace without launching a tracee.
+	ptraceContFn       func(tid, signal int) error
+	ptraceSingleStepFn func(tid, signal int) error
 }
 
-// drainParked returns the next held stop if one may be surfaced now, recording
-// it as the current stop.
+// drainParked returns the next held stop if one may be surfaced now, installing
+// its current-TID and pending-signal state together.
 //
 // lastStopTID is updated here, on delivery, and never at park time — from this
 // point the delivered thread is the one the engine acts on, and the one the
@@ -118,7 +125,7 @@ func (b *linuxBackend) drainParked() (StopEvent, bool) {
 	if !ok {
 		return StopEvent{}, false
 	}
-	b.recordStop(ev.TID)
+	b.recordDeliveredStop(ev)
 	return ev, true
 }
 
@@ -126,7 +133,10 @@ func (b *linuxBackend) execPtrace(fn func()) { b.tracer.execPtrace(fn) }
 
 // closeTracer releases the dedicated tracer thread. The engine calls this after
 // its loop exits (process gone), when no further ptrace ops can be issued.
-func (b *linuxBackend) closeTracer() { b.tracer.close() }
+func (b *linuxBackend) closeTracer() {
+	b.purge()
+	b.tracer.close()
+}
 
 const linuxPtraceOptions = syscall.PTRACE_O_TRACEEXIT |
 	syscall.PTRACE_O_TRACEEXEC |
@@ -209,6 +219,12 @@ func attachToProcess(b Backend, pid int) error {
 // attached one. running reports whether the engine's waitLoop is in flight —
 // true for a running tracee, false for one suspended at a stop.
 func killProcess(b Backend, pid int, cmd *exec.Cmd, running bool) error {
+	if lb, ok := b.(*linuxBackend); ok {
+		// stepQueue stays wait-loop-owned while a running tracee still has a
+		// waitLoop in flight; only the synchronized signal state is safe to
+		// clear from the engine goroutine.
+		defer lb.pendingSignals.purge()
+	}
 	if cmd != nil {
 		// SIGKILL via the OS handle is not a ptrace op, so it is safe from any
 		// thread and keeps Kill responsive even if the tracer thread is busy.
@@ -282,20 +298,22 @@ func isAlreadyExited(err error) bool {
 func (b *linuxBackend) ContinueProcess() error {
 	b.endStep()
 	tid := b.traceTID()
+	signal := b.pendingSignals.take(tid)
 	var err error
-	b.execPtrace(func() { err = syscall.PtraceCont(tid, 0) })
+	b.execPtrace(func() { err = b.ptraceCont(tid, signal) })
 	if err != nil {
-		return fmt.Errorf("PTRACE_CONT tid %d: %w", tid, err)
+		return fmt.Errorf("PTRACE_CONT tid %d signal %d: %w", tid, signal, err)
 	}
 	return nil
 }
 
 func (b *linuxBackend) SingleStep(tid int) error {
 	b.beginStep(tid)
+	signal := b.pendingSignals.take(tid)
 	var err error
-	b.execPtrace(func() { err = syscall.PtraceSingleStep(tid) })
+	b.execPtrace(func() { err = b.ptraceSingleStep(tid, signal) })
 	if err != nil {
-		return fmt.Errorf("PTRACE_SINGLESTEP tid %d: %w", tid, err)
+		return fmt.Errorf("PTRACE_SINGLESTEP tid %d signal %d: %w", tid, signal, err)
 	}
 	return nil
 }
@@ -309,9 +327,9 @@ func (b *linuxBackend) SingleStep(tid int) error {
 // could be lost. Targeting the main thread (whose TID equals the tgid) makes
 // the signal surface from Wait() as StopEvent{StopSignal, SIGSTOP} with
 // TID==b.pid, where the engine's manual-stop detection turns it into
-// EventPaused. The engine never injects this SIGSTOP back (Continue resumes
-// with signal 0), so it triggers no group-stop and resume is a plain
-// ContinueProcess. ESRCH (thread already gone) is an idempotent no-op,
+// EventPaused. recordDeliveredStop excludes this SIGSTOP from pending delivery,
+// so Continue resumes with signal 0; it triggers no group-stop and resume is a
+// plain ContinueProcess. ESRCH (thread already gone) is an idempotent no-op,
 // matching process.kill. tgkill is a plain signal syscall,
 // not a ptrace op, so it need not run on the tracer thread.
 func (b *linuxBackend) StopProcess() error {
@@ -463,6 +481,11 @@ func (b *linuxBackend) Threads() ([]int, error) {
 // happens-after the previous one, along with the step-state writes the engine
 // makes in between.
 //
+// A delivered StopSignal also installs pendingSignals[tid] before lastStopTID is
+// published. The map is mutex-protected because Wait writes it and the engine
+// consumes it on resume; keeping it per TID prevents another stop from stealing
+// or clearing the signal.
+//
 // wait4 runs on the calling (waitLoop) thread, NOT the tracer thread: waiting
 // for a tracee is legal from any thread of the tracer process, and keeping it
 // off the tracer thread lets the engine issue control ops concurrently. Every
@@ -591,11 +614,12 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 					b.park(StopEvent{Reason: reason, TID: tid})
 					continue
 				}
-				b.recordStop(tid)
+				ev := StopEvent{Reason: reason, TID: tid}
+				b.recordDeliveredStop(ev)
 				if reason == StopSingleStep {
 					b.endStep()
 				}
-				return StopEvent{Reason: reason, TID: tid}, nil
+				return ev, nil
 
 			default:
 				// An unrecognised PTRACE_EVENT. We enable only TRACEEXIT,
@@ -654,12 +678,13 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			b.park(StopEvent{Reason: reason, TID: tid, Signal: int(sig)})
 			continue
 		}
-		b.recordStop(tid)
-		return StopEvent{
+		ev := StopEvent{
 			Reason: reason,
 			TID:    tid,
 			Signal: int(sig),
-		}, nil
+		}
+		b.recordDeliveredStop(ev)
+		return ev, nil
 	}
 }
 
@@ -683,6 +708,22 @@ func (b *linuxBackend) recordStop(tid int) {
 	}
 }
 
+// recordDeliveredStop installs a signal before publishing its TID as the
+// current resume target. Outside teardown, a concurrent reader may observe the
+// previous TID, but it cannot observe the new TID without the signal that
+// belongs to it.
+func (b *linuxBackend) recordDeliveredStop(ev StopEvent) {
+	if ev.Reason == StopSignal && ev.Signal != b.PauseSignal() {
+		b.pendingSignals.set(ev.TID, ev.Signal)
+	}
+	b.recordStop(ev.TID)
+}
+
+func (b *linuxBackend) purge() {
+	b.stepQueue.purge()
+	b.pendingSignals.purge()
+}
+
 func isNoSuchProcess(err error) bool {
 	return errors.Is(err, syscall.ESRCH) || errors.Is(err, os.ErrNotExist)
 }
@@ -695,8 +736,9 @@ func (b *linuxBackend) continueIfTraceeExists(tid int, signal int) error {
 	if tid == 0 {
 		return nil
 	}
+	b.pendingSignals.clear(tid)
 	var err error
-	b.execPtrace(func() { err = syscall.PtraceCont(tid, signal) })
+	b.execPtrace(func() { err = b.ptraceCont(tid, signal) })
 	if err != nil && !isNoSuchProcess(err) {
 		return err
 	}
@@ -707,8 +749,9 @@ func (b *linuxBackend) singleStepIfTraceeExists(tid int) error {
 	if tid == 0 {
 		return nil
 	}
+	b.pendingSignals.clear(tid)
 	var err error
-	b.execPtrace(func() { err = syscall.PtraceSingleStep(tid) })
+	b.execPtrace(func() { err = b.ptraceSingleStep(tid, 0) })
 	if err != nil && !isNoSuchProcess(err) {
 		return err
 	}
@@ -731,4 +774,30 @@ func (b *linuxBackend) resumeAbsorbed(tid int, signal int) error {
 		return b.singleStepIfTraceeExists(tid)
 	}
 	return b.continueIfTraceeExists(tid, signal)
+}
+
+func (b *linuxBackend) ptraceCont(tid, signal int) error {
+	if b.ptraceContFn != nil {
+		return b.ptraceContFn(tid, signal)
+	}
+	return syscall.PtraceCont(tid, signal)
+}
+
+func (b *linuxBackend) ptraceSingleStep(tid, signal int) error {
+	if b.ptraceSingleStepFn != nil {
+		return b.ptraceSingleStepFn(tid, signal)
+	}
+	_, _, errno := syscall.Syscall6(
+		syscall.SYS_PTRACE,
+		uintptr(syscall.PTRACE_SINGLESTEP),
+		uintptr(tid),
+		0,
+		uintptr(signal),
+		0,
+		0,
+	)
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }
