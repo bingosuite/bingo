@@ -33,6 +33,7 @@ type fakeDebugger struct {
 	setBPErr         error
 	clearBPErr       error
 	continueErr      error
+	emitContinued    bool
 	stepOverErr      error
 	stepIntoErr      error
 	stepOutErr       error
@@ -75,8 +76,14 @@ func (f *fakeDebugger) Attach(pid int, binaryPath string) error {
 	f.record("Attach")
 	return f.attachErr
 }
-func (f *fakeDebugger) Kill() error     { f.record("Kill"); return nil }
-func (f *fakeDebugger) Continue() error { f.record("Continue"); return f.continueErr }
+func (f *fakeDebugger) Kill() error { f.record("Kill"); return nil }
+func (f *fakeDebugger) Continue() error {
+	f.record("Continue")
+	if f.continueErr == nil && f.emitContinued {
+		f.push(protocol.MustEvent(protocol.EventContinued, 0, protocol.ContinuedPayload{}))
+	}
+	return f.continueErr
+}
 func (f *fakeDebugger) StepOver() error { f.record("StepOver"); return f.stepOverErr }
 func (f *fakeDebugger) StepInto() error { f.record("StepInto"); return f.stepIntoErr }
 func (f *fakeDebugger) StepOut() error  { f.record("StepOut"); return f.stepOutErr }
@@ -1029,6 +1036,112 @@ func countCalls(calls []string, name string) int {
 	}
 	return n
 }
+
+func newManagedTimeoutHub(timeout time.Duration) (*fakeDebugger, *hub.Hub, *fakeWSConn, context.CancelFunc) {
+	fd := newFakeDebugger()
+	managed := hub.NewSession("timeout-session", func() debugger.Debugger { return fd }, nil)
+	hub.ExportedSetSuspendTimeout(managed, timeout)
+	cancel := runHub(managed)
+	conn := newFakeWSConn()
+	mustAddClient(managed, conn)
+	waitForEventKind(conn, protocol.EventSessionState, nil)
+	launchManaged(conn, fd, "timeout-target")
+	return fd, managed, conn, cancel
+}
+
+var _ = Describe("Suspend safety timeout", func() {
+	It("uses the normal resume state and event path after auto-continue succeeds", func() {
+		const timeout = 50 * time.Millisecond
+		fd, managed, conn, cancel := newManagedTimeoutHub(timeout)
+		defer func() {
+			cancel()
+			Eventually(managed.Done(), "500ms", "10ms").Should(BeClosed())
+		}()
+		fd.emitContinued = true
+
+		fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+			protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+		waitForEventKind(conn, protocol.EventBreakpointHit, nil)
+		var suspended protocol.SessionStatePayload
+		waitForEventKind(conn, protocol.EventSessionState, &suspended)
+		Expect(suspended.State).To(Equal(protocol.StateSuspended))
+
+		runningEvent, ok := recvEvent(conn)
+		Expect(ok).To(BeTrue())
+		Expect(runningEvent.Kind).To(Equal(protocol.EventSessionState))
+		var running protocol.SessionStatePayload
+		Expect(protocol.DecodeEventPayload(runningEvent, &running)).To(Succeed())
+		Expect(running.State).To(Equal(protocol.StateRunning))
+
+		continued, ok := recvEvent(conn)
+		Expect(ok).To(BeTrue())
+		Expect(continued.Kind).To(Equal(protocol.EventContinued))
+		Expect(continued.Seq).To(BeNumerically(">", runningEvent.Seq))
+		Expect(managed.State()).To(Equal(protocol.StateRunning))
+		Consistently(func() int {
+			return countCalls(fd.recordedCalls(), "Continue")
+		}, 2*timeout, 5*time.Millisecond).Should(Equal(1))
+	})
+
+	It("reports a rejected auto-continue and still accepts a client retry", func() {
+		const timeout = 50 * time.Millisecond
+		fd, managed, conn, cancel := newManagedTimeoutHub(timeout)
+		defer func() {
+			cancel()
+			Eventually(managed.Done(), "500ms", "10ms").Should(BeClosed())
+		}()
+		fd.continueErr = errors.New("reinstall failed")
+		fd.emitContinued = true
+
+		fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+			protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+		waitForEventKind(conn, protocol.EventBreakpointHit, nil)
+		waitForEventKind(conn, protocol.EventSessionState, nil)
+
+		var commandErr protocol.ErrorPayload
+		waitForEventKind(conn, protocol.EventError, &commandErr)
+		Expect(commandErr.Command).To(Equal(protocol.CmdContinue))
+		Expect(managed.State()).To(Equal(protocol.StateSuspended))
+		Expect(countCalls(fd.recordedCalls(), "Continue")).To(Equal(1))
+
+		fd.continueErr = nil
+		conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
+
+		var running protocol.SessionStatePayload
+		waitForEventKind(conn, protocol.EventSessionState, &running)
+		Expect(running.State).To(Equal(protocol.StateRunning))
+		waitForEventKind(conn, protocol.EventContinued, nil)
+		Expect(managed.State()).To(Equal(protocol.StateRunning))
+		Expect(countCalls(fd.recordedCalls(), "Continue")).To(Equal(2))
+	})
+
+	It("re-arms the full interval after each rejected auto-continue", func() {
+		const timeout = 120 * time.Millisecond
+		fd, managed, conn, cancel := newManagedTimeoutHub(timeout)
+		defer func() {
+			cancel()
+			Eventually(managed.Done(), "500ms", "10ms").Should(BeClosed())
+		}()
+		fd.continueErr = errors.New("still suspended")
+
+		fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+			protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+		waitForEventKind(conn, protocol.EventBreakpointHit, nil)
+		waitForEventKind(conn, protocol.EventSessionState, nil)
+		waitForEventKind(conn, protocol.EventError, nil)
+
+		Consistently(func() int {
+			return countCalls(fd.recordedCalls(), "Continue")
+		}, timeout/2, 5*time.Millisecond).Should(Equal(1))
+
+		waitForEventKind(conn, protocol.EventError, nil)
+		Expect(countCalls(fd.recordedCalls(), "Continue")).To(Equal(2))
+		Consistently(func() int {
+			return countCalls(fd.recordedCalls(), "Continue")
+		}, timeout/2, 5*time.Millisecond).Should(Equal(2))
+		Expect(managed.State()).To(Equal(protocol.StateSuspended))
+	})
+})
 
 var _ = Describe("Restart", func() {
 	var fd *fakeDebugger

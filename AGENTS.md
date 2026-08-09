@@ -159,6 +159,12 @@ The hub blocks after broadcasting any of these "suspending" events until a
 While suspended, **non-resuming** commands (`SetBreakpoint`, `Locals`, …) are
 still executed immediately — the process is paused, so it's safe.
 
+The 30-minute safety timeout synthesizes a versioned `CmdContinue` and uses the
+same `executeCommand` path as a client resume. Success therefore performs the
+normal `running` state transition and event ordering. A rejected auto-continue
+broadcasts `EventError`, remains in the suspended wait loop, and re-arms a full
+30-minute interval so client retries stay serviceable without a hot retry loop.
+
 A successful `Continue` emits a **non-suspending** `EventContinued` from the
 engine (`engine.Continue` → `emitContinued`) before the process runs free. It is
 not in the suspending set and does not gate the hub — it's a fire-and-forget
