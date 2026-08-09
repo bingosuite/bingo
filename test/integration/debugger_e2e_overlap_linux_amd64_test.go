@@ -240,9 +240,10 @@ var _ = Describe("Linux amd64 sibling-breakpoint / step-over overlap (PROOF)", L
 
 			var (
 				orphanCycles int
-				minStopped   = 1 << 30
 				maxStopped   int
-				minAtTrap    = 1 << 30
+				maxAtTrap    int
+				overlapReady int // stops taken with >=2 threads parked on a marker
+				totalStops   int
 			)
 
 			for i := 0; i < iters; i++ {
@@ -280,28 +281,32 @@ var _ = Describe("Linux amd64 sibling-breakpoint / step-over overlap (PROOF)", L
 					}
 
 					if k == 0 {
-						// LOAD-BEARING NON-VACUITY CHECK. It is not enough that
-						// some threads are in tracing-stop: they must be parked
-						// ON the marker instructions. An amd64 INT3 stop leaves
-						// RIP one byte past the trap, so accept addr and addr+1.
-						states, stopped := waitForTracingStops(pid, perCycle, 5*time.Second)
+						// NON-VACUITY MEASUREMENT. It is not enough that some
+						// threads are in tracing-stop: they must be parked ON a
+						// marker instruction. An amd64 INT3 stop leaves RIP one
+						// byte past the trap, so accept addr and addr+1.
+						//
+						// This is recorded per stop and asserted ONCE at the end
+						// rather than per cycle: a sibling that took an unrelated
+						// ptrace event while the engine was suspended is only
+						// resumed when the next Backend.Wait absorbs it, so an
+						// individual cycle can legitimately start with the
+						// siblings not yet re-parked. That is a cycle where no
+						// overlap is possible — not a failure.
+						states, stopped := waitForMarkerStops(pid, trapPCs, perCycle, 2*time.Second)
 						atTrap := countAtTrap(pid, states, trapPCs)
-						if stopped < minStopped {
-							minStopped = stopped
-						}
+						totalStops++
 						if stopped > maxStopped {
 							maxStopped = stopped
 						}
-						if atTrap < minAtTrap {
-							minAtTrap = atTrap
+						if atTrap > maxAtTrap {
+							maxAtTrap = atTrap
+						}
+						if atTrap >= 2 {
+							overlapReady++
 						}
 						j.logf("cycle %d: first stop at line %d; tracing-stopped=%d atMarkerPC=%d of %d marker threads\n%s",
 							i, line, stopped, atTrap, perCycle, renderStates(pid, states, trapPCs))
-						Expect(atTrap).To(BeNumerically(">=", 2),
-							"cycle %d: NON-VACUITY FAILED — fewer than two threads are parked ON a marker "+
-								"instruction (MARK_A=0x%x MARK_B=0x%x), so the step-over that follows "+
-								"cannot overlap a pending sibling breakpoint stop\n%s\n%s",
-							i, addrA, addrB, renderStates(pid, states, trapPCs), j.dump())
 					}
 
 					// THE PROBE. Every stop is a resting point at which BOTH
@@ -372,6 +377,21 @@ var _ = Describe("Linux amd64 sibling-breakpoint / step-over overlap (PROOF)", L
 					i, siblings, hitsB, j.dump())
 			}
 
+			// GLOBAL NON-VACUITY GATE: the spec is only meaningful if the
+			// scenario it claims to test actually occurred — sibling threads
+			// parked in their own INT3 stops while a step-over ran. Asserted
+			// once, over the whole run, so a single unlucky cycle cannot make
+			// the spec flaky, but a run that never set up the race cannot pass
+			// silently either.
+			Expect(maxAtTrap).To(BeNumerically(">=", 2),
+				"NON-VACUITY FAILED — no stop in %d cycles ever had two threads parked ON a marker "+
+					"instruction (MARK_A=0x%x MARK_B=0x%x), so no step-over could overlap a pending "+
+					"sibling breakpoint stop and this run proves nothing\n%s",
+				iters, addrA, addrB, j.dump())
+			Expect(overlapReady).To(BeNumerically(">=", 1),
+				"NON-VACUITY FAILED — not one of %d cycles began with the overlap precondition met\n%s",
+				totalStops, j.dump())
+
 			// Every cycle survived: both breakpoints still armed, target runs
 			// to a clean exit, and every marker thread completed every cycle.
 			Expect(probeArmed(d, srcFile, lineA)).To(BeTrue(), "BP A armed at end\n%s", j.dump())
@@ -389,12 +409,12 @@ var _ = Describe("Linux amd64 sibling-breakpoint / step-over overlap (PROOF)", L
 			AddReportEntry("overlap-cycles", iters)
 			AddReportEntry("overlap-siblings", siblings)
 			AddReportEntry("overlap-orphans", orphanCycles)
-			AddReportEntry("overlap-tracing-stopped-min", minStopped)
 			AddReportEntry("overlap-tracing-stopped-max", maxStopped)
-			AddReportEntry("overlap-at-marker-pc-min", minAtTrap)
+			AddReportEntry("overlap-at-marker-pc-max", maxAtTrap)
+			AddReportEntry("overlap-ready-cycles", fmt.Sprintf("%d/%d", overlapReady, totalStops))
 			GinkgoWriter.Printf(
-				"OVERLAP PROOF SUMMARY: cycles=%d siblings=%d orphans=%d stopped(min/max)=%d/%d atMarkerPC(min)=%d\n",
-				iters, siblings, orphanCycles, minStopped, maxStopped, minAtTrap)
+				"OVERLAP PROOF SUMMARY: cycles=%d siblings=%d orphans=%d stopped(max)=%d atMarkerPC(max)=%d overlapReady=%d/%d\n",
+				iters, siblings, orphanCycles, maxStopped, maxAtTrap, overlapReady, totalStops)
 		})
 })
 
@@ -564,14 +584,16 @@ func countStopped(states []threadState) int {
 	return n
 }
 
-// waitForTracingStops polls /proc until at least want threads report
-// tracing-stop, returning the final snapshot and count. It never fails the
-// spec — the caller asserts, so the snapshot can be included in the report.
-func waitForTracingStops(pid, want int, timeout time.Duration) ([]threadState, int) {
+// waitForMarkerStops polls /proc until at least want threads are parked ON a
+// marker instruction, returning the final snapshot and the tracing-stop count.
+// It never fails the spec — the caller records and asserts, so the snapshot can
+// be included in a report. Bounded and early-exiting: a cycle in which the
+// siblings have not re-parked is a legitimate no-overlap cycle, not a hang.
+func waitForMarkerStops(pid int, trapPCs map[uint64]string, want int, timeout time.Duration) ([]threadState, int) {
 	deadline := time.Now().Add(timeout)
 	for {
 		states, stopped := procThreadStates(pid)
-		if stopped >= want || time.Now().After(deadline) {
+		if countAtTrap(pid, states, trapPCs) >= want || time.Now().After(deadline) {
 			return states, stopped
 		}
 		time.Sleep(2 * time.Millisecond)
