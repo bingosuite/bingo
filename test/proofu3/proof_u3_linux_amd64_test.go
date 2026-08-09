@@ -54,6 +54,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime/pprof"
+	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -406,6 +407,58 @@ func TestProof_SuspendedKillWedgedByPlainChild(t *testing.T) {
 	requireWedgeStack(t, r)
 }
 
+// --- Ownership attribution (deterministic; no wait4 wake race) --------------
+
+// TestProof_OwnershipPlainChildren removes the race from the argument. At the
+// moment of measurement session A's reapAfterKill is the process's ONLY waiter,
+// so the pids it consumes are named rather than inferred. It asserts three
+// things a correct implementation would each falsify: Kill blocks while only
+// UNOWNED children live, it survives every intermediate death and ends on the
+// last (i.e. its terminator is process-wide ECHILD), and the peers' exit
+// statuses were consumed by A rather than by the harness.
+func TestProof_OwnershipPlainChildren(t *testing.T) {
+	r := runChild(t, "proof-ownership-plain-children", 120*time.Second)
+	requireCode(t, r, "proof-ownership-plain-children", exitStolen)
+	mustResult(t, r, "kill_blocked_while_only_unowned_children_live=true",
+		"Kill must block while the only live children belong to no session")
+	mustResult(t, r, "kill_returned_after_last_peer_death=true",
+		"Kill must end on the LAST unowned death, proving a process-wide ECHILD terminator")
+	mustResult(t, r, "peer_statuses_consumed_by_session_a=3",
+		"every unowned exit status must have been consumed by session A's wait")
+	if strings.Contains(r.output, "reaped by the HARNESS just now") {
+		t.Errorf("attribution broken: the harness reaped a peer itself:\n%s", r.output)
+	}
+}
+
+// TestProof_OwnershipForeignTracee is the same deterministic attribution, but
+// the victim is a REAL peer debugger session's tracee, with every owned tid
+// recorded. Session B is suspended at entry so it has no waitLoop; session A is
+// therefore the only waiter, and B's death is provably delivered to A.
+func TestProof_OwnershipForeignTracee(t *testing.T) {
+	r := runChild(t, "proof-ownership-foreign-tracee", 120*time.Second)
+	requireCode(t, r, "proof-ownership-foreign-tracee", exitStolen)
+	mustResult(t, r, "kill_blocked_while_peer_session_tracee_lives=true",
+		"Kill must block while another SESSION's tracee is alive")
+	mustResult(t, r, "kill_returned_on_peer_session_tracee_death=true",
+		"Kill must be released by the death of a tracee it does not own")
+	mustResult(t, r, "b_tracee_status_consumed_by_session_a=true",
+		"session A must have consumed the exit status of session B's tracee")
+	mustResult(t, r, "b_session_saw_its_own_process_exit=false",
+		"session B must never learn its own tracee died")
+	if strings.Contains(r.output, "reaped by the HARNESS just now") {
+		t.Errorf("attribution broken: the harness reaped B's tracee itself:\n%s", r.output)
+	}
+}
+
+// mustResult asserts an exact RESULT line, so a proof cannot pass on a value it
+// never actually observed.
+func mustResult(t *testing.T, r childResult, want, why string) {
+	t.Helper()
+	if !strings.Contains(r.output, "RESULT "+want) {
+		t.Errorf("missing RESULT %s — %s\n%s", want, why, r.output)
+	}
+}
+
 // --- U3-b: cross-session stop/exit theft ------------------------------------
 
 // TestProof_PeerWaitLoopStealsProcessExit runs two sessions with concurrently
@@ -537,6 +590,10 @@ func runScenario(name string) int {
 		return scenarioSuspendedKillLivePeer()
 	case "proof-suspended-kill-plain-child":
 		return scenarioSuspendedKillPlainChild()
+	case "proof-ownership-plain-children":
+		return scenarioOwnershipPlainChildren()
+	case "proof-ownership-foreign-tracee":
+		return scenarioOwnershipForeignTracee()
 	case "proof-peer-waitloop-steals-exit":
 		return scenarioPeerWaitLoopStealsExit()
 	case "proof-reapafterkill-vs-peer-death":
@@ -713,6 +770,56 @@ func awaitReaped(pid int, timeout time.Duration) bool {
 		time.Sleep(20 * time.Millisecond)
 	}
 	return false
+}
+
+// threadTIDs enumerates every kernel task of pid. Recording this set BEFORE a
+// process dies is what lets the harness name the exact tids a foreign wait must
+// have consumed.
+func threadTIDs(pid int) []int {
+	entries, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", pid))
+	if err != nil {
+		return nil
+	}
+	tids := make([]int, 0, len(entries))
+	for _, e := range entries {
+		if n, err := strconv.Atoi(e.Name()); err == nil {
+			tids = append(tids, n)
+		}
+	}
+	sort.Ints(tids)
+	return tids
+}
+
+// reapedBySomeoneElse reports whether pid's exit status has already been
+// consumed by another waiter in this process. A non-blocking wait4 on the exact
+// pid is the discriminator: ECHILD means the status is gone (somebody reaped
+// it), a returned pid means WE just reaped it — which would invalidate any
+// claim that the session under test did.
+func reapedBySomeoneElse(pid int) (string, bool) {
+	var ws syscall.WaitStatus
+	wpid, err := syscall.Wait4(pid, &ws, syscall.WNOHANG|syscall.WALL, nil)
+	switch {
+	case isNoChild(err):
+		return "ECHILD (status already consumed by another waiter)", true
+	case err != nil:
+		return "wait4 error: " + err.Error(), false
+	case wpid == 0:
+		return "still live (no status available)", false
+	default:
+		return fmt.Sprintf("reaped by the HARNESS just now (pid=%d) — not attributable", wpid), false
+	}
+}
+
+func isNoChild(err error) bool { return errors.Is(err, syscall.ECHILD) }
+
+// startUntracedChild spawns a plain child this process never waits on, so its
+// only possible reaper is whatever else calls wait4 in this process.
+func startUntracedChild() (int, error) {
+	c := exec.Command(longBin)
+	if err := c.Start(); err != nil {
+		return 0, err
+	}
+	return c.Process.Pid, nil
 }
 
 // killAsync runs d.Kill() on its own goroutine so a wedged kill can be observed
@@ -975,6 +1082,177 @@ func scenarioPeerWaitLoopStealsLaunch() int {
 	_ = syscall.Kill(r.pid, syscall.SIGKILL)
 	_ = syscall.Kill(aPID, syscall.SIGKILL)
 	return exitOK
+}
+
+// scenarioOwnershipPlainChildren is the DETERMINISTIC ownership proof. It
+// removes the wait4 wake race entirely: at the moment of measurement, session
+// A's reapAfterKill is the ONLY waiter in the process (A's own tracee is
+// already reaped; the peers are untraced children nobody waits on). Therefore
+// every status the process receives is necessarily returned to A, and the
+// harness can name the exact pids A consumed instead of inferring theft from a
+// timeout.
+//
+// It also shows the terminator is process-wide ECHILD rather than "my tracee is
+// gone": Kill stays blocked as each peer dies and returns only after the LAST
+// one is reaped.
+func scenarioOwnershipPlainChildren() int {
+	const peers = 3
+	pids := make([]int, 0, peers)
+	for i := 0; i < peers; i++ {
+		pid, err := startUntracedChild()
+		if err != nil {
+			tracef("start untraced peer %d: %v", i, err)
+			return exitSetup
+		}
+		pids = append(pids, pid)
+	}
+	result("peer_pids", fmt.Sprint(pids))
+	result("peer_pids_traced_by_any_session", false)
+
+	a, aPID, err := launchSuspended(longBin)
+	if err != nil {
+		tracef("launch A: %v", err)
+		return exitSetup
+	}
+	aTIDs := threadTIDs(aPID)
+	result("a_tracee_pid", aPID)
+	result("a_owned_tids", fmt.Sprint(aTIDs))
+
+	killed := killAsync(a)
+	if !awaitReaped(aPID, 15*time.Second) {
+		tracef("A's own tracee never reaped; cannot attribute the wait")
+		return exitSetup
+	}
+	result("a_tracee_reaped", true)
+
+	// A owns nothing that is still alive, yet Kill must not return: the only
+	// thing left for its Wait4(-1, WALL) to find are pids owned by nobody.
+	select {
+	case err := <-killed:
+		tracef("A.Kill returned early (err=%v) — no wedge, defect not reproduced", err)
+		result("kill_returned_before_peers_died", true)
+		for _, pid := range pids {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+		return exitOK
+	case <-time.After(3 * time.Second):
+		result("kill_blocked_while_only_unowned_children_live", true)
+	}
+
+	// Release the peers one at a time. Each death is a status only A can
+	// receive. Kill must survive every intermediate death and end on the last.
+	for i, pid := range pids {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+		last := i == len(pids)-1
+		select {
+		case err := <-killed:
+			if !last {
+				tracef("A.Kill returned after peer %d/%d died — expected it to keep waiting",
+					i+1, len(pids))
+				result("kill_returned_after_peer_index", i)
+				return exitSetup
+			}
+			tracef("A.Kill returned only after the LAST unowned child died (err=%v)", err)
+			result("kill_returned_after_last_peer_death", true)
+		case <-time.After(4 * time.Second):
+			if last {
+				tracef("A.Kill still blocked after every peer died — different failure mode")
+				result("kill_returned_after_last_peer_death", false)
+				dumpBlockedGoroutines()
+				return exitWedged
+			}
+			result(fmt.Sprintf("kill_still_blocked_after_peer_%d_death", i), true)
+		}
+	}
+
+	// Attribution: every peer status was consumed by A's loop, not by us.
+	consumed := 0
+	for _, pid := range pids {
+		why, ok := reapedBySomeoneElse(pid)
+		result(fmt.Sprintf("peer_%d_status", pid), why)
+		if ok {
+			consumed++
+		}
+	}
+	result("peer_statuses_consumed_by_session_a", consumed)
+	result("peer_count", len(pids))
+	tracef("session A consumed %d/%d statuses for pids it does not own: %v",
+		consumed, len(pids), pids)
+	return exitStolen
+}
+
+// scenarioOwnershipForeignTracee is the same deterministic attribution applied
+// to a REAL peer debugger session's tracee, naming every tid.
+//
+// Session B is launched and left suspended at its entry stop, so B has NO
+// waitLoop armed (engine.Launch consumed the execve stop with a pid-specific
+// wait). Session A is then suspended-killed, parking reapAfterKill in
+// Wait4(-1, WALL) as the process's only waiter. Killing B's tracee therefore
+// delivers B's tids to A — provably, not probably.
+func scenarioOwnershipForeignTracee() int {
+	bExit := make(chan struct{}, 1)
+	b, bPID, err := launchSuspended(longBin)
+	if err != nil {
+		tracef("launch B: %v", err)
+		return exitSetup
+	}
+	drain(b, bExit, nil)
+	bTIDs := threadTIDs(bPID)
+	result("b_session_tracee_pid", bPID)
+	result("b_session_owned_tids", fmt.Sprint(bTIDs))
+	result("b_waitloop_armed", false) // suspended at entry: no waitLoop exists
+
+	a, aPID, err := launchSuspended(longBin)
+	if err != nil {
+		tracef("launch A: %v", err)
+		return exitSetup
+	}
+	result("a_session_tracee_pid", aPID)
+	result("a_session_owned_tids", fmt.Sprint(threadTIDs(aPID)))
+
+	killed := killAsync(a)
+	if !awaitReaped(aPID, 15*time.Second) {
+		tracef("A's own tracee never reaped; cannot attribute the wait")
+		return exitSetup
+	}
+	result("a_tracee_reaped", true)
+
+	select {
+	case err := <-killed:
+		tracef("A.Kill returned early (err=%v) — no wedge this run", err)
+		result("kill_returned_before_peer_died", true)
+		_ = syscall.Kill(bPID, syscall.SIGKILL)
+		return exitOK
+	case <-time.After(3 * time.Second):
+		result("kill_blocked_while_peer_session_tracee_lives", true)
+	}
+
+	// The single contested event: the death of a tracee owned by session B.
+	tracef("killing session B's tracee (pid=%d, tids=%v) while only A waits", bPID, bTIDs)
+	_ = syscall.Kill(bPID, syscall.SIGKILL)
+
+	select {
+	case err := <-killed:
+		tracef("A.Kill returned immediately after B's tracee died (err=%v)", err)
+		result("kill_returned_on_peer_session_tracee_death", true)
+	case <-time.After(10 * time.Second):
+		tracef("A.Kill still blocked after B's tracee died")
+		result("kill_returned_on_peer_session_tracee_death", false)
+		dumpBlockedGoroutines()
+		return exitWedged
+	}
+
+	why, ok := reapedBySomeoneElse(bPID)
+	result("b_tracee_status_after_a_kill_returned", why)
+	result("b_tracee_status_consumed_by_session_a", ok)
+	result("b_session_saw_its_own_process_exit", len(bExit) > 0)
+	result("tids_owned_by_b_but_consumed_by_a", fmt.Sprint(bTIDs))
+	tracef("session A's reapAfterKill consumed the exit status of session B's "+
+		"tracee pid=%d (tids %v); B itself was never told", bPID, bTIDs)
+	if !ok {
+		return exitSetup
+	}
+	return exitStolen
 }
 
 // scenarioSuspendedKillPlainChild shows the wedge is not specific to a second
