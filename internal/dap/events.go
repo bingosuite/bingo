@@ -10,7 +10,7 @@ import (
 // zero or more DAP messages. Runs on the hub write-pump goroutine.
 func (h *Handler) translateEvent(evt protocol.Event) {
 	switch evt.Kind {
-	case protocol.EventStepped, protocol.EventBreakpointHit, protocol.EventPaused, protocol.EventPanic:
+	case protocol.EventStepped, protocol.EventBreakpointHit, protocol.EventPaused:
 		h.onStop(evt)
 	case protocol.EventContinued:
 		h.onContinued()
@@ -103,10 +103,6 @@ func stopGoroutine(evt protocol.Event) protocol.Goroutine {
 		return p.Goroutine
 	case protocol.EventPaused:
 		var p protocol.PausedPayload
-		_ = protocol.DecodeEventPayload(evt, &p)
-		return p.Goroutine
-	case protocol.EventPanic:
-		var p protocol.PanicPayload
 		_ = protocol.DecodeEventPayload(evt, &p)
 		return p.Goroutine
 	}

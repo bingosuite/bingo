@@ -275,9 +275,6 @@ export class TelemetryObserver {
       case "Stepped":
         this.#update({ lastStop: describeStop("Stepped", payload) });
         break;
-      case "Panic":
-        this.#update({ lastStop: `Panic: ${payloadText(payload.message, "")}` });
-        break;
       case "Continued":
         this.#update({ sessionState: "running", lastStop: "Continued" });
         break;

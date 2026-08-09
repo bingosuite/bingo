@@ -12,7 +12,6 @@ const utf8 = new TextDecoder("utf-8", { fatal: true });
 
 const eventKinds = new Set([
   "BreakpointHit",
-  "Panic",
   "Stepped",
   "Paused",
   "Output",

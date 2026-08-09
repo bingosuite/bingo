@@ -173,13 +173,6 @@ func describeEvent(evt protocol.Event) (string, bool) {
 		}
 		return fmt.Sprintf("exited code=%d%s", p.ExitCode, reason), true
 
-	case protocol.EventPanic:
-		var p protocol.PanicPayload
-		if protocol.DecodeEventPayload(evt, &p) != nil {
-			return "", false
-		}
-		return fmt.Sprintf("Panic %q at %s", oneLine(p.Message), locString(p.Goroutine.CurrentLoc)), true
-
 	case protocol.EventOutput:
 		var p protocol.OutputPayload
 		if protocol.DecodeEventPayload(evt, &p) != nil {

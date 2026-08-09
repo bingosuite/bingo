@@ -27,7 +27,6 @@ type EventKind string
 // command (Continue / Step*) arrives. See AGENTS.md → suspend/resume protocol.
 const (
 	EventBreakpointHit EventKind = "BreakpointHit"
-	EventPanic         EventKind = "Panic"
 	EventStepped       EventKind = "Stepped"
 
 	// EventPaused reports that a Pause request forcibly halted the running
@@ -75,6 +74,15 @@ const (
 	// at the new process's entry point (same as after Launch).
 	EventRestarted EventKind = "Restarted"
 )
+
+// EventPanic is retained so existing Go consumers of pkg/protocol keep
+// compiling.
+//
+// Deprecated: bingo has never emitted this event. A Go language panic currently
+// terminates the tracee and is reported as EventProcessExited, usually with exit
+// code 2. Detecting a panic before termination requires runtime-aware debugger
+// support that is not implemented.
+const EventPanic EventKind = "Panic"
 
 type CommandKind string
 

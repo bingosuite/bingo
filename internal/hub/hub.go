@@ -25,7 +25,6 @@ var ErrHubClosed = errors.New("hub is shutting down")
 // asynchronously on demand rather than as a self-stop.
 var suspendingEvents = map[protocol.EventKind]bool{
 	protocol.EventBreakpointHit: true,
-	protocol.EventPanic:         true,
 	protocol.EventStepped:       true,
 	protocol.EventPaused:        true,
 }
@@ -271,7 +270,7 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 	h.broadcast(evt)
 
 	switch evt.Kind {
-	case protocol.EventBreakpointHit, protocol.EventPanic, protocol.EventStepped, protocol.EventPaused:
+	case protocol.EventBreakpointHit, protocol.EventStepped, protocol.EventPaused:
 		h.transitionState(protocol.StateSuspended)
 	case protocol.EventProcessExited:
 		h.transitionState(protocol.StateExited)

@@ -21,7 +21,6 @@ func TestStoppedReason(t *testing.T) {
 	cases := map[protocol.EventKind]string{
 		protocol.EventBreakpointHit: "breakpoint",
 		protocol.EventStepped:       "step",
-		protocol.EventPanic:         "exception",
 		protocol.EventPaused:        "pause",
 		protocol.EventProcessExited: "pause", // fallback
 	}

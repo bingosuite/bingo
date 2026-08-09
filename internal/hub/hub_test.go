@@ -560,6 +560,22 @@ var _ = Describe("Hub", func() {
 		})
 	})
 
+	Describe("deprecated Panic compatibility event", func() {
+		It("does not enter the suspend gate", func() {
+			conn := newFakeWSConn()
+			mustAddClient(h, conn)
+
+			fd.push(protocol.MustEvent(protocol.EventPanic, 1, protocol.PanicPayload{Message: "boom"}))
+			waitForEventKind(conn, protocol.EventPanic, nil)
+
+			Consistently(h.State, "100ms", "10ms").Should(Equal(protocol.StateRunning))
+
+			conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
+			Consistently(fd.recordedCalls, "100ms", "10ms").
+				ShouldNot(ContainElement("Continue"))
+		})
+	})
+
 	Describe("Kill while running", func() {
 		It("terminates the process even with no breakpoint set (no suspend first)", func() {
 			conn := newFakeWSConn()

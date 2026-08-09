@@ -27,8 +27,6 @@ func stoppedReason(kind protocol.EventKind) string {
 		return "breakpoint"
 	case protocol.EventStepped:
 		return "step"
-	case protocol.EventPanic:
-		return "exception"
 	case protocol.EventPaused:
 		return "pause"
 	default:

@@ -83,6 +83,9 @@ type BreakpointHitPayload struct {
 	Frames     []Frame    `json:"frames"`
 }
 
+// PanicPayload is retained for source compatibility with EventPanic.
+//
+// Deprecated: bingo has never produced this payload.
 type PanicPayload struct {
 	Message   string    `json:"message"`
 	Goroutine Goroutine `json:"goroutine"`

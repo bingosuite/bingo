@@ -654,6 +654,18 @@ func TestInitializeAdvertisesEvaluateForHovers(t *testing.T) {
 	}
 }
 
+func TestInitializeDoesNotAdvertiseExceptionStops(t *testing.T) {
+	hh := newHarness(t)
+	hh.sendReq("initialize", initArgs())
+	resp := recvType[*godap.InitializeResponse](hh)
+	if len(resp.Body.ExceptionBreakpointFilters) != 0 ||
+		resp.Body.SupportsExceptionOptions ||
+		resp.Body.SupportsExceptionInfoRequest ||
+		resp.Body.SupportsExceptionFilterOptions {
+		t.Errorf("exception capabilities unexpectedly advertised: %+v", resp.Body)
+	}
+}
+
 // TestVariablesExpandsNestedStruct proves a struct local returned in EventLocals
 // with Children is served with a fresh child variablesReference, and that a
 // follow-up variables request on that ref returns the cached children WITHOUT a

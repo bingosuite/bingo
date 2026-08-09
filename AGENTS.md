@@ -136,12 +136,20 @@ Two envelope types: `Event` (server → client) and `Command` (client → server
 Both versioned; both carry `Kind` + raw-JSON `Payload`. Decode with
 `DecodeEventPayload` / `DecodeCommandPayload` after switching on `Kind`.
 
+`EventPanic` and `PanicPayload` are deprecated source-compatibility tombstones.
+The server has never emitted them: a Go language panic currently terminates the
+tracee and surfaces as `EventProcessExited` (normally exit code 2), not as a
+suspending exception stop. Detecting `runtime.gopanic` before termination would
+require separate runtime-aware debugger support. Keep the exported names until a
+deliberate breaking protocol/API version change, but do not add them to
+suspending-event routing, client capability claims, or state transitions.
+
 ### Suspend/resume protocol
 
 The hub blocks after broadcasting any of these "suspending" events until a
 "resuming" command arrives (or the 30-min safety timeout fires):
 
-- Suspending events: `BreakpointHit`, `Panic`, `Stepped`, `Paused`
+- Suspending events: `BreakpointHit`, `Stepped`, `Paused`
 - Resuming commands: `Continue`, `StepOver`, `StepInto`, `StepOut`
 
 While suspended, **non-resuming** commands (`SetBreakpoint`, `Locals`, …) are
@@ -200,7 +208,7 @@ session could never be resumed again.
 `SessionState` ∈ {`idle`, `running`, `suspended`, `exited`}.
 
 ```
-            Launch / Attach       BreakpointHit / Panic / Stepped / Paused
+            Launch / Attach       BreakpointHit / Stepped / Paused
    idle ────────────────────> running <────────────────────────────────── suspended
     ▲                            │                Continue / Step*
     │                            │
@@ -1064,7 +1072,7 @@ session.
 
 `EventStepped`(entry)=handshake signal; `EventStepped`(step)→`stopped`
 reason=step; `EventBreakpointHit`→`stopped` reason=breakpoint;
-`EventPanic`→reason=exception; `EventPaused`→reason=pause;
+`EventPaused`→reason=pause;
 `EventProcessExited`→`exited`(code)+`terminated`; `EventOutput`→`output`;
 `EventRestarted`→delayed `restart` response; `EventEvaluate`→`evaluate` response
 (correlated via `evalQ`, NOT a stop — see below); `EventSessionState`→ignored on

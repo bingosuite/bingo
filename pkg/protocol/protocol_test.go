@@ -164,7 +164,7 @@ var _ = Describe("Event", func() {
 				},
 			),
 
-			Entry("Panic",
+			Entry("deprecated Panic compatibility tombstone",
 				protocol.EventPanic,
 				protocol.PanicPayload{
 					Message:   "runtime error: index out of range",

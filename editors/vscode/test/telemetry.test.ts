@@ -33,6 +33,13 @@ describe("telemetry codec", () => {
     assert.deepEqual(decoded.snapshot?.threads, []);
   });
 
+  it("rejects the deprecated Panic compatibility tombstone", () => {
+    assert.throws(
+      () => decodeEvent(envelope(1, "Panic", { message: "boom" })),
+      /unknown telemetry event kind/,
+    );
+  });
+
   it("rejects malformed, incompatible, oversized, and hostile payloads", () => {
     assert.throws(() => decodeEvent("{"), /valid JSON/);
     assert.throws(

@@ -284,12 +284,6 @@ func printEvent(evt protocol.Event) {
 				p.Breakpoint.ID, p.Breakpoint.Location.File, p.Breakpoint.Location.Line)
 		}
 
-	case protocol.EventPanic:
-		var p protocol.PanicPayload
-		if protocol.DecodeEventPayload(evt, &p) == nil {
-			fmt.Printf("\n  [panic] %s\nbingo> ", p.Message)
-		}
-
 	case protocol.EventOutput:
 		var p protocol.OutputPayload
 		if protocol.DecodeEventPayload(evt, &p) == nil {
