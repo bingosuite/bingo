@@ -2051,9 +2051,12 @@ slow-client eviction. There is deliberately no DAP-awareness anywhere in
   DAP socket as a failed writer — the socket lifecycle is owned by `Serve`/`Close`.
 - `ReadMessage()` (called on the hub read-pump goroutine): blocks on an internal
   `cmdOut chan []byte` of marshalled bingo `Command`s produced by the DAP read
-  loop; returns `io.EOF` on Close. **cmdOut-priority:** a non-blocking check of
-  `cmdOut` precedes the `{cmdOut | done}` select, so a `Kill` enqueued right
-  before `Close` (disconnect-terminate) is still handed off before EOF. The hub
+  loop; returns `io.EOF` on Close. **cmdOut-priority:** it probes `cmdOut` before
+  the `{cmdOut | done}` select and, if `done` wins, probes `cmdOut` once more
+  before returning EOF. The final drain is load-bearing: disconnect enqueues
+  `Kill` before `Close`, but both channels can become ready between the first
+  probe and the blocking select; without the re-probe, random select choice can
+  drop the queued kill while another observer keeps the session alive. The hub
   may backpressure this read pump while its ordinary-command queue is full;
   `cmdOut` stays bounded, and Handler `Close` unblocks both `ReadMessage` and a
   DAP producer waiting to enqueue.
