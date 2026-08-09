@@ -1657,10 +1657,14 @@ are detected by a `mach_msg` receive loop.
   registers so arm64 leaves SP unmoved and amd64's retaddr push is already in the
   FP rule) and walking the saved-FP chain (`fp = *fp`). `walkStack` preserves
   saved return PCs, but every non-top frame uses `returnPC-1` for function/line/
-  scope and CFI lookup (underflow guarded): the saved PC is after CALL/BL and can
-  equal an exclusive lexical/FDE boundary, while one byte back lies within the
-  call instruction on both supported architectures. The top frame's live PC is
-  never adjusted. Missing/uncovered CFI degrades gracefully to the old `FP + 16`
+  scope and CFI lookup, via the shared `returnLookupPC` primitive
+  (`frameLookupPC` = "top frame untouched, otherwise `returnLookupPC`"): the
+  saved PC is after CALL/BL and can equal an exclusive lexical/FDE boundary,
+  while one byte back lies within the call instruction on both supported
+  architectures. The top frame's live PC is never adjusted, and `locationForPC`
+  itself is never globally shifted — only known return addresses go through
+  `returnLookupPC` (the goroutine snapshot's `g.gopc` is the other caller).
+  Missing/uncovered CFI degrades gracefully to the old `FP + 16`
   heuristic (`cfaFallbackFromFP`) rather than erroring the stop. The reader is
   arch-generic (maps SP/FP DWARF register
   numbers by `runtime.GOARCH` — arm64 SP=31/FP=29, amd64 RSP=7/RBP=6) and
@@ -1915,6 +1919,19 @@ event embeds the same ID-0 unknown — `currentGoroutineFrom` must never borrow 
 first real goroutine. This preserves honest behavior for stripped binaries,
 attach-without-DWARF, pre-runtime-init entry stops, zeroed/unreadable registers,
 and scheduler-stack stops whose `m.curg` cannot be resolved.
+
+**`CreatedLoc` is a normalized return address.** The runtime fills `g.gopc` from
+`sys.GetCallerPC()`, so it is the address the `go` call returns to, not the `go`
+statement. DWARF lookups are byte-granular half-open intervals, so the raw value
+can resolve to the statement *after* the spawn (and does in the `concurrency`
+fixture); `readGoroutine` therefore runs gopc through the same `returnLookupPC`
+primitive the caller-frame walk uses (see the
+DWARF reader notes). `gopc == 0` stays 0 — extra-M/cgo-callback goroutines can
+have a positive goid and no call site, and an unconditional decrement would
+underflow into an unmapped high address. `StartLoc` (startpc) is a function
+entry, not a return address, and is deliberately NOT adjusted. The `concurrency`
+E2E pins the resolved lines against the fixture's `// SPAWN_WORKER` /
+`// SPAWN_LEAF` markers.
 
 **Coherent metadata reads — the half degradation can't cover.** Degradation
 answers reads that *fail*. It cannot answer reads that all *succeed* while

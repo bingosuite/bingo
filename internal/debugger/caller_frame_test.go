@@ -44,8 +44,13 @@ func TestFrameLookupPC(t *testing.T) {
 	if got := frameLookupPC(0x1000, 0); got != 0x1000 {
 		t.Fatalf("top frame lookup PC = %#x, want live PC %#x", got, uint64(0x1000))
 	}
-	if got := frameLookupPC(0x2000, 1); got != 0x1fff {
-		t.Fatalf("caller lookup PC = %#x, want call PC %#x", got, uint64(0x1fff))
+	if got := frameLookupPC(0x1000, -1); got != 0x1000 {
+		t.Fatalf("negative frame lookup PC = %#x, want live PC %#x", got, uint64(0x1000))
+	}
+	for _, frameIndex := range []int{1, 2, 7} {
+		if got, want := frameLookupPC(0x2000, frameIndex), returnLookupPC(0x2000); got != want {
+			t.Fatalf("frame %d lookup PC = %#x, want call PC %#x", frameIndex, got, want)
+		}
 	}
 	if got := frameLookupPC(0, 1); got != 0 {
 		t.Fatalf("zero caller PC underflowed to %#x", got)
@@ -57,6 +62,18 @@ func TestFrameLookupPC(t *testing.T) {
 	}
 	if classifyScopePC(frameLookupPC(0x2010, 1), discontiguous, nil) != scopePCInside {
 		t.Fatal("adjusted caller PC should be inside the second discontiguous range")
+	}
+}
+
+func TestReturnLookupPC(t *testing.T) {
+	if got := returnLookupPC(0); got != 0 {
+		t.Fatalf("zero PC = %#x, want 0 (no call site recorded)", got)
+	}
+	if got := returnLookupPC(0x4a2b10); got != 0x4a2b0f {
+		t.Fatalf("return address lookup PC = %#x, want %#x", got, uint64(0x4a2b0f))
+	}
+	if got := returnLookupPC(1); got != 0 {
+		t.Fatalf("minimal non-zero PC = %#x, want 0", got)
 	}
 }
 
