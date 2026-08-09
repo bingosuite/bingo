@@ -846,6 +846,38 @@ describe("per-element string limit", () => {
     );
   });
 
+  it("counts replacement characters as one unit each", () => {
+    // Invalid UTF-8 reaches the wire as one U+FFFD per bad byte (encoding/json)
+    // and is one UTF-16 unit here, which is what lets the producer's count
+    // agree with this one for non-UTF-8-clean tracee strings.
+    const atLimit = "\uFFFD".repeat(maximumStringLength);
+    assert.equal(atLimit.length, maximumStringLength);
+    assert.doesNotThrow(() =>
+      decodeEvent(snapshotWith((g) => { g.currentLoc = { file: atLimit, line: 1 }; })),
+    );
+    assert.throws(
+      () =>
+        decodeEvent(
+          snapshotWith((g) => {
+            g.currentLoc = { file: `${atLimit}\uFFFD`, line: 1 };
+          }),
+        ),
+      TelemetryProtocolError,
+    );
+  });
+
+  it("rejects a string of 4096 astral code points", () => {
+    // Looks like "exactly at the limit" by code point, but is 8192 UTF-16
+    // units — the case a rune-based producer limit would get backwards.
+    const full = "\u{1F600}".repeat(maximumStringLength);
+    assert.equal([...full].length, maximumStringLength);
+    assert.equal(full.length, 2 * maximumStringLength);
+    assert.throws(
+      () => decodeEvent(snapshotWith((g) => { g.currentLoc = { file: full, line: 1 }; })),
+      TelemetryProtocolError,
+    );
+  });
+
   it("pins the limit against the Go producer constant", () => {
     const source = goSource("pkg/protocol/protocol.go");
     assert.match(
@@ -956,22 +988,41 @@ describe("truthful omission surfacing", () => {
     assert.equal(view.serverTotals, undefined);
   });
 
-  it("never reports a total below what actually arrived", () => {
+  it("rejects a total below what arrived rather than normalizing it", () => {
+    // The contradiction is refused at the decoder, so the view never has to
+    // paper over it. Silently clamping would repair dishonest data into
+    // something plausible and hide a broken producer.
+    assert.throws(
+      () =>
+        decodeEvent(
+          frame(1, "GoroutineSnapshot", {
+            goroutines: [
+              { id: 1, status: "running", currentLoc: { file: "a.go", line: 1 } },
+              { id: 2, status: "waiting", currentLoc: { file: "a.go", line: 1 } },
+            ],
+            threads: [],
+            totals: { goroutines: 1 },
+          }),
+        ),
+      TelemetryProtocolError,
+    );
+
+    // And the view model reports exactly what the wire said, unmodified.
     const view = toSessionViewModel(
       baseModel({
         snapshot: {
           ...snapshot([goroutine(1, 0, { current: true }), goroutine(2, 1)]),
           totals: {
-            goroutines: 1,
-            threads: 0,
+            goroutines: 9,
+            threads: 4,
             goroutinesClipped: false,
             threadsClipped: false,
           },
         },
       }),
     );
-    assert.equal(view.serverTotals?.goroutines, 2);
-    assert.equal(view.serverTotals?.goroutinesOmitted, 0);
+    assert.equal(view.serverTotals?.goroutines, 9);
+    assert.equal(view.serverTotals?.goroutinesOmitted, 7);
   });
 
   // The four scan-clipping combinations: each count must be marked a lower bound
