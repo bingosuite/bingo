@@ -22,7 +22,7 @@ build OS=os_name ARCH=arch_name:
 #		 just run darwin arm64 							-> 	runs ./build/bingo/bingo_darwin_arm64 (MacOs specified, ARM64 specified)
 #		 just run linux amd64 -addr 127.0.0.1:6061 -v 	->  runs ./build/bingo/bingo_linux_amd64 -addr 127.0.0.1:6061 -v
 
-# ARGS:  -addr string    listen address (default "127.0.0.1:6060")
+# ARGS:  -addr string    listen address (default ":6060")
 #		 -idle-timeout duration
 #		                 exit after no managed sessions for this duration;
 #		                 omitted/0 keeps the server persistent; positive values
@@ -34,8 +34,8 @@ run OS=os_name ARCH=arch_name *ARGS="":
 
 # Default WS (-addr) and DAP (-dap-addr) listen addresses for the server recipes.
 # Override on the CLI, e.g. `just server darwin arm64 :7070 :4712`.
-ws_addr := "127.0.0.1:6060"
-dap_addr := "127.0.0.1:4711"
+ws_addr := ":6060"
+dap_addr := ":4711"
 
 # Build then run the server with EVERYTHING enabled: both the WebSocket (-addr)
 # and DAP (-dap-addr) listeners, using the standard defaults so a DAP driver

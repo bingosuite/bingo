@@ -8,7 +8,10 @@ import (
 	"time"
 )
 
-const maxAcceptRetryDelay = time.Second
+const (
+	initialAcceptRetryDelay = 5 * time.Millisecond
+	maxAcceptRetryDelay     = time.Second
+)
 
 // Server accepts DAP connections on a TCP listener and hands each one to a
 // Handler bound to the given Provider. One goroutine per connection.
@@ -25,7 +28,11 @@ type Server struct {
 	// ReadProtocolMessage and wedge wg.Wait().
 	handlers map[*Handler]struct{}
 	closing  chan struct{}
-	wg       sync.WaitGroup
+	// Tests lengthen retry timing so Close can deterministically interrupt a
+	// pending backoff instead of racing the production 5ms timer.
+	acceptRetryInitialDelay time.Duration
+	acceptRetryMaxDelay     time.Duration
+	wg                      sync.WaitGroup
 }
 
 // NewServer creates a DAP server over provider. It does not listen until Serve.
@@ -34,10 +41,12 @@ func NewServer(provider Provider, log *slog.Logger) *Server {
 		log = slog.Default()
 	}
 	return &Server{
-		provider: provider,
-		log:      log,
-		handlers: make(map[*Handler]struct{}),
-		closing:  make(chan struct{}),
+		provider:                provider,
+		log:                     log,
+		handlers:                make(map[*Handler]struct{}),
+		closing:                 make(chan struct{}),
+		acceptRetryInitialDelay: initialAcceptRetryDelay,
+		acceptRetryMaxDelay:     maxAcceptRetryDelay,
 	}
 }
 
@@ -96,15 +105,15 @@ func (s *Server) acceptLoop(ln net.Listener) {
 			}
 			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
 				if retryDelay == 0 {
-					retryDelay = 5 * time.Millisecond
+					retryDelay = s.acceptRetryInitialDelay
 				} else {
 					retryDelay *= 2
 				}
-				if retryDelay > maxAcceptRetryDelay {
-					retryDelay = maxAcceptRetryDelay
+				if retryDelay > s.acceptRetryMaxDelay {
+					retryDelay = s.acceptRetryMaxDelay
 				}
-				s.log.Warn("dap accept error; retrying", "err", err, "delay", retryDelay)
 				timer := time.NewTimer(retryDelay)
+				s.log.Warn("dap accept error; retrying", "err", err, "delay", retryDelay)
 				select {
 				case <-timer.C:
 				case <-s.closing:

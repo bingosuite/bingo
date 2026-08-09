@@ -63,6 +63,20 @@ type retryAddr string
 func (a retryAddr) Network() string { return "test" }
 func (a retryAddr) String() string  { return string(a) }
 
+type notifyingWriter struct {
+	once  sync.Once
+	wrote chan struct{}
+}
+
+func newNotifyingWriter() *notifyingWriter {
+	return &notifyingWriter{wrote: make(chan struct{})}
+}
+
+func (w *notifyingWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.wrote) })
+	return len(p), nil
+}
+
 func quietServer(t *testing.T) *Server {
 	t.Helper()
 	rec := &cmdRecorder{}
@@ -172,5 +186,37 @@ func TestAcceptLoopRetriesTemporaryErrors(t *testing.T) {
 
 	if err := s.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("close: %v", err)
+	}
+}
+
+func TestCloseInterruptsAcceptRetryBackoff(t *testing.T) {
+	s := quietServer(t)
+	writer := newNotifyingWriter()
+	s.log = slog.New(slog.NewTextHandler(writer, nil))
+	s.acceptRetryInitialDelay = time.Hour
+	s.acceptRetryMaxDelay = time.Hour
+
+	listener := newRetryListener()
+	s.mu.Lock()
+	s.listener = listener
+	s.wg.Add(1)
+	s.mu.Unlock()
+	go s.acceptLoop(listener)
+
+	select {
+	case <-writer.wrote:
+	case <-time.After(time.Second):
+		t.Fatal("accept loop did not enter retry backoff")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- s.Close() }()
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("close: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not interrupt the pending accept retry backoff")
 	}
 }

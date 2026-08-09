@@ -43,9 +43,9 @@ drive a debug session over a TCP socket while BinGo's own visual clients observe
 Manual clients can start the server with a DAP listener:
 
 ```sh
-just server                       # builds + runs both listeners on IPv4 loopback
+just server                       # builds + runs with -addr :6060 -dap-addr :4711
 # or, from a prebuilt binary:
-bingo -addr 127.0.0.1:6060 -dap-addr 127.0.0.1:4711
+bingo -addr :6060 -dap-addr :4711
 ```
 
 `just server` starts both listeners with the defaults above; use `just server-ws`
@@ -65,7 +65,7 @@ Frontends can identify and reuse a compatible bingo process through
   "instanceId": "4dd4dfdd-7f55-41a5-bd95-c086ce6f3c2a",
   "dap": {
     "enabled": true,
-    "address": "127.0.0.1:4711",
+    "address": "0.0.0.0:4711",
     "sessionEventVersion": 1
   },
   "managedIdleShutdown": {
@@ -96,7 +96,7 @@ opt into server-owned idle shutdown:
 ```sh
 bingo -addr 127.0.0.1:6060 -dap-addr 127.0.0.1:4711 -idle-timeout 30s
 # equivalent development recipe:
-just server darwin arm64 127.0.0.1:6060 127.0.0.1:4711 -idle-timeout 30s
+just server darwin arm64 :6060 :4711 -idle-timeout 30s
 ```
 
 The timeout is armed at startup and whenever the last managed session
@@ -106,10 +106,6 @@ joined a session do not keep the process alive, so a process owner must allow
 enough grace for its health check and DAP handshake. A zero or omitted timeout
 disables idle shutdown. Positive values must be at least `1ms` and use whole
 milliseconds so the enforced duration exactly matches `timeoutMs`.
-
-The shipped CLI and `just server` defaults bind both protocols to IPv4
-loopback. Explicit non-loopback binds are unauthenticated and should only be
-used on trusted networks or behind an authenticated transport.
 
 ### VS Code companion extension
 

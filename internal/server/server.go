@@ -63,7 +63,7 @@ type Server struct {
 	idleTimerHook func()
 }
 
-// New creates a Server that will listen on addr (e.g. "127.0.0.1:6060").
+// New creates a Server that will listen on addr (e.g. ":6060").
 func New(addr string, log *slog.Logger) *Server {
 	return newServer(addr, 0, log)
 }
