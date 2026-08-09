@@ -94,17 +94,17 @@ export function serverTotals(
   if (snapshot === undefined || totals === undefined) {
     return undefined;
   }
-  // A total can never be below what actually arrived; clamping keeps the view
-  // honest if a peer ever reports otherwise.
-  const goroutines = Math.max(totals.goroutines, snapshot.goroutines.length);
-  const threads = Math.max(totals.threads, snapshot.threads.length);
+  // No clamping: the decoder already REJECTS totals below the delivered counts,
+  // because a total that contradicts what arrived is dishonest data rather than
+  // a truncation report. Normalizing it here as well would quietly repair the
+  // contradiction and hide a broken producer behind a plausible-looking view.
   return {
-    goroutines,
-    threads,
+    goroutines: totals.goroutines,
+    threads: totals.threads,
     goroutinesClipped: totals.goroutinesClipped,
     threadsClipped: totals.threadsClipped,
-    goroutinesOmitted: goroutines - snapshot.goroutines.length,
-    threadsOmitted: threads - snapshot.threads.length,
+    goroutinesOmitted: totals.goroutines - snapshot.goroutines.length,
+    threadsOmitted: totals.threads - snapshot.threads.length,
   };
 }
 
