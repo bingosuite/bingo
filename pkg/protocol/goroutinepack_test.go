@@ -555,6 +555,69 @@ var _ = Describe("goroutine event packing", func() {
 			Expect(goroutineIDs(kept.Goroutines)).To(Equal([]int{1, 2}))
 		})
 
+		It("rejects a string of MaxGoroutineStringLength astral code points", func() {
+			// The case a rune-based limit gets exactly backwards: 4096 astral
+			// code points look like "exactly at the limit" but are 8192 UTF-16
+			// units on the wire, which the consumer must refuse.
+			full := strings.Repeat("\U0001F600", protocol.MaxGoroutineStringLength)
+			Expect(len([]rune(full))).To(Equal(protocol.MaxGoroutineStringLength))
+			Expect(utf16Units(full)).To(Equal(2 * protocol.MaxGoroutineStringLength))
+
+			out, report := nonAnchor(func(g *protocol.Goroutine) { g.CurrentLoc.File = full })
+			Expect(report.Degraded).To(BeFalse())
+			Expect(goroutineIDs(out.Goroutines)).To(Equal([]int{1}), "dropped, not emitted")
+			for _, g := range out.Goroutines {
+				Expect(g.CurrentLoc.File).NotTo(ContainSubstring("\U0001F600"))
+			}
+		})
+
+		DescribeTable("counts invalid UTF-8 the way the wire renders it",
+			func(build func(n int) string, unitsPerRepeat int) {
+				// encoding/json substitutes one U+FFFD per invalid byte, and a
+				// range loop yields one RuneError per invalid byte, so the two
+				// agree. A limit that counted BYTES would disagree here.
+				fits := protocol.MaxGoroutineStringLength / unitsPerRepeat
+				atLimit := build(fits)
+				Expect(utf16Units(atLimit)).To(BeNumerically("<=", protocol.MaxGoroutineStringLength))
+				Expect(utf16Units(atLimit)).To(BeNumerically(">", protocol.MaxGoroutineStringLength-unitsPerRepeat))
+				kept, _ := nonAnchor(func(g *protocol.Goroutine) { g.CurrentLoc.File = atLimit })
+				Expect(goroutineIDs(kept.Goroutines)).To(Equal([]int{1, 2}), "the largest fitting string is kept")
+
+				over := build(fits + 1)
+				Expect(utf16Units(over)).To(BeNumerically(">", protocol.MaxGoroutineStringLength))
+				dropped, _ := nonAnchor(func(g *protocol.Goroutine) { g.CurrentLoc.File = over })
+				Expect(goroutineIDs(dropped.Goroutines)).To(Equal([]int{1}), "one repeat more is dropped")
+			},
+			Entry("bare invalid bytes", func(n int) string { return strings.Repeat("\xff", n) }, 1),
+			Entry("truncated multi-byte sequences", func(n int) string {
+				return strings.Repeat("\xe2\x80", n)
+			}, 2),
+			Entry("encoded surrogate halves", func(n int) string {
+				return strings.Repeat("\xed\xa0\x80", n)
+			}, 3),
+		)
+
+		It("agrees with the post-wire length for every escape class", func() {
+			// The property the whole limit rests on: what Go counts is what the
+			// consumer will measure after the value has been through JSON.
+			for _, s := range []string{
+				strings.Repeat("a", 4096),
+				strings.Repeat("\U0001F600", 2048),
+				strings.Repeat("\xff", 100),
+				strings.Repeat("\xe2\x80", 50),
+				"a<b>c&d\"e\\f",
+				"\u2028\u2029\u0000\u001f",
+				"服务 café \U0001F680",
+			} {
+				raw, err := json.Marshal(s)
+				Expect(err).NotTo(HaveOccurred())
+				var wire string
+				Expect(json.Unmarshal(raw, &wire)).To(Succeed())
+				Expect(utf16Units(s)).To(Equal(utf16Units(wire)),
+					"the producer's count must survive the round trip: %q", s)
+			}
+		})
+
 		It("degrades when the current goroutine violates the limit", func() {
 			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: []protocol.Goroutine{
