@@ -15,8 +15,11 @@ import { fileURLToPath, URL } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
 
 import { currentTarget } from "./platform.mjs";
-import { terminateOwnedProcessGroup } from "./owned-process.mjs";
-import { withTimeout } from "./timing.mjs";
+import {
+  observeOwnedProcess,
+  terminateOwnedProcessGroup,
+  waitForOwnedProcessExit,
+} from "./owned-process.mjs";
 
 const target = currentTarget();
 const vsix = fileURLToPath(
@@ -32,10 +35,9 @@ const extracted = join(
 rmSync(extracted, { force: true, recursive: true });
 mkdirSync(extracted, { recursive: true });
 const idleTimeoutMs = 2000;
-let child;
-let exit;
-let childExited = false;
+let ownedServer;
 let failure;
+let cleanupComplete = false;
 
 try {
   run("unzip", ["-q", vsix, "-d", extracted]);
@@ -43,7 +45,7 @@ try {
   const binary = join(extracted, "extension", "bin", "bingo");
   const logPath = join(extracted, "server.log");
   const logFD = openSync(logPath, "a", 0o600);
-  child = spawn(
+  const child = spawn(
     binary,
     [
       "-addr",
@@ -59,22 +61,16 @@ try {
       stdio: ["ignore", logFD, logFD],
     },
   );
-  exit = new Promise((resolve, reject) => {
-    child.once("error", (error) => {
-      childExited = true;
-      reject(error);
-    });
-    child.once("exit", (code, signal) => {
-      childExited = true;
-      resolve({ code, signal });
-    });
-  });
+  ownedServer = observeOwnedProcess(child);
   closeSync(logFD);
   child.unref();
-  // The harness must stay alive to observe server-owned exit without relying on a leaked timeout.
-  child.ref();
+  ownedServer.ref();
 
-  const health = await pollHealth(managementPort, dapPort, exit);
+  const health = await pollHealth(
+    managementPort,
+    dapPort,
+    ownedServer.outcome,
+  );
   if (
     health.service !== "bingo" ||
     health.managementApiVersion !== 1 ||
@@ -88,11 +84,14 @@ try {
     throw new Error(`unexpected packaged server health: ${JSON.stringify(health)}`);
   }
 
-  const outcome = await withTimeout(
-    exit,
+  const outcome = await waitForOwnedProcessExit(
+    ownedServer,
     idleTimeoutMs + 8000,
     "packaged server did not self-exit after its idle grace",
   );
+  if (outcome.kind === "error") {
+    throw outcome.error;
+  }
   if (outcome.code !== 0 || outcome.signal !== null) {
     throw new Error(
       `packaged server exited with code ${String(outcome.code)} signal ${String(outcome.signal)}`,
@@ -104,13 +103,10 @@ try {
 } catch (error) {
   failure = error;
 } finally {
-  if (failure !== undefined && child !== undefined && !childExited) {
+  if (failure !== undefined && ownedServer !== undefined) {
     try {
-      if (child.pid !== undefined && exit !== undefined) {
-        child.ref();
-        await terminateOwnedProcessGroup(child.pid, exit);
-        childExited = true;
-      }
+      await terminateOwnedProcessGroup(ownedServer);
+      cleanupComplete = true;
     } catch (cleanupError) {
       failure = new AggregateError(
         [failure, cleanupError],
@@ -118,7 +114,7 @@ try {
       );
     }
   }
-  if (child === undefined || childExited) {
+  if (failure === undefined || ownedServer === undefined || cleanupComplete) {
     try {
       rmSync(extracted, { force: true, recursive: true });
     } catch (cleanupError) {
@@ -131,7 +127,7 @@ try {
             );
     }
   } else {
-    log(`Preserved ${extracted}: test-owned server exit was not confirmed`);
+    log(`Preserved ${extracted}: test-owned process-group cleanup was incomplete`);
   }
 }
 

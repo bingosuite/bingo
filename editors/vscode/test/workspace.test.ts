@@ -47,15 +47,21 @@ describe("repository VS Code integration", () => {
     assert.doesNotMatch(productionProcessSources, /SIGKILL|process\.kill/);
     assert.match(
       readText("editors/vscode/scripts/owned-process.mjs"),
-      /signalProcess\(-pid, "SIGKILL"\)/,
+      /sendSignal\(signalProcess, -pid, "SIGKILL"\)/,
     );
     const smoke = readText("editors/vscode/scripts/smoke-server.mjs");
-    assert.match(
-      smoke,
-      /failure !== undefined && child !== undefined && !childExited/,
-    );
+    assert.match(smoke, /ownedServer = observeOwnedProcess\(child\)/);
     assert.match(smoke, /terminateOwnedProcessGroup/);
-    assert.match(smoke, /if \(child === undefined \|\| childExited\)/);
+    assert.match(smoke, /cleanupComplete/);
+    assert.match(smoke, /process-group cleanup was incomplete/);
+
+    const packagedE2E = readText("editors/vscode/test/packagedE2E.ts");
+    assert.match(packagedE2E, /ownedServer = observeOwnedProcess\(child\)/);
+    assert.match(packagedE2E, /terminateOwnedProcessGroup/);
+    assert.doesNotMatch(
+      packagedE2E,
+      /process\.kill\s*\(\s*child\.pid\s*,\s*["']SIGKILL["']/,
+    );
   });
 
   it("exposes exactly the two normal bingo debug choices", () => {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter, once } from "node:events";
 import {
   existsSync,
@@ -17,6 +17,12 @@ import { filterTree } from "../src/tree.js";
 import { SessionRegistry } from "../src/registry.js";
 import { defaultDelay, ServerManager } from "../src/serverManager.js";
 import { spawnDetachedServer } from "../src/serverProcess.js";
+import {
+  observeOwnedProcess,
+  terminateOwnedProcessGroup,
+  waitForOwnedProcessExit,
+  type OwnedProcess,
+} from "../scripts/owned-process.mjs";
 import {
   decodeSessionAnnouncement,
   sessionDAPEventName,
@@ -63,9 +69,10 @@ async function main(): Promise<void> {
   );
   rmSync(scratch, { force: true, recursive: true });
   mkdirSync(scratch, { recursive: true });
-  let child: ChildProcess | undefined;
+  let ownedServer: OwnedProcess | undefined;
   let manager: ServerManager | undefined;
-  let succeeded = false;
+  let failure: Error | undefined;
+  let cleanupComplete = false;
   try {
     const vsix = resolve(repositoryRoot, "dist", `bingo-${target}.vsix`);
     const extracted = join(scratch, "vsix");
@@ -92,7 +99,8 @@ async function main(): Promise<void> {
       spawnServer(request, onOutcome) {
         spawns += 1;
         return spawnDetachedServer(request, onOutcome, (command, args, options) => {
-          child = spawn(command, args, options);
+          const child = spawn(command, args, options);
+          ownedServer = observeOwnedProcess(child);
           return child;
         });
       },
@@ -145,36 +153,71 @@ async function main(): Promise<void> {
     assert.ok(firstDepth <= lastDepth);
 
     manager.dispose();
-    if (child === undefined) {
+    if (ownedServer === undefined) {
       throw new Error("managed server was not spawned");
     }
-    await waitForExit(child, config.idleTimeoutMs + 10_000);
+    const outcome = await waitForOwnedProcessExit(
+      ownedServer,
+      config.idleTimeoutMs + 10_000,
+      "managed server did not self-exit",
+    );
+    if (outcome.kind === "error") {
+      throw outcome.error;
+    }
     assert.equal(
-      child.exitCode,
+      outcome.code,
       0,
       "managed server must self-exit cleanly after idle",
     );
+    assert.equal(outcome.signal, null);
     process.stdout.write(
       `[idle] instance=${firstHealth.instanceId} self-exited after all sessions closed\n`,
     );
-    succeeded = true;
+  } catch (error) {
+    failure = asError(error);
   } finally {
-    if (!succeeded) {
+    if (failure !== undefined) {
       manager?.dispose();
     }
+    if (failure !== undefined && ownedServer !== undefined) {
+      try {
+        await terminateOwnedProcessGroup(ownedServer, {
+          gracefulTimeoutMs: 5000,
+          exitTimeoutMs: 5000,
+          groupTimeoutMs: 3000,
+        });
+        cleanupComplete = true;
+      } catch (cleanupError) {
+        failure = new AggregateError(
+          [failure, asError(cleanupError)],
+          "packaged concurrency E2E failed and test-owned process cleanup also failed",
+        );
+      }
+    }
     const serverLog = join(scratch, "server.log");
-    if (!succeeded && existsSync(serverLog)) {
+    if (failure !== undefined && existsSync(serverLog)) {
       process.stderr.write(`[server log]\n${readFileSync(serverLog, "utf8")}\n`);
     }
-    if (!succeeded && child?.pid !== undefined && child.exitCode === null) {
+    if (failure === undefined || ownedServer === undefined || cleanupComplete) {
       try {
-        process.kill(child.pid, "SIGKILL");
-      } catch {
-        // The exact test-owned server may already have exited.
+        rmSync(scratch, { force: true, recursive: true });
+      } catch (cleanupError) {
+        failure =
+          failure === undefined
+            ? asError(cleanupError)
+            : new AggregateError(
+                [failure, asError(cleanupError)],
+                "packaged concurrency E2E failed and scratch cleanup also failed",
+              );
       }
-      await Promise.race([once(child, "exit"), delay(3000)]);
+    } else {
+      process.stderr.write(
+        `Preserved ${scratch}: test-owned process-group cleanup was incomplete\n`,
+      );
     }
-    rmSync(scratch, { force: true, recursive: true });
+  }
+  if (failure !== undefined) {
+    throw failure;
   }
 }
 
@@ -551,22 +594,14 @@ async function freePort(): Promise<number> {
   return port;
 }
 
-async function waitForExit(process: ChildProcess, timeoutMs: number): Promise<void> {
-  if (process.exitCode !== null) {
-    return;
-  }
-  await Promise.race([
-    once(process, "exit").then(() => undefined),
-    delay(timeoutMs).then(() => {
-      throw new Error("managed server did not self-exit");
-    }),
-  ]);
-}
-
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolveDelay) => {
     setTimeout(resolveDelay, milliseconds);
   });
+}
+
+function asError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
 }
 
 function run(command: string, args: readonly string[]): void {

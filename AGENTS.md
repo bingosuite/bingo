@@ -936,9 +936,13 @@ activation/view/custom-event acknowledgement test; linux additionally runs the
 real packaged DAP→WebSocket graphical-model E2E. Darwin native-debug execution
 requires local/self-hosted Apple Silicon, where the same E2E covers all five
 examples. Both tests observe server-owned idle exit on success. On failure the
-smoke may SIGKILL only the detached process group it created; the packaged E2E
-may signal only its exact captured server PID. Cleanup is test-only and must
-never enter extension production code.
+test harness tracks the detached child's terminal outcome before signaling,
+requests graceful shutdown with SIGTERM to the exact captured server PID, and
+escalates to SIGKILL on only its captured process group when the tracked server
+remains live past a bounded grace. It then waits for the server outcome and
+confirms the owned group is absent before deleting scratch artifacts; incomplete
+cleanup is reported and preserves those artifacts. Cleanup is test-only and
+must never enter extension production code.
 Apple's external linker can vary `LC_UUID` even for identical cgo inputs, but
 current dyld rejects binaries with `-no_uuid`; `normalize-mach-o-uuid.mjs`
 therefore derives a stable UUID from the unsigned Mach-O with its UUID and
