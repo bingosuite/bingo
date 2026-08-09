@@ -249,12 +249,12 @@ type ErrorPayload struct {
 
 // internal/hub/hub.go
 func (h *Hub) broadcastError(kind protocol.CommandKind, err error) {
-    evt, e := protocol.NewEvent(protocol.EventError, h.seq.Add(1), protocol.ErrorPayload{
+    evt, e := protocol.NewEvent(protocol.EventError, 0, protocol.ErrorPayload{
         Command: kind,
         Message: err.Error(),
     })
     if e != nil {
-        h.log.Error("failed to marshal error event", "err", e)
+        h.log.Error("failed to marshal error event", "err", e, "cause", err)
         return
     }
     h.broadcast(evt)
@@ -267,6 +267,10 @@ version before hub injection, send that connection a close-1002 frame naming
 the expected and received versions, and disconnect it. Broadcasting an
 `EventError` would expose one client's malformed input to innocent clients and
 consume a shared hub sequence number for a connection-local failure.
+
+`broadcast` assigns the hub sequence while holding the outbound lock, then
+marshals and delivers the frame in that same order. Event constructors must not
+allocate or reuse hub sequence numbers themselves.
 
 ### On error message content
 
