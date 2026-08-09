@@ -192,10 +192,8 @@ reported asynchronously via the `Paused` event once the interrupt surfaces (see
 [Pause — async interrupt](#pause--async-interrupt)). `Kill` was previously
 misrouted through `resumeCh`, which is only drained while suspended — so a `Kill`
 against a runaway target (tight loop, no breakpoints) could never terminate it
-through the protocol. Routing `Kill` via `cmdCh` fixes that; the suspended wait
-loop `return`s after executing a `Kill` (like `Restart`), since the process it
-was waiting to resume no longer exists. `Kill` with no active debugger is a
-benign no-op success (nothing to terminate).
+through the protocol. Routing `Kill` via `cmdCh` fixes that. `Kill` with no active
+debugger is a benign no-op success (nothing to terminate).
 
 Stale resumes: a resuming command sent **while the process is still running**
 (an erroneous or racing client) lands in `resumeCh` but is not drained by Run's
@@ -222,6 +220,30 @@ loop** (it checks that the session left `suspended` before returning). Bailing
 out on a failed resume would strand the client: the process is still suspended,
 but a retry resume lands in `resumeCh`, which only the wait loop drains, so the
 session could never be resumed again.
+
+**Leaving the wait loop is decided by observed state, never by command kind.**
+Both branches that execute a command while suspended — `resumeCh` and `cmdCh` —
+return only `if h.State() != protocol.StateSuspended`. The `cmdCh` branch used to
+return unconditionally for `CmdRestart`/`CmdKill` on the premise that the process
+it was waiting on no longer existed. That premise only holds when the command
+*succeeded*: a `Restart` rejected before it touches the debugger (raw hub with no
+factory, no prior `Launch` — an Attach-based session, malformed `RestartPayload`)
+and a `Kill` the debugger refuses both broadcast an `EventError` and leave the
+original process suspended. Returning there stranded the session exactly like a
+rejected resume — every later `Continue`/`Step*` landed in `resumeCh`, which
+Run's outer loop never drains — leaving a live, frozen tracee that only a
+successful `Kill`/`Restart` or a full session teardown could recover (and on a
+raw hub `Restart` can never succeed, so only teardown could). The state check is
+exhaustive: successful Restart → `running` (returns), failed relaunch → `idle`
+(returns, old debugger discarded), rejected Restart / failed `Kill` → still
+`suspended` (stays, retryable). A **successful** `Kill` also leaves the state
+`suspended` — `executeCommand` has no state case for it — so the loop stays
+parked until the debugger reports its own teardown as `EventProcessExited` or a
+closed `Events` channel, which the wait loop's events branch already handles
+(engine shutdown always produces one; see
+[Engine concurrency model](#engine-concurrency-model--non-obvious-invariants)).
+Waiting for that signal is strictly more accurate than inferring death from a
+command kind.
 
 ### Session state machine
 
@@ -823,12 +845,16 @@ a resuming command); it is now routed via `cmdCh` for exactly this reason — se
 routed through the ordinary `cmdCh` (like `SetBreakpoint`), which both Run's
 outer loop and the suspend-wait loop's `case cc := <-h.cmdCh:` branch drain.
 The one special case: that branch normally loops back to keep waiting for a
-resume after executing a non-resuming command, but for `CmdRestart` **and**
-`CmdKill` it `return`s instead — the suspended process it was waiting on no
-longer exists (replaced or terminated), so there's nothing left to resume, and
-returning lets Run's outer loop naturally pick up the new/closed debugger's
-events channel (`h.dbg` is reassigned inside `handleRestart` before the
-confirmation event is broadcast).
+resume after executing a non-resuming command, and it leaves only when the
+command moved the session out of `suspended` — `h.State() != StateSuspended`,
+the same guard the `resumeCh` branch uses. A **successful** `CmdRestart` hits
+that (it transitions to `running`, or to `idle` if the relaunch failed), so
+Run's outer loop naturally picks up the new debugger's events channel (`h.dbg`
+is reassigned inside `handleRestart` before the confirmation event is
+broadcast). A `CmdRestart` **rejected** before it touches the debugger, or a
+failed `CmdKill`, leaves the original process suspended and the loop keeps
+waiting — keying the exit off the command kind instead wedged those sessions,
+see [Suspend/resume protocol](#suspendresume-protocol).
 
 `EventRestarted` is a confirmation event (like `BreakpointSet`), not a
 suspending one — the new process's suspended state (if any, e.g. break-on-
