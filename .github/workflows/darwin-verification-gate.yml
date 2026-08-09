@@ -20,9 +20,18 @@ permissions:
   pull-requests: write
   statuses: write
 
+# Runs are serialized per pull request and are NEVER cancelled. Cancellation
+# terminates the job between the pending status and the final one, and a killed
+# runner cannot be relied on to run its cleanup, so an interrupted run can strand
+# the required head status on `pending` forever. Superseding therefore happens
+# only while a run is still queued, where it has posted nothing.
+#
+# Unrelated label events are routed to a per-run group so they can never queue
+# behind — or cancel a queued — `synchronize`/`reopened`/verified-label run. Only
+# events that are authoritative for the current head share the `policy` group.
 concurrency:
-  group: darwin-verification-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  group: darwin-verification-${{ github.event.pull_request.number }}-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'darwin-e2e-verified' && format('unrelated-{0}', github.run_id) || 'policy' }}
+  cancel-in-progress: false
 
 jobs:
   publish-darwin-verification:
@@ -41,6 +50,7 @@ jobs:
       - name: Evaluate and publish Darwin verification
         env:
           GH_TOKEN: ${{ github.token }}
+          DARWIN_GATE_DECISION_FILE: ${{ runner.temp }}/darwin-gate-decision
         run: |
           set -euo pipefail
           if [ ! -r .github/scripts/darwin-verification-gate.sh ]; then
@@ -51,8 +61,37 @@ jobs:
               -f context='Darwin E2E verified' \
               -f description='Trusted Darwin verification policy is unavailable.' \
               -f target_url="$run_url" >/dev/null
+            printf '%s\n' missing-policy > "$DARWIN_GATE_DECISION_FILE"
             echo "::error title=Darwin E2E verification policy unavailable::The trusted base does not contain the gate script, so this head fails closed."
             exit 1
           fi
 
           bash .github/scripts/darwin-verification-gate.sh
+
+      # The gate posts `pending` before it can decide. If the job is interrupted
+      # (cancellation, timeout, runner loss) between those points, the required
+      # head status would stay `pending` and block the PR forever. `always()`
+      # also runs on cancellation, so this best-effort step replaces a
+      # never-resolved `pending` with an explicit failure.
+      - name: Fail closed when no decision was published
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DARWIN_GATE_DECISION_FILE: ${{ runner.temp }}/darwin-gate-decision
+        run: |
+          set -euo pipefail
+          if [ -s "$DARWIN_GATE_DECISION_FILE" ]; then
+            printf 'Darwin verification gate decided: %s\n' \
+              "$(cat "$DARWIN_GATE_DECISION_FILE")"
+            exit 0
+          fi
+
+          head_sha=$(jq -er '.pull_request.head.sha' "$GITHUB_EVENT_PATH")
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head_sha" \
+            -f state=failure \
+            -f context='Darwin E2E verified' \
+            -f description='Darwin verification gate ended without a decision.' \
+            -f target_url="$run_url" >/dev/null
+          echo "::error title=Darwin E2E verification incomplete::The gate did not publish a decision for this head, so it fails closed."
+          exit 1
