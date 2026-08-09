@@ -261,6 +261,13 @@ func (h *Hub) broadcastError(kind protocol.CommandKind, err error) {
 }
 ```
 
+An incompatible WebSocket envelope is not a command/debugger failure and must
+not use this broadcast path. It is local to the offending peer: validate the
+version before hub injection, send that connection a close-1002 frame naming
+the expected and received versions, and disconnect it. Broadcasting an
+`EventError` would expose one client's malformed input to innocent clients and
+consume a shared hub sequence number for a connection-local failure.
+
 ### On error message content
 
 Bingo is a **local developer tool**: the client is the operator debugging their
@@ -287,3 +294,4 @@ server-side `slog` output and map to short client-facing messages there. The
 | Goroutine → owner error propagation              | Emit a typed `protocol.Event` (`EventError` / `EventProcessExited`) on `Debugger.Events()`    |
 | Methods not on the `Debugger` interface          | Keep unexported on `engine`; return errors up the synchronous chain to the loop               |
 | Server → WebSocket client error                  | Broadcast a typed `EventError`; message text is intentionally surfaced (local tool)           |
+| Incompatible WebSocket envelope                  | Close only that peer with code 1002; never broadcast or allocate a hub sequence                |
