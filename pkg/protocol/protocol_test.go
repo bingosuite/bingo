@@ -327,6 +327,24 @@ var _ = Describe("Event", func() {
 					Expect(protocol.DecodeEventPayload(e, &p)).To(Succeed())
 					Expect(p.Goroutines).To(HaveLen(1))
 					Expect(p.Goroutines[0].ID).To(Equal(1))
+					Expect(p.Totals).To(BeNil())
+				},
+			),
+
+			Entry("Goroutines with totals",
+				protocol.EventGoroutines,
+				protocol.GoroutinesPayload{
+					Goroutines: []protocol.Goroutine{sampleGoroutine},
+					Totals:     &protocol.SnapshotTotals{Goroutines: 9001, Clipped: true},
+				},
+				func(e protocol.Event) {
+					var p protocol.GoroutinesPayload
+					Expect(protocol.DecodeEventPayload(e, &p)).To(Succeed())
+					Expect(p.Goroutines).To(HaveLen(1))
+					Expect(p.Totals).NotTo(BeNil())
+					Expect(p.Totals.Goroutines).To(Equal(9001))
+					Expect(p.Totals.Threads).To(BeZero())
+					Expect(p.Totals.Clipped).To(BeTrue())
 				},
 			),
 
@@ -350,6 +368,25 @@ var _ = Describe("Event", func() {
 					Expect(p.Current).To(Equal(1))
 					Expect(p.Created).To(Equal([]int{7, 8}))
 					Expect(p.Exited).To(Equal([]int{3}))
+					Expect(p.Totals).To(BeNil())
+				},
+			),
+
+			Entry("GoroutineSnapshot with totals",
+				protocol.EventGoroutineSnapshot,
+				protocol.GoroutineSnapshotPayload{
+					Goroutines: []protocol.Goroutine{sampleGoroutine},
+					Threads:    []protocol.Thread{sampleThread},
+					Current:    1,
+					Totals:     &protocol.SnapshotTotals{Goroutines: 41203, Threads: 64},
+				},
+				func(e protocol.Event) {
+					var p protocol.GoroutineSnapshotPayload
+					Expect(protocol.DecodeEventPayload(e, &p)).To(Succeed())
+					Expect(p.Totals).NotTo(BeNil())
+					Expect(p.Totals.Goroutines).To(Equal(41203))
+					Expect(p.Totals.Threads).To(Equal(64))
+					Expect(p.Totals.Clipped).To(BeFalse())
 				},
 			),
 
@@ -789,6 +826,7 @@ var _ = Describe("Version", func() {
 		},
 		Entry("newer", "999.0"),
 		Entry("older", "1.1"),
+		Entry("the previous release", "1.2"),
 		Entry("omitted", ""),
 	)
 	It("is stamped on every event", func() {
@@ -797,5 +835,21 @@ var _ = Describe("Version", func() {
 		wire, _ := protocol.MarshalEvent(e)
 		decoded, _ := protocol.UnmarshalEvent(wire)
 		Expect(decoded.Version).To(Equal(protocol.Version))
+	})
+	It("is 1.4 — the goroutine event budget and totals reshape", func() {
+		Expect(protocol.Version).To(Equal("1.4"))
+	})
+})
+
+var _ = Describe("goroutine event limits", func() {
+	It("scopes the byte budget to the goroutine event family", func() {
+		Expect(protocol.MaxGoroutineEventBytes).To(Equal(2 * 1024 * 1024))
+	})
+
+	It("pins the element-count caps and the thread floor", func() {
+		Expect(protocol.MaxSnapshotGoroutines).To(Equal(5000))
+		Expect(protocol.MaxSnapshotThreads).To(Equal(2048))
+		Expect(protocol.MinThreadsRetained).To(Equal(32))
+		Expect(protocol.MinThreadsRetained).To(BeNumerically("<", protocol.MaxSnapshotThreads))
 	})
 })

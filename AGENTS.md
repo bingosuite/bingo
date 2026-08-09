@@ -321,7 +321,7 @@ protocol rather than to this change:
   lifecycle panel does) therefore blanks that panel until the next automatic
   stop; an append-only timeline (the VS Code view) is unaffected. Making a query
   addressable to its requester needs wire-level correlation and is deliberately
-  out of scope here — a candidate for a telemetry 1.3.
+  out of scope here — a candidate for a future protocol revision.
 
 `syncMu` serializes synchronous commands, but a timeout does **not** cancel the
 command already sent to the server. The pending queue therefore retains a
@@ -1627,6 +1627,47 @@ stop to a real goid; DAP omits its optional `stopped.threadId`.
 new `Thread`, new `GoroutineSnapshotPayload`, new `EventGoroutineSnapshot` +
 `CmdGoroutineSnapshot`.
 
+**Size budget — scoped to this event family only (1.4, issue #194).** These are
+the only two events that carry an unbounded runtime collection, so they are the
+only two that are bounded. `protocol.MaxGoroutineEventBytes` (2 MiB) is the exact
+marshalled-`Event` ceiling for `EventGoroutineSnapshot` and `EventGoroutines`;
+`MaxSnapshotGoroutines` (5000) and `MaxSnapshotThreads` (2048) cap element counts
+independently, and `MinThreadsRetained` (32) is an ordered thread floor. There is
+deliberately **no** generic hub message cap, **no** generic client read cap, and
+**no** `Location` truncation, chunking, or compression — those have different
+blast radii and are not this contract.
+
+The pure packers `protocol.PackSnapshot` / `protocol.PackGoroutines`
+([goroutinepack.go](pkg/protocol/goroutinepack.go)) share one algorithm. Both
+measure the **real** `Event` envelope at `Seq = math.MaxUint64` (the hub
+re-stamps seq at broadcast time, so anything narrower under-counts), derive the
+reserve from a real marshal of the skeleton — current goid, lifecycle deltas,
+totals — rather than a hard-coded overhead, and charge each element its
+standalone marshal length. That accounting is exact because JSON arrays are
+additive: escaping is per-value and context-free, and `encoding/json` emits a
+`json.RawMessage` payload verbatim. Each candidate is marshalled once, so the
+pass is O(n) — never a re-marshal of the whole payload per candidate, and never a
+binary search. A final exact `MarshalEvent` at max seq is the enforced contract.
+
+Selection is deterministic so every client on one stop sees the same bytes:
+current goroutine, then its ancestors nearest-first (keeping a spawn tree rooted),
+then the rest by ascending goid; current thread first, then ascending MID. The
+current goroutine and current thread are **anchors** retained in every
+non-degraded result. Created/Exited are reserved first and **never** trimmed. An
+oversized non-anchor is skipped and packing continues — one pathological element
+must not hide every element after it. Threads take their ordered floor, then
+goroutines compete, then leftover budget is reclaimed for the remaining threads.
+If the anchors alone cannot fit, the result degrades to empty collections (with
+the deltas intact) and reports it — never a panic.
+
+**Totals = the honesty channel.** `SnapshotTotals{Goroutines, Threads, Clipped}`
+is present **iff** the wire omits elements or the runtime scan was clipped, and
+absent on a complete unclipped result, so its mere presence means "this is not
+everything". `Clipped` means `maxGoroutineScan` was hit before packing started,
+which makes the goroutine count a **lower bound** — consumers must render it as
+such (the VS Code view appends `+`). Layer A owns the contract and the packers;
+producer wiring in `internal/debugger` is layer B and does not exist yet.
+
 **Streaming cadence (the load-bearing invariant).** `EventGoroutineSnapshot` is
 auto-emitted on exactly the suspends that can change the concurrency picture —
 **breakpoint hit, pause, and the launch/attach entry stop** — and on demand via
@@ -2241,7 +2282,7 @@ target metadata, architecture, mode, and entitlements.
 The extension package version is the installed-runtime upgrade boundary:
 material shipped behavior changes must bump both `package.json` and the lockfile
 or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.3.2**) in source and VSIX
+and package verifier pin the current version (**0.4.0**) in source and VSIX
 metadata.
 The root Run and Debug dropdown exposes exactly two `"type":"bingo"` choices:
 launch one of five progressive examples through a `pickString`, and join a
@@ -2318,13 +2359,63 @@ activation and keys observers by `DebugSession.id`, never
 
 **Concurrency webview ownership/security.** The extension host, not the
 webview, owns one bounded WebSocket observer/model per live DAP session. It
-reuses the normalized management endpoint, validates protocol 1.3 envelopes,
+reuses the normalized management endpoint, validates protocol 1.4 envelopes,
 payload/string/count limits and seq gaps, and reconnects only while the DAP
 session lives. It sends `CmdGoroutineSnapshot` once after every successful
 WebSocket join and thereafter only for explicit Refresh—never run control.
-The observer accepts at most 8 MiB per envelope and 8,193 goroutines (the rich
-8,192 prefix plus one current anchor); the recreatable webview receives
-validated view models through a
+
+**Two limits, deliberately different (issue #194).** `maximumEnvelopeBytes`
+(2 MiB) is the decoder contract and mirrors `protocol.MaxGoroutineEventBytes`;
+`maximumTransportBytes` = that plus 64 KiB slack is what `ws` gets as
+`maxPayload`. The transport MUST stay strictly above the decoder so a frame that
+violates the contract is delivered and rejected *here*, as a deterministic
+`TelemetryProtocolError`, instead of dying below the decoder where it is
+indistinguishable from a flaky link. Byte checking still happens before parse.
+
+**Fatal vs transient.** `TelemetryProtocolError` and `ws`'s
+`WS_ERR_UNSUPPORTED_MESSAGE_LENGTH` are deterministic: the same peer will produce
+the identical bad frame again, so the observer latches `connection: "error"` and
+does **not** reconnect. Genuine transport closes keep the existing reconnect
+ladder. Reconnecting on a contract violation is what used to burn 1 + 6 attempts
+and kill the view for the rest of the session.
+
+**Fatality is scoped to the bounded kinds.** The byte check must stay *before*
+the parse, but the kind is only known *after* it — so an over-budget frame gets a
+bounded scan of its envelope prefix (the server emits `v`,`kind`,`seq`,`payload`
+in that order) and is fatal only for `GoroutineSnapshot`/`Goroutines`. Everything
+else on the wire is deliberately unbounded: `EventLocals`/`EventFrames`/
+`EventEvaluate` are broadcast to **every** client and are capped only by the
+debugger's `maxTotalNodes`, so a big variable expansion in the Variables pane can
+legitimately exceed 2 MiB. Latching the view dead on that would be a regression,
+so it stays transient. An unreadable prefix also falls back to transient — never
+latch on a guess.
+
+**Lifecycle deltas are not packed elements.** `created`/`exited` are never
+trimmed by the packer, and the debugger's scan reaches `maxGoroutineScan` (8192),
+well past `MaxSnapshotGoroutines` (5000). The consumer must therefore NOT apply
+the element cap to them; doing so falsely rejected a legal frame, which — now
+that protocol errors are terminal — killed the view on exactly the workload this
+contract exists for. The byte contract is their real bound.
+
+**Shallow parse for unconsumed kinds.** The envelope is strictly validated for
+every kind (exact keys, `v == 1.4`, known kind, `seq >= 1`, object payload). But
+only the kinds the observer actually reads — `SessionState`, `BreakpointHit`,
+`Paused`, `Stepped`, `Panic`, `Continued`, `ProcessExited`, `Error`,
+`GoroutineSnapshot` — get the deep recursive node walk. Everything else
+(`Output`, `BreakpointSet`/`Cleared`, `Locals`, `Frames`, `Goroutines`,
+`Evaluate`, `Restarted`) returns a **sanitized empty payload** immediately: the
+raw body is never forwarded to `applyEvent`. Keep that set in lockstep with
+`observer.ts` — a broadcast `EventGoroutines` exceeding the 20,000-node budget on
+an event nobody reads is exactly the bug this closes.
+
+**Truthful omission surfacing.** `SnapshotTotals` is decoded (optional, unknown
+keys still rejected) and surfaced as `SessionViewModel.serverTotals`, kept
+separate from `tree.omitted` (this view's own filter and render cap). The thread
+statistic uses `totals.threads` when present, and a clipped scan renders a
+trailing `+` lower-bound marker. A goroutine whose parent was omitted stays a
+root in the tree.
+
+The recreatable webview receives validated view models through a
 ready/rendered-ack protocol. Every document has a generation token; async
 `postMessage` completions may mutate delivery state only while their captured
 view and generation are current, even when an old and new render share a
@@ -2650,7 +2741,7 @@ independent `wireProtocolVersion` from `pkg/protocol.Version`, a per-process
 UUID `instanceId`, the enabled/resolved DAP listener address, managed-idle
 configuration in milliseconds, and the current session count. The DAP object
 also advertises `sessionEventVersion:1`; graphical clients require it before
-reusing a managed server because older API-v1/wire-v1.2 servers do not emit the
+reusing a managed server because older API-v1 servers on earlier wire versions do not emit the
 `bingo/session/v1` discovery event. Management API
 compatibility and WebSocket wire compatibility are separate checks: changing
 one does not implicitly version the other. A DAP bind to `:0` MUST publish the
@@ -3238,12 +3329,27 @@ through the justfile.
 ## When you change something
 
 - **Wire protocol** (`pkg/protocol`): bump `Version` for breaking changes,
-  and update the round-trip table in `protocol_test.go`. Currently **1.3**
-  (goroutine ID 0/status `unknown` is the synthetic unresolved stop identity).
-  1.2 reshaped `Variable` with `Kind` + `Children` for the type-aware expandable
-  tree and added the name-only `CmdEvaluate`/`EventEvaluate` command/event. 1.1
-  reshaped `Goroutine` and added `Thread`/`GoroutineSnapshotPayload` +
+  and update the round-trip table in `protocol_test.go`. Currently **1.4** (the
+  goroutine event family's size contract: `MaxGoroutineEventBytes` /
+  `MaxSnapshotGoroutines` / `MaxSnapshotThreads` / `MinThreadsRetained`,
+  `SnapshotTotals` on both `GoroutineSnapshotPayload` and `GoroutinesPayload`,
+  and the pure `PackSnapshot` / `PackGoroutines` packers). 1.3 reserved
+  goroutine ID 0/status `unknown` as the synthetic unresolved stop identity.
+  1.2 had the reshaped `Variable` — added `Kind` + `Children` for the
+  type-aware expandable tree — and the new `CmdEvaluate`/`EventEvaluate`
+  name-only evaluate command/event with `EvaluatePayloadCmd`/`EvaluatePayload`.
+  1.1 had reshaped
+  `Goroutine` and added `Thread`/`GoroutineSnapshotPayload` +
   `EventGoroutineSnapshot`/`CmdGoroutineSnapshot`.
+- **Goroutine event budget** (`pkg/protocol/goroutinepack.go`): the budget is
+  scoped to `EventGoroutineSnapshot` + `EventGoroutines` and must stay that way —
+  do not generalise it into a hub or client cap, and do not add `Location`
+  truncation, chunking, or compression. If you change a limit, the selection
+  order, or the totals rule, update the VS Code decoder constants
+  (`editors/vscode/src/telemetry.ts`) in the same commit: the drift test pins
+  them against this Go source. Keep `maximumTransportBytes` strictly **above**
+  `maximumEnvelopeBytes` so a contract violation is delivered and rejected as a
+  deterministic protocol error rather than killed inside `ws`.
 - **Management API** (`internal/server`): `ManagementAPIVersion` is independent
   of the wire protocol. Bump it for incompatible `/api/health` or management
   semantics, keep the response structs/tags and README example aligned, and

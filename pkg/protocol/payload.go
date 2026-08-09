@@ -139,8 +139,28 @@ type FramesPayload struct {
 	Frames []Frame `json:"frames"`
 }
 
+// SnapshotTotals reports the ORIGINAL, untrimmed size of a goroutine event's
+// collections, so a consumer can say "showing 5,000 of 41,203" instead of
+// quietly presenting a truncated set as the whole truth.
+//
+// It is present exactly when the wire omits elements or the runtime scan was
+// clipped, and absent on a complete, unclipped result — so its mere presence
+// means "what you received is not everything".
+//
+// Clipped means the debugger's runtime walk hit its own scan ceiling before
+// packing even started, which makes Goroutines a LOWER BOUND rather than an
+// exact count. A consumer must render it as such.
+type SnapshotTotals struct {
+	Goroutines int  `json:"goroutines,omitempty"`
+	Threads    int  `json:"threads,omitempty"`
+	Clipped    bool `json:"clipped,omitempty"`
+}
+
 type GoroutinesPayload struct {
 	Goroutines []Goroutine `json:"goroutines"`
+
+	// Totals is set only when the list is incomplete — see SnapshotTotals.
+	Totals *SnapshotTotals `json:"totals,omitempty"`
 }
 
 // GoroutineSnapshotPayload is the full concurrency picture at a suspend point:
@@ -162,6 +182,9 @@ type GoroutineSnapshotPayload struct {
 	Current    int         `json:"current,omitempty"` // goid of the current goroutine, 0 if unknown
 	Created    []int       `json:"created,omitempty"` // goids new since the previous automatic snapshot
 	Exited     []int       `json:"exited,omitempty"`  // goids gone since the previous automatic snapshot
+
+	// Totals is set only when the collections are incomplete — see SnapshotTotals.
+	Totals *SnapshotTotals `json:"totals,omitempty"`
 }
 
 type SessionStatePayload struct {
