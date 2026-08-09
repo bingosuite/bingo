@@ -15,13 +15,14 @@ import (
 var _ Client = (*wsClient)(nil)
 
 const (
-	syncTimeout     = 10 * time.Second
 	dialTimeout     = 5 * time.Second
 	eventBufferSize = 64
 )
 
-// pendingReq is a synchronous method blocked on its confirmation event (or an
-// EventError for the same command kind).
+var syncTimeout = 10 * time.Second
+
+// pendingReq keeps its place after a timeout because the server command is not
+// cancelled. A nil ch marks reply debt whose eventual response must be consumed.
 type pendingReq struct {
 	wantKind protocol.EventKind
 	cmdKind  protocol.CommandKind
@@ -41,10 +42,10 @@ type wsClient struct {
 	// syncMu serialises sendAndWait so one in-flight pending request at a time.
 	syncMu sync.Mutex
 
-	// pending: read-pump checks this on every event and routes matching
-	// confirmations / errors to pending.ch instead of the public events chan.
+	// pending preserves request order across timeouts so a late reply cannot be
+	// mistaken for a newer same-kind request.
 	pendingMu sync.Mutex
-	pending   *pendingReq
+	pending   []*pendingReq
 
 	// writeMu: gorilla allows one concurrent reader and one concurrent writer.
 	writeMu sync.Mutex
@@ -134,28 +135,67 @@ func (c *wsClient) readPump() {
 }
 
 func (c *wsClient) routeToPending(evt protocol.Event) bool {
-	c.pendingMu.Lock()
-	p := c.pending
-	c.pendingMu.Unlock()
-
-	if p == nil {
-		return false
-	}
-
-	if evt.Kind == p.wantKind {
-		p.ch <- evt
-		return true
-	}
-
+	var errorCommand protocol.CommandKind
 	if evt.Kind == protocol.EventError {
 		var ep protocol.ErrorPayload
-		if protocol.DecodeEventPayload(evt, &ep) == nil && ep.Command == p.cmdKind {
-			p.ch <- evt
-			return true
+		if protocol.DecodeEventPayload(evt, &ep) != nil {
+			return false
 		}
+		errorCommand = ep.Command
 	}
 
+	c.pendingMu.Lock()
+	for i, p := range c.pending {
+		matches := evt.Kind == p.wantKind
+		if evt.Kind == protocol.EventError {
+			matches = errorCommand == p.cmdKind
+		}
+		if !matches {
+			continue
+		}
+
+		ch := p.ch
+		c.removePendingAt(i)
+		c.pendingMu.Unlock()
+
+		if ch != nil {
+			ch <- evt
+		}
+		return true
+	}
+	c.pendingMu.Unlock()
+
 	return false
+}
+
+func (c *wsClient) removePendingAt(i int) {
+	copy(c.pending[i:], c.pending[i+1:])
+	c.pending[len(c.pending)-1] = nil
+	c.pending = c.pending[:len(c.pending)-1]
+}
+
+func (c *wsClient) discardPending(req *pendingReq) {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+
+	for i, p := range c.pending {
+		if p == req {
+			c.removePendingAt(i)
+			return
+		}
+	}
+}
+
+func (c *wsClient) retirePending(req *pendingReq) {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+
+	for _, p := range c.pending {
+		if p == req {
+			p.ch = nil
+			return
+		}
+	}
 }
 
 func (c *wsClient) send(cmd protocol.Command) error {
@@ -178,16 +218,11 @@ func (c *wsClient) sendAndWait(cmd protocol.Command, wantKind protocol.EventKind
 	req := &pendingReq{wantKind: wantKind, cmdKind: cmd.Kind, ch: ch}
 
 	c.pendingMu.Lock()
-	c.pending = req
+	c.pending = append(c.pending, req)
 	c.pendingMu.Unlock()
 
-	defer func() {
-		c.pendingMu.Lock()
-		c.pending = nil
-		c.pendingMu.Unlock()
-	}()
-
 	if err := c.send(cmd); err != nil {
+		c.discardPending(req)
 		return protocol.Event{}, err
 	}
 
@@ -200,8 +235,10 @@ func (c *wsClient) sendAndWait(cmd protocol.Command, wantKind protocol.EventKind
 		}
 		return evt, nil
 	case <-time.After(syncTimeout):
+		c.retirePending(req)
 		return protocol.Event{}, fmt.Errorf("timeout waiting for %s response", wantKind)
 	case <-c.done:
+		c.discardPending(req)
 		return protocol.Event{}, fmt.Errorf("client closed")
 	}
 }
