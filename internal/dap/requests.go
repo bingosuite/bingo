@@ -482,13 +482,12 @@ func (h *Handler) onDisconnect(req *godap.DisconnectRequest) {
 		terminate = true
 	}
 
-	h.send(&godap.DisconnectResponse{Response: h.response(req.Seq, "disconnect")})
-
 	if terminate && hasSession {
 		if cmd, err := marshalCommand(protocol.CmdKill, nil); err == nil {
 			h.enqueue(cmd) // drained by ReadMessage's priority path before EOF
 		}
 	}
+	h.send(&godap.DisconnectResponse{Response: h.response(req.Seq, "disconnect")})
 	_ = h.Close()
 }
 

@@ -2054,12 +2054,13 @@ slow-client eviction. There is deliberately no DAP-awareness anywhere in
   loop; returns `io.EOF` on Close. **cmdOut-priority:** it probes `cmdOut` before
   the `{cmdOut | done}` select and, if `done` wins, probes `cmdOut` once more
   before returning EOF. The final drain is load-bearing: disconnect enqueues
-  `Kill` before `Close`, but both channels can become ready between the first
-  probe and the blocking select; without the re-probe, random select choice can
-  drop the queued kill while another observer keeps the session alive. The hub
-  may backpressure this read pump while its ordinary-command queue is full;
-  `cmdOut` stays bounded, and Handler `Close` unblocks both `ReadMessage` and a
-  DAP producer waiting to enqueue.
+  `Kill` before writing its response (which can call `Close` on failure) and
+  before its explicit `Close`, but both channels can become ready between the
+  first probe and the blocking select. Without the re-probe, random select
+  choice can drop the queued kill while another observer keeps the session
+  alive. The hub may backpressure this read pump while its ordinary-command
+  queue is full; `cmdOut` stays bounded, and Handler `Close` unblocks both
+  `ReadMessage` and a DAP producer waiting to enqueue.
 - `Serve()` (its own goroutine, one per connection): the DAP read loop —
   `godap.ReadProtocolMessage` → `dispatchRequest`. Runs the handshake state
   machine, enqueues bingo commands, and answers non-hub requests directly.

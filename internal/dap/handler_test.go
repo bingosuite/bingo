@@ -373,6 +373,22 @@ func (nopConn) SetDeadline(time.Time) error      { return nil }
 func (nopConn) SetReadDeadline(time.Time) error  { return nil }
 func (nopConn) SetWriteDeadline(time.Time) error { return nil }
 
+type failWriteConn struct {
+	nopConn
+	beforeWrite func()
+	closed      chan struct{}
+}
+
+func (c *failWriteConn) Write([]byte) (int, error) {
+	c.beforeWrite()
+	return 0, errors.New("forced write failure")
+}
+
+func (c *failWriteConn) Close() error {
+	close(c.closed)
+	return nil
+}
+
 // sendReq writes a DAP request with an auto-incrementing seq, returning that seq.
 func (hh *harness) sendReq(command string, m godap.RequestMessage) int {
 	hh.t.Helper()
@@ -1349,6 +1365,42 @@ func TestReadMessageDrainsQueuedCommandAcrossClose(t *testing.T) {
 		if _, _, err := h.ReadMessage(); !errors.Is(err, io.EOF) {
 			t.Fatalf("trial %d: ReadMessage after draining command returned %v, want EOF", i, err)
 		}
+	}
+}
+
+func TestDisconnectQueuesKillBeforeFailedResponse(t *testing.T) {
+	filler, err := marshalCommand(protocol.CmdContinue, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conn := &failWriteConn{closed: make(chan struct{})}
+	h := NewHandler(conn, nil, slog.New(slog.NewTextHandler(nopWriter{}, nil)))
+	h.session = &fakeSession{id: "sess-test"}
+	conn.beforeWrite = func() {
+		// Filling the queue during the response write makes the ordering
+		// deterministic: a later Kill cannot race done after send closes it.
+		for len(h.cmdOut) < cap(h.cmdOut) {
+			h.cmdOut <- filler
+		}
+	}
+
+	h.onDisconnect(&godap.DisconnectRequest{})
+
+	select {
+	case <-conn.closed:
+	default:
+		t.Fatal("DisconnectResponse write failure did not close the connection")
+	}
+
+	_, data, err := h.ReadMessage()
+	if err != nil {
+		t.Fatalf("ReadMessage after failed DisconnectResponse: %v", err)
+	}
+	rec := &cmdRecorder{}
+	rec.add(data)
+	if kinds := rec.kinds(); len(kinds) != 1 || kinds[0] != protocol.CmdKill {
+		t.Fatalf("first command after failed DisconnectResponse = %v, want [%s]", kinds, protocol.CmdKill)
 	}
 }
 
