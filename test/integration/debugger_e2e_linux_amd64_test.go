@@ -565,7 +565,15 @@ func declareStepOverlapPauseSpec() {
 		Label("overlap"), func() {
 			p, idA, idB := setupOverlap("overlap_pause_target", overlapTargetSrc)
 
-			iters := envInt("BINGO_E2E_OVERLAP_PAUSE_ITERS", 40)
+			// Sized for statistical power against the target's own 180s
+			// watchdog, not for speed. Only ~10-22% of cycles land the
+			// interrupt inside the machine-step window (measured: 9/40, 5/40,
+			// 4/40 across three native runs), so at 40 cycles the held-interrupt
+			// assertion below would itself flake at roughly 0.9^40 ~ 1.5%. 70
+			// cycles takes that to ~0.06% while costing ~88s at the slowest
+			// per-cycle rate yet observed (1.25s under -race) — still ~2x inside
+			// the watchdog, so this must not be raised much further.
+			iters := envInt("BINGO_E2E_OVERLAP_PAUSE_ITERS", 70)
 			paused := 0
 			pausedEvents := 0
 			heldInterrupts := 0
