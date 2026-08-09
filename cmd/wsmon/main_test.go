@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"io"
 	"strings"
@@ -344,3 +345,53 @@ func TestRunLiveIgnoresTimeout(t *testing.T) {
 }
 
 func m0() *monitor { return &monitor{clients: -1} }
+
+const usageHeader = "usage: wsmon -session <id> [-addr host:port] [-once] [-timeout d]"
+
+// bindFlags installs the custom usage on the FlagSet it is given, so anything
+// reporting a usage error must go through that set — see usageError.
+func TestBindFlagsInstallsCustomUsage(t *testing.T) {
+	var out bytes.Buffer
+	fs := flag.NewFlagSet("wsmon", flag.ContinueOnError)
+	fs.SetOutput(&out)
+	bindFlags(fs)
+
+	fs.Usage()
+
+	if got := out.String(); !strings.Contains(got, usageHeader) {
+		t.Fatalf("usage output = %q, want the custom header", got)
+	}
+	if got := out.String(); !strings.Contains(got, "-timeout") {
+		t.Fatalf("usage output = %q, want the flag defaults", got)
+	}
+}
+
+// A validation failure must print the same usage a parse failure does. Calling
+// the package-level flag.Usage() here instead of the set's own would silently
+// print the stock "Usage of <binary>:" header — the regression this pins.
+func TestUsageErrorUsesTheFlagSetUsage(t *testing.T) {
+	var out bytes.Buffer
+	fs := flag.NewFlagSet("wsmon", flag.ContinueOnError)
+	fs.SetOutput(&out)
+	cfg := bindFlags(fs)
+	if err := fs.Parse([]string{"-session", "s1", "-timeout", "-5s"}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	err := cfg.validate()
+	if err == nil {
+		t.Fatal("validate() accepted a negative -timeout")
+	}
+	usageError(fs, err)
+
+	got := out.String()
+	if !strings.Contains(got, "error: -timeout must be >= 0") {
+		t.Fatalf("output = %q, want the validation message", got)
+	}
+	if !strings.Contains(got, usageHeader) {
+		t.Fatalf("output = %q, want the custom usage header, not the stock one", got)
+	}
+	if strings.Contains(got, "Usage of ") {
+		t.Fatalf("output = %q, want no stock flag-package header", got)
+	}
+}
