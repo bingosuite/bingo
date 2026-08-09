@@ -1185,3 +1185,49 @@ func TestJoinedObserverRestartResetsTerminationForNextExit(t *testing.T) {
 	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateExited})
 	expectNoDAPMessage(t, hh)
 }
+
+func TestJoinedObserverFreshLaunchStartsNewLifecycle(t *testing.T) {
+	hh := startJoinWithoutWelcome(t)
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateRunning})
+	expectNoDAPMessage(t, hh)
+
+	hh.inject(protocol.EventProcessExited, protocol.ProcessExitedPayload{ExitCode: 55})
+	firstExit := recvType[*godap.ExitedEvent](hh)
+	if firstExit.Body.ExitCode != 55 {
+		t.Fatalf("first exit code = %d, want 55", firstExit.Body.ExitCode)
+	}
+	_ = recvType[*godap.TerminatedEvent](hh)
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateExited})
+	expectNoDAPMessage(t, hh)
+
+	// Another client launches a fresh process through the same managed hub.
+	// No EventRestarted is emitted for this exited→idle→running path.
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateIdle})
+	expectNoDAPMessage(t, hh)
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateIdle})
+	expectNoDAPMessage(t, hh)
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateRunning})
+	expectNoDAPMessage(t, hh)
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateRunning})
+	expectNoDAPMessage(t, hh)
+
+	// The new epoch must also restore state-only stop reconciliation.
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateSuspended})
+	stopped := recvType[*godap.StoppedEvent](hh)
+	if stopped.Body.Reason != "pause" {
+		t.Fatalf("stopped reason = %q, want pause", stopped.Body.Reason)
+	}
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateSuspended})
+	expectNoDAPMessage(t, hh)
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateRunning})
+	expectNoDAPMessage(t, hh)
+
+	hh.inject(protocol.EventProcessExited, protocol.ProcessExitedPayload{ExitCode: 66})
+	secondExit := recvType[*godap.ExitedEvent](hh)
+	if secondExit.Body.ExitCode != 66 {
+		t.Fatalf("second exit code = %d, want 66", secondExit.Body.ExitCode)
+	}
+	_ = recvType[*godap.TerminatedEvent](hh)
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateExited})
+	expectNoDAPMessage(t, hh)
+}

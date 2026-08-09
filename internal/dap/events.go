@@ -66,6 +66,10 @@ func (h *Handler) onSessionState(evt protocol.Event) {
 	h.awaitingWelcome = false
 	previousState := h.joinedState
 	h.joinedState = p.State
+	if p.State == protocol.StateRunning &&
+		(previousState == protocol.StateExited || previousState == protocol.StateIdle) {
+		h.terminated = false
+	}
 	tid := h.curThreadID
 	if tid == 0 {
 		// No stop event has been seen yet on a freshly-joined suspended session,
