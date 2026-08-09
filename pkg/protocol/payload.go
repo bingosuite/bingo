@@ -241,10 +241,9 @@ type LocalsPayloadCmd struct {
 // stack frame (FrameIndex 0 is innermost). This is name-only: no dotted paths,
 // indexing, or arithmetic — those belong to a later expression-evaluator PR.
 // A local or parameter is resolved first. A bare global then prefers the
-// frame's DWARF compilation-unit package before falling back to the whole
-// image; a qualified global uses the whole-image lookup directly. Generic shape
-// code is scoped to the instantiating CU, so explicit qualification may be
-// needed to inspect a global from the package that defined the generic.
+// logical code package at the frame PC (including inline abstract origins and
+// generic functions emitted in another package's CU) before falling back to the
+// whole image; a qualified global uses the whole-image lookup directly.
 // Answered with EventEvaluate.
 type EvaluatePayloadCmd struct {
 	FrameIndex int    `json:"frameIndex"`
