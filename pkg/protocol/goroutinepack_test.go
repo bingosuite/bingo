@@ -1237,6 +1237,32 @@ var _ = Describe("goroutine event packing", func() {
 			}
 		})
 
+		It("does not pay for packing just because a scan clipped", func() {
+			// Clipping means "attach the totals", not "something must be
+			// trimmed". Treating it as the latter made a thread-churning target
+			// — whose runtime.allm passes the scan ceiling — do full
+			// per-element packing on every single stop, which cost enough to
+			// push the churn e2e past its target's watchdog.
+			snap := protocol.GoroutineSnapshotPayload{
+				Goroutines: packGoroutines(20),
+				Threads:    packThreads(2048),
+				Current:    1,
+			}
+			protocol.ResetPackMarshalCounts()
+			out, report := protocol.PackSnapshot(snap, false, true)
+			elements, envelopes := protocol.PackMarshalCounts()
+
+			Expect(report.Omitted()).To(BeFalse(), "nothing needed trimming")
+			Expect(out.Threads).To(HaveLen(2048))
+			Expect(elements).To(BeZero(), "a clipped scan must not force per-element work")
+			Expect(envelopes).To(BeZero())
+			Expect(out.Totals).NotTo(BeNil(), "but the totals must still be attached")
+			Expect(out.Totals.ThreadsClipped).To(BeTrue())
+			Expect(out.Totals.GoroutinesClipped).To(BeFalse())
+			Expect(eventBytes(protocol.EventGoroutineSnapshot, out)).
+				To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
+		})
+
 		It("falls back to per-element packing only when trimming is needed", func() {
 			gs := packGoroutines(8192)
 			protocol.ResetPackMarshalCounts()
