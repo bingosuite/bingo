@@ -10,7 +10,7 @@ bingo speaks two protocols against **one** debug session at the same time:
   the OS-thread set, and created/exited lifecycle deltas — streams here as
   `EventGoroutineSnapshot`.
 
-The VS Code 0.3.1 extension wires both together automatically: DAP drives while
+The VS Code 0.3.2 extension wires both together automatically: DAP drives while
 the **Bingo Concurrency** Activity Bar view observes the exact session over
 WebSocket. `cmd/wsmon` remains the terminal observer for non-VS Code workflows.
 
@@ -40,7 +40,7 @@ architecture behind this.
   just vscode-install
   ```
 
-  Automatic graphical telemetry requires **bingosuite.bingo 0.3.1 or newer**. Run
+  Automatic graphical telemetry requires **bingosuite.bingo 0.3.2 or newer**. Run
   **Developer: Reload Window** once after installation or update. The companion
   owns debugger type `"bingo"` and connects directly to bingo's DAP listener;
   it neither invokes nor validates `dlv`, and it does not replace the Go
@@ -177,5 +177,6 @@ repaints with the new round's workers — the plumbing, end to end.
 - Snapshots stream on **breakpoint / pause / entry**, not per single-step (steps
   stay cheap). Use the driver's breakpoints/continue to advance between frames.
 - If the tracee is a stripped binary or stopped before runtime init, the snapshot
-  degrades to a single synthetic goroutine; both observers render the degraded
-  state rather than failing the debug session.
+  degrades to a single synthetic goroutine (`id: 0`, status `unknown`); both
+  observers render the degraded state rather than assigning the stop to an
+  unrelated real goroutine or failing the debug session.

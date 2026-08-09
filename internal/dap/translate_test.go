@@ -1,6 +1,8 @@
 package dap
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	godap "github.com/google/go-dap"
@@ -14,6 +16,25 @@ func TestThreadIDClampsToOne(t *testing.T) {
 		if got := threadID(in); got != want {
 			t.Errorf("threadID(%d) = %d, want %d", in, got, want)
 		}
+	}
+}
+
+func TestStoppedThreadIDOmittedWhenUnknown(t *testing.T) {
+	cases := map[int]int{-5: 0, 0: 0, 1: 1, 7: 7}
+	for in, want := range cases {
+		if got := stoppedThreadID(in); got != want {
+			t.Errorf("stoppedThreadID(%d) = %d, want %d", in, got, want)
+		}
+	}
+	raw, err := json.Marshal(godap.StoppedEventBody{
+		Reason:   "pause",
+		ThreadId: stoppedThreadID(0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "threadId") {
+		t.Fatalf("unknown stopped body = %s, want threadId omitted", raw)
 	}
 }
 

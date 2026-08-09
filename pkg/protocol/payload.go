@@ -43,15 +43,15 @@ type Frame struct {
 // one that ran its `go` statement) and lifecycle state. IDs are the runtime's
 // goid (fits Go int on both supported 64-bit platforms).
 type Goroutine struct {
-	ID         int      `json:"id"`                   // goid
+	ID         int      `json:"id"`                   // goid; 0 for a synthetic unknown goroutine
 	ParentID   int      `json:"parentId,omitempty"`   // parent goroutine's goid; 0 for the root
-	Status     string   `json:"status"`               // scheduler status: "running" | "runnable" | "waiting" | "syscall" | "dead" | ...
+	Status     string   `json:"status"`               // scheduler status, or "unknown" for a synthetic fallback
 	WaitReason string   `json:"waitReason,omitempty"` // why a waiting goroutine is blocked (e.g. "chan receive")
 	CurrentLoc Location `json:"currentLoc"`           // where the goroutine is now (live PC if running, scheduled PC if parked)
 	StartLoc   Location `json:"startLoc,omitempty"`   // the goroutine's entry function (startpc)
 	CreatedLoc Location `json:"createdLoc,omitempty"` // the `go` statement that spawned it (gopc)
 	ThreadID   int      `json:"threadId,omitempty"`   // OS thread (m.procid) currently running it; 0 if not running
-	Current    bool     `json:"current,omitempty"`    // true for the goroutine the debugger is stopped in
+	Current    bool     `json:"current,omitempty"`    // true for the stopped goroutine or its unknown synthetic stand-in
 }
 
 // Thread is one OS thread (a runtime M) in the tracee. It complements the

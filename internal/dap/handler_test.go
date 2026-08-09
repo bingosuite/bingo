@@ -689,6 +689,19 @@ func TestHandshakeLaunchToBreakpoint(t *testing.T) {
 	}
 }
 
+func TestUnknownBreakpointStopOmitsThreadID(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+
+	hh.inject(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{
+		Goroutine: protocol.Goroutine{Status: "unknown", Current: true},
+	})
+	stopped := recvType[*godap.StoppedEvent](hh)
+	if stopped.Body.ThreadId != 0 {
+		t.Errorf("threadId = %d, want omitted for unknown goroutine", stopped.Body.ThreadId)
+	}
+}
+
 func TestOwnContinueIsSuppressed(t *testing.T) {
 	hh := newHarness(t)
 	hh.doHandshake(t)

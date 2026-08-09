@@ -353,6 +353,25 @@ var _ = Describe("Event", func() {
 				},
 			),
 
+			Entry("GoroutineSnapshot with unknown current goroutine",
+				protocol.EventGoroutineSnapshot,
+				protocol.GoroutineSnapshotPayload{
+					Goroutines: []protocol.Goroutine{{
+						Status:  "unknown",
+						Current: true,
+					}},
+				},
+				func(e protocol.Event) {
+					var p protocol.GoroutineSnapshotPayload
+					Expect(protocol.DecodeEventPayload(e, &p)).To(Succeed())
+					Expect(p.Goroutines).To(HaveLen(1))
+					Expect(p.Goroutines[0].ID).To(BeZero())
+					Expect(p.Goroutines[0].Status).To(Equal("unknown"))
+					Expect(p.Goroutines[0].Current).To(BeTrue())
+					Expect(p.Current).To(BeZero())
+				},
+			),
+
 			Entry("Error with command",
 				protocol.EventError,
 				protocol.ErrorPayload{Command: protocol.CmdSetBreakpoint, Message: "address not found"},

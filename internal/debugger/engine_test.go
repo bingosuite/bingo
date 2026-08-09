@@ -987,7 +987,8 @@ var _ = Describe("Engine", func() {
 
 			var p protocol.SteppedPayload
 			Expect(protocol.DecodeEventPayload(evt, &p)).To(Succeed())
-			Expect(p.Goroutine.Status).To(Equal("waiting"))
+			Expect(p.Goroutine.ID).To(BeZero())
+			Expect(p.Goroutine.Status).To(Equal("unknown"))
 		})
 
 		It("puts the engine back into stateSuspended after the step", func() {
@@ -1215,7 +1216,8 @@ var _ = Describe("Engine", func() {
 			gs, err := d.Goroutines()
 			Expect(err).NotTo(HaveOccurred())
 			Expect(gs).To(HaveLen(1))
-			Expect(gs[0].Status).To(Equal("waiting"))
+			Expect(gs[0].ID).To(BeZero())
+			Expect(gs[0].Status).To(Equal("unknown"))
 		})
 	})
 
@@ -1224,12 +1226,13 @@ var _ = Describe("Engine", func() {
 			debugger.ExportedForceSuspended(d)
 		})
 
-		It("returns one goroutine with status 'waiting'", func() {
+		It("returns one synthetic unknown goroutine", func() {
 			gs, err := d.Goroutines()
 			Expect(err).NotTo(HaveOccurred())
 			Expect(gs).To(HaveLen(1))
-			Expect(gs[0].ID).To(Equal(1))
-			Expect(gs[0].Status).To(Equal("waiting"))
+			Expect(gs[0].ID).To(BeZero())
+			Expect(gs[0].Status).To(Equal("unknown"))
+			Expect(gs[0].Current).To(BeTrue())
 		})
 	})
 

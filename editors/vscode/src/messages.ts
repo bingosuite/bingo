@@ -48,7 +48,7 @@ export function decodeWebviewMessage(value: unknown): WebviewMessage {
       exactKeys(message, ["type", "id"]);
       return {
         type: "selectGoroutine",
-        id: safeInteger(message.id, "goroutine id", 1),
+        id: safeInteger(message.id, "goroutine id", 0),
       };
     case "selectSession":
       exactKeys(message, ["type", "id"]);

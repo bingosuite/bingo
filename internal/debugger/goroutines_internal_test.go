@@ -2,15 +2,17 @@ package debugger
 
 import (
 	"encoding/binary"
+	"errors"
 	"testing"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
 type goroutineMemoryBackend struct {
-	mem   map[uint64]byte
-	regs  Registers
-	reads map[uint64]int
+	mem    map[uint64]byte
+	regs   Registers
+	regErr error
+	reads  map[uint64]int
 }
 
 func newGoroutineMemoryBackend() *goroutineMemoryBackend {
@@ -35,6 +37,13 @@ func goroutineTestLayout() *goLayout {
 		gParentGoid:   56,
 		gGopc:         64,
 		gStartpc:      72,
+		mProcid:       0,
+		mID:           8,
+		mSpinning:     16,
+		mG0:           24,
+		mG0OK:         true,
+		mGsignal:      32,
+		mGsignalOK:    true,
 		mCurg:         80,
 		mAlllink:      88,
 	}
@@ -52,6 +61,17 @@ func seedTestGoroutine(
 	backend.seedU64(gptr+uint64(layout.gGoid), goid)
 	backend.seedU64(gptr+uint64(layout.gStack)+uint64(layout.stackLo), stackLo)
 	backend.seedU64(gptr+uint64(layout.gStack)+uint64(layout.stackHi), stackHi)
+}
+
+func seedTestM(
+	backend *goroutineMemoryBackend,
+	layout *goLayout,
+	mptr, procid, curg, next uint64,
+) {
+	backend.seedU64(mptr+uint64(layout.mProcid), procid)
+	backend.seedU64(mptr+uint64(layout.mID), procid)
+	backend.seedU64(mptr+uint64(layout.mCurg), curg)
+	backend.seedU64(mptr+uint64(layout.mAlllink), next)
 }
 
 func (b *goroutineMemoryBackend) seedU64(addr, value uint64) {
@@ -91,7 +111,7 @@ func (b *goroutineMemoryBackend) WriteMemory(addr uint64, src []byte) error {
 }
 
 func (b *goroutineMemoryBackend) GetRegisters(int) (Registers, error) {
-	return b.regs, nil
+	return b.regs, b.regErr
 }
 
 func (b *goroutineMemoryBackend) SetRegisters(_ int, regs Registers) error {
@@ -127,7 +147,7 @@ func TestBuildGoroutineListAnchorsCurrentBeyondRichScan(t *testing.T) {
 
 	liveSP := stack + currentIndex*gStride + 8
 	e := &engine{backend: backend}
-	result := e.buildGoroutineListFrom(layout, allgsPtr, length, liveSP, 0x1234, 0)
+	result := e.buildGoroutineListFrom(layout, allgsPtr, length, liveSP, 0x1234, 0, 0)
 	got, anchorID := result.Items, result.AnchorID
 	if !result.Complete {
 		t.Fatal("buildGoroutineListFrom degraded instead of returning the rich prefix plus current anchor")
@@ -174,7 +194,7 @@ func TestBuildGoroutineListUsesDirectCurrentPointerBeyondFallback(t *testing.T) 
 	length := uint64(maxGoroutineScan*3 + 1)
 	e := &engine{backend: backend}
 	result := e.buildGoroutineListFrom(
-		layout, allgsPtr, length, stackLo+8, 0x1234, currentG,
+		layout, allgsPtr, length, stackLo+8, 0x1234, currentG, 0,
 	)
 	got, anchorID := result.Items, result.AnchorID
 	if !result.Complete || len(got) != 2 {
@@ -202,7 +222,7 @@ func TestBuildGoroutineListBoundsFallbackTail(t *testing.T) {
 	length := uint64(maxGoroutineScan*3 + 1)
 	e := &engine{backend: backend}
 	result := e.buildGoroutineListFrom(
-		layout, allgsPtr, length, 0xdeadbeef, 0x1234, 0,
+		layout, allgsPtr, length, 0xdeadbeef, 0x1234, 0, 0,
 	)
 	got, anchorID := result.Items, result.AnchorID
 	if !result.Complete || len(got) != 1 || anchorID != 0 {
@@ -221,27 +241,206 @@ func TestBuildGoroutineListBoundsFallbackTail(t *testing.T) {
 	}
 }
 
-func TestFindCurrentGoroutineFromThreadList(t *testing.T) {
+func TestBuildGoroutineListUsesMCurgForSchedulerStop(t *testing.T) {
 	const (
-		firstM   = uint64(0x400000)
-		secondM  = uint64(0x400100)
-		firstG   = uint64(0x500000)
+		allgsPtr = uint64(0x1000)
+		mptr     = uint64(0x400000)
+		systemG  = uint64(0x500000)
 		currentG = uint64(0x500100)
-		stackLo  = uint64(0xa0000000)
+		systemSP = uint64(0xa0000008)
+	)
+	layout := goroutineTestLayout()
+	for _, tc := range []struct {
+		name   string
+		offset int64
+	}{
+		{name: "g0", offset: layout.mG0},
+		{name: "gsignal", offset: layout.mGsignal},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := newGoroutineMemoryBackend()
+			backend.seedU64(allgsPtr, currentG)
+			seedTestGoroutine(backend, layout, systemG, 0, systemSP-8, systemSP+0xff8)
+			seedTestGoroutine(backend, layout, currentG, 99, 0xb0000000, 0xb0001000)
+			backend.seedU64(systemG+uint64(layout.gM), mptr)
+			backend.seedU64(currentG+uint64(layout.gM), mptr)
+			seedTestM(backend, layout, mptr, 77, currentG, 0)
+			backend.seedU64(mptr+uint64(tc.offset), systemG)
+
+			e := &engine{backend: backend}
+			result := e.buildGoroutineListFrom(
+				layout, allgsPtr, 1, systemSP, 0x1234, systemG, 0,
+			)
+			got, anchorID := result.Items, result.AnchorID
+			if !result.Complete || len(got) != 1 || !got[0].Current || got[0].ID != 99 {
+				t.Fatalf("goroutines = %+v, complete = %t; want current m.curg id 99", got, result.Complete)
+			}
+			if anchorID != 0 {
+				t.Fatalf("anchor id = %d, want 0 because m.curg was already in the rich prefix", anchorID)
+			}
+			if got[0].ThreadID != 77 {
+				t.Fatalf("current thread id = %d, want 77", got[0].ThreadID)
+			}
+		})
+	}
+}
+
+func TestCurrentGoroutineFromRegisterRejectsUnrelatedPositiveGoID(t *testing.T) {
+	const (
+		mptr      = uint64(0x400000)
+		candidate = uint64(0x500000)
+		currentG  = uint64(0x500100)
 	)
 	layout := goroutineTestLayout()
 	backend := newGoroutineMemoryBackend()
-	backend.seedU64(firstM+uint64(layout.mCurg), firstG)
-	backend.seedU64(firstM+uint64(layout.mAlllink), secondM)
-	backend.seedU64(secondM+uint64(layout.mCurg), currentG)
-	backend.seedU64(secondM+uint64(layout.mAlllink), 0)
-	seedTestGoroutine(backend, layout, firstG, 1, 0x1000, 0x2000)
-	seedTestGoroutine(backend, layout, currentG, 99, stackLo, stackLo+0x1000)
+	seedTestGoroutine(backend, layout, candidate, 88, 0xa0000000, 0xa0001000)
+	seedTestGoroutine(backend, layout, currentG, 99, 0xb0000000, 0xb0001000)
+	backend.seedU64(candidate+uint64(layout.gM), mptr)
+	backend.seedU64(currentG+uint64(layout.gM), mptr)
+	seedTestM(backend, layout, mptr, 77, currentG, 0)
 
 	e := &engine{backend: backend}
-	result := e.findCurrentGoroutineInThreadList(layout, firstM, stackLo+8, 0x1234)
-	if !result.Complete || !result.Found || !result.Item.Current || result.Item.ID != 99 {
-		t.Fatalf("current goroutine = %+v; want current id 99", result)
+	result := e.currentGoroutineFromRegister(layout, candidate, 0xdeadbeef, 0x1234)
+	if !result.Complete || result.Found {
+		t.Fatalf("current goroutine = %+v; want complete rejection of stale positive-goid candidate", result)
+	}
+}
+
+func TestFindCurrentGoroutineByProcIDContinuesPastRichThreadCap(t *testing.T) {
+	const (
+		mBase    = uint64(0x400000)
+		mStride  = uint64(0x100)
+		currentG = uint64(0x900000)
+		targetID = uint64(777777)
+	)
+	layout := goroutineTestLayout()
+	backend := newGoroutineMemoryBackend()
+	count := maxThreadScan + 2
+	for i := 0; i < count; i++ {
+		mptr := mBase + uint64(i)*mStride
+		next := uint64(0)
+		if i+1 < count {
+			next = mptr + mStride
+		}
+		procid := uint64(1000 + i)
+		curg := uint64(0)
+		if i == count-1 {
+			procid = targetID
+			curg = currentG
+			seedTestGoroutine(backend, layout, currentG, 99, 0xb0000000, 0xb0001000)
+			backend.seedU64(currentG+uint64(layout.gM), mptr)
+		}
+		seedTestM(backend, layout, mptr, procid, curg, next)
+	}
+
+	e := &engine{backend: backend}
+	result := e.findCurrentGoroutineByProcIDFrom(layout, mBase, targetID, 0x1234)
+	if !result.Complete || !result.Found ||
+		!result.Item.Current || result.Item.ID != 99 || result.Item.ThreadID != int(targetID) {
+		t.Fatalf("current goroutine = %+v; want id 99 on stopped thread %d", result, targetID)
+	}
+}
+
+func TestFindCurrentGoroutineByProcIDBoundsTargetedContinuation(t *testing.T) {
+	const (
+		mBase   = uint64(0x400000)
+		mStride = uint64(0x100)
+	)
+	layout := goroutineTestLayout()
+	backend := newGoroutineMemoryBackend()
+	count := maxThreadScan + maxCurrentThreadScan + 1
+	for i := 0; i < count; i++ {
+		mptr := mBase + uint64(i)*mStride
+		next := uint64(0)
+		if i+1 < count {
+			next = mptr + mStride
+		}
+		seedTestM(backend, layout, mptr, uint64(1000+i), 0, next)
+	}
+
+	e := &engine{backend: backend}
+	result := e.findCurrentGoroutineByProcIDFrom(layout, mBase, ^uint64(0), 0x1234)
+	if !result.Complete || result.Found {
+		t.Fatalf("current goroutine = %+v; want complete bounded miss", result)
+	}
+	firstUnscanned := mBase + uint64(maxThreadScan+maxCurrentThreadScan)*mStride
+	if reads := backend.reads[firstUnscanned+uint64(layout.mProcid)]; reads != 0 {
+		t.Fatalf("first procid beyond targeted budget reads = %d, want 0", reads)
+	}
+
+	backend.reads = make(map[uint64]int)
+	threads := e.readThreadsFrom(layout, mBase, 99, 0x1234)
+	if !threads.Complete || len(threads.Items) != maxThreadScan {
+		t.Fatalf("threads = %+v, want only the bounded rich prefix", threads)
+	}
+	if reads := backend.reads[firstUnscanned+uint64(layout.mCurg)]; reads != 0 {
+		t.Fatalf("first curg beyond targeted budget reads = %d, want 0", reads)
+	}
+}
+
+func TestReadThreadsAnchorsCurrentBeyondRichThreadCap(t *testing.T) {
+	const (
+		mBase    = uint64(0x400000)
+		mStride  = uint64(0x100)
+		currentG = uint64(0x900000)
+	)
+	layout := goroutineTestLayout()
+	backend := newGoroutineMemoryBackend()
+	count := maxThreadScan + 2
+	for i := 0; i < count; i++ {
+		mptr := mBase + uint64(i)*mStride
+		next := uint64(0)
+		if i+1 < count {
+			next = mptr + mStride
+		}
+		curg := uint64(0)
+		if i == count-1 {
+			curg = currentG
+			seedTestGoroutine(backend, layout, currentG, 99, 0xb0000000, 0xb0001000)
+		}
+		seedTestM(backend, layout, mptr, uint64(1000+i), curg, next)
+	}
+
+	e := &engine{backend: backend}
+	result := e.readThreadsFrom(layout, mBase, 99, 0x1234)
+	got := result.Items
+	if !result.Complete {
+		t.Fatal("readThreadsFrom degraded instead of returning the rich prefix plus current anchor")
+	}
+	if len(got) != maxThreadScan+1 {
+		t.Fatalf("threads = %d, want rich prefix plus one current anchor", len(got))
+	}
+	current := 0
+	for _, thread := range got {
+		if thread.Current {
+			current++
+			if thread.GoID != 99 {
+				t.Fatalf("current thread = %+v, want goid 99", thread)
+			}
+		}
+	}
+	if current != 1 {
+		t.Fatalf("current threads = %d, want 1", current)
+	}
+}
+
+func TestCurrentGoroutineFromReturnsUnknownInsteadOfFirstRealGoroutine(t *testing.T) {
+	fallback := protocol.Location{File: "runtime.go", Line: 42, Function: "runtime.schedule"}
+	for _, snap := range []protocol.GoroutineSnapshotPayload{
+		{Goroutines: []protocol.Goroutine{{ID: 1}, {ID: 2}}},
+		{Goroutines: []protocol.Goroutine{{Status: "unknown", Current: true}}},
+	} {
+		got := currentGoroutineFrom(snap, fallback)
+		if got.ID != 0 || got.Status != "unknown" || !got.Current || got.CurrentLoc != fallback {
+			t.Fatalf("fallback goroutine = %+v, want current synthetic unknown at %+v", got, fallback)
+		}
+	}
+
+	got := currentGoroutineFrom(protocol.GoroutineSnapshotPayload{
+		Goroutines: []protocol.Goroutine{{ID: 99, Status: "running", Current: true}},
+	}, fallback)
+	if got.ID != 99 || got.CurrentLoc != fallback {
+		t.Fatalf("identified current goroutine = %+v, want frame location %+v", got, fallback)
 	}
 }
 
@@ -273,10 +472,24 @@ func TestDegradedGoroutineSnapshotPreservesPreviousLiveSet(t *testing.T) {
 	}
 
 	snapshot := e.goroutineSnapshot()
-	if len(snapshot.Goroutines) != 1 || !snapshot.Goroutines[0].Current {
-		t.Fatalf("degraded snapshot goroutines = %+v, want one current synthetic goroutine", snapshot.Goroutines)
+	if len(snapshot.Goroutines) != 1 ||
+		snapshot.Goroutines[0].ID != 0 ||
+		snapshot.Goroutines[0].Status != "unknown" ||
+		!snapshot.Goroutines[0].Current {
+		t.Fatalf("degraded snapshot goroutines = %+v, want one current unknown goroutine", snapshot.Goroutines)
 	}
 	if _, ok := e.prevGoids[42]; !ok || len(e.prevGoids) != 1 {
 		t.Fatalf("prevGoids = %v, want unchanged {42}", e.prevGoids)
+	}
+}
+
+func TestLiveRegistersPreservesStoppedTIDOnReadFailure(t *testing.T) {
+	backend := newGoroutineMemoryBackend()
+	backend.regErr = errors.New("registers unavailable")
+	e := &engine{backend: backend, curTID: 77}
+
+	tid, sp, pc, gptr := e.liveRegisters()
+	if tid != 77 || sp != 0 || pc != 0 || gptr != 0 {
+		t.Fatalf("live registers = tid:%d sp:%x pc:%x g:%x, want tid 77 with unknown registers", tid, sp, pc, gptr)
 	}
 }

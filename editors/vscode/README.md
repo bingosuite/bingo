@@ -20,10 +20,11 @@ just vscode-install
 ```
 
 This builds, verifies, and installs `dist/bingo-<platform>.vsix`. The graphical
-concurrency view debuted in 0.3.0; **0.3.1** adds capability-safe managed-server
-reuse and is the minimum supported version. Rerun the command to update, then run
-**Developer: Reload Window** once so the active extension host loads the new
-bundle. Package without installing with `just vscode-package`. Uninstall with:
+concurrency view debuted in 0.3.0; **0.3.2** adds wire 1.3's honest unknown
+stopped-goroutine rendering and is the minimum supported version. Rerun the
+command to update, then run **Developer: Reload Window** once so the active
+extension host loads the new bundle. Package without installing with
+`just vscode-package`. Uninstall with:
 
 ```sh
 code --uninstall-extension bingosuite.bingo

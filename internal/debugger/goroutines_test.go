@@ -122,7 +122,7 @@ func expectDegradedSnapshotPreservesBaseline(degraded, recovered protocol.Gorout
 		observeSnapshot(degraded),
 		observeSnapshot(recovered),
 	}).To(Equal([]snapshotObservation{
-		{Goroutines: []int{1}, Selected: 1},
+		{Goroutines: []int{0}},
 		{
 			Goroutines: []int{101, 102},
 			Threads:    2,
@@ -273,7 +273,7 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 
 			gs, err := d.Goroutines()
 			Expect(err).NotTo(HaveOccurred())
-			Expect(goroutineIDs(gs)).To(Equal([]int{1}))
+			Expect(goroutineIDs(gs)).To(Equal([]int{0}))
 			Expect(gs[0].Current).To(BeTrue())
 		},
 		Entry("for an unreadable allgs slot", func() uint64 {
@@ -321,7 +321,7 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 		clipped := debugger.ExportedGoroutineWalkResult(d)
 
 		Expect(clipped).To(Equal(debugger.ExportedWalkResult{
-			Count:    debugger.ExportedMaxGoroutineScan() + 1,
+			Count:    debugger.ExportedMaxGoroutineScan(),
 			Complete: true,
 			Clipped:  true,
 		}))
@@ -343,6 +343,9 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 			Goroutines: []protocol.Goroutine{{ID: 101}, {ID: 102}},
 		})
 
-		Expect(current).To(Equal(protocol.Goroutine{}))
+		Expect(current).To(Equal(protocol.Goroutine{
+			Status:  "unknown",
+			Current: true,
+		}))
 	})
 })

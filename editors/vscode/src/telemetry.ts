@@ -1,10 +1,10 @@
 import { TextDecoder } from "node:util";
 
-export const wireProtocolVersion = "1.2";
+export const wireProtocolVersion = "1.3";
 export const snapshotCommandKind = "GoroutineSnapshot";
 export const maximumEnvelopeBytes = 2 * 1024 * 1024;
 export const maximumGoroutines = 5000;
-export const maximumThreads = 2048;
+export const maximumThreads = 2049;
 export const maximumStringLength = 4096;
 
 const maximumPayloadNodes = 20_000;
@@ -263,7 +263,7 @@ function decodeGoroutine(value: unknown, label: string): Goroutine {
     label,
   );
   return {
-    id: integer(item.id, `${label}.id`, 1),
+    id: integer(item.id, `${label}.id`, 0),
     parentId: optionalInteger(item.parentId, `${label}.parentId`),
     status: boundedString(item.status, `${label}.status`),
     waitReason: optionalString(item.waitReason, `${label}.waitReason`),

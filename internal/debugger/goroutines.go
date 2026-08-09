@@ -21,7 +21,7 @@ import (
 // and they need two distinct defences:
 //
 //   - A required read FAILS or an entry is retired mid-walk. Handled by
-//     degrading: an incomplete walk falls back to the legacy single-synthetic
+//     degrading: an incomplete walk falls back to a synthetic unknown
 //     goroutine rather than being mistaken for a lifecycle change.
 //   - Every read SUCCEEDS but the values are mutually inconsistent, because
 //     they were taken from different generations of a table that was
@@ -34,6 +34,9 @@ const (
 	maxGoroutineScan = 8192
 	// maxThreadScan bounds the runtime.allm linked-list walk likewise.
 	maxThreadScan = 2048
+	// maxCurrentThreadScan bounds the targeted continuation past the rich allm
+	// prefix. It reads only enough fields to find the stopped M or current g.
+	maxCurrentThreadScan = 2048
 	// maxGoStringLen caps a wait-reason string read from tracee memory.
 	maxGoStringLen = 256
 
@@ -62,11 +65,15 @@ type goLayout struct {
 
 	bufPC int64 // gobuf.pc, relative to gSched
 
-	mProcid   int64
-	mCurg     int64
-	mID       int64
-	mAlllink  int64
-	mSpinning int64
+	mProcid    int64
+	mG0        int64
+	mG0OK      bool
+	mGsignal   int64
+	mGsignalOK bool
+	mCurg      int64
+	mID        int64
+	mAlllink   int64
+	mSpinning  int64
 
 	// waitReasonStrings array, for turning g.waitreason into a human string.
 	wrBase   uint64
@@ -103,6 +110,8 @@ func resolveGoLayout(dw *dwarfReader) goLayout {
 	l.bufPC = req("runtime.gobuf", "pc")
 
 	l.mProcid = req("runtime.m", "procid")
+	l.mG0, l.mG0OK = dw.structMemberOffset("runtime.m", "g0")
+	l.mGsignal, l.mGsignalOK = dw.structMemberOffset("runtime.m", "gsignal")
 	l.mCurg = req("runtime.m", "curg")
 	l.mID = req("runtime.m", "id")
 	l.mAlllink = req("runtime.m", "alllink")
@@ -429,6 +438,7 @@ func allgsEntryAddress(ptr, index uint64) (uint64, bool) {
 // the rich walk reached its safety ceiling but every visited entry was readable.
 func (e *engine) buildGoroutineList(
 	liveSP, livePC, currentGptr uint64,
+	stopTID int,
 ) goroutineWalkResult {
 	l, ok := e.getGoLayout()
 	if !ok {
@@ -438,12 +448,13 @@ func (e *engine) buildGoroutineList(
 	if !ok || ptr == 0 || length == 0 {
 		return goroutineWalkResult{}
 	}
-	return e.buildGoroutineListFrom(l, ptr, length, liveSP, livePC, currentGptr)
+	return e.buildGoroutineListFrom(l, ptr, length, liveSP, livePC, currentGptr, stopTID)
 }
 
 func (e *engine) buildGoroutineListFrom(
 	l *goLayout,
 	ptr, length, liveSP, livePC, currentGptr uint64,
+	stopTID int,
 ) goroutineWalkResult {
 	richLength := min(length, uint64(maxGoroutineScan))
 	rich, currentFound := e.readRichGoroutines(l, ptr, richLength, liveSP, livePC)
@@ -454,7 +465,7 @@ func (e *engine) buildGoroutineListFrom(
 	current := currentGoroutineResult{Complete: true}
 	if !currentFound {
 		current = e.resolveCurrentGoroutineAnchor(
-			l, ptr, richLength, length, liveSP, livePC, currentGptr,
+			l, ptr, richLength, length, liveSP, livePC, currentGptr, stopTID,
 		)
 		if !current.Complete {
 			return goroutineWalkResult{}
@@ -463,10 +474,7 @@ func (e *engine) buildGoroutineListFrom(
 
 	anchorID := 0
 	if current.Found {
-		rich.Items = append(rich.Items, protocol.Goroutine{})
-		copy(rich.Items[1:], rich.Items)
-		rich.Items[0] = current.Item
-		anchorID = current.Item.ID
+		rich.Items, anchorID = installCurrentGoroutine(rich.Items, current.Item)
 	}
 	return goroutineWalkResult{
 		Items:    rich.Items,
@@ -474,6 +482,22 @@ func (e *engine) buildGoroutineListFrom(
 		Clipped:  length > richLength,
 		AnchorID: anchorID,
 	}
+}
+
+func installCurrentGoroutine(
+	gs []protocol.Goroutine,
+	current protocol.Goroutine,
+) ([]protocol.Goroutine, int) {
+	for i := range gs {
+		if gs[i].ID == current.ID {
+			gs[i] = current
+			return gs, 0
+		}
+	}
+	gs = append(gs, protocol.Goroutine{})
+	copy(gs[1:], gs)
+	gs[0] = current
+	return gs, current.ID
 }
 
 func (e *engine) readRichGoroutines(
@@ -509,9 +533,40 @@ func (e *engine) readRichGoroutines(
 func (e *engine) resolveCurrentGoroutineAnchor(
 	l *goLayout,
 	ptr, richLength, length, liveSP, livePC, currentGptr uint64,
+	stopTID int,
 ) currentGoroutineResult {
 	if currentGptr != 0 {
-		result := e.readGoroutine(l, currentGptr, liveSP, livePC)
+		current := e.currentGoroutineFromRegister(l, currentGptr, liveSP, livePC)
+		if !current.Complete || current.Found {
+			return current
+		}
+	}
+	if procid, ok := e.archRuntimeMProcID(stopTID); ok {
+		current := e.findCurrentGoroutineByProcID(l, procid, livePC)
+		if !current.Complete || current.Found {
+			return current
+		}
+	}
+	if liveSP == 0 {
+		return currentGoroutineResult{Complete: true}
+	}
+	if richLength >= length {
+		return currentGoroutineResult{Complete: true}
+	}
+	fallbackEnd := min(length, richLength+uint64(maxGoroutineScan))
+	return e.findCurrentGoroutine(l, ptr, richLength, fallbackEnd, liveSP, livePC)
+}
+
+func (e *engine) currentGoroutineFromRegister(
+	l *goLayout,
+	gptr, liveSP, livePC uint64,
+) currentGoroutineResult {
+	goid, ok := e.readI64(gptr + uint64(l.gGoid))
+	if !ok {
+		return currentGoroutineResult{}
+	}
+	if goid > 0 {
+		result := e.readGoroutine(l, gptr, liveSP, livePC)
 		if !result.Complete {
 			return currentGoroutineResult{}
 		}
@@ -522,19 +577,83 @@ func (e *engine) resolveCurrentGoroutineAnchor(
 				Complete: true,
 			}
 		}
-	}
-	if liveSP == 0 {
 		return currentGoroutineResult{Complete: true}
 	}
-	current := e.findCurrentGoroutineFromThreads(l, liveSP, livePC)
-	if !current.Complete || current.Found {
-		return current
-	}
-	if richLength >= length {
+	if goid != 0 {
 		return currentGoroutineResult{Complete: true}
 	}
-	fallbackEnd := min(length, richLength+uint64(maxGoroutineScan))
-	return e.findCurrentGoroutine(l, ptr, richLength, fallbackEnd, liveSP, livePC)
+	mptr, ok := e.readU64(gptr + uint64(l.gM))
+	if !ok {
+		return currentGoroutineResult{}
+	}
+	if mptr == 0 {
+		return currentGoroutineResult{Complete: true}
+	}
+	schedulerG, complete := e.isSchedulerG(l, mptr, gptr)
+	if !complete {
+		return currentGoroutineResult{}
+	}
+	if !schedulerG {
+		return currentGoroutineResult{Complete: true}
+	}
+	return e.readCurrentGoroutineFromM(l, mptr, livePC)
+}
+
+func (e *engine) isSchedulerG(l *goLayout, mptr, gptr uint64) (bool, bool) {
+	if l.mG0OK {
+		g0, ok := e.readU64(mptr + uint64(l.mG0))
+		if !ok {
+			return false, false
+		}
+		if g0 == gptr {
+			return true, true
+		}
+	}
+	if l.mGsignalOK {
+		gsignal, ok := e.readU64(mptr + uint64(l.mGsignal))
+		if !ok {
+			return false, false
+		}
+		if gsignal == gptr {
+			return true, true
+		}
+	}
+	return false, true
+}
+
+func (e *engine) readCurrentGoroutineFromM(
+	l *goLayout,
+	mptr, livePC uint64,
+) currentGoroutineResult {
+	gptr, ok := e.readU64(mptr + uint64(l.mCurg))
+	if !ok {
+		return currentGoroutineResult{}
+	}
+	if gptr == 0 {
+		return currentGoroutineResult{Complete: true}
+	}
+	owner, ok := e.readU64(gptr + uint64(l.gM))
+	if !ok {
+		return currentGoroutineResult{}
+	}
+	if owner != mptr {
+		return currentGoroutineResult{Complete: true}
+	}
+	result := e.readGoroutine(l, gptr, 0, 0)
+	if !result.Complete {
+		return currentGoroutineResult{}
+	}
+	if !result.Include {
+		return currentGoroutineResult{Complete: true}
+	}
+	current := result.Item
+	current.Current = true
+	current.CurrentLoc = e.locForPC(livePC)
+	return currentGoroutineResult{
+		Item:     current,
+		Found:    true,
+		Complete: true,
+	}
 }
 
 // findCurrentGoroutine is the bounded fallback when the architecture-specific
@@ -580,12 +699,12 @@ func (e *engine) findCurrentGoroutine(
 	return currentGoroutineResult{Complete: true}
 }
 
-// findCurrentGoroutineFromThreads resolves the running g through runtime.allm.
-// Unlike linux FS-relative TLS, m.curg is stable across internal and external
-// linking. SP containment still decides whether the candidate is authoritative.
-func (e *engine) findCurrentGoroutineFromThreads(
+// findCurrentGoroutineByProcID resolves the stopped Linux M exactly, then uses
+// m.curg even when the stop occurred on g0 and SP is outside the user g's stack.
+// The second window is targeted-only so the rich thread list remains capped.
+func (e *engine) findCurrentGoroutineByProcID(
 	l *goLayout,
-	liveSP, livePC uint64,
+	procid, livePC uint64,
 ) currentGoroutineResult {
 	if e.dw == nil {
 		return currentGoroutineResult{Complete: true}
@@ -601,45 +720,49 @@ func (e *engine) findCurrentGoroutineFromThreads(
 	if mptr == 0 {
 		return currentGoroutineResult{Complete: true}
 	}
-	return e.findCurrentGoroutineInThreadList(l, mptr, liveSP, livePC)
+	return e.findCurrentGoroutineByProcIDFrom(l, mptr, procid, livePC)
 }
 
-func (e *engine) findCurrentGoroutineInThreadList(
+func (e *engine) findCurrentGoroutineByProcIDFrom(
 	l *goLayout,
-	mptr, liveSP, livePC uint64,
+	mptr, procid, livePC uint64,
 ) currentGoroutineResult {
-	for i := 0; i < maxThreadScan && mptr != 0; i++ {
-		curg, ok := e.readU64(mptr + uint64(l.mCurg))
-		if !ok {
+	match, next, complete := e.findMByProcID(l, mptr, procid, maxThreadScan)
+	if !complete {
+		return currentGoroutineResult{}
+	}
+	if match == 0 && next != 0 {
+		match, _, complete = e.findMByProcID(l, next, procid, maxCurrentThreadScan)
+		if !complete {
 			return currentGoroutineResult{}
 		}
-		if curg != 0 {
-			lo, hi, ok := e.readGoroutineStackBounds(l, curg)
-			if !ok {
-				return currentGoroutineResult{}
-			}
-			if stackContainsSP(lo, hi, liveSP) {
-				result := e.readGoroutine(l, curg, liveSP, livePC)
-				if !result.Complete {
-					return currentGoroutineResult{}
-				}
-				if result.Include && result.Item.Current {
-					return currentGoroutineResult{
-						Item:     result.Item,
-						Found:    true,
-						Complete: true,
-					}
-				}
-				return currentGoroutineResult{Complete: true}
-			}
+	}
+	if match == 0 {
+		return currentGoroutineResult{Complete: true}
+	}
+	return e.readCurrentGoroutineFromM(l, match, livePC)
+}
+
+func (e *engine) findMByProcID(
+	l *goLayout,
+	mptr, procid uint64,
+	limit int,
+) (match, next uint64, complete bool) {
+	for i := 0; i < limit && mptr != 0; i++ {
+		candidate, ok := e.readU64(mptr + uint64(l.mProcid))
+		if !ok {
+			return 0, 0, false
+		}
+		if candidate == procid {
+			return mptr, 0, true
 		}
 		next, ok := e.readU64(mptr + uint64(l.mAlllink))
 		if !ok {
-			return currentGoroutineResult{}
+			return 0, 0, false
 		}
 		mptr = next
 	}
-	return currentGoroutineResult{Complete: true}
+	return 0, mptr, true
 }
 
 func (e *engine) allmHead() (uint64, bool) {
@@ -669,31 +792,21 @@ func (e *engine) readThreads(currentGoid int, livePC uint64) threadWalkResult {
 	if !ok {
 		return threadWalkResult{}
 	}
+	return e.readThreadsFrom(l, mptr, currentGoid, livePC)
+}
 
-	var out []protocol.Thread
+func (e *engine) readThreadsFrom(
+	l *goLayout,
+	mptr uint64,
+	currentGoid int,
+	livePC uint64,
+) threadWalkResult {
+	out := make([]protocol.Thread, 0, maxThreadScan+1)
+	currentFound := false
 	i := 0
 	for ; i < maxThreadScan && mptr != 0; i++ {
-		t := protocol.Thread{}
-		if procid, ok := e.readU64(mptr + uint64(l.mProcid)); ok {
-			t.ID = int(procid)
-		}
-		if id, ok := e.readI64(mptr + uint64(l.mID)); ok {
-			t.MID = int(id)
-		}
-		if sp, ok := e.readU8(mptr + uint64(l.mSpinning)); ok {
-			t.Spinning = sp != 0
-		}
-		if curg, ok := e.readU64(mptr + uint64(l.mCurg)); ok && curg != 0 {
-			if goid, ok := e.readI64(curg + uint64(l.gGoid)); ok && goid > 0 {
-				t.GoID = int(goid)
-				if int(goid) == currentGoid {
-					t.Current = true
-					t.CurrentLoc = e.locForPC(livePC)
-				} else if schedPC, ok := e.readU64(curg + uint64(l.gSched) + uint64(l.bufPC)); ok {
-					t.CurrentLoc = e.locForPC(schedPC)
-				}
-			}
-		}
+		t := e.readThread(l, mptr, currentGoid, livePC)
+		currentFound = currentFound || t.Current
 		out = append(out, t)
 
 		next, ok := e.readU64(mptr + uint64(l.mAlllink))
@@ -702,40 +815,114 @@ func (e *engine) readThreads(currentGoid int, livePC uint64) threadWalkResult {
 		}
 		mptr = next
 	}
+	clipped := i == maxThreadScan && mptr != 0
+	if currentGoid > 0 && !currentFound && mptr != 0 {
+		currentM, complete := e.findMByCurrentGoid(l, mptr, currentGoid, maxCurrentThreadScan)
+		if !complete {
+			return threadWalkResult{}
+		}
+		if currentM != 0 {
+			current := e.readThread(l, currentM, currentGoid, livePC)
+			if !current.Current {
+				return threadWalkResult{}
+			}
+			out = append(out, current)
+		}
+	}
 	return threadWalkResult{
 		Items:    out,
 		Complete: true,
-		Clipped:  i == maxThreadScan && mptr != 0,
+		Clipped:  clipped,
 	}
 }
 
-// liveRegisters reads the currently-stopped thread's SP, PC, and Go ABI
+func (e *engine) readThread(
+	l *goLayout,
+	mptr uint64,
+	currentGoid int,
+	livePC uint64,
+) protocol.Thread {
+	t := protocol.Thread{}
+	if procid, ok := e.readU64(mptr + uint64(l.mProcid)); ok {
+		t.ID = int(procid)
+	}
+	if id, ok := e.readI64(mptr + uint64(l.mID)); ok {
+		t.MID = int(id)
+	}
+	if sp, ok := e.readU8(mptr + uint64(l.mSpinning)); ok {
+		t.Spinning = sp != 0
+	}
+	if curg, ok := e.readU64(mptr + uint64(l.mCurg)); ok && curg != 0 {
+		if goid, ok := e.readI64(curg + uint64(l.gGoid)); ok && goid > 0 {
+			t.GoID = int(goid)
+			if int(goid) == currentGoid {
+				t.Current = true
+				t.CurrentLoc = e.locForPC(livePC)
+			} else if schedPC, ok := e.readU64(curg + uint64(l.gSched) + uint64(l.bufPC)); ok {
+				t.CurrentLoc = e.locForPC(schedPC)
+			}
+		}
+	}
+	return t
+}
+
+func (e *engine) findMByCurrentGoid(
+	l *goLayout,
+	mptr uint64,
+	currentGoid, limit int,
+) (uint64, bool) {
+	for i := 0; i < limit && mptr != 0; i++ {
+		curg, ok := e.readU64(mptr + uint64(l.mCurg))
+		if !ok {
+			return 0, false
+		}
+		if curg != 0 {
+			goid, ok := e.readI64(curg + uint64(l.gGoid))
+			if !ok {
+				return 0, false
+			}
+			if int(goid) == currentGoid {
+				return mptr, true
+			}
+		}
+		next, ok := e.readU64(mptr + uint64(l.mAlllink))
+		if !ok {
+			return 0, false
+		}
+		mptr = next
+	}
+	return 0, true
+}
+
+// liveRegisters reads the currently-stopped thread's TID, SP, PC, and Go ABI
 // current-g pointer. The pointer is only a candidate: readGoroutine validates it
-// against SP containment before it can become the snapshot anchor.
-func (e *engine) liveRegisters() (sp, pc, currentGptr uint64) {
+// against SP containment or resolves its M's curg before it becomes the anchor.
+// TID survives a register-read failure so Linux can still resolve m.curg.
+func (e *engine) liveRegisters() (tid int, sp, pc, currentGptr uint64) {
 	tid, err := e.activeTID()
 	if err != nil {
-		return 0, 0, 0
+		return 0, 0, 0, 0
 	}
 	regs, err := e.backend.GetRegisters(tid)
 	if err != nil {
-		return 0, 0, 0
+		return tid, 0, 0, 0
 	}
 	currentGptr, _ = e.archCurrentGoroutinePointer(regs)
-	return regs.SP, regs.PC, currentGptr
+	return tid, regs.SP, regs.PC, currentGptr
 }
 
-// syntheticGoroutine is the legacy fallback: a single goroutine standing in for
-// the stopped thread's location when the runtime can't be introspected. It
-// preserves behavior for stripped binaries, attach-without-DWARF, and the
-// pre-runtime-init entry stop (and keeps the fakeBackend unit tests green).
-func (e *engine) syntheticGoroutine(livePC uint64) protocol.Goroutine {
+func unknownGoroutine(loc protocol.Location) protocol.Goroutine {
 	return protocol.Goroutine{
-		ID:         1,
-		Status:     "waiting",
-		CurrentLoc: e.locForPC(livePC),
+		Status:     "unknown",
+		CurrentLoc: loc,
 		Current:    true,
 	}
+}
+
+// syntheticGoroutine represents an unresolved stopped goroutine without
+// borrowing a real goid. DAP may assign its own transport-only thread handle.
+func (e *engine) syntheticGoroutine(livePC uint64) protocol.Goroutine {
+	return unknownGoroutine(e.locForPC(livePC))
 }
 
 // degradedSnapshot is the single construction point for an incomplete runtime
@@ -751,8 +938,8 @@ func (e *engine) degradedSnapshot(livePC uint64) protocol.GoroutineSnapshotPaylo
 // synthetic goroutine when the runtime can't be read. This backs the on-demand
 // Goroutines() query and the DAP threads list.
 func (e *engine) readGoroutines() ([]protocol.Goroutine, error) {
-	sp, pc, currentGptr := e.liveRegisters()
-	result := e.buildGoroutineList(sp, pc, currentGptr)
+	tid, sp, pc, currentGptr := e.liveRegisters()
+	result := e.buildGoroutineList(sp, pc, currentGptr, tid)
 	if result.Complete {
 		return result.Items, nil
 	}
@@ -778,9 +965,9 @@ func (e *engine) goroutineSnapshotQuery() protocol.GoroutineSnapshotPayload {
 }
 
 func (e *engine) buildSnapshot(trackLifecycle bool) protocol.GoroutineSnapshotPayload {
-	sp, pc, currentGptr := e.liveRegisters()
+	tid, sp, pc, currentGptr := e.liveRegisters()
 
-	goroutines := e.buildGoroutineList(sp, pc, currentGptr)
+	goroutines := e.buildGoroutineList(sp, pc, currentGptr, tid)
 	if !goroutines.Complete {
 		// Degraded snapshot: still report where we're stopped, but don't touch
 		// the remembered live set — an empty read (e.g. at the entry stop before
@@ -862,14 +1049,25 @@ func (e *engine) diffGoids(live map[int]struct{}) (created, exited []int) {
 }
 
 // currentGoroutineFrom returns the goroutine marked Current in a snapshot, used
-// as the single Goroutine embedded in a stop event. Unknown is safer than
-// attributing the stop to the first unrelated goroutine when a capped scan has
-// not yet found the stopped goroutine.
-func currentGoroutineFrom(snap protocol.GoroutineSnapshotPayload) protocol.Goroutine {
+// as the single Goroutine embedded in a stop event. An unresolved snapshot must
+// never substitute another real goroutine merely because it appears first.
+func currentGoroutineFrom(
+	snap protocol.GoroutineSnapshotPayload,
+	fallbackLoc protocol.Location,
+) protocol.Goroutine {
 	for _, g := range snap.Goroutines {
 		if g.Current {
+			if g.ID == 0 {
+				if fallbackLoc == (protocol.Location{}) {
+					fallbackLoc = g.CurrentLoc
+				}
+				return unknownGoroutine(fallbackLoc)
+			}
+			if fallbackLoc != (protocol.Location{}) {
+				g.CurrentLoc = fallbackLoc
+			}
 			return g
 		}
 	}
-	return protocol.Goroutine{}
+	return unknownGoroutine(fallbackLoc)
 }

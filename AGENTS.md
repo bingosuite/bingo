@@ -1618,7 +1618,11 @@ and streams a `GoroutineSnapshotPayload` carrying: the goroutine set with
 (the `go` statement, gopc), the thread set, the current goroutine, and
 **created/exited goid deltas** since the previous snapshot.
 
-**Version 1.1** (`pkg/protocol`): reshaped `Goroutine` (added `ParentID`,
+**Version 1.3** (`pkg/protocol`): reserves goroutine ID 0 with status `unknown`
+for a synthetic unresolved stopped goroutine. Consumers must not attribute that
+stop to a real goid; DAP omits its optional `stopped.threadId`.
+
+**Version 1.1** reshaped `Goroutine` (added `ParentID`,
 `StartLoc`, `CreatedLoc`, `ThreadID`, `Current`; renamed `GoLoc`→`CreatedLoc`),
 new `Thread`, new `GoroutineSnapshotPayload`, new `EventGoroutineSnapshot` +
 `CmdGoroutineSnapshot`.
@@ -1627,7 +1631,7 @@ new `Thread`, new `GoroutineSnapshotPayload`, new `EventGoroutineSnapshot` +
 auto-emitted on exactly the suspends that can change the concurrency picture —
 **breakpoint hit, pause, and the launch/attach entry stop** — and on demand via
 `CmdGoroutineSnapshot`. It is **NOT** emitted per step: `emitStepped` stays cheap
-(embeds a synthetic single goroutine, no `allgs` scan) to protect the fragile
+(embeds an ID-0 synthetic unknown goroutine, no `allgs` scan) to protect the fragile
 single-step/step-over path from extra per-step memory reads. `emitBreakpointHit`
 / `emitPaused` build the snapshot **once**, embed its current goroutine in the
 stop event, then stream the same snapshot — one build, no double scan, no double
@@ -1696,18 +1700,22 @@ made lifecycle-tracking or the automatic path non-tracking; the unit tests
 around `snapshotFrom` pin the seam's semantics but cannot catch a rewiring.
 
 **Graceful fallback.** Every read is best-effort. `resolveGoLayout` marks the
-layout invalid if any required `g`/`gobuf`/`stack`/`m` offset is missing, and an
-unreadable `allgs` header/slot, required `g` status/goid/stack bound, or `allm`
-head/link degrades the whole snapshot to the legacy single synthetic goroutine
-(`ID:1, Status:"waiting"`, current PC) rather than returning a partial live set
-or erroring the stop. Both stack bounds are required for every included live
-goroutine: without them SP containment cannot rule that goroutine in or out as
-the stopped one. Intentional nil/dead/freelist entries remain filters, and
-optional metadata remains best-effort. This distinction is load-bearing on
-Linux: ptrace stops only the reporting thread, so sibling runtime mutations can
-race the walk; only backends that stop the world make the reads race-free. This
-also preserves behavior for stripped binaries / attach-without-DWARF and keeps
-the `fakeBackend` engine unit tests green.
+layout invalid if any required `g`/`gobuf`/`stack`/`m` offset is missing, and any
+unreadable `allgs` header/slot, required `g` status/goid/stack bound, or
+required targeted-current/allm link degrades the whole snapshot to one synthetic
+unknown goroutine (`ID:0, Status:"unknown"`, current PC) rather than returning a
+partial live set, changing `prevGoids`, or erroring the stop. Both stack bounds
+are required for every included live goroutine: without them SP containment
+cannot rule that goroutine in or out as the stopped one. Intentional
+nil/dead/freelist entries remain filters, and optional metadata remains
+best-effort. This distinction is load-bearing on Linux: ptrace stops only the
+reporting thread, so sibling runtime mutations can race the walk; only backends
+that stop the world make the reads race-free. If every required read succeeds
+but the bounded current lookup misses, `Current` remains 0 and the stop event
+embeds the same ID-0 unknown — `currentGoroutineFrom` must never borrow the first
+real goroutine. This preserves honest behavior for stripped binaries,
+attach-without-DWARF, pre-runtime-init entry stops, zeroed/unreadable registers,
+and scheduler-stack stops whose `m.curg` cannot be resolved.
 
 **Coherent metadata reads — the half degradation can't cover.** Degradation
 answers reads that *fail*. It cannot answer reads that all *succeed* while
@@ -1739,25 +1747,31 @@ and its read **order** is the whole mechanism:
 Worst case under the correct order is missing a goroutine created during the
 read, which the runtime explicitly sanctions for lock-free readers. See #235.
 
-**Current goroutine = SP-containment** (platform-independent): the stopped
-thread's SP within `[g.stack.lo, g.stack.hi)`. Discovery is independent of the
-`maxGoroutineScan=8192` rich `runtime.allgs` prefix, so a large target cannot
-make BreakpointHit/Paused identify the prefix's first unrelated goroutine while
-frames come from the real stopped TID. The engine first resolves an O(1)
-architecture candidate where the ABI provides a stable one (arm64: X28 is
-`*g`) and accepts it only after the same SP-containment check. On linux/amd64,
-`FS_BASE` is not a stable `*g` address under external linking, so the reader
-walks the bounded `runtime.allm` list and tests each `m.curg` by SP containment
-instead of hardcoding an ELF TLS offset. If neither path resolves the current
-goroutine, a final pass examines at most one additional `maxGoroutineScan`
-`allgs` entry range, reading only pointer + stack bounds until a match. A
-beyond-prefix match is fully decoded once and prepended as the current anchor;
-the rich scan and both fallbacks remain bounded under corrupt metadata.
-Unreadable required data in either the rich walk or a targeted anchor lookup
-degrades the whole snapshot and leaves `prevGoids` unchanged; a bounded miss is
-complete and reports unknown rather than substituting the first unrelated
-entry. The current *thread* is the M whose `curg` goid equals the current goid. A
-non-current goroutine's `CurrentLoc` uses `gobuf.pc` (where it resumes); the
+**Current goroutine discovery is independent and bounded.** SP containment
+(`g.stack.lo <= stopped SP < g.stack.hi`) identifies ordinary user-stack stops
+inside the `maxGoroutineScan=8192` rich `runtime.allgs` prefix. If that misses:
+
+1. On arm64, X28 provides the stopped `*g`. A user `g` is validated by SP
+   containment; if X28 names g0/gsignal instead, the reader follows
+   `g.m → m.curg`, verifies `curg.m == m`, and marks that live positive-goid
+   goroutine current without requiring its stack to contain the scheduler SP.
+2. On linux/amd64, `FS_BASE` is not a stable `*g` address under external
+   linking. Linux ptrace TIDs and `runtime.m.procid` are the same kernel TID, so
+   the reader searches for the exact stopped M, then resolves `m.curg` as above.
+   The ordinary `allm` window remains `maxThreadScan=2048`; one additional
+   targeted-only 2048-M continuation reads only `procid`/`alllink` until the
+   match. Darwin never compares its Mach thread port to `m.procid` (a pthread).
+3. A final stack-only pass examines at most one additional
+   `maxGoroutineScan` `allgs` range, reading pointer + stack bounds until a
+   match.
+
+A current goroutine already in the rich prefix is replaced in place; a
+beyond-prefix match is fully decoded once and prepended as an anchor excluded
+from lifecycle deltas. `readThreads` likewise keeps its rich prefix capped and
+may append exactly one current-M anchor found by a bounded goid-only
+continuation, so thread/current identity stays coherent without unbounded
+latency. If every bounded path misses, identity is unknown rather than guessed.
+A non-current goroutine's `CurrentLoc` uses `gobuf.pc` (where it resumes); the
 current one uses the live PC. Status strings are hardcoded (stable across Go
 versions); wait-reason strings are read dynamically from
 `runtime.waitReasonStrings`. Goroutines with goid<=0 or status `_Gdead` (scan
@@ -2214,7 +2228,7 @@ target metadata, architecture, mode, and entitlements.
 The extension package version is the installed-runtime upgrade boundary:
 material shipped behavior changes must bump both `package.json` and the lockfile
 or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.3.1**) in source and VSIX
+and package verifier pin the current version (**0.3.2**) in source and VSIX
 metadata.
 The root Run and Debug dropdown exposes exactly two `"type":"bingo"` choices:
 launch one of five progressive examples through a `pickString`, and join a
@@ -2291,7 +2305,7 @@ activation and keys observers by `DebugSession.id`, never
 
 **Concurrency webview ownership/security.** The extension host, not the
 webview, owns one bounded WebSocket observer/model per live DAP session. It
-reuses the normalized management endpoint, validates protocol 1.2 envelopes,
+reuses the normalized management endpoint, validates protocol 1.3 envelopes,
 payload/string/count limits and seq gaps, and reconnects only while the DAP
 session lives. It sends `CmdGoroutineSnapshot` once after every successful
 WebSocket join and thereafter only for explicit Refresh—never run control.
@@ -2363,9 +2377,9 @@ session.
 - `initialized` fires immediately (the target image is already loaded, so
   breakpoints resolve right away — there is no entry stop to wait for).
 - `onSessionState` (`events.go`) consumes that welcome **once** (gated on
-  `awaitingWelcome`): `suspended`→`suspended=true` + `stopped reason=pause` (tid
-  defaults to 1 — the engine inspects the currently-stopped goroutine regardless
-  of the DAP threadId); `exited`→`terminated`; idle/running→nothing. For the
+  `awaitingWelcome`): `suspended`→`suspended=true` + `stopped reason=pause`
+  (`threadId` omitted until a stop identifies a positive goid);
+  `exited`→`terminated`; idle/running→nothing. For the
   normal launch/attach path `awaitingWelcome` is never set, so it is a no-op
   there (the entry stop drives the initial state instead).
 - `onConfigurationDone`'s `joining` branch responds to the attach but does NOT
@@ -2386,6 +2400,12 @@ state on the join path (see *Joining an existing session*);
 ignored** (WebSocket-only concurrency stream with no DAP equivalent; translating
 it would corrupt the `threads`→`EventGoroutines` FIFO — see the goroutine
 snapshot section).
+
+Suspending events carry the runtime goid when it is known. An ID-0 synthetic
+unknown omits DAP's optional `stopped.threadId`; never clamp an unresolved stop
+to 1, because that identifies the unrelated real g1. `threads` responses may
+still assign the lone synthetic entry a transport-only positive handle because
+DAP requires every listed `Thread.id` to be non-zero.
 
 `EventContinued` → DAP `continued` **only for out-of-band resumes**. The Handler
 increments `pendingContinues` before enqueuing its OWN continue and decrements it
@@ -3190,11 +3210,11 @@ through the justfile.
 ## When you change something
 
 - **Wire protocol** (`pkg/protocol`): bump `Version` for breaking changes,
-  and update the round-trip table in `protocol_test.go`. Currently **1.2** (the
-  reshaped `Variable` — added `Kind` + `Children` for the type-aware expandable
-  tree — and the new `CmdEvaluate`/`EventEvaluate` name-only evaluate command/
-  event with `EvaluatePayloadCmd`/`EvaluatePayload`). 1.1 had reshaped
-  `Goroutine` and added `Thread`/`GoroutineSnapshotPayload` +
+  and update the round-trip table in `protocol_test.go`. Currently **1.3**
+  (goroutine ID 0/status `unknown` is the synthetic unresolved stop identity).
+  1.2 reshaped `Variable` with `Kind` + `Children` for the type-aware expandable
+  tree and added the name-only `CmdEvaluate`/`EventEvaluate` command/event. 1.1
+  reshaped `Goroutine` and added `Thread`/`GoroutineSnapshotPayload` +
   `EventGoroutineSnapshot`/`CmdGoroutineSnapshot`.
 - **Management API** (`internal/server`): `ManagementAPIVersion` is independent
   of the wire protocol. Bump it for incompatible `/api/health` or management

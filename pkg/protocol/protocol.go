@@ -7,7 +7,7 @@ import (
 	"fmt"
 )
 
-const Version = "1.2"
+const Version = "1.3"
 
 // VersionError reports that a peer used a wire version other than Version.
 type VersionError struct {

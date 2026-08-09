@@ -78,13 +78,6 @@ func (h *Handler) onSessionState(evt protocol.Event) {
 	}
 	h.awaitingWelcome = false
 	tid := h.curThreadID
-	if tid == 0 {
-		// No stop event has been seen yet on a freshly-joined suspended session,
-		// so we have no goroutine id. DAP requires a threadId; the engine
-		// inspects the currently-stopped goroutine regardless, so a synthetic
-		// id is safe here.
-		tid = 1
-	}
 	switch p.State {
 	case protocol.StateSuspended:
 		h.suspended = true
@@ -124,7 +117,7 @@ func stopGoroutine(evt protocol.Event) protocol.Goroutine {
 }
 
 func (h *Handler) onStop(evt protocol.Event) {
-	tid := threadID(stopGoroutine(evt).ID)
+	tid := stoppedThreadID(stopGoroutine(evt).ID)
 
 	h.mu.Lock()
 	// Every stop is a fresh memory snapshot; drop variable subtrees cached

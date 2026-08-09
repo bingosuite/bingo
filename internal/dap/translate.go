@@ -9,12 +9,20 @@ import (
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
-// DAP has a single-threaded stop model keyed by threadId; bingo reports the
-// stopped goroutine. A goroutine id of 0 (runtime g0 / not yet assigned) is not
-// a valid DAP threadId, so clamp to 1. threadID keeps that mapping in one place.
+// DAP thread-list entries require an id. A synthetic bingo goroutine has ID 0,
+// so threadID gives it a transport-only handle without claiming a runtime goid.
 func threadID(goroutineID int) int {
 	if goroutineID < 1 {
 		return 1
+	}
+	return goroutineID
+}
+
+// stopped.threadId is optional. Omit it when bingo cannot identify a runtime
+// goroutine instead of pointing the stop at an unrelated real goroutine.
+func stoppedThreadID(goroutineID int) int {
+	if goroutineID < 1 {
+		return 0
 	}
 	return goroutineID
 }
