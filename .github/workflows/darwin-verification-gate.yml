@@ -12,13 +12,13 @@ name: Darwin verification gate
 # passes, and add the `darwin-e2e-verified` label to the PR. The gate is a
 # no-op (green) for PRs that don't touch that code.
 #
-# On every `synchronize` (new commits pushed) the `darwin-e2e-verified` label is
-# automatically removed: a prior verification only covers the commits it was
-# run against, so it must not silently carry forward onto unverified code. The
-# gate then re-evaluates the (now-current) label state in the same run, rather
-# than trusting the stale `github.event.pull_request.labels` payload, since that
-# payload predates the removal step. It also re-runs on `labeled`/`unlabeled` so
-# adding the label back flips the check to green without needing a new push.
+# On every `synchronize` (new commits pushed), the current head is unverified by
+# definition: a prior verification only covers the commits it was run against.
+# The workflow best-effort removes the stale label for same-repository PRs, but
+# public-fork tokens are read-only and may leave it in place. The synchronize run
+# therefore fails closed without consulting the live label. Removing/toggling
+# and then re-adding the label triggers `unlabeled`/`labeled` runs that evaluate
+# the live label and revalidate the same head without another push.
 # To actually block merges, mark "Darwin E2E verified" as a required status
 # check in branch protection.
 
@@ -43,50 +43,74 @@ jobs:
       # files under internal/debugger, the darwin E2E spec, and entitlements.
       DARWIN_NATIVE_REGEX: '^(internal/debugger/.*_darwin_.*|internal/debugger/trap_arm64\.go|test/integration/.*_darwin_.*_test\.go|entitlements\.plist)$'
     steps:
+      - uses: actions/checkout@v4
+        with:
+          # The gate must never execute a fork-modified copy of its own policy.
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      - name: Test Darwin verification gate decision
+        run: |
+          if [ -r .github/scripts/darwin-verification-gate_test.sh ]; then
+            bash .github/scripts/darwin-verification-gate_test.sh
+          else
+            echo "Trusted base predates the gate script; the gate step will use its fail-closed bootstrap."
+          fi
+
       - name: Remove stale verification label on new commits
+        id: stale-verification
         if: github.event.action == 'synchronize'
+        env:
+          IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          pr='${{ github.event.pull_request.number }}'
-          if gh pr edit "$pr" --repo "${{ github.repository }}" --remove-label "$VERIFIED_LABEL" 2>/dev/null; then
-            echo "Removed '$VERIFIED_LABEL' label — new commits require re-verification."
+          if output=$(gh pr edit "$PR_NUMBER" --repo "$REPOSITORY" \
+            --remove-label "$VERIFIED_LABEL" 2>&1); then
+            echo "status=cleared" >> "$GITHUB_OUTPUT"
+            echo "Cleared '$VERIFIED_LABEL' if present — new commits require re-verification."
           else
-            echo "'$VERIFIED_LABEL' label was not present — nothing to remove."
+            exit_code=$?
+            echo "status=failed" >> "$GITHUB_OUTPUT"
+            if [ "$IS_FORK" = "true" ]; then
+              echo "::warning title=Stale Darwin verification label not removed::The public-fork GITHUB_TOKEN is read-only, so '$VERIFIED_LABEL' could not be removed (exit $exit_code). The gate will fail closed; remove or toggle the stale label, then re-add it to verify this head."
+            else
+              echo "::warning title=Stale Darwin verification label not removed::The API failed to remove '$VERIFIED_LABEL' (exit $exit_code). The gate will fail closed; remove or toggle the stale label, then re-add it to verify this head."
+            fi
+            printf '%s\n' "$output" >&2
           fi
 
       - name: Require local darwin E2E verification when darwin-native code changes
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          LABEL_CLEANUP: ${{ steps.stale-verification.outputs.status }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          pr='${{ github.event.pull_request.number }}'
-          gh pr diff "$pr" --repo "${{ github.repository }}" --name-only > changed.txt
-          echo "Changed files in this PR:"
-          sed 's/^/  /' changed.txt
+          gh pr diff "$PR_NUMBER" --repo "$REPOSITORY" --name-only > changed.txt
 
-          if grep -Eq "$DARWIN_NATIVE_REGEX" changed.txt; then
+          if [ ! -r .github/scripts/darwin-verification-gate.sh ]; then
+            echo "Changed files in this PR:"
+            sed 's/^/  /' changed.txt
             echo
-            echo "Darwin-native (CI-unexecutable) files changed:"
-            grep -E "$DARWIN_NATIVE_REGEX" changed.txt | sed 's/^/  /'
-            darwin_changed=true
-          else
-            darwin_changed=false
-          fi
-
-          echo
-          if [ "$darwin_changed" != "true" ]; then
-            echo "No darwin-native code changed — gate not required. ✅"
+            if grep -Eq "$DARWIN_NATIVE_REGEX" changed.txt; then
+              echo "::error title=Darwin E2E verification policy unavailable::The trusted base does not contain the gate script, so this Darwin-native change fails closed."
+              exit 1
+            fi
+            echo "No darwin-native code changed; gate not required."
             exit 0
           fi
 
-          # Re-fetch the current label state live rather than trusting
-          # github.event.pull_request.labels, which is a snapshot from before
-          # this run (and predates the removal step above on `synchronize`).
-          has_label=$(gh pr view "$pr" --repo "${{ github.repository }}" --json labels \
-            -q "[.labels[].name] | any(. == \"$VERIFIED_LABEL\")")
-
-          if [ "$has_label" = "true" ]; then
-            echo "'$VERIFIED_LABEL' label present — darwin backend verified locally. ✅"
-            exit 0
+          has_label=
+          if [ "$EVENT_ACTION" != "synchronize" ]; then
+            has_label=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" --json labels \
+              -q "[.labels[].name] | any(. == \"$VERIFIED_LABEL\")")
           fi
 
-          echo "::error title=Darwin E2E verification required::This PR changes darwin-native debugger code that cannot be executed on GitHub-hosted runners. Run 'just e2e-darwin' locally on Apple Silicon, confirm it passes, then add the '${VERIFIED_LABEL}' label to this PR."
-          exit 1
+          EVENT_ACTION="$EVENT_ACTION" \
+            CHANGED_FILES=changed.txt \
+            HAS_VERIFIED_LABEL="$has_label" \
+            LABEL_CLEANUP="${LABEL_CLEANUP:-not-run}" \
+            bash .github/scripts/darwin-verification-gate.sh
