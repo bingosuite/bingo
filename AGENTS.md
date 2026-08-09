@@ -558,6 +558,20 @@ are detected by a `mach_msg` receive loop.
   raw bytes and are unit-tested without DWARF or a backend; the global ceiling is
   pinned by `TestFormatTypedBudget` (a pathological nested aggregate truncates to
   ~`maxTotalNodes`).
+- `subprogramVars` is a depth-aware walk of the full containing subprogram,
+  not a flat scan to the first null DIE. Both `DW_TAG_lexical_block` and
+  `DW_TAG_inlined_subroutine` define variable scope. The containing subprogram
+  must have a concrete matching range (Go's no-range subprograms are abstract
+  inline definitions); nested-scope containment compares the **unslid** stopped
+  PC against every range from `dwarf.Data.Ranges`
+  (linux lexical blocks use range lists and ranges can be discontiguous);
+  missing or unreadable ranges are conservatively active rather than making
+  variables disappear. Definitely inactive subtrees are pruned with
+  `Reader.SkipChildren`, and same-name variables are deduplicated so the
+  deepest active declaration wins for both Locals and EvaluateName. Concrete
+  inline DIEs whose names only exist through `DW_AT_abstract_origin` remain
+  unsupported and are skipped — do not resolve abstract origins or location
+  lists without extending the documented expression model deliberately.
 - `EvaluateName` resolves a **single variable name only** (no dotted paths /
   indexing / arithmetic): a local or parameter in the subprogram containing the
   frame PC first, then a package-level global via `globalVar` (matches the exact

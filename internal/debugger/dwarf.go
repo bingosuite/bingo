@@ -467,37 +467,117 @@ func (r *dwarfReader) subprogramVars(pc uint64) ([]*dwarf.Entry, error) {
 			continue
 		}
 
-		lowpc, hasLow := entry.Val(dwarf.AttrLowpc).(uint64)
-		if !hasLow {
+		switch r.scopePCState(entry, dwarfPC) {
+		case scopePCOutside:
 			rd.SkipChildren()
 			continue
-		}
-		highpc, ok := highPCValue(entry, lowpc)
-		if !ok || dwarfPC < lowpc || dwarfPC >= highpc {
+		case scopePCUnknown:
+			// Go uses no-range subprograms as abstract inline definitions; they
+			// cannot identify the concrete frame whose variables are requested.
 			rd.SkipChildren()
 			continue
 		}
 
-		var out []*dwarf.Entry
-		for {
-			child, err := rd.Next()
-			if err == io.EOF || child == nil {
-				break
-			}
-			if err != nil {
-				return nil, fmt.Errorf("DWARF child read: %w", err)
-			}
-			if child.Tag == 0 {
-				break
-			}
-			if child.Tag != dwarf.TagVariable && child.Tag != dwarf.TagFormalParameter {
-				continue
-			}
-			out = append(out, child)
-		}
-		return out, nil
+		return r.collectSubprogramVars(rd, dwarfPC)
 	}
 	return nil, nil
+}
+
+type scopePCMatch uint8
+
+const (
+	scopePCUnknown scopePCMatch = iota
+	scopePCOutside
+	scopePCInside
+)
+
+func (r *dwarfReader) scopePCState(entry *dwarf.Entry, dwarfPC uint64) scopePCMatch {
+	ranges, err := r.data.Ranges(entry)
+	return classifyScopePC(dwarfPC, ranges, err)
+}
+
+func classifyScopePC(dwarfPC uint64, ranges [][2]uint64, err error) scopePCMatch {
+	// Missing or unreadable ranges cannot safely exclude a scope from inspection.
+	if err != nil || len(ranges) == 0 {
+		return scopePCUnknown
+	}
+	for _, pcs := range ranges {
+		if dwarfPC >= pcs[0] && dwarfPC < pcs[1] {
+			return scopePCInside
+		}
+	}
+	return scopePCOutside
+}
+
+func isVariableScope(tag dwarf.Tag) bool {
+	return tag == dwarf.TagLexDwarfBlock || tag == dwarf.TagInlinedSubroutine
+}
+
+type scopedVariable struct {
+	entry *dwarf.Entry
+	depth int
+}
+
+func (r *dwarfReader) collectSubprogramVars(rd *dwarf.Reader, dwarfPC uint64) ([]*dwarf.Entry, error) {
+	depth := 1
+	scopeDepth := 0
+	// SkipChildren consumes the skipped subtree's terminator, so only traversed
+	// children get a depth slot.
+	scopeAtDepth := []bool{false, false}
+	vars := make([]scopedVariable, 0)
+	byName := make(map[string]int)
+
+	for depth > 0 {
+		entry, err := rd.Next()
+		if err == io.EOF || entry == nil {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("DWARF child read: %w", err)
+		}
+		if entry.Tag == 0 {
+			if scopeAtDepth[depth] {
+				scopeDepth--
+			}
+			depth--
+			continue
+		}
+
+		isScope := isVariableScope(entry.Tag)
+		if isScope && r.scopePCState(entry, dwarfPC) == scopePCOutside {
+			rd.SkipChildren()
+			continue
+		}
+
+		if entry.Tag == dwarf.TagVariable || entry.Tag == dwarf.TagFormalParameter {
+			name, _ := entry.Val(dwarf.AttrName).(string)
+			if name != "" {
+				if index, ok := byName[name]; !ok {
+					byName[name] = len(vars)
+					vars = append(vars, scopedVariable{entry: entry, depth: scopeDepth})
+				} else if scopeDepth > vars[index].depth {
+					vars[index] = scopedVariable{entry: entry, depth: scopeDepth}
+				}
+			}
+		}
+
+		if entry.Children {
+			depth++
+			if depth >= len(scopeAtDepth) {
+				scopeAtDepth = append(scopeAtDepth, false)
+			}
+			scopeAtDepth[depth] = isScope
+			if isScope {
+				scopeDepth++
+			}
+		}
+	}
+
+	out := make([]*dwarf.Entry, len(vars))
+	for i := range vars {
+		out[i] = vars[i].entry
+	}
+	return out, nil
 }
 
 // varType resolves a DIE's DW_AT_type to a concrete dwarf.Type (nil on absence
