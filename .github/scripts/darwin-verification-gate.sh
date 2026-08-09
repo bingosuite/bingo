@@ -59,6 +59,10 @@ fail_closed() {
   fi
   exit "$exit_code"
 }
+# `set -E` propagates this trap into command-substitution subshells, where a
+# failure would post a status the parent then posts again (and where
+# `final_status_posted` cannot propagate back out). Every `$(...)` below the
+# trap therefore disarms it so the parent shell stays the only decision point.
 trap fail_closed ERR
 
 case "$event_action" in
@@ -96,11 +100,11 @@ if [ "$event_action" = "synchronize" ] || [ "$event_action" = "reopened" ]; then
   fi
 fi
 
-files_json=$(mktemp)
+files_json=$(trap - ERR; mktemp)
 trap 'rm -f "$files_json"' EXIT
 gh api --paginate --slurp \
   "repos/$GITHUB_REPOSITORY/pulls/$pr_number/files?per_page=100" > "$files_json"
-listed_changed_files=$(jq -er '[.[][]] | length' "$files_json")
+listed_changed_files=$(trap - ERR; jq -er '[.[][]] | length' "$files_json")
 
 if [ "$listed_changed_files" -ne "$declared_changed_files" ]; then
   echo "PR files API returned $listed_changed_files of $declared_changed_files changed files; refusing an incomplete gate decision." >&2
@@ -111,7 +115,7 @@ echo "Changed files in this PR:"
 jq -r '.[][] | .filename | @json' "$files_json" | sed 's/^/  /'
 echo
 
-darwin_changed=$(jq -r --arg regex "$darwin_native_regex" \
+darwin_changed=$(trap - ERR; jq -r --arg regex "$darwin_native_regex" \
   'any(.[][]; .filename | test($regex))' "$files_json")
 
 if [ "$darwin_changed" = "false" ]; then
@@ -149,7 +153,7 @@ case "$event_action" in
     exit 1
     ;;
   labeled | unlabeled)
-    live_labels=$(gh api --paginate \
+    live_labels=$(trap - ERR; gh api --paginate \
       "repos/$GITHUB_REPOSITORY/issues/$pr_number/labels?per_page=100" \
       --jq '.[].name')
     if grep -Fxq "$verified_label" <<< "$live_labels"; then
