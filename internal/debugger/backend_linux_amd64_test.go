@@ -425,7 +425,7 @@ func TestLinuxBackendInternalResumesClearPendingSignal(t *testing.T) {
 	}
 }
 
-func TestLinuxKillCleanupDoesNotTouchWaitOwnedQueue(t *testing.T) {
+func TestLinuxEngineCleanupDoesNotTouchWaitOwnedQueue(t *testing.T) {
 	const tid = 7001
 	b, _ := newRecordingLinuxBackend(t, tid)
 	b.pendingSignals.set(tid, int(syscall.SIGSEGV))
@@ -439,6 +439,10 @@ func TestLinuxKillCleanupDoesNotTouchWaitOwnedQueue(t *testing.T) {
 	}
 	if got := len(b.parked); got != 1 {
 		t.Fatalf("parked stops after kill cleanup = %d, want 1 retained for the wait loop", got)
+	}
+	b.closeTracer()
+	if got := len(b.parked); got != 1 {
+		t.Fatalf("parked stops after tracer cleanup = %d, want 1 retained for the wait loop", got)
 	}
 }
 
