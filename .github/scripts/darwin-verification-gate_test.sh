@@ -648,6 +648,23 @@ head_tests_cannot_write_pull_requests() {
   ! grep -Eq 'pull-requests:[[:space:]]*write' "$head_test_workflow"
 }
 
+# Bash >= 4.4 propagates an ERR trap into command-substitution subshells, so an
+# unguarded $(...) publishes a duplicate status from the subshell before the
+# parent publishes its own. Every substitution below the trap must disarm it.
+# shellcheck disable=SC2016  # shell syntax is matched literally, not expanded.
+command_substitutions_disarm_the_err_trap() {
+  local body
+  body=$(awk '/^trap fail_closed ERR$/ {found = 1; next} found' "$gate")
+  [ -n "$body" ] || return 1
+
+  local offenders
+  offenders=$(printf '%s\n' "$body" | grep -F '$(' | grep -Fv '$(trap - ERR;' || true)
+  if [ -n "$offenders" ]; then
+    printf 'unguarded command substitution:\n%s\n' "$offenders" >&2
+    return 1
+  fi
+}
+
 gate_workflows_are_valid_yaml() {
   python3 -c 'import sys, yaml
 for path in sys.argv[1:]:
@@ -677,6 +694,8 @@ assert_workflow "only the trusted workflow may publish commit statuses" \
   only_trusted_publishes_statuses
 assert_workflow "untrusted policy test cannot write pull requests" \
   head_tests_cannot_write_pull_requests
+assert_workflow "command substitutions cannot double-publish a status" \
+  command_substitutions_disarm_the_err_trap
 
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' 2>/dev/null; then
   assert_workflow "gate workflows are valid YAML" gate_workflows_are_valid_yaml

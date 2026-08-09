@@ -1491,6 +1491,14 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   absent. This converts an interrupted run into a failing head status instead of
   a permanently pending one.
 
+  **Only the top-level shell may publish.** `set -E` propagates the policy's ERR
+  trap into command-substitution subshells, so an unguarded `$(...)` that fails
+  publishes a status from the subshell and then again from the parent (the
+  subshell's "already posted" flag cannot propagate back out). Every `$(...)`
+  below the trap installation disarms it with `$(trap - ERR; …)`, and a contract
+  test enforces that statically — the runtime symptom only reproduces on the
+  runner's bash 5, not on macOS's bash 3.2.
+
 Build/test commands:
 
 ```sh
