@@ -591,7 +591,10 @@ are detected by a `mach_msg` receive loop.
   deepest active declaration wins for both Locals and EvaluateName. Concrete
   inline DIEs whose names only exist through `DW_AT_abstract_origin` remain
   unsupported and are skipped — do not resolve abstract origins or location
-  lists without extending the documented expression model deliberately.
+  lists without extending the documented expression model deliberately. A
+  concrete ranged subprogram with `Children=false` has no locals; never seed a
+  child walk for it, or the next sibling DIE leaks into the frame. Malformed
+  child-DIE read errors propagate instead of becoming a truncated success.
 - `EvaluateName` resolves a **single variable name only** (no dotted paths /
   indexing / arithmetic): a local or parameter in the subprogram containing the
   frame PC first, then a package-level global via `globalVar` (matches the exact
