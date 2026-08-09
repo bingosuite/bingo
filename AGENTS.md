@@ -1554,8 +1554,10 @@ are detected by a `mach_msg` receive loop.
   `interface {}` / `error` self-reference.
 - **Bounds & fallback (never error the stop):** `maxValueDepth=4`,
   `maxChildren=100` (overflow appended as a synthetic `… N more` node),
-  pointer-deref depth `1`, `maxStringBytes≈256`, and a **visited-address cycle
-  guard** (pointer targets) so self-referential structures can't infinite-loop.
+  pointer-deref depth `1`, `maxStringBytes≈256`, and an **active recursion-path
+  cycle guard** for pointer targets. Pointer addresses are removed as each
+  subtree unwinds, so self-referential structures terminate without suppressing
+  later sibling aliases to the same non-cyclic target.
   Those are *per-path* caps; on top of them a **shared global ceiling**
   (`maxTotalNodes=10000`, `maxTotalBytes=256 KiB`) is threaded through `formatCtx`
   and debited once per `formatNode` and by every read. Without it a
