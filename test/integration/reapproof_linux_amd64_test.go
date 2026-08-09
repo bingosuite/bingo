@@ -25,9 +25,17 @@
 //	negative control  a plain child that IS waited for MUST disappear
 //	                  (detector does not report false positives, and the
 //	                  observation window is long enough for a real reap)
-//	subject           the debugger-launched tracee after EventProcessExited
+//	reap control      a debugger-launched TRACEE, killed while suspended so
+//	                  Kill runs production's existing reapAfterKill path,
+//	                  MUST disappear from /proc (traced children of this
+//	                  process are reapable, and the detector reports "gone"
+//	                  for a tracee too — so a persistent subject zombie can
+//	                  only be a property of the natural-exit lifetime)
+//	subject           the debugger-launched tracee after EventProcessExited,
+//	                  followed by one targeted nonblocking wait4(pid, WNOHANG)
+//	                  to establish that its own final status was still pending
 //
-// All three run the same binary in the same process, back to back, so a
+// All four run the same binary in the same process, back to back, so a
 // difference between them can only come from who reaps.
 //
 // Run: go test -tags e2e -count=1 -v -timeout 600s ./test/integration \
@@ -37,6 +45,19 @@
 //
 //	BINGO_PROOF_SETTLE_MS   (default 5000)  observation window per subject
 //	BINGO_PROOF_CYCLES      (default 25)    launch→exit cycles in the accumulation spec
+//
+// SCOPE — what this file does and does not measure. Every claim below is backed
+// by an assertion here; nothing else may be inferred from these results.
+//
+//	MEASURED    the natural-exit (os.Exit) path of a debugger-LAUNCHED tracee,
+//	            on linux/amd64, in one no-race run and one race run per
+//	            experiment; the reported exit code; whether the owned final
+//	            status is still pending afterwards; and that the same codebase
+//	            DOES reap a traced child through reapAfterKill.
+//	NOT MEASURED the attach path (nothing here attaches to a pre-existing
+//	            process, so no claim is made about it); retention of sibling
+//	            thread tasks, file descriptors, memory or any other resource
+//	            beyond the leader task's /proc entry; and any non-linux platform.
 
 package integration
 
@@ -221,6 +242,61 @@ func zombieChildren() []int {
 	return out
 }
 
+// reapOwned performs exactly ONE precisely-targeted, nonblocking wait for pid.
+//
+// This is the load-bearing measurement for the final-reaping claim. Observing
+// "state Z for the whole window" alone leaves two readings open: the status was
+// still pending and nobody asked for it, or the task was for some reason not
+// reapable at all. Wait4(pid, WNOHANG) settles it. WNOHANG means the call can
+// never block, so if it returns pid the status was already sitting there,
+// unconsumed, waiting for an owner that never came — a missing reap, not an
+// unreapable child. Returning 0 would mean somebody else got there first.
+func reapOwned(pid int) (int, syscall.WaitStatus, time.Duration, error) {
+	var ws syscall.WaitStatus
+	start := time.Now()
+	got, err := syscall.Wait4(pid, &ws, syscall.WNOHANG|syscall.WALL, nil)
+	return got, ws, time.Since(start), err
+}
+
+// childrenOfSelf lists every task currently parented to this process. The
+// reapAfterKill control kills its session at the entry stop, before the target's
+// main() has run and published a PID file, so the tracee has to be identified by
+// diffing this set across the launch. Deliberately black-box: no engine
+// internals are reached into.
+func childrenOfSelf() []int {
+	self := os.Getpid()
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	var out []int
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		if _, ppid, present := readTaskState(pid); present && ppid == self {
+			out = append(out, pid)
+		}
+	}
+	sort.Ints(out)
+	return out
+}
+
+func addedChildren(before, after []int) []int {
+	was := make(map[int]bool, len(before))
+	for _, p := range before {
+		was[p] = true
+	}
+	var out []int
+	for _, p := range after {
+		if !was[p] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // reapEverything drains every reapable child so the runner is left clean no
 // matter what the spec observed. WNOHANG keeps it from ever blocking.
 func reapEverything() int {
@@ -374,14 +450,146 @@ var _ = Describe("PROOF U2: linux/amd64 tracee reaping after PTRACE_EVENT_EXIT",
 				pid, code, v.reaped, v.everZombie, v.persistentZombie,
 				v.finalState, v.finalPPid, os.Getpid(), v.timeline))
 
+			// Now claim the status explicitly, targeted at exactly this PID and
+			// nonblocking. Done AFTER the observation window and BEFORE the
+			// hypothesis assertion, so the evidence is recorded even though the
+			// assertion below is expected to fail while the defect is present.
+			zombiesBefore := zombieChildren()
+			gotPID, ws, took, werr := reapOwned(pid)
+			_, _, presentAfterReap := readTaskState(pid)
+			AddReportEntry("subject-owned-reap", fmt.Sprintf(
+				"wait4(pid=%d, WNOHANG|WALL) -> returned=%d err=%v took=%s "+
+					"exited=%v exitStatus=%d signaled=%v procEntryAfterReap=%v "+
+					"zombieChildrenBeforeReap=%v",
+				pid, gotPID, werr, took.Round(time.Microsecond),
+				ws.Exited(), ws.ExitStatus(), ws.Signaled(), presentAfterReap,
+				zombiesBefore))
+
+			// Self-diagnosis. A targeted wait on a thread-group leader returns 0
+			// while any sibling task in the group is still unreaped
+			// (delay_group_leader), which would be a different — and materially
+			// weaker — finding than "the leader's own status was pending". If
+			// that happens, record exactly what was drained so the run is
+			// conclusive either way rather than merely red.
+			if gotPID == 0 && werr == nil {
+				drained := reapEverything()
+				retryPID, retryWS, retryTook, retryErr := reapOwned(pid)
+				_, _, presentAfterRetry := readTaskState(pid)
+				AddReportEntry("subject-owned-reap-retry", fmt.Sprintf(
+					"targeted wait returned 0; drainedSiblings=%d then wait4(pid=%d) -> "+
+						"returned=%d err=%v took=%s exitStatus=%d procEntryAfterRetry=%v",
+					drained, pid, retryPID, retryErr, retryTook.Round(time.Microsecond),
+					retryWS.ExitStatus(), presentAfterRetry))
+			}
+
+			if v.persistentZombie {
+				// These four assertions are the difference between "a zombie was
+				// seen" and "the owned final status was still pending". They must
+				// hold whenever the leak is real.
+				Expect(werr).NotTo(HaveOccurred(),
+					"wait4(%d, WNOHANG) must not error while the task is a zombie", pid)
+				Expect(gotPID).To(Equal(pid),
+					"exactly the subject PID must be immediately reapable: a single "+
+						"nonblocking wait4(%d, WNOHANG|WALL) returned %d. The final wait "+
+						"status was still pending %s after EventProcessExited, so nothing "+
+						"in the engine, the backend or the Go runtime ever consumed it. "+
+						"(A 0 here would instead mean the leader was still held by an "+
+						"unreaped sibling task — see the subject-owned-reap-retry entry.)",
+					pid, gotPID, window)
+				Expect(ws.Exited()).To(BeTrue(),
+					"the pending status must be a normal exit, not a signal death")
+				Expect(ws.ExitStatus()).To(Equal(reapProofExitCode),
+					"the pending status must carry the tracee's real exit code")
+				Expect(presentAfterReap).To(BeFalse(),
+					"/proc/%d must be gone once the pending status is claimed — proving the "+
+						"task was reapable all along and only the reap was missing", pid)
+			}
+
 			Expect(v.persistentZombie).To(BeFalse(),
 				"HYPOTHESIS U2 CONFIRMED: tracee pid=%d is still a zombie (state=%q, ppid=%d) "+
 					"%s after EventProcessExited(code=%d) — the engine tore down on the main "+
 					"thread's PTRACE_EVENT_EXIT and nothing ever reaped the final wait status. "+
+					"A single nonblocking wait4(%d, WNOHANG|WALL) then returned %d in %s with "+
+					"exit status %d, proving the owned status was pending the entire time. "+
 					"timeline=[%s]",
-				pid, v.finalState, v.finalPPid, window, code, v.timeline)
+				pid, v.finalState, v.finalPPid, window, code,
+				pid, gotPID, took.Round(time.Microsecond), ws.ExitStatus(), v.timeline)
 		})
 
+		// The correctly-reaping control. It is not enough to show that a plain
+		// exec'd child can be reaped (the negative control already does that):
+		// the subject is a PTRACE tracee, so the question "are traced children
+		// reapable by this codebase at all?" has to be answered with a traced
+		// child, through a path production code already owns.
+		//
+		// Kill on a SUSPENDED session is exactly that path. engine.Kill captures
+		// running=false (state is stateSuspended at the entry stop), which routes
+		// process.kill → killProcess → reapAfterKill, and reapAfterKill drains
+		// until ECHILD. If /proc/<pid> is gone afterwards, then a traced child of
+		// this process IS reapable, the /proc detector does report "gone" for a
+		// tracee, and the persistent zombie seen in the subject spec can only be
+		// a property of the NATURAL-EXIT lifetime — not of ptrace, not of the
+		// harness, not of the detector.
+		It("reaps a suspended session's tracee when Kill runs the reapAfterKill path", func() {
+			bin := buildTarget("reapproof_killctl", reapProofTargetSrc)
+			pidFile := filepath.Join(GinkgoT().TempDir(), "killctl.pid")
+
+			before := childrenOfSelf()
+			d := debugger.New(nil)
+			Expect(d.Launch(bin, []string{pidFile}, nil)).To(Succeed(), "Launch kill-control target")
+			awaitEvent(d.Events(), 20*time.Second, protocol.EventStepped) // entry stop ⇒ suspended
+
+			// The target is stopped at the execve trap, so main() has not run and
+			// no PID file exists yet; identify the tracee by diffing children.
+			added := addedChildren(before, childrenOfSelf())
+			Expect(added).To(HaveLen(1),
+				"expected exactly one new child after Launch, got %v", added)
+			pid := added[0]
+
+			stopState, stopPPid, present := readTaskState(pid)
+			Expect(present).To(BeTrue(), "tracee /proc entry must exist while suspended")
+			AddReportEntry("kill-control(at entry stop)", fmt.Sprintf(
+				"pid=%d state=%q ppid=%d tracerPID=%d", pid, stopState, stopPPid, os.Getpid()))
+
+			// Kill while suspended ⇒ killProcess(running=false) ⇒ reapAfterKill.
+			killStart := time.Now()
+			Expect(d.Kill()).To(Succeed(), "Kill a suspended session")
+			killTook := time.Since(killStart)
+
+			v := classify(observe(pid, window))
+			AddReportEntry("kill-control(after Kill)", fmt.Sprintf(
+				"pid=%d killReturnedIn=%s reaped=%v everZombie=%v persistentZombie=%v "+
+					"finalState=%q timeline=[%s]",
+				pid, killTook.Round(time.Millisecond), v.reaped, v.everZombie,
+				v.persistentZombie, v.finalState, v.timeline))
+
+			Expect(v.reaped).To(BeTrue(),
+				"REAP CONTROL FAILED: a suspended session's tracee (pid=%d) killed through "+
+					"reapAfterKill is still present after %s (state=%q). If traced children "+
+					"were not reapable at all, the subject result would say nothing about the "+
+					"natural-exit path. timeline=[%s]",
+				pid, window, v.finalState, v.timeline)
+			Expect(v.persistentZombie).To(BeFalse(),
+				"a tracee reaped via reapAfterKill must not remain a zombie")
+		})
+
+		// NOTE ON READING THIS SPEC'S NUMBERS. The residual count here is NOT the
+		// per-session leak rate, and must not be quoted as one. Because the linux
+		// waitLoop waits on Wait4(-1, WALL) — process-wide, not scoped to its own
+		// tracee — each new session incidentally reaps and discards the PREVIOUS
+		// session's pending status (the `ws.Exited() && tid != b.pid` → continue
+		// branch). So N sequential sessions in one process leave exactly ONE
+		// zombie: the last one, which has no successor to clear it. That is the
+		// present-day shape of the leak — one leaked zombie per idle server, not
+		// one per session.
+		//
+		// The warning that matters for triage: that masking is a side effect of
+		// the cross-session wait scope tracked in #205. If #205 is fixed by
+		// isolating each session's wait namespace WITHOUT also adding a final
+		// reap on the natural-exit path, the incidental cleanup disappears and
+		// this leak becomes one zombie per session — unbounded in a long-lived
+		// server. Final reaping must be preserved by, and verified alongside, any
+		// #205 isolation fix.
 		It("does not accumulate zombie tracees across repeated launch→exit cycles", func() {
 			bin := buildTarget("reapproof_cycles", reapProofTargetSrc)
 			dir := GinkgoT().TempDir()
@@ -412,25 +620,41 @@ var _ = Describe("PROOF U2: linux/amd64 tracee reaping after PTRACE_EVENT_EXIT",
 			time.Sleep(window)
 
 			var stillZombie []int
-			for _, pid := range pids {
+			var zombieCycleIdx []int
+			for i, pid := range pids {
 				state, _, present := readTaskState(pid)
 				if present && strings.HasPrefix(state, "Z") {
 					stillZombie = append(stillZombie, pid)
+					zombieCycleIdx = append(zombieCycleIdx, i)
 				}
 			}
 			zc := zombieChildren()
 
+			// Whether the survivor is precisely the LAST cycle is the signature
+			// of incidental cross-session reaping: every earlier zombie was
+			// cleared by the next session's process-wide Wait4, and only the
+			// final session had no successor.
+			onlyLastCycle := len(zombieCycleIdx) == 1 && zombieCycleIdx[0] == cycles-1
+
 			AddReportEntry("cycles", fmt.Sprintf(
-				"launched=%d exitCodes=%v zombieTracees=%d zombieChildrenOfTestProcess=%d",
-				cycles, codes, len(stillZombie), len(zc)))
+				"launched=%d exitCodes=%v zombieTracees=%d zombieCycleIndexes=%v "+
+					"onlyLastCycleLeaked=%v zombieChildrenOfTestProcess=%d",
+				cycles, codes, len(stillZombie), zombieCycleIdx, onlyLastCycle, len(zc)))
 
 			Expect(codes).To(Equal(map[int]int{reapProofExitCode: cycles}),
 				"every cycle must report the real exit code")
 			Expect(stillZombie).To(BeEmpty(),
 				"HYPOTHESIS U2 CONFIRMED (accumulation): %d of %d tracees are still zombies "+
-					"%s after their EventProcessExited. A long-lived server leaks one defunct "+
-					"process per debug session. zombie pids=%v",
-				len(stillZombie), cycles, window, stillZombie)
+					"%s after their EventProcessExited (cycle indexes %v, onlyLastCycle=%v). "+
+					"READ THIS AS: exactly one leaked zombie per idle server today — each "+
+					"earlier zombie was incidentally reaped and discarded by the NEXT "+
+					"session's process-wide Wait4(-1, WALL), and only the final session had "+
+					"no successor to clear it. This is NOT a per-session rate. WARNING: that "+
+					"incidental cleanup is a side effect of the cross-session wait scope in "+
+					"#205; isolating sessions there without also adding a final reap on the "+
+					"natural-exit path turns this into one zombie per session, unbounded. "+
+					"zombie pids=%v",
+				len(stillZombie), cycles, window, zombieCycleIdx, onlyLastCycle, stillZombie)
 		})
 
 		// The accumulation result above is only interpretable once you know who

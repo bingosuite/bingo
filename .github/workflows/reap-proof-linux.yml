@@ -9,21 +9,35 @@ name: PROOF U2 (linux tracee reaping)
 #    tracees behind in a long-lived server process."
 #
 # The Ginkgo specs live in test/integration/reapproof_linux_amd64_test.go under
-# label `reapproof`. Three specs run in this order:
+# label `reapproof`. The steps below run in this order:
 #
 #   1. controls      negative (a Wait()ed child vanishes) + positive (a
 #                    never-Wait()ed child stays Z). If EITHER fails the
 #                    experiment is invalid and this job fails hard — no
 #                    conclusion may be drawn from the subject.
-#   2. subject       one debugger launch→exit; asserts the tracee is NOT a
-#                    persistent zombie after EventProcessExited (and that the
-#                    reported exit code is still 42).
-#   3. accumulation  N launch→exit cycles; asserts zombies do not pile up.
+#   2. reap control  a debugger-launched TRACEE killed while suspended, so Kill
+#                    runs production's existing reapAfterKill path, MUST vanish
+#                    from /proc. Also must pass: it proves traced children of
+#                    this process are reapable at all, which is what isolates
+#                    the subject result to the natural-exit lifetime.
+#   3. subject       one debugger launch→exit; asserts the tracee is NOT a
+#                    persistent zombie after EventProcessExited, that the
+#                    reported exit code is still 42, and — via one targeted
+#                    nonblocking wait4(pid, WNOHANG) after the window — that the
+#                    tracee's own final status was still pending.
+#   4. accumulation  N launch→exit cycles; asserts zombies do not pile up.
+#   5. attribution / multi-session  scope probes for the separate cross-session
+#                    wait defect already tracked as issue #205.
 #
-# Specs 2 and 3 are expected to FAIL if the hypothesis is true, so they are run
-# with their exit status captured rather than failing the job — the point is to
-# collect the evidence for both -race and no-race, not to gate a merge. The job
-# summary at the end states the verdict.
+# POLARITY. Steps 3-5 are INVERTED: their assertions state the CORRECT
+# behaviour, so a nonzero go test status means the defect reproduced. They run
+# with their exit status captured rather than failing the job, so the job
+# conclusion is NOT the result — the Verdict step is. Steps 1-2 are normal
+# polarity and must pass.
+#
+# RUN MODES. Each experiment runs exactly once per mode named in the verdict
+# table: `/no-race` = one run without -race, `/race` = one run with -race. No
+# experiment is repeated within a mode, and no statistical claim is made.
 
 on:
   # Branch-scoped push trigger: this workflow file does not exist on the default
@@ -76,6 +90,21 @@ jobs:
           go test -tags e2e -count=1 -v -timeout 300s ./test/integration \
             -ginkgo.label-filter=reapproof \
             -ginkgo.focus='establishes that the /proc detector'
+
+      # Must also pass. Normal polarity: it asserts the CORRECT behaviour and
+      # gets it. This is the control that rules out "traced children just are not
+      # reapable", which would otherwise make the subject result uninterpretable.
+      - name: Reap control (suspended Kill via reapAfterKill, no -race)
+        run: |
+          go test -tags e2e -count=1 -v -timeout 300s ./test/integration \
+            -ginkgo.label-filter=reapproof \
+            -ginkgo.focus='reaps a suspended session'
+
+      - name: Reap control (suspended Kill via reapAfterKill, -race)
+        run: |
+          go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration \
+            -ginkgo.label-filter=reapproof \
+            -ginkgo.focus='reaps a suspended session'
 
       - name: Subject — single cycle (no -race)
         id: subject_norace
@@ -143,9 +172,31 @@ jobs:
       - name: Verdict
         run: |
           {
-            echo "## PROOF U2 — linux/amd64 tracee reaping after PTRACE_EVENT_EXIT"
+            echo "## PROOF U2 — linux/amd64 final reaping after PTRACE_EVENT_EXIT"
             echo
-            echo "Controls passed (detector distinguishes reaped from unreaped children)."
+            echo "### How to read this table"
+            echo
+            echo "Rows below are **inverted**: each assertion states the CORRECT"
+            echo "behaviour, so a **nonzero** status means the defect reproduced and"
+            echo "**0** means it did not. The job conclusion is meaningless here —"
+            echo "this table is the result."
+            echo
+            echo "Each row ran **exactly once** in the mode named"
+            echo "(\`/no-race\` = one run without \`-race\`, \`/race\` = one run with"
+            echo "\`-race\`). No row is repeated within a mode and no statistical or"
+            echo "flake-rate claim is made."
+            echo
+            echo "### Controls (normal polarity — these had to pass for the job to reach this step)"
+            echo
+            echo "- **detector validity**: a \`Wait()\`ed child vanishes; a never-waited child stays \`Z\`."
+            echo "- **reap control (\`reapAfterKill\`), no-race and race**: a debugger-launched *tracee*,"
+            echo "  killed while suspended so \`Kill\` takes production's existing"
+            echo "  \`reapAfterKill\` path, disappears from \`/proc\`. Traced children of this"
+            echo "  process are therefore reapable, and the detector does report \"gone\" for a"
+            echo "  tracee — so a persistent subject zombie can only be a property of the"
+            echo "  **natural-exit** lifetime, not of ptrace, the detector or the harness."
+            echo
+            echo "### Experiments"
             echo
             echo "| experiment | go test exit status | reading |"
             echo "| --- | --- | --- |"
@@ -154,19 +205,47 @@ jobs:
               "subject/race:${{ steps.subject_race.outputs.status }}" \
               "accumulation/no-race:${{ steps.accum_norace.outputs.status }}" \
               "accumulation/race:${{ steps.accum_race.outputs.status }}" \
-              "attribution:${{ steps.attrib.outputs.status }}" \
-              "multi-session:${{ steps.multi.outputs.status }}" \
+              "attribution/no-race:${{ steps.attrib.outputs.status }}" \
+              "multi-session/no-race:${{ steps.multi.outputs.status }}" \
               "multi-session/race:${{ steps.multi_race.outputs.status }}"; do
               name="${pair%%:*}"; st="${pair##*:}"
               if [ "$st" = "0" ]; then
-                echo "| $name | 0 | assertion held — hypothesis NOT reproduced |"
+                echo "| $name | 0 | assertion held — defect NOT reproduced |"
               else
                 echo "| $name | $st | assertion violated — **defect reproduced** |"
               fi
             done
             echo
+            echo "### Reading the accumulation number"
+            echo
+            echo "The residual zombie count is **not** a per-session rate. Because the"
+            echo "linux waitLoop waits process-wide (\`Wait4(-1, WALL)\`), each new session"
+            echo "incidentally reaps and discards the previous session's pending status, so"
+            echo "N sequential sessions leave **exactly one** zombie — the last, which has no"
+            echo "successor. Today's shape is **one leaked zombie per idle server**."
+            echo
+            echo "> **Warning for triage:** that masking is a side effect of the"
+            echo "> cross-session wait scope tracked in **#205**. Isolating each session's"
+            echo "> wait namespace *without* also adding a final reap on the natural-exit"
+            echo "> path removes the incidental cleanup and turns this into **one zombie per"
+            echo "> session, unbounded**. Final reaping must be preserved by, and verified"
+            echo "> alongside, any #205 fix."
+            echo
+            echo "### Scope"
+            echo
+            echo "Measured: the natural-exit (\`os.Exit\`) path of a debugger-**launched**"
+            echo "tracee on linux/amd64; the reported exit code; whether the tracee's own"
+            echo "final status was still pending (one targeted \`wait4(pid, WNOHANG|WALL)\`"
+            echo "after the observation window); and that \`reapAfterKill\` does reap a tracee."
+            echo
+            echo "Not measured, and not claimed: the **attach** path (nothing here attaches to"
+            echo "a pre-existing process); retention of **sibling thread tasks, file"
+            echo "descriptors, memory or any other resource** beyond the leader task's"
+            echo "\`/proc\` entry; and any non-linux platform."
+            echo
             echo "Settle window: ${BINGO_PROOF_SETTLE_MS}ms · cycles: ${BINGO_PROOF_CYCLES}"
             echo
-            echo "See the step logs for the per-sample /proc timelines"
-            echo "(\`subject(debugger-launched)\`, \`positive-control\`, \`negative-control\`, \`cycles\`, \`sessionN\`)."
+            echo "Per-sample \`/proc\` timelines are in the step logs under report entries"
+            echo "\`negative-control\`, \`positive-control\`, \`kill-control(...)\`,"
+            echo "\`subject(debugger-launched)\`, \`subject-owned-reap\`, \`cycles\`, \`sessionN\`."
           } >> "$GITHUB_STEP_SUMMARY"
