@@ -312,3 +312,99 @@ func TestStepQueueCountsHeldSignalsSeparately(t *testing.T) {
 		t.Fatalf("parkedSignalCount() = %d after drain+purge, want the cumulative 1", got)
 	}
 }
+
+// TestStepQueueResumeForRearmsOnlyTheSteppedThread pins the rule that decides
+// how an absorbed stop's thread is resumed. Getting this wrong on the stepped
+// thread cancels its single step while the gate stays latched, which freezes the
+// tracee forever: no completion can arrive, so every later foreign stop parks
+// and Wait never returns.
+func TestStepQueueResumeForRearmsOnlyTheSteppedThread(t *testing.T) {
+	const (
+		stepped = 4100
+		foreign = 4200
+	)
+
+	cases := []struct {
+		name     string
+		stepping bool
+		stepTID  int
+		tid      int
+		want     stepResume
+	}{
+		{"idle queue continues", false, 0, foreign, resumeContinue},
+		{"idle queue continues even the last stepped tid", false, 0, stepped, resumeContinue},
+		{"stepped thread re-arms its step", true, stepped, stepped, resumeSingleStep},
+		{"foreign thread continues mid-step", true, stepped, foreign, resumeContinue},
+		{"another thread's tid does not match a live step", true, stepped, stepped + 1, resumeContinue},
+		// stepping is the authority, not stepTID. endStep happens to zero the
+		// tid today, so a guard that dropped the stepping term would behave the
+		// same; pin the conjunction so that coupling cannot become load-bearing
+		// without this failing.
+		{"a leftover stepTID without a live step continues", false, stepped, stepped, resumeContinue},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q := &stepQueue{stepping: tc.stepping, stepTID: tc.stepTID}
+			if got := q.resumeFor(tc.tid); got != tc.want {
+				t.Fatalf("resumeFor(%d) = %v, want %v", tc.tid, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStepQueueResumeForFollowsTheLiveStep checks the decision tracks the step
+// rather than a one-off snapshot: a thread that was being stepped must go back
+// to a plain continue once its step is over, or an absorbed stop would arm a
+// single step the engine never asked for.
+func TestStepQueueResumeForFollowsTheLiveStep(t *testing.T) {
+	const stepped = 4300
+
+	q := &stepQueue{}
+	q.beginStep(stepped)
+	if got := q.resumeFor(stepped); got != resumeSingleStep {
+		t.Fatalf("resumeFor during the step = %v, want resumeSingleStep", got)
+	}
+
+	q.endStep()
+	if got := q.resumeFor(stepped); got != resumeContinue {
+		t.Fatalf("resumeFor after the step = %v, want resumeContinue", got)
+	}
+
+	q.clearStepIfStepped(stepped)
+	if got := q.resumeFor(stepped); got != resumeContinue {
+		t.Fatalf("resumeFor after a dead stepped thread = %v, want resumeContinue", got)
+	}
+}
+
+// TestStepQueueAbortStepLiftsTheGateAndDropsHeldStops covers the two absorb
+// cases that cannot re-arm the step — exec replaces the image the breakpoint
+// lived in, and an unknown ptrace event has no safe interpretation. Both must
+// leave the queue inert so the failing Wait tears the session down instead of
+// stranding held stops behind a step that can never finish.
+func TestStepQueueAbortStepLiftsTheGateAndDropsHeldStops(t *testing.T) {
+	const (
+		stepped = 4400
+		foreign = 4500
+	)
+
+	q := &stepQueue{}
+	q.beginStep(stepped)
+	q.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
+	q.park(StopEvent{Reason: StopSignal, TID: foreign + 1, Signal: 11})
+
+	q.abortStep()
+
+	if q.stepping {
+		t.Fatal("abortStep left the step gate latched — every later foreign stop would park forever")
+	}
+	if got := len(q.parked); got != 0 {
+		t.Fatalf("%d stops still held after abortStep, want 0 — they name threads the engine must not act on", got)
+	}
+	if _, ok := q.releasable(); ok {
+		t.Fatal("abortStep left a releasable stop behind")
+	}
+	if got := q.resumeFor(stepped); got != resumeContinue {
+		t.Fatalf("resumeFor after abortStep = %v, want resumeContinue", got)
+	}
+}
