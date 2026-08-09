@@ -136,6 +136,18 @@ Two envelope types: `Event` (server → client) and `Command` (client → server
 Both versioned; both carry `Kind` + raw-JSON `Payload`. Decode with
 `DecodeEventPayload` / `DecodeCommandPayload` after switching on `Kind`.
 
+**Exact-version ingress is mandatory.** Every Go WebSocket peer validates each
+inbound envelope with `protocol.ValidateVersion`, including the client's initial
+welcome event and every later event. The hub validates commands in the client
+read pump **before** `injectCommand`, so an incompatible `Continue` / `Step*`
+cannot enter `resumeCh`. A missing/empty version is incompatible. On mismatch,
+terminate only that connection with WebSocket close code 1002 and a reason that
+names the expected and received versions; do not broadcast `EventError` or
+increment the shared hub sequence for a peer-local compatibility failure.
+`/api/health` remains a discovery preflight, not a substitute for per-envelope
+validation. Exact enforcement of the existing contract does not itself require
+a `Version` bump.
+
 ### Suspend/resume protocol
 
 The hub blocks after broadcasting any of these "suspending" events until a

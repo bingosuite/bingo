@@ -78,12 +78,14 @@ Frontends can identify and reuse a compatible bingo process through
 
 The response is non-cacheable. `managementApiVersion` versions this HTTP
 contract independently of `wireProtocolVersion`; integrations should require
-management API v1 and separately check that they support the advertised bingo
-wire version. Graphical clients also require `dap.sessionEventVersion: 1`,
-which guarantees the server emits `bingo/session/v1` after managed session
-discovery. `instanceId` changes on every process start. The DAP address is the
-actual bound listener address, including the selected port when bingo was
-started with `-dap-addr ...:0`.
+management API v1 and exact equality with the advertised bingo wire version.
+Native WebSocket peers also enforce that equality on every command and event
+envelope, including the initial welcome; a missing or mismatched `v` closes only
+the incompatible connection. Graphical clients also require
+`dap.sessionEventVersion: 1`, which guarantees the server emits
+`bingo/session/v1` after managed session discovery. `instanceId` changes on
+every process start. The DAP address is the actual bound listener address,
+including the selected port when bingo was started with `-dap-addr ...:0`.
 
 The intended process-owner flow is **connect or start**: health-check the known
 management address, reuse a compatible bingo if present, otherwise start one
