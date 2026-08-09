@@ -1141,6 +1141,13 @@ breakpoint the process is currently parked on re-arms it through the engine's
 step-off path (see the clearbp spec), so the e2e continue-to-exit uses a
 no-breakpoint target, not a clear-then-continue.
 
+`bpByFile` keeps the stable DAP id separate from the debugger's internal id.
+After `EventRestarted`, reconcile its exact source-path/line keys from
+`RestartedPayload` before replying: retained entries adopt the fresh debugger
+id, while discarded entries are removed and emit a `breakpoint` changed event
+with their prior DAP id and `verified:false`. Do not reset `setQ`/`clearQ`;
+those FIFOs still own any in-flight confirmations.
+
 ### Server wiring + multi-client discovery
 
 `internal/server` implements `dap.Provider` (`dapProvider`): `CreateSession` →
