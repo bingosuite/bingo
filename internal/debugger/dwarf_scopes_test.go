@@ -2,6 +2,7 @@ package debugger
 
 import (
 	"debug/dwarf"
+	"encoding/binary"
 	"errors"
 	"os"
 	"os/exec"
@@ -43,6 +44,84 @@ func TestVariableScopeTags(t *testing.T) {
 	if isVariableScope(dwarf.TagSubprogram) {
 		t.Error("the containing subprogram is selected before nested scope traversal")
 	}
+}
+
+func TestSubprogramVarsRejectChildlessSubprogramSiblings(t *testing.T) {
+	dies := []byte{1}
+	dies = appendSyntheticSubprogram(dies, 2, "childless", 0x1000)
+	dies = appendSyntheticSubprogram(dies, 3, "sibling", 0x2000)
+	dies = append(dies, 4)
+	dies = append(dies, "siblingOnly"...)
+	dies = append(dies, 0, 0, 0)
+	r := syntheticScopeReader(t, dies)
+
+	entries, err := r.subprogramVars(0x1001)
+	if err != nil {
+		t.Fatalf("subprogramVars: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("childless subprogram leaked sibling locals: %v", entryNameCounts(entries))
+	}
+	if _, err := r.EvaluateName(readableBackend{}, 0x1001, 0, "siblingOnly"); err == nil {
+		t.Fatal("EvaluateName matched a sibling parameter for a childless subprogram")
+	}
+}
+
+func TestSubprogramVarsReturnsMalformedChildError(t *testing.T) {
+	dies := []byte{1}
+	dies = appendSyntheticSubprogram(dies, 3, "malformed", 0x3000)
+	dies = append(dies, 0x7f, 0, 0)
+	r := syntheticScopeReader(t, dies)
+
+	_, err := r.subprogramVars(0x3001)
+	if err == nil || !strings.Contains(err.Error(), "DWARF child read") {
+		t.Fatalf("subprogramVars error = %v, want malformed child read error", err)
+	}
+}
+
+func syntheticScopeReader(t *testing.T, dies []byte) *dwarfReader {
+	t.Helper()
+	const (
+		dwarfFormAddr   = 0x01
+		dwarfFormData4  = 0x06
+		dwarfFormString = 0x08
+	)
+	abbrev := []byte{
+		1, byte(dwarf.TagCompileUnit), 1, 0, 0,
+		2, byte(dwarf.TagSubprogram), 0,
+		byte(dwarf.AttrName), dwarfFormString,
+		byte(dwarf.AttrLowpc), dwarfFormAddr,
+		byte(dwarf.AttrHighpc), dwarfFormData4,
+		0, 0,
+		3, byte(dwarf.TagSubprogram), 1,
+		byte(dwarf.AttrName), dwarfFormString,
+		byte(dwarf.AttrLowpc), dwarfFormAddr,
+		byte(dwarf.AttrHighpc), dwarfFormData4,
+		0, 0,
+		4, byte(dwarf.TagFormalParameter), 0,
+		byte(dwarf.AttrName), dwarfFormString,
+		0, 0,
+		0,
+	}
+	unit := []byte{4, 0, 0, 0, 0, 0, 8}
+	unit = append(unit, dies...)
+	info := make([]byte, 4, 4+len(unit))
+	binary.LittleEndian.PutUint32(info, uint32(len(unit)))
+	info = append(info, unit...)
+
+	data, err := dwarf.New(abbrev, nil, nil, info, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("create synthetic DWARF: %v", err)
+	}
+	return &dwarfReader{data: data}
+}
+
+func appendSyntheticSubprogram(dst []byte, abbreviation byte, name string, lowPC uint64) []byte {
+	dst = append(dst, abbreviation)
+	dst = append(dst, name...)
+	dst = append(dst, 0)
+	dst = binary.LittleEndian.AppendUint64(dst, lowPC)
+	return binary.LittleEndian.AppendUint32(dst, 0x10)
 }
 
 const lexicalScopeFixtureSrc = `package main
@@ -276,22 +355,40 @@ func assertLinuxLexicalRangeForm(t *testing.T, r *dwarfReader) {
 func inlineScopesAtPC(t *testing.T, r *dwarfReader, runtimePC uint64) (total, inactive int) {
 	t.Helper()
 	dwarfPC := uint64(int64(runtimePC) - r.slide)
+	rd := containingSubprogramReader(t, r, dwarfPC)
+	depth := 1
+	for depth > 0 {
+		child := requiredDIE(t, rd, "subprogram children")
+		if child.Tag == 0 {
+			depth--
+			continue
+		}
+		if child.Tag == dwarf.TagInlinedSubroutine {
+			total++
+			ranges := requiredRanges(t, r, child, "inline")
+			if len(ranges) > 0 && !pcInRanges(dwarfPC, ranges) {
+				inactive++
+			}
+		}
+		if child.Children {
+			depth++
+		}
+	}
+	return total, inactive
+}
+
+func containingSubprogramReader(t *testing.T, r *dwarfReader, dwarfPC uint64) *dwarf.Reader {
+	t.Helper()
 	rd := r.data.Reader()
 	for {
-		entry, err := rd.Next()
-		if err != nil {
-			t.Fatalf("read fixture DWARF: %v", err)
-		}
+		entry := requiredDIE(t, rd, "fixture DWARF")
 		if entry == nil {
-			return 0, 0
+			t.Fatal("no subprogram contains fixture PC")
 		}
 		if entry.Tag != dwarf.TagSubprogram {
 			continue
 		}
-		ranges, err := r.data.Ranges(entry)
-		if err != nil {
-			t.Fatalf("read subprogram ranges: %v", err)
-		}
+		ranges := requiredRanges(t, r, entry, "subprogram")
 		if !pcInRanges(dwarfPC, ranges) {
 			rd.SkipChildren()
 			continue
@@ -299,35 +396,29 @@ func inlineScopesAtPC(t *testing.T, r *dwarfReader, runtimePC uint64) (total, in
 		if !entry.Children {
 			t.Fatal("containing subprogram has no children")
 		}
-		depth := 1
-		for depth > 0 {
-			child, err := rd.Next()
-			if err != nil {
-				t.Fatalf("read subprogram children: %v", err)
-			}
-			if child == nil {
-				t.Fatal("unexpected end of subprogram children")
-			}
-			if child.Tag == 0 {
-				depth--
-				continue
-			}
-			if child.Tag == dwarf.TagInlinedSubroutine {
-				total++
-				ranges, err := r.data.Ranges(child)
-				if err != nil {
-					t.Fatalf("read inline ranges: %v", err)
-				}
-				if len(ranges) > 0 && !pcInRanges(dwarfPC, ranges) {
-					inactive++
-				}
-			}
-			if child.Children {
-				depth++
-			}
-		}
-		return total, inactive
+		return rd
 	}
+}
+
+func requiredDIE(t *testing.T, rd *dwarf.Reader, context string) *dwarf.Entry {
+	t.Helper()
+	entry, err := rd.Next()
+	if err != nil {
+		t.Fatalf("read %s: %v", context, err)
+	}
+	if entry == nil {
+		t.Fatalf("unexpected end of %s", context)
+	}
+	return entry
+}
+
+func requiredRanges(t *testing.T, r *dwarfReader, entry *dwarf.Entry, context string) [][2]uint64 {
+	t.Helper()
+	ranges, err := r.data.Ranges(entry)
+	if err != nil {
+		t.Fatalf("read %s ranges: %v", context, err)
+	}
+	return ranges
 }
 
 func pcInRanges(pc uint64, ranges [][2]uint64) bool {
