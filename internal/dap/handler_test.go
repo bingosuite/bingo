@@ -83,6 +83,32 @@ func (r *cmdRecorder) waitForCommands(t *testing.T, kind protocol.CommandKind, c
 	return nil
 }
 
+func (r *cmdRecorder) count(kind protocol.CommandKind) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	count := 0
+	for _, cmd := range r.cmds {
+		if cmd.Kind == kind {
+			count++
+		}
+	}
+	return count
+}
+
+func (r *cmdRecorder) requireNoAdditionalCommands(t *testing.T, kind protocol.CommandKind, expected int) {
+	t.Helper()
+	deadline := time.Now().Add(50 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if got := r.count(kind); got != expected {
+			t.Fatalf("%s command count = %d, want %d throughout quiet period; saw %v", kind, got, expected, r.kinds())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := r.count(kind); got != expected {
+		t.Fatalf("%s command count = %d, want %d after quiet period; saw %v", kind, got, expected, r.kinds())
+	}
+}
+
 type fakeSession struct {
 	id      string
 	cmds    *cmdRecorder
@@ -777,15 +803,43 @@ func TestRestartRejectsOverlappingRequest(t *testing.T) {
 	if rejected.RequestSeq != secondSeq || rejected.Success || rejected.Message != "restart already in progress" {
 		t.Fatalf("overlapping restart response = %+v, want immediate error for request %d", rejected.Response, secondSeq)
 	}
-	if commands := hh.cmds.waitForCommands(t, protocol.CmdRestart, 1); len(commands) != 1 {
-		t.Fatalf("restart commands = %d, want exactly 1", len(commands))
-	}
+	hh.cmds.waitForCommands(t, protocol.CmdRestart, 1)
+	hh.cmds.requireNoAdditionalCommands(t, protocol.CmdRestart, 1)
 
 	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{})
 	restarted := recvType[*godap.RestartResponse](hh)
 	if restarted.RequestSeq != firstSeq || !restarted.Success {
 		t.Fatalf("restart response = %+v, want success for original request %d", restarted.Response, firstSeq)
 	}
+}
+
+func TestRestartAfterSuccessSupersedesPendingEntry(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+
+	firstSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdRestart)
+	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{})
+	first := recvType[*godap.RestartResponse](hh)
+	if first.RequestSeq != firstSeq || !first.Success {
+		t.Fatalf("first restart response = %+v, want success for request %d", first.Response, firstSeq)
+	}
+
+	secondSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	hh.cmds.waitForCommands(t, protocol.CmdRestart, 2)
+
+	continues := hh.cmds.count(protocol.CmdContinue)
+	hh.inject(protocol.EventStepped, protocol.SteppedPayload{Goroutine: protocol.Goroutine{ID: 1}})
+	hh.cmds.requireNoAdditionalCommands(t, protocol.CmdContinue, continues)
+
+	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{})
+	second := recvType[*godap.RestartResponse](hh)
+	if second.RequestSeq != secondSeq || !second.Success {
+		t.Fatalf("second restart response = %+v, want success for request %d", second.Response, secondSeq)
+	}
+	hh.inject(protocol.EventStepped, protocol.SteppedPayload{Goroutine: protocol.Goroutine{ID: 2}})
+	hh.cmds.waitForCommands(t, protocol.CmdContinue, continues+1)
+	hh.inject(protocol.EventContinued, protocol.ContinuedPayload{})
 }
 
 func TestRestartErrorAllowsRetry(t *testing.T) {
