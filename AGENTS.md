@@ -2439,8 +2439,21 @@ without reconnecting; that is what stops the 1 + 6-attempt ladder that used to
 kill the view. Everything else stays transient, including `ws`'s
 `WS_ERR_UNSUPPORTED_MESSAGE_LENGTH`: a frame above the TRANSPORT cap is never
 delivered, so its kind is unknowable, and a legal, deliberately-unbounded
-`Locals`/`Frames`/`Evaluate` broadcast can land there. Latching on it would kill
-the view over an event the observer never even reads.
+`Locals`/`Frames`/`Evaluate` broadcast — which the hub sends to EVERY client —
+can land there. Latching on it would kill the view over an event the observer
+never even reads. The 64 KiB slack exists so a frame just over the decoder
+budget is still delivered and can be classified by kind; it cannot make an
+unbounded family fit, so it does not make a transport rejection safe to latch.
+
+The full classification, pinned by real-`ws` tests:
+
+| Frame | Kind readable? | Outcome |
+| --- | --- | --- |
+| > transport cap, any kind | no — `ws` discarded it | transient, reconnects |
+| > decoder cap, bounded kind | yes, via prefix scan | **fatal**, no reconnect |
+| > decoder cap, unbounded kind | yes, via prefix scan | transient, reconnects |
+| > decoder cap, unreadable prefix | no | transient, reconnects |
+| decoded, breaks a named rule | n/a | **fatal**, no reconnect |
 
 **Refresh is the manual recovery path.** The latch stops the *automatic* ladder;
 an explicit user Refresh is not a loop, so it clears the latch and redials.
