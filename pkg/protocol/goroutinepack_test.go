@@ -458,6 +458,82 @@ var _ = Describe("goroutine event packing", func() {
 			Expect(out.Goroutines).To(BeEmpty())
 		})
 
+		DescribeTable("never exceeds the decoder's count cap on a deep chain",
+			func(depth int) {
+				// Anchors are placed before the per-element cap check, so the
+				// cap must also be enforced on the anchor COUNT — otherwise a
+				// long spawn chain yields a payload under 2 MiB but over the
+				// element cap, which the consumer fatally rejects.
+				gs := chain(depth, 0)
+
+				snap, snapReport := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+					Goroutines: gs, Threads: []protocol.Thread{}, Current: depth,
+				}, false, false)
+				Expect(len(snap.Goroutines)).To(BeNumerically("<=", protocol.MaxSnapshotGoroutines))
+				Expect(snapReport.Degraded).To(Equal(depth > protocol.MaxSnapshotGoroutines),
+					"over the cap the snapshot must degrade explicitly")
+
+				// The flat shape does not require ancestors, so it simply packs
+				// up to the cap instead of degrading.
+				list, listReport := protocol.PackGoroutines(gs, false)
+				Expect(len(list.Goroutines)).To(BeNumerically("<=", protocol.MaxSnapshotGoroutines))
+				Expect(listReport.Degraded).To(BeFalse())
+				if depth > protocol.MaxSnapshotGoroutines {
+					Expect(list.Goroutines).To(HaveLen(protocol.MaxSnapshotGoroutines))
+					Expect(list.Totals).NotTo(BeNil())
+					Expect(list.Totals.Goroutines).To(Equal(depth))
+				}
+			},
+			Entry("exactly at the cap", protocol.MaxSnapshotGoroutines),
+			Entry("one over the cap", protocol.MaxSnapshotGoroutines+1),
+			Entry("at the scan ceiling", 8192),
+		)
+
+		It("drops the current goid when the result degrades", func() {
+			// A degraded payload names no goroutine, so claiming one is current
+			// is a dangling reference. Lifecycle deltas and totals survive.
+			gs := chain(protocol.MaxSnapshotGoroutines+1, 0)
+			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+				Goroutines: gs,
+				Current:    protocol.MaxSnapshotGoroutines + 1,
+				Created:    []int{7, 8},
+				Exited:     []int{3},
+			}, false, false)
+
+			Expect(report.Degraded).To(BeTrue())
+			Expect(out.Goroutines).To(BeEmpty())
+			Expect(out.Current).To(BeZero(), "no goroutine was delivered to be current")
+			Expect(out.Created).To(Equal([]int{7, 8}))
+			Expect(out.Exited).To(Equal([]int{3}))
+			Expect(out.Totals).NotTo(BeNil())
+
+			raw, err := json.Marshal(out)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(raw)).NotTo(ContainSubstring(`"current"`), "omitempty drops it entirely")
+		})
+
+		It("drops a current goid that names no goroutine in the input", func() {
+			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+				Goroutines: []protocol.Goroutine{{ID: 1, Status: "waiting"}},
+				Threads:    []protocol.Thread{},
+				Current:    999,
+			}, false, false)
+
+			Expect(report.Degraded).To(BeFalse())
+			Expect(out.Current).To(BeZero())
+			Expect(goroutineIDs(out.Goroutines)).To(Equal([]int{1}))
+		})
+
+		It("keeps the current goid in every non-degraded result", func() {
+			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+				Goroutines: packGoroutines(8192), Threads: packThreads(8), Current: 4096,
+			}, false, false)
+
+			Expect(report.Degraded).To(BeFalse())
+			Expect(out.Current).To(Equal(4096))
+			Expect(goroutineIDs(out.Goroutines)).To(ContainElement(4096))
+		})
+
 		It("keeps an ancestor chain that exactly fills the count cap", func() {
 			gs := chain(protocol.MaxSnapshotGoroutines, 0)
 			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
