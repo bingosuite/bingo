@@ -1691,10 +1691,12 @@ around `snapshotFrom` pin the seam's semantics but cannot catch a rewiring.
 
 **Graceful fallback.** Every read is best-effort. `resolveGoLayout` marks the
 layout invalid if any required `g`/`gobuf`/`stack`/`m` offset is missing, and an
-unreadable `allgs` header/slot, required `g` status/goid, or `allm` head/link
-degrades the whole snapshot to the legacy single synthetic goroutine (`ID:1,
-Status:"waiting"`, current PC) rather than returning a partial live set or
-erroring the stop. Intentional nil/dead/freelist entries remain filters, and
+unreadable `allgs` header/slot, required `g` status/goid/stack bound, or `allm`
+head/link degrades the whole snapshot to the legacy single synthetic goroutine
+(`ID:1, Status:"waiting"`, current PC) rather than returning a partial live set
+or erroring the stop. Both stack bounds are required for every included live
+goroutine: without them SP containment cannot rule that goroutine in or out as
+the stopped one. Intentional nil/dead/freelist entries remain filters, and
 optional metadata remains best-effort. This distinction is load-bearing on
 Linux: ptrace stops only the reporting thread, so sibling runtime mutations can
 race the walk; only backends that stop the world make the reads race-free. This
@@ -1705,10 +1707,12 @@ the `fakeBackend` engine unit tests green.
 thread's SP within `[g.stack.lo, g.stack.hi)`. The current *thread* is the M
 whose `curg` goid equals the current goid. A non-current goroutine's
 `CurrentLoc` uses `gobuf.pc` (where it resumes); the current one uses the live
-PC. Status strings are hardcoded (stable across Go versions); wait-reason
-strings are read dynamically from `runtime.waitReasonStrings`. Goroutines with
-goid<=0 or status `_Gdead` (scan bit stripped) are filtered out — their exit
-surfaces in the next Exited delta.
+PC. If a complete but clipped scan has not found the current goroutine, stop
+events report unknown rather than substituting the first unrelated entry.
+Status strings are hardcoded (stable across Go versions); wait-reason strings
+are read dynamically from `runtime.waitReasonStrings`. Goroutines with goid<=0
+or status `_Gdead` (scan bit stripped) are filtered out — their exit surfaces
+in the next Exited delta.
 
 **Note on `go f(args)` wrappers.** A goroutine started with arguments gets a
 compiler-generated `<caller>.gowrapN` closure as its startpc, so `StartLoc`
