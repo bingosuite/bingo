@@ -79,8 +79,10 @@ jobs:
           go test -tags proofu3 -count=1 -v -timeout 1200s \
             ./test/proofu3 -run 'TestControl_|TestFloor_'
 
+      # Deliberately NOT `if: always()`: a proof result is only meaningful when
+      # the controls passed, so a red Controls step must suppress it rather than
+      # let a green Proofs step stand beside it.
       - name: Proofs (green == defect reproduced)
-        if: always()
         run: |
           go test -tags proofu3 -count=1 -v -timeout 3600s \
             ./test/proofu3 -run 'TestProof_'
