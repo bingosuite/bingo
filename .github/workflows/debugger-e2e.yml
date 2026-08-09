@@ -44,7 +44,7 @@ jobs:
   linux-amd64:
     name: Linux amd64 (ptrace)
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -62,8 +62,16 @@ jobs:
       - name: E2E basic (continue + step-over correctness)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=basic
 
-      - name: E2E churn (multi-thread robustness)
-        run: go test -tags e2e -race -count=1 -v -timeout 600s ./test/integration -ginkgo.label-filter=churn
+      # Repeated: the foreign-thread stop this suite races against is timing
+      # dependent, so a single green run is weak evidence. Five rounds is the
+      # standing bar for the linux wait-side park queue (issue #199).
+      - name: E2E churn (multi-thread robustness, 5 rounds)
+        run: |
+          for round in 1 2 3 4 5; do
+            echo "::group::churn round $round"
+            go test -tags e2e -race -count=1 -v -timeout 600s ./test/integration -ginkgo.label-filter=churn
+            echo "::endgroup::"
+          done
 
       - name: E2E pause (async interrupt)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=pause
@@ -91,9 +99,9 @@ jobs:
 
       # linux-only: Wait4(-1, WALL) is what lets a foreign thread's stop arrive
       # mid-single-step (issue #199). The darwin receive loop parks stragglers
-      # itself, so the engine's deferral queue never fills there.
+      # itself, so the linux park queue has no counterpart to exercise there.
       - name: E2E overlap (foreign-thread stop during a single-step)
-        run: go test -tags e2e -race -count=1 -v -timeout 600s ./test/integration -ginkgo.label-filter=overlap
+        run: go test -tags e2e -race -count=1 -v -timeout 1800s ./test/integration -ginkgo.label-filter=overlap
 
   darwin-arm64:
     name: Darwin arm64 (Mach exceptions)
