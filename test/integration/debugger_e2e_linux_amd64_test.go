@@ -186,9 +186,6 @@ func main() {
 	for atomic.LoadInt64(&signalledProgress) == 0 || atomic.LoadInt64(&siblingProgress) == 0 {
 		runtime.Gosched()
 	}
-	signalledBefore := atomic.LoadInt64(&signalledProgress)
-	siblingBefore := atomic.LoadInt64(&siblingProgress)
-
 	if err := syscall.Tgkill(os.Getpid(), signalledTID, syscall.SIGUSR1); err != nil {
 		os.Exit(91)
 	}
@@ -197,6 +194,8 @@ func main() {
 	case <-time.After(5 * time.Second):
 		os.Exit(92)
 	}
+	signalledBefore := atomic.LoadInt64(&signalledProgress)
+	siblingBefore := atomic.LoadInt64(&siblingProgress)
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -761,6 +760,8 @@ func declareStepOverlapSignalSpec() {
 	It("resumes the thread that stopped when a foreign signal lands mid-step",
 		Label("overlap"), func() {
 			p, bpA, bpB := setupOverlap("overlap_signal_target", overlapSignalTargetSrc)
+			parkedSignalsBefore, ok := debugger.LinuxParkedSignalCount(p.h.d)
+			Expect(ok).To(BeTrue(), "parked-signal hook unavailable")
 
 			iters := envInt("BINGO_E2E_OVERLAP_SIGNAL_ITERS", 80)
 			for i := 0; i < iters; i++ {
@@ -793,10 +794,13 @@ func declareStepOverlapSignalSpec() {
 			// otherwise this ran as a plain overlap spec.
 			Expect(p.signalOutputs).To(BeNumerically(">", 0),
 				"no signal stops were reported — the foreign-signal path was never exercised")
-			// And the parking rule itself must have run. Asserted here as well
-			// as in the step-over spec because this is the variant that carries
-			// foreign non-suspending signal stops through the queue, not just
-			// breakpoint stops.
+			parkedSignals, ok := debugger.LinuxParkedSignalCount(p.h.d)
+			Expect(ok).To(BeTrue(), "parked-signal hook unavailable after the run")
+			Expect(parkedSignals).To(BeNumerically(">", parkedSignalsBefore),
+				"signals were reported, but none was parked during a step across %d cycles", iters)
+			// The generic counter remains a second guard on the queue as a
+			// whole, while the signal-specific counter proves this variant did
+			// not pass on parked breakpoint traps alone.
 			parked, ok := debugger.LinuxParkedStopCount(p.h.d)
 			Expect(ok).To(BeTrue(), "parked-stop hook unavailable")
 			Expect(parked).To(BeNumerically(">", 0),
@@ -813,6 +817,7 @@ func declareStepOverlapSignalSpec() {
 			AddReportEntry("overlap-signal-goroutines", len(p.goroutines))
 			AddReportEntry("overlap-signal-late-goroutines", len(p.lateGoroutines))
 			AddReportEntry("overlap-signal-parked-stops", parked)
+			AddReportEntry("overlap-signal-parked-signal-stops", parkedSignals-parkedSignalsBefore)
 		})
 }
 

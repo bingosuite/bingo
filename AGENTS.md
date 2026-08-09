@@ -627,10 +627,13 @@ stopped TID and the signal argument to the next ptrace resume:
    mutex-protected because `Wait` publishes from its goroutine while the engine
    consumes it; unlike `stepQueue`, this state crosses goroutines.
 
-The host-agnostic map tests, linux backend resume-argument tests, the `signals`
+The host-agnostic map tests, linux backend raw ptrace-tuple tests, the `signals`
 E2E label (one SIGSEGV/SIGABRT output followed by signal death, one handled
-thread-directed ordinary signal with sibling progress, and Pause suppression),
-and the foreign-signal `overlap` spec are the regression gates.
+thread-directed ordinary signal with post-delivery sibling progress, and Pause
+suppression), and the foreign-signal `overlap` spec are the regression gates.
+The overlap spec must observe a signal-specific parked-stop count increase;
+signal outputs plus generic parked traps are not proof that a signal was held
+during a step.
 
 **Composition constraint for #205:** a future process-wide wait broker may own
 the raw `wait4`, but it must route the complete `(TID, signal)` status to the

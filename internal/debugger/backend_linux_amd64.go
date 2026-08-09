@@ -112,10 +112,9 @@ type linuxBackend struct {
 
 	pendingSignals pendingSignals
 
-	// Nil in production; tests inject these to pin the exact TID/signal pair
-	// passed to ptrace without launching a tracee.
-	ptraceContFn       func(tid, signal int) error
-	ptraceSingleStepFn func(tid, signal int) error
+	// Nil in production; tests inject this at the raw syscall seam to pin the
+	// exact ptrace request, TID, and signal without launching a tracee.
+	ptraceSyscall6Fn func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno)
 }
 
 // drainParked returns the next held stop if one may be surfaced now, installing
@@ -758,19 +757,21 @@ func (b *linuxBackend) singleStepIfTraceeExists(tid int) error {
 }
 
 func (b *linuxBackend) ptraceCont(tid, signal int) error {
-	if b.ptraceContFn != nil {
-		return b.ptraceContFn(tid, signal)
-	}
-	return syscall.PtraceCont(tid, signal)
+	return b.ptraceResume(syscall.PTRACE_CONT, tid, signal)
 }
 
 func (b *linuxBackend) ptraceSingleStep(tid, signal int) error {
-	if b.ptraceSingleStepFn != nil {
-		return b.ptraceSingleStepFn(tid, signal)
+	return b.ptraceResume(syscall.PTRACE_SINGLESTEP, tid, signal)
+}
+
+func (b *linuxBackend) ptraceResume(request, tid, signal int) error {
+	call := syscall.Syscall6
+	if b.ptraceSyscall6Fn != nil {
+		call = b.ptraceSyscall6Fn
 	}
-	_, _, errno := syscall.Syscall6(
+	_, _, errno := call(
 		syscall.SYS_PTRACE,
-		uintptr(syscall.PTRACE_SINGLESTEP),
+		uintptr(request),
 		uintptr(tid),
 		0,
 		uintptr(signal),
