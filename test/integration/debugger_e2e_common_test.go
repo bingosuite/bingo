@@ -19,7 +19,7 @@
 // Tuning env vars:
 //
 //	BINGO_E2E_ITERS        (default 25)   basic continue+stepover iterations
-//	BINGO_E2E_CHURN_ITERS  (default 200)  iterations under thread churn
+//	BINGO_E2E_CHURN_ITERS  (default 200)  churn iterations and target watchdog budget
 //	BINGO_E2E_DEBUG        (unset)        route engine debug logs + every event to stderr
 
 package integration
@@ -79,59 +79,6 @@ func main() {
 	x := 0
 	for i := 0; i < 1000000; i++ {
 		x += compute(i % 10) // BP
-		x++
-		time.Sleep(time.Millisecond)
-		_ = x
-	}
-}
-`
-
-// churnTargetSrc forces continuous OS-thread creation/teardown (LockOSThread +
-// short sleeps across GOMAXPROCS worker goroutines) so that breakpoint stops
-// and single-steps happen in a genuinely multi-threaded context. This is the
-// scenario that reproduces the darwin single-step race and stresses linux
-// clone/thread-exit handling.
-const churnTargetSrc = `package main
-
-import (
-	"os"
-	"runtime"
-	"sync/atomic"
-	"time"
-)
-
-var sink int64
-
-func churn() {
-	for {
-		runtime.LockOSThread()
-		var x int64
-		for i := 0; i < 2000; i++ {
-			x += int64(i)
-		}
-		atomic.AddInt64(&sink, x)
-		runtime.UnlockOSThread()
-		time.Sleep(50 * time.Microsecond)
-	}
-}
-
-func work(n int) int64 {
-	var s int64
-	for i := 0; i < n; i++ {
-		s += int64(i)
-	}
-	return s
-}
-
-func main() {
-	go func() { time.Sleep(180 * time.Second); os.Exit(0) }()
-	runtime.GOMAXPROCS(4)
-	for i := 0; i < 8; i++ {
-		go churn()
-	}
-	x := int64(0)
-	for i := 0; i < 1000000; i++ {
-		x += work(i % 50) // BP
 		x++
 		time.Sleep(time.Millisecond)
 		_ = x
@@ -409,16 +356,23 @@ func declareBasicStepOverSpec() {
 // note above).
 func declareChurnSpec() {
 	It("survives continue+step-over under continuous thread churn", Label("churn"), func() {
-		line := markerLine(churnTargetSrc, "// BP")
-		bin := buildTarget("churn_target", churnTargetSrc)
+		iters := envInt("BINGO_E2E_CHURN_ITERS", 200)
+		targetSource, watchdogBudget := churnTargetSource(iters)
+		AddReportEntry("churn-watchdog-budget", watchdogBudget.String())
 
+		line := markerLine(targetSource, "// BP")
+		bin := buildTarget("churn_target", targetSource)
+
+		started := time.Now()
+		defer func() {
+			AddReportEntry("churn-elapsed", time.Since(started).Round(time.Millisecond).String())
+		}()
 		h := newE2EHarness(bin)
 		h.waitFor(20*time.Second, protocol.EventStepped)
 
 		_, err := h.d.SetBreakpoint("churn_target.go", line)
 		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint")
 
-		iters := envInt("BINGO_E2E_CHURN_ITERS", 200)
 		for i := 0; i < iters; i++ {
 			Expect(h.d.Continue()).To(Succeed(), "Continue #%d", i)
 			evt := h.waitFor(20*time.Second,

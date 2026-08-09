@@ -459,10 +459,12 @@ are detected by a `mach_msg` receive loop.
   tracer-thread handoff entirely (mirrors Delve). This is load-bearing for the
   goroutine snapshot: it issues dozens of small reads per stop across every live
   goroutine, and the old word-at-a-time-PEEKDATA-through-execPtrace path made a
-  snapshot-on-every-breakpoint so slow it pushed the `churn` e2e past its
-  target's 180s watchdog. The fallback keeps the original error semantics for
-  genuinely-unmapped addresses. (Darwin was never affected — it already
-  bulk-reads via `mach_vm_read`.)
+  snapshot-on-every-breakpoint so slow it pushed the `churn` e2e into its
+  then-fixed 180s target watchdog. The harness now derives that watchdog from
+  `BINGO_E2E_CHURN_ITERS` (2s per iteration plus 60s) before compiling the
+  target, so the tuning knob scales both test work and target lifetime. The
+  fallback keeps the original error semantics for genuinely-unmapped addresses.
+  (Darwin was never affected — it already bulk-reads via `mach_vm_read`.)
 - Single-step vs breakpoint disambiguation uses **both** `stepping` and
   `stepTID` (the exact TID `SingleStep` was issued against). Only a `cause==0`
   SIGTRAP on `stepTID` is the step's completion; the same stop on any other
