@@ -579,15 +579,15 @@ acknowledgement in rule 5 (see the locking note below):
    `stepping`. This is what guarantees a same-address sibling is delivered only
    after the reinstall, so it resolves to a real breakpoint rather than the
    spurious-trap path.
-4. **`recordStop` runs on delivery only.** Never at park time — moving the resume
+4. **Current-stop state is installed on delivery only.** Never at park time —
+   moving the resume
    target to a thread the engine is not working on is precisely the corruption
    being fixed. The same rule covers the stop's **signal**, which is why the
    queue holds whole `StopEvent`s: the signal is a field of the parked event,
-   not backend state, so it cannot be observed against a thread other than its
-   own and there is no separate signal record to keep in step with `recordStop`
-   (the ordering hazard issue #204 raises for pending signals). Do not hoist the
-   signal — or any other per-stop datum — into `linuxBackend`; that would
-   reintroduce exactly that ordering obligation.
+   not current backend state. `drainParked` moves it into the per-TID pending
+   signal map only when the event is released, immediately before publishing
+   `lastStopTID`; recording it at park time would let another stop consume it
+   against the wrong thread (issue #206).
 5. **A dead stepped thread closes through an internal reconciliation boundary.**
    `interruptStepIfStepped` clears hardware ownership (`stepping`/`stepTID`) when
    the exact stepped TID exits, because its completion can never arrive, but it
@@ -627,7 +627,7 @@ acknowledgement in rule 5 (see the locking note below):
    ptrace op. `ESRCH`/`ENOENT` is benign — the anchor was mid-exit and simply
    finished dying, which is what the release asked for. Any other failure leaves
    the hold in place **and the gate closed**, and the engine halts suspended
-   (`Error → Paused`, no new `waitLoop`) rather than resuming past a thread
+   (   `Error → Paused`, no new `waitLoop`) rather than resuming past a thread
    nothing will ever deliver. `ContinueProcess`/`SingleStep` already refuse while
    `stepExitPending`, so both halt paths make Kill/Restart the only recovery.
    No path leaks a held owner: it is discharged on a successful acknowledgement,
@@ -926,7 +926,7 @@ distinguish safe recovery from the mid-instruction path.
   `wait4` frame survives in the timeout dump. Fixing it belongs with #205/#217,
   not here.
 
-**No lock, and none is needed.** `parked` is touched only inside `Wait`.
+**No lock on the queue, and none is needed.** `parked` is touched only inside `Wait`.
 Successive `Wait` calls run on different one-shot `waitLoop` goroutines that the
 engine starts with `go e.waitLoop()` **after** consuming the previous `Wait`'s
 result from `stopCh`, so no two ever overlap; that channel-and-goroutine-start
@@ -934,7 +934,9 @@ chain is also what orders the `stepping`/`stepTID` writes the engine makes in
 between (`SingleStep` sets them, `ContinueProcess` clears them) and the
 `completeStepThreadExit` acknowledgement against the next `Wait`'s reads.
 Only the cumulative diagnostic counters are atomic because native tests read
-them concurrently; do not add a queue mutex.
+them concurrently; do not add a queue mutex. This no-lock rule applies only to
+`stepQueue`: pending signals cross from `Wait` to the engine loop and therefore
+have their own mutex.
 
 Regression gates: the classifier table, the queue-mechanics tests **and** the
 resume-decision tests covering rules 7–11 in
@@ -1072,6 +1074,48 @@ so the held-interrupt assertion is the spec's own flake risk — at 40 cycles it
 would fail spuriously ~0.9^40 ≈ 1.5% of the time. 70 takes that to ~0.06% and
 still costs only ~88s at the slowest per-cycle rate yet observed. Lowering it
 re-introduces the flake; raising it much further runs into the watchdog.
+
+## Linux signal forwarding
+
+Source: [pending_signal.go](internal/debugger/pending_signal.go) plus the
+delivery and resume wiring in
+[backend_linux_amd64.go](internal/debugger/backend_linux_amd64.go).
+
+Linux ptrace reports an ordinary or fatal signal as a signal-delivery stop. The
+engine emits one `EventOutput` and resumes; resuming with signal `0` suppresses
+delivery, so a synchronous fault immediately refaults and fatal signals never
+terminate (issue #206). The backend owns the fix because only it knows both the
+stopped TID and the signal argument to the next ptrace resume:
+
+1. A surfaced `StopSignal` is recorded in `pendingSignals[tid]` **before**
+   `lastStopTID` publishes that TID. A pending signal is never a process-wide or
+   single-slot value: another stop may move `lastStopTID`, but cannot transfer or
+   clear a different TID's signal.
+2. `ContinueProcess` and `SingleStep(tid)` atomically take only that exact TID's
+   signal and pass it as ptrace's data argument. Taking is one-shot even when the
+   ptrace call fails, so a stale signal cannot be injected by a later retry.
+3. The parked-stop FIFO from #202 retains the signal inside the `StopEvent`.
+   Parking never touches pending state. `drainParked` performs the same
+   signal-before-TID delivery handoff as a live `Wait` result.
+4. Pause's main-thread `SIGSTOP` is deliberately excluded from pending state,
+   preserving manual Pause and leftover-interrupt suppression. Clone `SIGSTOP`,
+   `SIGURG`, `SIGCONT`, ptrace events and spurious breakpoint traps remain
+   internal Wait-loop cases with their existing explicit resume signal.
+5. Every internal continue/single-step clears pending state only for its own TID;
+   process exit, Kill/detach and tracer shutdown purge all of it. The map is
+   mutex-protected because `Wait` publishes from its goroutine while the engine
+   consumes it; unlike `stepQueue`, this state crosses goroutines.
+
+The host-agnostic map tests, linux backend resume-argument tests, the `signals`
+E2E label (one SIGSEGV/SIGABRT output followed by signal death, one handled
+thread-directed ordinary signal with sibling progress, and Pause suppression),
+and the foreign-signal `overlap` spec are the regression gates.
+
+**Composition constraint for #205:** a future process-wide wait broker may own
+the raw `wait4`, but it must route the complete `(TID, signal)` status to the
+owning session/backend and preserve FIFO order. Pending signal state stays
+per-session and per-TID; it must not move into one process-global broker slot or
+be installed before the owning backend actually delivers the stop.
 
 ## Architecture-specific traps
 
@@ -1242,6 +1286,11 @@ are detected by a `mach_msg` receive loop.
   `waitLoop` → `stopCh` → engine-loop handoff. Regression coverage is
   `TestLinuxBackend*StopTID*`, run under `-race` in the unit-test workflow.
   Non-main thread exits are absorbed inside `Wait`.
+- User-visible signal stops carry per-TID pending delivery state. `ContinueProcess`
+  and `SingleStep` inject only the signal owned by the exact resumed TID; a
+  parked stop does not install that state until delivery. Pause `SIGSTOP` is
+  excluded and all teardown paths purge it. See
+  [Linux signal forwarding](#linux-signal-forwarding).
 - `ReadMemory` uses **`process_vm_readv(2)`** as the fast path, falling back to
   `PTRACE_PEEKDATA` only when it is unavailable or short-reads. `process_vm_readv`
   bulk-copies the whole buffer in one syscall and — unlike ptrace ops — is NOT
@@ -2492,7 +2541,8 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   (StackFrames chain + Locals + Goroutines at a breakpoint), `breakpoints`
   (a cleared breakpoint stops firing), `kill` (Kill terminates a
   freely-running tracee), `exit` (EventProcessExited reports the tracee's real
-  exit code), `overlap` (linux-only: a foreign thread's breakpoint stop
+  exit code), `signals` (linux-only: fatal and ordinary signal forwarding plus
+  the shared Pause-suppression control), `overlap` (linux-only: a foreign thread's breakpoint stop
   surfacing while another thread single-steps off a software breakpoint —
   issue #199), `attach` (attach by PID to an already-running tracee — one the
   debugger did not launch — then breakpoint it), `concurrency` (the
@@ -2523,12 +2573,12 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   breakpoint stops (reads the `debugger.DarwinTaskPortSendRefs` hook), a check
   meaningless on the ptrace backend.
 
-  **Platform scoping — both containers run the full set.** The darwin container
-  wires the same specs as linux: `basic`, `stepping`, `breakpoints`, `churn`,
+  **Platform scoping — both containers run the shared set.** The darwin container
+  wires the same shared specs as linux: `basic`, `stepping`, `breakpoints`, `churn`,
   `kill`, `exit`, `attach`, `concurrency`, `pause`, `inspect`, `restart`,
-  `fullstack`, and `dap`,
-  plus the
-  darwin-only `hygiene` (Mach exception port-right leak regression). This was NOT
+  `fullstack`, and `dap`. Linux additionally runs `signals` and `overlap`;
+  darwin additionally runs the
+  `hygiene` Mach exception port-right leak regression. This was NOT
   always so:
   under the old darwin wait4/ptrace model the step-off-an-armed-trap specs
   (`basic`, `stepping`, `breakpoints`, `churn`) and `kill` (kill-while-running)
@@ -2831,6 +2881,8 @@ just e2e-darwin                            # native darwin/arm64 Mach-exception 
 # Filter to one label, e.g. only the correctness gate (package path must come
 # before the -ginkgo.* flag so `go test` doesn't mistake it for the package):
 go test -tags e2e -race ./test/integration -ginkgo.label-filter=basic
+# Linux signal delivery and its Pause suppression control:
+go test -tags e2e -race ./test/integration -ginkgo.label-filter=signals
 # The full-stack spec exercises client → WebSocket → hub → debugger → tracee:
 go test -tags e2e -race ./test/integration -ginkgo.label-filter=fullstack
 ```
