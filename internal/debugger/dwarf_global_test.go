@@ -66,7 +66,7 @@ func genericFrame() string {
 var closure = makeClosure()
 
 func main() {
-	println(frame(), receiver{}.method(), closure(), inlineFrame(), genericFrame(), left.Frame(), right.Frame(), right.Fallback(), asmfixture.Read(), initValue)
+	println(frame(), receiver{}.method(), closure(), inlineFrame(), genericFrame(), left.Frame(), right.Frame(), right.Fallback(), asmfixture.Read(), initValue, Collide, GenGlobal)
 }
 `,
 	"left/left.go": `package left
@@ -294,6 +294,15 @@ func assertEvaluatesGlobal(t *testing.T, r *dwarfReader, pc uint64, query, exact
 	}
 }
 
+func assertDistinctGlobalCollision(t *testing.T, r *dwarfReader, first, second string) {
+	t.Helper()
+	firstAddr := exactGlobalAddress(t, r, first)
+	secondAddr := exactGlobalAddress(t, r, second)
+	if firstAddr == secondAddr {
+		t.Fatalf("collision globals %q and %q share address %#x", first, second, firstAddr)
+	}
+}
+
 func TestEvaluateNamePrefersFramePackageGlobals(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -369,33 +378,40 @@ func TestEvaluateNameUsesLogicalCodePackage(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			r := buildScopedGlobalsFixture(t, tc.gcflags)
 
-			genericPC := subprogramPCContaining(t, r, "/generic.Identity[")
-			genericLocation := r.locationForPC(genericPC)
-			if want := scopedGlobalsModule + "/generic.Identity["; !strings.Contains(genericLocation.Function, want) {
-				t.Fatalf("generic Frame.Function = %q, want function containing %q", genericLocation.Function, want)
-			}
-			if got := physicalPackageForPC(t, r, genericPC); got != "main" {
-				t.Fatalf("generic physical CU = %q, want main to exercise instantiator-CU regression", got)
-			}
-			assertEvaluatesGlobal(t, r, genericPC, "GenGlobal", scopedGlobalsModule+"/generic.GenGlobal")
+			assertDistinctGlobalCollision(t, r, "main.Collide", scopedGlobalsModule+"/inline.Collide")
+			assertDistinctGlobalCollision(t, r, "main.GenGlobal", scopedGlobalsModule+"/generic.GenGlobal")
 
-			var inlinePC uint64
-			if tc.optimized {
-				inlinePC = inlinedSubprogramPC(t, r, "/inline.Small")
-				inlineLocation := r.locationForPC(inlinePC)
-				if inlineLocation.Function != "main.inlineFrame" {
-					t.Fatalf("inline Frame.Function = %q, want physical main.inlineFrame", inlineLocation.Function)
+			t.Run("generic shape", func(t *testing.T) {
+				genericPC := subprogramPCContaining(t, r, "/generic.Identity[")
+				genericLocation := r.locationForPC(genericPC)
+				if want := scopedGlobalsModule + "/generic.Identity["; !strings.Contains(genericLocation.Function, want) {
+					t.Fatalf("generic Frame.Function = %q, want function containing %q", genericLocation.Function, want)
 				}
-				if !strings.HasSuffix(inlineLocation.File, "/inline/inline.go") {
-					t.Fatalf("inline current-PC file = %q, want inline/inline.go", inlineLocation.File)
+				if got := physicalPackageForPC(t, r, genericPC); got != "main" {
+					t.Fatalf("generic physical CU = %q, want main to exercise instantiator-CU regression", got)
 				}
-				if got := physicalPackageForPC(t, r, inlinePC); got != "main" {
-					t.Fatalf("inline physical CU = %q, want main to exercise caller-CU regression", got)
+				assertEvaluatesGlobal(t, r, genericPC, "GenGlobal", scopedGlobalsModule+"/generic.GenGlobal")
+			})
+
+			t.Run("inlined function", func(t *testing.T) {
+				var inlinePC uint64
+				if tc.optimized {
+					inlinePC = inlinedSubprogramPC(t, r, "/inline.Small")
+					inlineLocation := r.locationForPC(inlinePC)
+					if inlineLocation.Function != "main.inlineFrame" {
+						t.Fatalf("inline Frame.Function = %q, want physical main.inlineFrame", inlineLocation.Function)
+					}
+					if !strings.HasSuffix(inlineLocation.File, "/inline/inline.go") {
+						t.Fatalf("inline current-PC file = %q, want inline/inline.go", inlineLocation.File)
+					}
+					if got := physicalPackageForPC(t, r, inlinePC); got != "main" {
+						t.Fatalf("inline physical CU = %q, want main to exercise caller-CU regression", got)
+					}
+				} else {
+					inlinePC = subprogramPC(t, r, "/inline.Small")
 				}
-			} else {
-				inlinePC = subprogramPC(t, r, "/inline.Small")
-			}
-			assertEvaluatesGlobal(t, r, inlinePC, "Collide", scopedGlobalsModule+"/inline.Collide")
+				assertEvaluatesGlobal(t, r, inlinePC, "Collide", scopedGlobalsModule+"/inline.Collide")
+			})
 		})
 	}
 }
