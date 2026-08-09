@@ -216,9 +216,12 @@ What a consumer sees:
   otherwise be forced to reject the event. Count UTF-16 code units, not bytes or
   runes: an astral character costs two.
 - **Deltas are not packed elements.** Because they are never trimmed,
-  `created`/`exited` can legitimately exceed the element caps — the debugger's
-  scan reaches 8192. A consumer must not apply its element cap to them; the byte
-  contract is their bound.
+  `created`/`exited` can legitimately exceed the element caps. Their bound is
+  `MaxLifecycleDeltaIDs` (8192), which restates the debugger's own goroutine scan
+  ceiling — the thing that actually limits them. A consumer must validate them
+  against *that*, never against the packed-element cap, or it will reject legal
+  snapshots from any busy target. Even the worst case (both deltas full, widest
+  ids) stays well under half the byte budget.
 - **`totals` is the honesty channel.** It appears *only* when elements were left
   off the wire or the debugger's runtime scan was clipped, carrying the
   **original** counts. Its presence alone means "this is not everything".

@@ -26,10 +26,13 @@ type GoroutinePackReport struct {
 	// carries empty collections. The lifecycle deltas are still intact.
 	Degraded bool
 
-	// Oversized is true when even the degraded result exceeds the budget, which
-	// can only happen if the lifecycle deltas alone do — and those are never
-	// trimmed. The producer's runtime scan bounds them well below that in
-	// practice, so this is a corrupt-input signal rather than a normal outcome.
+	// Oversized is true when the result cannot conform to the wire contract:
+	// either the lifecycle deltas alone exceed the byte budget, or there are
+	// more of them than MaxLifecycleDeltaIDs. Deltas are never trimmed, so
+	// there is no lever left — the producer must decide what to do rather than
+	// have a corrupted lifecycle stream emitted on its behalf. The debugger's
+	// own scan bounds both cases well below the limits, so this signals corrupt
+	// input rather than a normal outcome.
 	Oversized bool
 }
 
@@ -75,6 +78,12 @@ func PackSnapshot(snap GoroutineSnapshotPayload, scanClipped bool) (GoroutineSna
 
 	// The snapshot shape IS a tree, so the whole spawn chain is required.
 	gs, ts, report := pack(snap.Goroutines, snap.Threads, snap.Current, totals, EventGoroutineSnapshot, build, true)
+	// Deltas are passed through untouched, so an over-long one is reported
+	// rather than trimmed: silently dropping lifecycle events would leave every
+	// consumer's created/exited tracking permanently wrong.
+	if len(snap.Created) > MaxLifecycleDeltaIDs || len(snap.Exited) > MaxLifecycleDeltaIDs {
+		report.Oversized = true
+	}
 	return shape(gs, ts, payloadTotals(totals, report)), report
 }
 
