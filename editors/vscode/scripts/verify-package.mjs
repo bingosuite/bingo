@@ -13,7 +13,7 @@ import { spawnSync } from "node:child_process";
 import { currentTarget } from "./platform.mjs";
 
 const target = currentTarget();
-const expectedExtensionVersion = "0.3.1";
+const expectedExtensionVersion = "0.3.2";
 const vsix = fileURLToPath(
   new URL(`../../../dist/bingo-${target}.vsix`, import.meta.url),
 );

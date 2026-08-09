@@ -1560,9 +1560,13 @@ func (e *engine) emitBreakpointHit(bp *breakpointEntry, stop StopEvent) {
 	// the stop event, then the full snapshot is streamed as its own event. One
 	// build avoids a double allgs scan and a double lifecycle-delta pass.
 	snap := e.goroutineSnapshot()
+	currentLoc := e.locForPC(stop.PC)
+	if len(frames) > 0 {
+		currentLoc = frames[0].Location
+	}
 	e.emit(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{
 		Breakpoint: bp.toProtocol(),
-		Goroutine:  currentGoroutineFrom(snap),
+		Goroutine:  currentGoroutineFrom(snap, currentLoc),
 		Frames:     frames,
 	})
 	e.emit(protocol.EventGoroutineSnapshot, snap)
@@ -1633,8 +1637,12 @@ func (e *engine) emitPaused(stop StopEvent) {
 	if e.dw != nil {
 		loc = e.dw.locationForPC(stop.PC)
 	}
+	currentLoc := loc
+	if len(frames) > 0 {
+		currentLoc = frames[0].Location
+	}
 	e.emit(protocol.EventPaused, protocol.PausedPayload{
-		Goroutine: currentGoroutineFrom(snap),
+		Goroutine: currentGoroutineFrom(snap, currentLoc),
 		Location:  loc,
 		Frames:    frames,
 	})

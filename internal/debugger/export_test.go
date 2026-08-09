@@ -131,14 +131,14 @@ func ExportedGoroutineSnapshotQuery(d Debugger) protocol.GoroutineSnapshotPayloa
 }
 
 func ExportedCurrentGoroutineFrom(snap protocol.GoroutineSnapshotPayload) protocol.Goroutine {
-	return currentGoroutineFrom(snap)
+	return currentGoroutineFrom(snap, protocol.Location{})
 }
 
 func ExportedThreadWalkResult(d Debugger) ExportedWalkResult {
 	e := d.(*engine)
 	var out ExportedWalkResult
 	if err := e.dispatch(func() error {
-		_, pc, _ := e.liveRegisters()
+		_, _, pc, _ := e.liveRegisters()
 		result := e.readThreads(0, pc)
 		out = ExportedWalkResult{
 			Count:    len(result.Items),
@@ -156,8 +156,8 @@ func ExportedGoroutineWalkResult(d Debugger) ExportedWalkResult {
 	e := d.(*engine)
 	var out ExportedWalkResult
 	if err := e.dispatch(func() error {
-		sp, pc, currentGptr := e.liveRegisters()
-		result := e.buildGoroutineList(sp, pc, currentGptr)
+		tid, sp, pc, currentGptr := e.liveRegisters()
+		result := e.buildGoroutineList(sp, pc, currentGptr, tid)
 		out = ExportedWalkResult{
 			Count:    len(result.Items),
 			Complete: result.Complete,
