@@ -93,7 +93,7 @@ var _ = Describe("goroutine event packing", func() {
 				Threads:    packThreads(64),
 				Current:    4096,
 			}
-			out, report := protocol.PackSnapshot(snap, false)
+			out, report := protocol.PackSnapshot(snap, false, false)
 
 			Expect(report.Degraded).To(BeFalse())
 			Expect(out.Goroutines).To(HaveLen(report.Goroutines))
@@ -132,10 +132,10 @@ var _ = Describe("goroutine event packing", func() {
 			}
 			bare, _ := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: packGoroutines(8192), Current: 1,
-			}, false)
+			}, false, false)
 			loaded, _ := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: packGoroutines(8192), Current: 1, Created: created,
-			}, false)
+			}, false, false)
 
 			Expect(len(loaded.Goroutines)).To(BeNumerically("<", len(bare.Goroutines)))
 			Expect(eventBytes(protocol.EventGoroutineSnapshot, loaded)).
@@ -146,7 +146,7 @@ var _ = Describe("goroutine event packing", func() {
 			gs := packGoroutines(8192)
 			snap, snapReport := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: gs, Current: 1,
-			}, false)
+			}, false, false)
 			list, listReport := protocol.PackGoroutines(gs, false)
 
 			Expect(snapReport.Bytes).To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
@@ -164,7 +164,7 @@ var _ = Describe("goroutine event packing", func() {
 			small := packGoroutines(200)
 			smallSnap, _ := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: small, Current: 1,
-			}, false)
+			}, false, false)
 			smallList, _ := protocol.PackGoroutines(small, false)
 			Expect(goroutineIDs(smallSnap.Goroutines)).To(Equal(goroutineIDs(smallList.Goroutines)))
 		})
@@ -226,7 +226,7 @@ var _ = Describe("goroutine event packing", func() {
 			}
 			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: gs, Threads: packThreads(16), Current: 1,
-			}, false)
+			}, false, false)
 
 			Expect(report.Degraded).To(BeFalse())
 			Expect(out.Goroutines).NotTo(BeEmpty())
@@ -251,7 +251,7 @@ var _ = Describe("goroutine event packing", func() {
 
 			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: gs, Current: 1,
-			}, false)
+			}, false, false)
 
 			Expect(report.Degraded).To(BeFalse())
 			Expect(out.Goroutines).To(HaveLen(3998), "only the two huge elements are dropped")
@@ -267,7 +267,7 @@ var _ = Describe("goroutine event packing", func() {
 
 			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: gs, Threads: packThreads(4), Current: 1, Created: []int{9},
-			}, false)
+			}, false, false)
 
 			Expect(report.Degraded).To(BeTrue())
 			Expect(out.Goroutines).To(BeEmpty())
@@ -317,7 +317,7 @@ var _ = Describe("goroutine event packing", func() {
 
 		It("keeps everything one byte below the cap", func() {
 			snap := padTo(protocol.MaxGoroutineEventBytes - 1)
-			out, report := protocol.PackSnapshot(snap, false)
+			out, report := protocol.PackSnapshot(snap, false, false)
 
 			Expect(report.Degraded).To(BeFalse())
 			Expect(out.Goroutines).To(HaveLen(len(snap.Goroutines)))
@@ -327,7 +327,7 @@ var _ = Describe("goroutine event packing", func() {
 
 		It("keeps everything exactly at the cap", func() {
 			snap := padTo(protocol.MaxGoroutineEventBytes)
-			out, report := protocol.PackSnapshot(snap, false)
+			out, report := protocol.PackSnapshot(snap, false, false)
 
 			Expect(report.Degraded).To(BeFalse())
 			Expect(out.Goroutines).To(HaveLen(len(snap.Goroutines)), "the cap is inclusive")
@@ -337,7 +337,7 @@ var _ = Describe("goroutine event packing", func() {
 
 		It("drops exactly one element one byte above the cap", func() {
 			snap := padTo(protocol.MaxGoroutineEventBytes + 1)
-			out, report := protocol.PackSnapshot(snap, false)
+			out, report := protocol.PackSnapshot(snap, false, false)
 
 			Expect(report.Degraded).To(BeFalse())
 			Expect(out.Goroutines).To(HaveLen(len(snap.Goroutines) - 1))
@@ -362,7 +362,7 @@ var _ = Describe("goroutine event packing", func() {
 				created = append(created, math.MaxInt64-i)
 			}
 			snap.Created = created
-			over, _ := protocol.PackSnapshot(snap, false)
+			over, _ := protocol.PackSnapshot(snap, false, false)
 			Expect(len(over.Goroutines)).To(BeNumerically("<=", 2))
 			Expect(eventBytes(protocol.EventGoroutineSnapshot, over)).
 				To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
@@ -395,7 +395,7 @@ var _ = Describe("goroutine event packing", func() {
 			}
 			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: gs, Current: 40,
-			}, false)
+			}, false, false)
 
 			Expect(report.Degraded).To(BeFalse())
 			ids := goroutineIDs(out.Goroutines)
@@ -413,7 +413,7 @@ var _ = Describe("goroutine event packing", func() {
 			gs := chain(600, 4096)
 			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: gs, Current: 600,
-			}, false)
+			}, false, false)
 
 			Expect(report.Degraded).To(BeTrue())
 			Expect(out.Goroutines).To(BeEmpty())
@@ -452,7 +452,7 @@ var _ = Describe("goroutine event packing", func() {
 			gs := chain(protocol.MaxSnapshotGoroutines+1, 0)
 			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: gs, Current: protocol.MaxSnapshotGoroutines + 1,
-			}, false)
+			}, false, false)
 
 			Expect(report.Degraded).To(BeTrue())
 			Expect(out.Goroutines).To(BeEmpty())
@@ -462,7 +462,7 @@ var _ = Describe("goroutine event packing", func() {
 			gs := chain(protocol.MaxSnapshotGoroutines, 0)
 			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: gs, Current: protocol.MaxSnapshotGoroutines,
-			}, false)
+			}, false, false)
 
 			Expect(report.Degraded).To(BeFalse())
 			Expect(out.Goroutines).To(HaveLen(protocol.MaxSnapshotGoroutines))
@@ -499,7 +499,7 @@ var _ = Describe("goroutine event packing", func() {
 				},
 				Threads: []protocol.Thread{},
 				Current: 1,
-			}, false)
+			}, false, false)
 		}
 
 		DescribeTable("accepts a string exactly at the limit",
@@ -564,7 +564,7 @@ var _ = Describe("goroutine event packing", func() {
 				},
 				Threads: []protocol.Thread{},
 				Current: 1,
-			}, false)
+			}, false, false)
 
 			Expect(report.Degraded).To(BeTrue(), "an anchor cannot be skipped")
 			Expect(out.Goroutines).To(BeEmpty())
@@ -578,7 +578,7 @@ var _ = Describe("goroutine event packing", func() {
 				},
 				Threads: []protocol.Thread{},
 				Current: 2,
-			}, false)
+			}, false, false)
 
 			Expect(report.Degraded).To(BeTrue())
 			Expect(out.Goroutines).To(BeEmpty())
@@ -604,7 +604,7 @@ var _ = Describe("goroutine event packing", func() {
 					{ID: 12, MID: 2},
 				},
 				Current: 1,
-			}, false)
+			}, false, false)
 			Expect(report.Degraded).To(BeFalse())
 			Expect(threadMIDs(out.Threads)).To(Equal([]int{0, 2}))
 
@@ -612,7 +612,7 @@ var _ = Describe("goroutine event packing", func() {
 				Goroutines: []protocol.Goroutine{{ID: 1, Status: "running", Current: true}},
 				Threads:    []protocol.Thread{{ID: 10, MID: 0, Current: true, CurrentLoc: long}},
 				Current:    1,
-			}, false)
+			}, false, false)
 			Expect(currentBad.Degraded).To(BeTrue())
 		})
 
@@ -644,7 +644,7 @@ var _ = Describe("goroutine event packing", func() {
 
 			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: gs, Threads: ts, Current: 1,
-			}, false)
+			}, false, false)
 
 			Expect(report.Degraded).To(BeFalse())
 			Expect(out.Goroutines).NotTo(BeEmpty())
@@ -669,7 +669,7 @@ var _ = Describe("goroutine event packing", func() {
 			// 8000 -> 4000 -> 2000 -> 1000 -> ... -> 1 by the i/2 parent rule.
 			out, _ := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: gs, Current: 8000,
-			}, false)
+			}, false, false)
 
 			ids := goroutineIDs(out.Goroutines)
 			Expect(ids[0]).To(Equal(8000))
@@ -693,7 +693,7 @@ var _ = Describe("goroutine event packing", func() {
 			ts[63].Current = true
 			out, _ := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: packGoroutines(8192), Threads: ts, Current: 1,
-			}, false)
+			}, false, false)
 
 			Expect(out.Threads[0].MID).To(Equal(63))
 			Expect(out.Threads[0].Current).To(BeTrue())
@@ -703,8 +703,8 @@ var _ = Describe("goroutine event packing", func() {
 			snap := protocol.GoroutineSnapshotPayload{
 				Goroutines: packGoroutines(8192), Threads: packThreads(64), Current: 4096,
 			}
-			first, firstReport := protocol.PackSnapshot(snap, false)
-			second, secondReport := protocol.PackSnapshot(snap, false)
+			first, firstReport := protocol.PackSnapshot(snap, false, false)
+			second, secondReport := protocol.PackSnapshot(snap, false, false)
 
 			firstRaw, err := json.Marshal(first)
 			Expect(err).NotTo(HaveOccurred())
@@ -749,7 +749,7 @@ var _ = Describe("goroutine event packing", func() {
 				Goroutines: []protocol.Goroutine{{ID: 1, Status: "running", Current: true}},
 				Threads:    lean,
 				Current:    1,
-			}, false)
+			}, false, false)
 
 			Expect(out.Threads).To(HaveLen(protocol.MaxSnapshotThreads))
 			Expect(report.Bytes).To(BeNumerically("<", protocol.MaxGoroutineEventBytes))
@@ -763,7 +763,7 @@ var _ = Describe("goroutine event packing", func() {
 					Goroutines: packGoroutines(1500),
 					Threads:    packThreads(threads),
 					Current:    1,
-				}, false)
+				}, false, false)
 
 				Expect(out.Threads).To(HaveLen(threads))
 				Expect(out.Goroutines).To(HaveLen(1500))
@@ -781,7 +781,7 @@ var _ = Describe("goroutine event packing", func() {
 				Goroutines: packGoroutines(8192),
 				Threads:    packThreads(64),
 				Current:    1,
-			}, false)
+			}, false, false)
 
 			Expect(len(out.Threads)).To(BeNumerically(">=", protocol.MinThreadsRetained))
 			Expect(threadMIDs(out.Threads)[:protocol.MinThreadsRetained]).
@@ -795,7 +795,7 @@ var _ = Describe("goroutine event packing", func() {
 				Goroutines: packGoroutines(100),
 				Threads:    packThreads(300),
 				Current:    1,
-			}, false)
+			}, false, false)
 
 			Expect(out.Threads).To(HaveLen(300))
 		})
@@ -805,7 +805,7 @@ var _ = Describe("goroutine event packing", func() {
 		It("is absent on a complete unclipped snapshot", func() {
 			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: packGoroutines(10), Threads: packThreads(4), Current: 1,
-			}, false)
+			}, false, false)
 
 			Expect(out.Totals).To(BeNil())
 			Expect(report.Omitted()).To(BeFalse())
@@ -820,12 +820,13 @@ var _ = Describe("goroutine event packing", func() {
 		It("is present with original counts when the snapshot omits elements", func() {
 			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: packGoroutines(8192), Threads: packThreads(64), Current: 1,
-			}, false)
+			}, false, false)
 
 			Expect(out.Totals).NotTo(BeNil())
 			Expect(out.Totals.Goroutines).To(Equal(8192))
 			Expect(out.Totals.Threads).To(Equal(64))
-			Expect(out.Totals.Clipped).To(BeFalse())
+			Expect(out.Totals.GoroutinesClipped).To(BeFalse())
+			Expect(out.Totals.ThreadsClipped).To(BeFalse())
 			Expect(report.Omitted()).To(BeTrue())
 		})
 
@@ -837,21 +838,70 @@ var _ = Describe("goroutine event packing", func() {
 			Expect(out.Totals.Threads).To(BeZero(), "this shape carries no threads")
 		})
 
-		It("is present on a complete snapshot when the scan was clipped", func() {
+		It("is present on a complete snapshot when a scan was clipped", func() {
 			out, _ := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: packGoroutines(10), Threads: packThreads(4), Current: 1,
-			}, true)
+			}, true, true)
 
 			Expect(out.Totals).NotTo(BeNil())
-			Expect(out.Totals.Clipped).To(BeTrue())
+			Expect(out.Totals.GoroutinesClipped).To(BeTrue())
 			Expect(out.Totals.Goroutines).To(Equal(10), "a lower bound, flagged as such")
+		})
+
+		DescribeTable("reports each scan's clipping independently",
+			func(goroutinesClipped, threadsClipped bool) {
+				out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+					Goroutines: packGoroutines(10), Threads: packThreads(4), Current: 1,
+				}, goroutinesClipped, threadsClipped)
+
+				if !goroutinesClipped && !threadsClipped {
+					Expect(out.Totals).To(BeNil(), "a complete unclipped result sends nothing")
+					Expect(report.Totals.AnyClipped()).To(BeFalse())
+					return
+				}
+				Expect(out.Totals).NotTo(BeNil())
+				Expect(out.Totals.GoroutinesClipped).To(Equal(goroutinesClipped))
+				Expect(out.Totals.ThreadsClipped).To(Equal(threadsClipped))
+				// The counts stay exact scanned totals either way; only the
+				// flags say which of them is a floor.
+				Expect(out.Totals.Goroutines).To(Equal(10))
+				Expect(out.Totals.Threads).To(Equal(4))
+				Expect(report.Totals.AnyClipped()).To(BeTrue())
+			},
+			Entry("neither", false, false),
+			Entry("goroutines only", true, false),
+			Entry("threads only", false, true),
+			Entry("both", true, true),
+		)
+
+		It("carries only the goroutine flag in the flat list shape", func() {
+			clipped, _ := protocol.PackGoroutines(packGoroutines(10), true)
+			Expect(clipped.Totals).NotTo(BeNil())
+			Expect(clipped.Totals.GoroutinesClipped).To(BeTrue())
+			Expect(clipped.Totals.ThreadsClipped).To(BeFalse(), "this shape has no threads")
+			Expect(clipped.Totals.Threads).To(BeZero())
+
+			plain, _ := protocol.PackGoroutines(packGoroutines(10), false)
+			Expect(plain.Totals).To(BeNil())
+		})
+
+		It("sends totals when only the thread scan clipped", func() {
+			// The regression a single shared flag hides: nothing was omitted and
+			// the goroutine count is exact, but the thread count is not.
+			out, _ := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+				Goroutines: packGoroutines(10), Threads: packThreads(4), Current: 1,
+			}, false, true)
+
+			Expect(out.Totals).NotTo(BeNil())
+			Expect(out.Totals.GoroutinesClipped).To(BeFalse())
+			Expect(out.Totals.ThreadsClipped).To(BeTrue())
 		})
 
 		It("is present on a complete goroutine list when the scan was clipped", func() {
 			out, _ := protocol.PackGoroutines(packGoroutines(10), true)
 
 			Expect(out.Totals).NotTo(BeNil())
-			Expect(out.Totals.Clipped).To(BeTrue())
+			Expect(out.Totals.GoroutinesClipped).To(BeTrue())
 		})
 	})
 
@@ -865,7 +915,7 @@ var _ = Describe("goroutine event packing", func() {
 				Current:    1,
 				Created:    created,
 				Exited:     exited,
-			}, false)
+			}, false, false)
 
 			Expect(out.Created).To(Equal(created))
 			Expect(out.Exited).To(Equal(exited))
@@ -884,7 +934,7 @@ var _ = Describe("goroutine event packing", func() {
 			}
 			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: gs, Current: 1, Created: created,
-			}, false)
+			}, false, false)
 
 			Expect(report.Degraded).To(BeTrue())
 			Expect(report.Oversized).To(BeFalse())
@@ -909,7 +959,7 @@ var _ = Describe("goroutine event packing", func() {
 				Current:    1,
 				Created:    created,
 				Exited:     exited,
-			}, false)
+			}, false, false)
 
 			Expect(report.Degraded).To(BeFalse())
 			Expect(report.Oversized).To(BeFalse())
@@ -935,7 +985,7 @@ var _ = Describe("goroutine event packing", func() {
 				Current:    1,
 				Created:    created,
 				Exited:     exited,
-			}, false)
+			}, false, false)
 
 			Expect(report.Oversized).To(BeFalse())
 			Expect(report.Degraded).To(BeFalse())
@@ -956,7 +1006,7 @@ var _ = Describe("goroutine event packing", func() {
 				Goroutines: []protocol.Goroutine{{ID: 1, Status: "running", Current: true}},
 				Current:    1,
 				Created:    created,
-			}, false)
+			}, false, false)
 
 			Expect(report.Oversized).To(BeTrue())
 			Expect(out.Created).To(HaveLen(protocol.MaxLifecycleDeltaIDs+1), "never trimmed")
@@ -981,7 +1031,7 @@ var _ = Describe("goroutine event packing", func() {
 			}
 			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: packGoroutines(4), Current: 1, Created: created,
-			}, false)
+			}, false, false)
 
 			Expect(report.Degraded).To(BeTrue())
 			Expect(report.Oversized).To(BeTrue())
@@ -997,7 +1047,7 @@ var _ = Describe("goroutine event packing", func() {
 			protocol.ResetPackMarshalCounts()
 			protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: gs, Threads: ts, Current: 1,
-			}, false)
+			}, false, false)
 			elements, envelopes := protocol.PackMarshalCounts()
 
 			Expect(elements).To(BeNumerically("<=", 2*(len(gs)+len(ts))))
@@ -1044,7 +1094,7 @@ var _ = Describe("goroutine event packing", func() {
 
 	Describe("empty and degenerate inputs", func() {
 		It("packs an empty snapshot without degrading", func() {
-			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{}, false)
+			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{}, false, false)
 
 			Expect(report.Degraded).To(BeFalse())
 			Expect(out.Goroutines).To(BeEmpty())
@@ -1057,7 +1107,7 @@ var _ = Describe("goroutine event packing", func() {
 			synthetic := []protocol.Goroutine{{ID: 1, Status: "waiting", Current: true}}
 			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: synthetic,
-			}, false)
+			}, false, false)
 
 			Expect(report.Degraded).To(BeFalse())
 			Expect(out.Goroutines).To(Equal(synthetic))
@@ -1069,7 +1119,7 @@ var _ = Describe("goroutine event packing", func() {
 		It("survives the wire with totals", func() {
 			out, _ := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 				Goroutines: packGoroutines(8192), Threads: packThreads(64), Current: 1,
-			}, true)
+			}, true, true)
 
 			evt := protocol.MustEvent(protocol.EventGoroutineSnapshot, 7, out)
 			raw, err := protocol.MarshalEvent(evt)
@@ -1081,7 +1131,7 @@ var _ = Describe("goroutine event packing", func() {
 			Expect(protocol.DecodeEventPayload(decodedEvent, &decoded)).To(Succeed())
 			Expect(decoded.Totals).NotTo(BeNil())
 			Expect(decoded.Totals.Goroutines).To(Equal(8192))
-			Expect(decoded.Totals.Clipped).To(BeTrue())
+			Expect(decoded.Totals.GoroutinesClipped).To(BeTrue())
 			Expect(goroutineIDs(decoded.Goroutines)).To(Equal(goroutineIDs(out.Goroutines)))
 		})
 

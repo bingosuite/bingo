@@ -143,17 +143,27 @@ type FramesPayload struct {
 // collections, so a consumer can say "showing 5,000 of 41,203" instead of
 // quietly presenting a truncated set as the whole truth.
 //
-// It is present exactly when the wire omits elements or the runtime scan was
+// It is present exactly when the wire omits elements or a runtime scan was
 // clipped, and absent on a complete, unclipped result — so its mere presence
 // means "what you received is not everything".
 //
-// Clipped means the debugger's runtime walk hit its own scan ceiling before
-// packing even started, which makes Goroutines a LOWER BOUND rather than an
-// exact count. A consumer must render it as such.
+// The clipped flags are PER COLLECTION because the debugger walks goroutines and
+// threads under independent ceilings (maxGoroutineScan and maxThreadScan). A
+// single shared flag cannot say which one fired, so a consumer would have to
+// guess — marking an exact count as approximate, or an approximate one as exact.
+// Each flag means only "this count is a lower bound"; the counts themselves are
+// always the original scanned totals.
 type SnapshotTotals struct {
-	Goroutines int  `json:"goroutines,omitempty"`
-	Threads    int  `json:"threads,omitempty"`
-	Clipped    bool `json:"clipped,omitempty"`
+	Goroutines        int  `json:"goroutines,omitempty"`
+	Threads           int  `json:"threads,omitempty"`
+	GoroutinesClipped bool `json:"goroutinesClipped,omitempty"`
+	ThreadsClipped    bool `json:"threadsClipped,omitempty"`
+}
+
+// AnyClipped reports whether either scan stopped early, which is what makes
+// Totals worth sending even when nothing was dropped in packing.
+func (t SnapshotTotals) AnyClipped() bool {
+	return t.GoroutinesClipped || t.ThreadsClipped
 }
 
 type GoroutinesPayload struct {
