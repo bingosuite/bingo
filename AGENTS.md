@@ -1180,6 +1180,12 @@ polling has no lifecycle effect. Positive idle durations below `1ms` or with a
 fractional millisecond are rejected so the timer and integer `timeoutMs` field
 always describe the exact same interval.
 
+**Listener safety.** The CLI and `just server` defaults bind management,
+WebSocket, and DAP endpoints to explicit IPv4 loopback. The protocols do not
+authenticate clients, and WebSocket clients without an `Origin` header are
+valid, so never restore wildcard defaults. Operators may explicitly choose a
+non-loopback address for trusted-network or externally authenticated setups.
+
 **Connect-or-start and ownership.** A frontend health-checks the known
 management address and reuses a compatible process; otherwise it starts bingo
 and lets listener binding arbitrate concurrent startup attempts. Frontends
