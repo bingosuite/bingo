@@ -267,3 +267,48 @@ func TestStepQueueCountsEveryPark(t *testing.T) {
 		t.Fatalf("after drain and purge: parkedCount = %d, want 2 (cumulative)", got)
 	}
 }
+
+// TestStepQueueCountsHeldSignalsSeparately pins the observable the native pause
+// spec relies on: a held asynchronous interrupt must be distinguishable from a
+// held sibling trap. Without the split counter the spec cannot tell "Pause
+// raced an in-flight step" from "a sibling happened to trap during one".
+func TestStepQueueCountsHeldSignalsSeparately(t *testing.T) {
+	const (
+		stepped = 41
+		foreign = 42
+	)
+
+	var q stepQueue
+	q.beginStep(stepped)
+
+	if got := q.parkedSignalCount(); got != 0 {
+		t.Fatalf("parkedSignalCount() = %d on a fresh queue, want 0", got)
+	}
+
+	q.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
+	if got := q.parkedSignalCount(); got != 0 {
+		t.Fatalf("parkedSignalCount() = %d after a held breakpoint, want 0 — a trap must not count as an interrupt", got)
+	}
+	if got := q.parkedCount(); got != 1 {
+		t.Fatalf("parkedCount() = %d, want 1", got)
+	}
+
+	q.park(StopEvent{Reason: StopSignal, TID: foreign, Signal: 19})
+	if got := q.parkedSignalCount(); got != 1 {
+		t.Fatalf("parkedSignalCount() = %d after a held signal, want 1", got)
+	}
+	if got := q.parkedCount(); got != 2 {
+		t.Fatalf("parkedCount() = %d, want 2 — the total must still count both", got)
+	}
+
+	// Counters are cumulative: draining and purging must not roll them back, or
+	// the spec's non-vaciuty gate could be reset to zero by ordinary progress.
+	q.endStep()
+	if _, ok := q.releasable(); !ok {
+		t.Fatal("releasable() withheld a stop after the step ended")
+	}
+	q.purge()
+	if got := q.parkedSignalCount(); got != 1 {
+		t.Fatalf("parkedSignalCount() = %d after drain+purge, want the cumulative 1", got)
+	}
+}

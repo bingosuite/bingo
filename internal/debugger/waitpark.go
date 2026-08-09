@@ -83,6 +83,11 @@ type stepQueue struct {
 	// Atomic because that test reads it through a public hook from its own
 	// goroutine (see park_diag_linux_amd64.go).
 	parkedTotal atomic.Int64
+
+	// parkedSignalTotal counts the subset of those that were signal stops, so
+	// the same test can distinguish a held asynchronous interrupt from a held
+	// sibling trap. Atomic for the same reason.
+	parkedSignalTotal atomic.Int64
 }
 
 // park holds a foreign stop until the in-flight step completes. It deliberately
@@ -91,11 +96,25 @@ type stepQueue struct {
 func (q *stepQueue) park(ev StopEvent) {
 	q.parked = append(q.parked, ev)
 	q.parkedTotal.Add(1)
+	if ev.Reason == StopSignal {
+		q.parkedSignalTotal.Add(1)
+	}
 }
 
 // parkedCount reports how many stops have been held back over the backend's
 // lifetime.
 func (q *stepQueue) parkedCount() int { return int(q.parkedTotal.Load()) }
+
+// parkedSignalCount reports how many of those held stops were signal stops
+// rather than breakpoint traps.
+//
+// It is split out because it is the only observable that distinguishes "an
+// asynchronous interrupt reached the backend while a step was in flight" from
+// "a sibling happened to trap". The linux wait loop absorbs SIGURG, SIGCONT and
+// a new thread's initial SIGSTOP before classification, so a parked signal stop
+// is a genuine externally-directed interrupt — in practice the SIGSTOP that
+// Pause sends at the main thread.
+func (q *stepQueue) parkedSignalCount() int { return int(q.parkedSignalTotal.Load()) }
 
 // releasable pops the oldest held stop if one may be surfaced now.
 //
