@@ -465,19 +465,27 @@ func (c *wsClient) StackFrames() ([]protocol.Frame, error) {
 }
 
 func (c *wsClient) Goroutines() ([]protocol.Goroutine, error) {
-	cmd, err := newCommand(protocol.CmdGoroutines, struct{}{})
+	p, err := c.GoroutineList()
 	if err != nil {
 		return nil, err
+	}
+	return p.Goroutines, nil
+}
+
+func (c *wsClient) GoroutineList() (protocol.GoroutinesPayload, error) {
+	cmd, err := newCommand(protocol.CmdGoroutines, struct{}{})
+	if err != nil {
+		return protocol.GoroutinesPayload{}, err
 	}
 	evt, err := c.sendAndWait(cmd, protocol.EventGoroutines)
 	if err != nil {
-		return nil, err
+		return protocol.GoroutinesPayload{}, err
 	}
 	var p protocol.GoroutinesPayload
 	if err := protocol.DecodeEventPayload(evt, &p); err != nil {
-		return nil, fmt.Errorf("decode Goroutines: %w", err)
+		return protocol.GoroutinesPayload{}, fmt.Errorf("decode Goroutines: %w", err)
 	}
-	return p.Goroutines, nil
+	return p, nil
 }
 
 // RequestGoroutineSnapshot sends CmdGoroutineSnapshot and returns once it is on

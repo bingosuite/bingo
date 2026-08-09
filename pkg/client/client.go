@@ -56,7 +56,20 @@ type Client interface {
 	Evaluate(frameIndex int, name string) (protocol.Variable, error)
 
 	StackFrames() ([]protocol.Frame, error)
+
+	// Goroutines blocks until the server returns the goroutine list. The list
+	// is BOUNDED by the wire contract, so on a highly concurrent target it can
+	// be a subset — use GoroutineList when you need to know that, and how much
+	// was left out. Kept returning a bare slice so existing callers are
+	// unaffected.
 	Goroutines() ([]protocol.Goroutine, error)
+
+	// GoroutineList is Goroutines plus the honesty channel: the payload's
+	// Totals carry the debugger's ORIGINAL counts and whether either runtime
+	// scan stopped early, so a caller can report "showing N of M" instead of
+	// presenting a bounded list as the whole runtime. Totals is nil exactly
+	// when the list is complete and neither scan clipped.
+	GoroutineList() (protocol.GoroutinesPayload, error)
 
 	// RequestGoroutineSnapshot asks the server for a full concurrency snapshot.
 	// Fire-and-forget like Pause: it returns as soon as the command is sent.

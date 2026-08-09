@@ -55,7 +55,7 @@ func TestFullSnapshotNextRendersOnceThenSummarises(t *testing.T) {
 
 	fullSnapshotNext.Store(true)
 	full := captureStdout(t, func() { printEvent(testSnapshotEvent(t, 2)) })
-	if !strings.Contains(full, "goroutines: 2  threads: 1  current: G1") {
+	if !strings.Contains(full, "goroutines: 2 live  threads: 1 live  current: G1") {
 		t.Fatalf("requested snapshot render = %q, want the full view", full)
 	}
 	if !strings.Contains(full, "created: [18]") {
@@ -66,10 +66,10 @@ func TestFullSnapshotNextRendersOnceThenSummarises(t *testing.T) {
 	}
 
 	summary := captureStdout(t, func() { printEvent(testSnapshotEvent(t, 3)) })
-	if !strings.Contains(summary, "[goroutines] 2 live, 1 threads, current G1") {
+	if !strings.Contains(summary, "[goroutines] 2 live, 1 live threads, current G1") {
 		t.Fatalf("automatic snapshot render = %q, want the summary line", summary)
 	}
-	if strings.Contains(summary, "goroutines: 2  threads: 1") {
+	if strings.Contains(summary, "goroutines: 2 live") {
 		t.Fatalf("automatic snapshot render = %q, want no full view", summary)
 	}
 }
@@ -94,5 +94,75 @@ func TestSnapshotErrorDisarmsFullRender(t *testing.T) {
 	summary := captureStdout(t, func() { printEvent(testSnapshotEvent(t, 3)) })
 	if !strings.Contains(summary, "[goroutines] 2 live") {
 		t.Fatalf("automatic snapshot render = %q, want the summary line", summary)
+	}
+}
+
+// TestCountOf pins the CLI's honesty contract. Goroutine events are bounded by
+// the wire contract, so printing the delivered length alone would state a
+// truncated event as the live truth. The two collections have independent scan
+// ceilings, so neither may borrow the other's lower-bound marker.
+func TestCountOf(t *testing.T) {
+	tests := []struct {
+		name   string
+		shown  int
+		totals *protocol.SnapshotTotals
+		which  collection
+		want   string
+	}{
+		{
+			name:  "complete list reports a live count",
+			shown: 12, totals: nil, which: totalGoroutines,
+			want: "12 live",
+		},
+		{
+			name:   "omitted goroutines report included out of total",
+			shown:  5000,
+			totals: &protocol.SnapshotTotals{Goroutines: 41203, Threads: 64},
+			which:  totalGoroutines,
+			want:   "5000 of 41203",
+		},
+		{
+			name:   "omitted threads report their own total",
+			shown:  32,
+			totals: &protocol.SnapshotTotals{Goroutines: 41203, Threads: 64},
+			which:  totalThreads,
+			want:   "32 of 64",
+		},
+		{
+			name:   "a clipped goroutine scan marks its total a floor",
+			shown:  10,
+			totals: &protocol.SnapshotTotals{Goroutines: 10, Threads: 4, GoroutinesClipped: true},
+			which:  totalGoroutines,
+			want:   "10 of 10+",
+		},
+		{
+			name:   "and does not mark the thread total",
+			shown:  4,
+			totals: &protocol.SnapshotTotals{Goroutines: 10, Threads: 4, GoroutinesClipped: true},
+			which:  totalThreads,
+			want:   "4 live",
+		},
+		{
+			name:   "a clipped thread scan marks only threads",
+			shown:  4,
+			totals: &protocol.SnapshotTotals{Goroutines: 10, Threads: 4, ThreadsClipped: true},
+			which:  totalThreads,
+			want:   "4 of 4+",
+		},
+		{
+			name:   "complete totals still read as live",
+			shown:  10,
+			totals: &protocol.SnapshotTotals{Goroutines: 10, Threads: 4},
+			which:  totalGoroutines,
+			want:   "10 live",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := countOf(tc.shown, tc.totals, tc.which); got != tc.want {
+				t.Errorf("countOf() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
