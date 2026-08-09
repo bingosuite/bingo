@@ -301,10 +301,12 @@ unrelated async events remain valid.
 `EventGoroutineSnapshot` is dual-purpose: it confirms `CmdGoroutineSnapshot`
 and is also pushed automatically after breakpoint, pause, and entry stops. A
 timed-out snapshot request is removed from the pending queue so it cannot consume
-the next unrelated telemetry snapshot. A genuinely late query reply therefore
-falls through to `Events()` too; the client cannot distinguish the two without
-wire correlation. The dependent snapshot/API cleanup removes this synchronous
-query surface rather than expanding the exception here.
+the next unrelated telemetry snapshot. This preserves the stream, not
+correlation: while the legacy synchronous API exists, a genuinely late query
+reply or an unrelated automatic push can still satisfy a later in-flight
+`GoroutineSnapshot` waiter; without a waiter, either falls through to `Events()`.
+Issue #187 and stacked PR #192 remove the synchronous query surface and that
+ambiguity rather than expanding the exception here.
 
 This is deliberately bounded by the id-less broadcast protocol. The queue
 preserves this client's ordered command stream; it cannot distinguish an

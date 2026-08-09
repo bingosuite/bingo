@@ -242,11 +242,12 @@ unrelated asynchronous events remain valid.
 `GoroutineSnapshot` is the temporary exception. Its confirmation event is also
 unsolicited telemetry emitted after breakpoint, pause, and entry stops, so a
 timed-out snapshot request is discarded instead of retired as debt. Otherwise
-the next auto-pushed snapshot would disappear into the retired query. A
-genuinely late query reply consequently reaches `Events()`; the id-less protocol
-cannot distinguish it from an automatic snapshot. The dependent snapshot/API
-cleanup removes this synchronous query rather than redesigning its semantics
-here.
+the next auto-pushed snapshot would disappear into the retired query. This
+preserves telemetry but cannot create correlation: while the legacy synchronous
+API exists, either a genuinely late query reply or an automatic push can satisfy
+a later in-flight snapshot waiter; with no waiter, either reaches `Events()`.
+Issue #187 and stacked PR #192 remove the synchronous query and that ambiguity
+rather than redesigning its semantics here.
 
 This fence covers only the serialized command stream sent by that client.
 Confirmation events carry no request ID and are broadcast to every client, so
