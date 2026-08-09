@@ -143,8 +143,10 @@ func (d *tableDebugger) Locals(int) ([]protocol.Variable, error) { return nil, n
 func (d *tableDebugger) Evaluate(int, string) (protocol.Variable, error) {
 	return protocol.Variable{}, nil
 }
-func (d *tableDebugger) StackFrames() ([]protocol.Frame, error)    { return nil, nil }
-func (d *tableDebugger) Goroutines() ([]protocol.Goroutine, error) { return nil, nil }
+func (d *tableDebugger) StackFrames() ([]protocol.Frame, error) { return nil, nil }
+func (d *tableDebugger) Goroutines() (protocol.GoroutinesPayload, error) {
+	return protocol.GoroutinesPayload{}, nil
+}
 func (d *tableDebugger) GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error) {
 	return protocol.GoroutineSnapshotPayload{}, nil
 }

@@ -46,7 +46,7 @@ type fakeDebugger struct {
 	localsResult     []protocol.Variable
 	evalResult       protocol.Variable
 	framesResult     []protocol.Frame
-	goroutinesResult []protocol.Goroutine
+	goroutinesResult protocol.GoroutinesPayload
 	snapshotResult   protocol.GoroutineSnapshotPayload
 }
 
@@ -122,7 +122,7 @@ func (f *fakeDebugger) StackFrames() ([]protocol.Frame, error) {
 	f.record("StackFrames")
 	return f.framesResult, nil
 }
-func (f *fakeDebugger) Goroutines() ([]protocol.Goroutine, error) {
+func (f *fakeDebugger) Goroutines() (protocol.GoroutinesPayload, error) {
 	f.record("Goroutines")
 	return f.goroutinesResult, nil
 }

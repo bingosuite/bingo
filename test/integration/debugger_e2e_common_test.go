@@ -742,9 +742,12 @@ func declareInspectSpec() {
 
 		grs, err := h.d.Goroutines()
 		Expect(err).NotTo(HaveOccurred(), "Goroutines")
-		Expect(len(grs)).To(BeNumerically(">=", 1), "at least one goroutine")
-		Expect(grs[0].CurrentLoc.Function).NotTo(BeEmpty(),
+		Expect(len(grs.Goroutines)).To(BeNumerically(">=", 1), "at least one goroutine")
+		Expect(grs.Goroutines[0].CurrentLoc.Function).NotTo(BeEmpty(),
 			"goroutine current location should resolve to a function")
+		// The on-demand query is packed too, not just the streamed snapshot.
+		Expect(len(grs.Goroutines)).To(BeNumerically("<=", protocol.MaxSnapshotGoroutines),
+			"goroutine list within the element cap")
 	})
 }
 
@@ -1108,6 +1111,31 @@ func declareConcurrencySpec() {
 			evt := h.waitFor(15*time.Second, protocol.EventGoroutineSnapshot)
 			var snap protocol.GoroutineSnapshotPayload
 			Expect(json.Unmarshal(evt.Payload, &snap)).To(Succeed(), "%s: decode snapshot", stop)
+
+			// Every auto-streamed snapshot must honour the wire contract. This
+			// is the only place it can be checked against a REAL runtime: the
+			// unit fakes have no DWARF, so they degrade to one goroutine and
+			// cannot tell a packed event from an unpacked one. See issue #194.
+			Expect(len(evt.Payload)).To(BeNumerically("<=", protocol.MaxGoroutineEventBytes),
+				"%s: snapshot payload within the byte budget", stop)
+			Expect(len(snap.Goroutines)).To(BeNumerically("<=", protocol.MaxSnapshotGoroutines),
+				"%s: goroutine count within the element cap", stop)
+			Expect(len(snap.Threads)).To(BeNumerically("<=", protocol.MaxSnapshotThreads),
+				"%s: thread count within the element cap", stop)
+			if snap.Current != 0 {
+				ids := make([]int, 0, len(snap.Goroutines))
+				for _, g := range snap.Goroutines {
+					ids = append(ids, g.ID)
+				}
+				Expect(ids).To(ContainElement(snap.Current),
+					"%s: current goroutine must be delivered", stop)
+			}
+			if snap.Totals != nil {
+				Expect(snap.Totals.Goroutines).To(BeNumerically(">=", len(snap.Goroutines)),
+					"%s: totals cannot be below what arrived", stop)
+				Expect(snap.Totals.Threads).To(BeNumerically(">=", len(snap.Threads)),
+					"%s: thread totals cannot be below what arrived", stop)
+			}
 			return snap
 		}
 

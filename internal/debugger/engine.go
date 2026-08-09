@@ -566,8 +566,8 @@ func (e *engine) StackFrames() ([]protocol.Frame, error) {
 	return frames, err
 }
 
-func (e *engine) Goroutines() ([]protocol.Goroutine, error) {
-	var goroutines []protocol.Goroutine
+func (e *engine) Goroutines() (protocol.GoroutinesPayload, error) {
+	var goroutines protocol.GoroutinesPayload
 	err := e.dispatch(func() error {
 		if err := e.requireSuspended(); err != nil {
 			return err

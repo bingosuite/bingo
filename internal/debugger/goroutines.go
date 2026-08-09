@@ -968,43 +968,95 @@ func (e *engine) syntheticGoroutine(livePC uint64) protocol.Goroutine {
 // degradedSnapshot is the single construction point for an incomplete runtime
 // walk. Downstream reporting must describe every such snapshot as degraded,
 // regardless of whether goroutine or thread traversal failed.
-func (e *engine) degradedSnapshot(livePC uint64) protocol.GoroutineSnapshotPayload {
-	return protocol.GoroutineSnapshotPayload{
-		Goroutines: []protocol.Goroutine{e.syntheticGoroutine(livePC)},
-	}
+//
+// It is packed like any other snapshot even though a single goroutine cannot
+// approach the byte budget: the contract also caps per-element strings, and
+// this one's location comes from DWARF like any other. Every path that emits a
+// goroutine event goes through the packer, so none can produce something a
+// conforming consumer must reject.
+//
+// Both counts are marked lower bounds. Absent totals mean "complete and exact",
+// which this emphatically is not: the stand-in is what we show when the runtime
+// could NOT be read, so claiming the runtime holds exactly one goroutine and no
+// threads would be the same class of overclaim the totals exist to prevent.
+// "At least one" is true whether the runtime is merely not up yet or a scan
+// failed partway.
+func (e *engine) degradedSnapshot(livePC uint64) (protocol.GoroutineSnapshotPayload, protocol.Goroutine) {
+	stand := e.syntheticGoroutine(livePC)
+	packed, _ := packForWire(protocol.GoroutineSnapshotPayload{
+		Goroutines: []protocol.Goroutine{stand},
+	}, true, true)
+	return packed, stand
 }
 
 // readGoroutines returns the live goroutine set, falling back to a single
 // synthetic goroutine when the runtime can't be read. This backs the on-demand
 // Goroutines() query and the DAP threads list.
-func (e *engine) readGoroutines() ([]protocol.Goroutine, error) {
+//
+// The list is packed to the wire contract before it leaves: an unbounded list is
+// the bug in issue #194, and a consumer that enforces the contract would have to
+// reject it. Packing preserves the current goroutine and reports the original
+// count, so a truncated list is still honest about its scale.
+func (e *engine) readGoroutines() (protocol.GoroutinesPayload, error) {
 	tid, sp, pc, currentGptr := e.liveRegisters()
 	result := e.buildGoroutineList(sp, pc, currentGptr, tid)
-	if result.Complete {
-		return result.Items, nil
+	gs, clipped := result.Items, result.Clipped
+	if !result.Complete {
+		// Lower bound, not an exact count: the stand-in stands for a runtime we
+		// could not read. See goroutineSnapshot's degraded branch.
+		gs, clipped = []protocol.Goroutine{e.syntheticGoroutine(pc)}, true
 	}
-	return []protocol.Goroutine{e.syntheticGoroutine(pc)}, nil
+	packed, report := protocol.PackGoroutines(gs, clipped)
+	if report.Oversized {
+		e.log.Warn("goroutine list exceeds the wire contract",
+			"bytes", report.Bytes, "goroutines", report.Totals.Goroutines)
+	}
+	return packed, nil
 }
 
-// goroutineSnapshot builds the automatic stop snapshot: the full concurrency
-// picture plus the created/exited deltas against the previous automatic
-// snapshot, adopting the new live set as the next baseline. Only the automatic
-// stops (entry, breakpoint hit, pause) own that baseline. Runs on the engine
-// loop thread; prevGoids needs no synchronization.
+// packForWire bounds a snapshot for delivery. It is deliberately the ONLY thing
+// packing decides: what may be delivered. The stop's identity is chosen from the
+// pre-pack scan by the caller and never read back out of the result, because
+// packing may legitimately degrade to empty collections when the required
+// anchors alone cannot satisfy the byte, count or string contract — at which
+// point the packed payload names no goroutine at all.
+func packForWire(in protocol.GoroutineSnapshotPayload, goroutinesClipped, threadsClipped bool) (protocol.GoroutineSnapshotPayload, protocol.GoroutinePackReport) {
+	return protocol.PackSnapshot(in, goroutinesClipped, threadsClipped)
+}
+
+// goroutineSnapshot builds the automatic stop snapshot and adopts its complete
+// live set as the next lifecycle baseline.
 func (e *engine) goroutineSnapshot() protocol.GoroutineSnapshotPayload {
+	packed, _ := e.buildSnapshot(true)
+	return packed
+}
+
+// goroutineSnapshotQuery is a pure observation: it emits no lifecycle deltas and
+// leaves prevGoids untouched, so a refresh cannot consume the next stop's delta.
+func (e *engine) goroutineSnapshotQuery() protocol.GoroutineSnapshotPayload {
+	packed, _ := e.buildSnapshot(false)
+	return packed
+}
+
+// snapshotWithCurrent is the automatic-stop path for callers that also need the
+// stopped goroutine's identity independently of the delivery bound.
+func (e *engine) snapshotWithCurrent() (protocol.GoroutineSnapshotPayload, protocol.Goroutine) {
 	return e.buildSnapshot(true)
 }
 
-// goroutineSnapshotQuery answers an on-demand CmdGoroutineSnapshot. It reports
-// the same live picture but is a pure observation: Created/Exited stay empty and
-// prevGoids is untouched, so a refresh between two stops cannot consume the
-// deltas the next automatic snapshot must report (they are only remembered
-// once, in prevGoids, and would otherwise be lost).
-func (e *engine) goroutineSnapshotQuery() protocol.GoroutineSnapshotPayload {
-	return e.buildSnapshot(false)
-}
-
-func (e *engine) buildSnapshot(trackLifecycle bool) protocol.GoroutineSnapshotPayload {
+// buildSnapshot reads both runtime collections completely before it can adopt a
+// lifecycle baseline, then returns the packed payload alongside the stop's
+// identity from the full pre-pack scan.
+//
+// The payload and the identity are deliberately separate. Packing bounds what
+// may be DELIVERED, and can legitimately degrade to empty collections when the
+// required anchors alone cannot fit the byte, count or string contract. Reading
+// the current goroutine back out of the packed payload would then lose the
+// stop's identity entirely — the breakpoint or pause event would name no
+// goroutine, and a DAP client would fall back to a synthetic thread while the
+// debugger knew exactly where it was stopped. A producer-side delivery cap must
+// never erase what the stop is.
+func (e *engine) buildSnapshot(trackLifecycle bool) (protocol.GoroutineSnapshotPayload, protocol.Goroutine) {
 	tid, sp, pc, currentGptr := e.liveRegisters()
 
 	goroutines := e.buildGoroutineList(sp, pc, currentGptr, tid)
@@ -1015,17 +1067,49 @@ func (e *engine) buildSnapshot(trackLifecycle bool) protocol.GoroutineSnapshotPa
 		return e.degradedSnapshot(pc)
 	}
 
-	live, current := snapshotGoroutineIDs(goroutines.Items, goroutines.AnchorID)
+	_, current := snapshotGoroutineIDs(goroutines.Items, goroutines.AnchorID)
 	threads := e.readThreads(current, pc)
 	if !threads.Complete {
+		// An incomplete thread walk degrades the whole snapshot, so the deltas
+		// must not run: diffing against a runtime we only partially read would
+		// adopt a truncated live set as the next baseline.
 		return e.degradedSnapshot(pc)
 	}
-	return e.snapshotFrom(goroutines.Items, threads.Items, current, live, trackLifecycle)
+	return e.finishSnapshot(goroutines, threads, pc, trackLifecycle)
 }
 
-// snapshotFrom assembles a payload after both runtime walks have completed.
-// trackLifecycle is the single point where an automatic snapshot's ownership of
-// the lifecycle baseline differs from a query's read-only view.
+// finishSnapshot resolves identity and lifecycle from complete scans before
+// packing decides which elements may leave the engine.
+func (e *engine) finishSnapshot(
+	goroutines goroutineWalkResult,
+	threads threadWalkResult,
+	pc uint64,
+	trackLifecycle bool,
+) (protocol.GoroutineSnapshotPayload, protocol.Goroutine) {
+	live, current := snapshotGoroutineIDs(goroutines.Items, goroutines.AnchorID)
+	currentG := currentGoroutineOf(goroutines.Items)
+	if !currentG.Current {
+		currentG = e.syntheticGoroutine(pc)
+	}
+
+	snap := protocol.GoroutineSnapshotPayload{
+		Goroutines: goroutines.Items,
+		Threads:    threads.Items,
+		Current:    current,
+	}
+	if trackLifecycle {
+		snap.Created, snap.Exited = e.diffGoids(live)
+	}
+	packed, report := packForWire(snap, goroutines.Clipped, threads.Clipped)
+	if report.Degraded || report.Oversized {
+		e.log.Warn("goroutine snapshot could not be packed within the wire contract",
+			"bytes", report.Bytes, "degraded", report.Degraded, "oversized", report.Oversized,
+			"goroutines", report.Totals.Goroutines, "threads", report.Totals.Threads)
+	}
+	return packed, currentG
+}
+
+// snapshotFrom is the complete-scan seam used by lifecycle ownership tests.
 func (e *engine) snapshotFrom(
 	gs []protocol.Goroutine,
 	threads []protocol.Thread,
@@ -1041,7 +1125,19 @@ func (e *engine) snapshotFrom(
 	if trackLifecycle {
 		snap.Created, snap.Exited = e.diffGoids(live)
 	}
-	return snap
+	packed, _ := packForWire(snap, false, false)
+	return packed
+}
+
+// currentGoroutineOf returns the scanned goroutine the stop belongs to. It reads
+// from the pre-pack scan for the reason snapshotWithCurrent documents.
+func currentGoroutineOf(gs []protocol.Goroutine) protocol.Goroutine {
+	for _, g := range gs {
+		if g.Current {
+			return g
+		}
+	}
+	return protocol.Goroutine{}
 }
 
 // snapshotGoroutineIDs keeps lifecycle deltas tied to the stable rich prefix.

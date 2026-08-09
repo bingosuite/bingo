@@ -347,7 +347,49 @@ func (m *monitor) render() {
 	}
 
 	fmt.Println()
-	fmt.Printf("counts: goroutines=%d threads=%d\n", len(m.snapshot.Goroutines), len(m.snapshot.Threads))
+	fmt.Println(countsLine(m.snapshot))
+}
+
+// countsLine states what arrived versus what the debugger actually had. The two
+// ways the picture can be incomplete are reported separately: elements the
+// packer left off the wire, and a runtime scan that stopped early (which makes
+// the totals themselves a floor, not a count).
+func bound(clipped bool) string {
+	if clipped {
+		return "+"
+	}
+	return ""
+}
+
+func countsLine(snap protocol.GoroutineSnapshotPayload) string {
+	shownG, shownT := len(snap.Goroutines), len(snap.Threads)
+	if snap.Totals == nil {
+		return fmt.Sprintf("counts: goroutines=%d threads=%d (complete)", shownG, shownT)
+	}
+	// The two scans have independent ceilings, so each count carries its own
+	// lower-bound marker. Marking both from one flag would call an exact count
+	// approximate (or worse, an approximate one exact).
+	line := fmt.Sprintf("counts: goroutines=%d/%d%s threads=%d/%d%s",
+		shownG, snap.Totals.Goroutines, bound(snap.Totals.GoroutinesClipped),
+		shownT, snap.Totals.Threads, bound(snap.Totals.ThreadsClipped))
+
+	var notes []string
+	if omitted := snap.Totals.Goroutines - shownG; omitted > 0 {
+		notes = append(notes, fmt.Sprintf("%d goroutines omitted from this event", omitted))
+	}
+	if omitted := snap.Totals.Threads - shownT; omitted > 0 {
+		notes = append(notes, fmt.Sprintf("%d threads omitted from this event", omitted))
+	}
+	if snap.Totals.GoroutinesClipped {
+		notes = append(notes, "goroutine scan hit its ceiling, so that total is a lower bound")
+	}
+	if snap.Totals.ThreadsClipped {
+		notes = append(notes, "thread scan hit its ceiling, so that total is a lower bound")
+	}
+	if len(notes) > 0 {
+		line += "\n  ! " + strings.Join(notes, "\n  ! ")
+	}
+	return line
 }
 
 func renderGoroutineTree(goroutines []protocol.Goroutine) {

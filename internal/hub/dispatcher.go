@@ -113,9 +113,9 @@ func dispatch(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, erro
 		if err != nil {
 			return dispatchResult{}, err
 		}
-		evt, err := protocol.NewEvent(protocol.EventGoroutines, 0, protocol.GoroutinesPayload{
-			Goroutines: goroutines,
-		})
+		// Forwarded as-is: the debugger already packed it to the wire contract,
+		// and rewrapping would drop the Totals that say what was left out.
+		evt, err := protocol.NewEvent(protocol.EventGoroutines, 0, goroutines)
 		if err != nil {
 			return dispatchResult{}, err
 		}

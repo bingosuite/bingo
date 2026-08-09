@@ -165,9 +165,9 @@ var _ = Describe("current-thread inspection", func() {
 
 		gs, err := d.Goroutines()
 		Expect(err).NotTo(HaveOccurred())
-		Expect(gs).To(HaveLen(1))
-		Expect(gs[0].CurrentLoc.Function).To(ContainSubstring("beta"),
-			"goroutine location should track the stopped thread (2), got %q", gs[0].CurrentLoc.Function)
+		Expect(gs.Goroutines).To(HaveLen(1))
+		Expect(gs.Goroutines[0].CurrentLoc.Function).To(ContainSubstring("beta"),
+			"goroutine location should track the stopped thread (2), got %q", gs.Goroutines[0].CurrentLoc.Function)
 	})
 
 	It("StackFrames tracks curTID after a step clears lastBPTID", func() {
