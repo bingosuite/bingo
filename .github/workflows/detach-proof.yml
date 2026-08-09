@@ -75,18 +75,21 @@ jobs:
           ./test/detachproof -run 'TestPtraceErrnoOnRunningTracee'
 
       - name: Control — suspended detach (must PASS)
+        id: control_suspended
         continue-on-error: true
         run: >
           go test -tags detachproof ${{ matrix.raceflag }} -count=1 -v -timeout 300s
           ./test/detachproof -run 'TestControlSuspendedDetach'
 
       - name: Control — running, no breakpoint (isolates the detach leak)
+        id: control_running
         continue-on-error: true
         run: >
           go test -tags detachproof ${{ matrix.raceflag }} -count=1 -v -timeout 300s
           ./test/detachproof -run 'TestControlRunningNoBreakpoint'
 
       - name: PROOF — attached + running Kill must fully release the tracee
+        id: proof_main
         continue-on-error: true
         env:
           BINGO_PROOF_ITERS: ${{ inputs.iters || 3 }}
@@ -95,10 +98,40 @@ jobs:
           ./test/detachproof -run 'TestAttachedRunningKillDetaches'
 
       - name: PROOF — the failure is silent to clients
+        id: proof_silent
         continue-on-error: true
         run: >
           go test -tags detachproof ${{ matrix.raceflag }} -count=1 -v -timeout 300s
           ./test/detachproof -run 'TestAttachedRunningKillEmitsNoError'
+
+      # The proof tests assert CORRECT behaviour, so their FAILURE is the
+      # confirmation. This step inverts that so the job's own conclusion is
+      # readable without opening the logs.
+      - name: Verdict
+        if: always()
+        run: |
+          main='${{ steps.proof_main.outcome }}'
+          csusp='${{ steps.control_suspended.outcome }}'
+          crun='${{ steps.control_running.outcome }}'
+          {
+            echo "### U4 verdict (${{ matrix.mode }})"
+            echo ""
+            echo "| Leg | Outcome | Meaning |"
+            echo "| --- | --- | --- |"
+            echo "| Control: suspended detach | $csusp | success = detach/restore work when stopped |"
+            echo "| Control: running, no breakpoint | $crun | success = isolates the trap leak |"
+            echo "| PROOF: attached+running Kill | $main | **failure = U4 CONFIRMED** |"
+            echo "| PROOF: silent to clients | ${{ steps.proof_silent.outcome }} | success = Kill returns nil |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$csusp" != "success" ]; then
+            echo "::error::control (suspended detach) failed — the harness itself is suspect, U4 is NOT proven"
+            exit 1
+          fi
+          if [ "$main" = "success" ]; then
+            echo "::notice::U4 NOT reproduced on this run"
+          else
+            echo "::notice::U4 CONFIRMED — the attached+running Kill path did not fully release the tracee"
+          fi
 
       - name: Leftover target processes (strict-cleanup check)
         if: always()

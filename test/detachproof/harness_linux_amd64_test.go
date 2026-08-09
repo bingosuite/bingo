@@ -35,6 +35,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -149,34 +150,46 @@ type target struct {
 	ready string
 	done  string
 	beat  string
+
+	// waited closes when the single reaper goroutine has collected the child's
+	// termination status; state then holds it (nil if a leaked engine waitLoop
+	// blocked in Wait4(-1) won the race for the status first).
+	waited chan struct{}
+	state  atomic.Pointer[os.ProcessState]
 }
 
 // startTarget launches bin as an INDEPENDENT OS process (never under the
-// debugger) and waits for its readiness marker. Cleanup is strict: SIGKILL and
-// reap, tolerating an already-reaped child (the engine's leaked waitLoop can
-// win the race for the exit status via Wait4(-1)).
+// debugger) and waits for its readiness marker. One reaper goroutine owns
+// Wait(), so the termination cause — crucially, death by SIGTRAP on a leftover
+// INT3 — is captured rather than lost. Cleanup is strict: SIGKILL, then join
+// the reaper.
 func startTarget(t *testing.T, bin string) *target {
 	t.Helper()
 	dir := t.TempDir()
 	tg := &target{
-		gate:  filepath.Join(dir, "gate"),
-		ready: filepath.Join(dir, "ready"),
-		done:  filepath.Join(dir, "done"),
-		beat:  filepath.Join(dir, "beat"),
+		gate:   filepath.Join(dir, "gate"),
+		ready:  filepath.Join(dir, "ready"),
+		done:   filepath.Join(dir, "done"),
+		beat:   filepath.Join(dir, "beat"),
+		waited: make(chan struct{}),
 	}
 	tg.cmd = exec.Command(bin, tg.gate, tg.ready, tg.done, tg.beat)
 	if err := tg.cmd.Start(); err != nil {
 		t.Fatalf("start target: %v", err)
 	}
 	tg.pid = tg.cmd.Process.Pid
+	go func() {
+		defer close(tg.waited)
+		if st, err := tg.cmd.Process.Wait(); err == nil {
+			tg.state.Store(st)
+		}
+	}()
 	t.Cleanup(func() {
 		_ = tg.cmd.Process.Signal(syscall.SIGKILL)
-		waited := make(chan struct{})
-		go func() { _, _ = tg.cmd.Process.Wait(); close(waited) }()
 		select {
-		case <-waited:
+		case <-tg.waited:
 		case <-time.After(3 * time.Second):
-			t.Logf("cleanup: reap of pid %d did not complete in 3s (leaked waitLoop may hold the status)", tg.pid)
+			t.Logf("cleanup: reap of pid %d did not complete in 3s (a leaked waitLoop may hold the status)", tg.pid)
 		}
 	})
 
@@ -187,6 +200,24 @@ func startTarget(t *testing.T, bin string) *target {
 	// attach harness) so the attach stop is not racing process startup.
 	time.Sleep(200 * time.Millisecond)
 	return tg
+}
+
+// terminated reports whether the target died within timeout and, if so, how.
+func (tg *target) terminated(timeout time.Duration) (dead bool, how string) {
+	select {
+	case <-tg.waited:
+	case <-time.After(timeout):
+		return false, ""
+	}
+	st := tg.state.Load()
+	if st == nil {
+		return true, "<status consumed by another waiter>"
+	}
+	desc := st.String()
+	if ws, ok := st.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		desc = fmt.Sprintf("%s (signal %d = %v)", desc, ws.Signal(), ws.Signal())
+	}
+	return true, desc
 }
 
 func waitForFile(path string, timeout time.Duration) bool {

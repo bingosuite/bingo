@@ -148,6 +148,15 @@ func resumeAndConfirmRunning(t *testing.T, tg *target, d debugger.Debugger) {
 // A FAILURE of this test on origin/main is the confirmation of hypothesis U4.
 func TestAttachedRunningKillDetaches(t *testing.T) {
 	iters := proofIters()
+	// Tallies make the deterministic part of the failure distinguishable from
+	// the racy part: the trap leak reproduces every time, while the detach
+	// outcome depends on whether the tracee happens to be in a transient
+	// ptrace-stop at the instant PTRACE_DETACH is issued.
+	var trapLeaks, detachLeaks, deaths, freezes, completions int
+	t.Cleanup(func() {
+		t.Logf("U4 TALLY over %d iteration(s): trap-left-behind=%d, still-traced=%d, target-died=%d, "+
+			"target-frozen=%d, target-completed=%d", iters, trapLeaks, detachLeaks, deaths, freezes, completions)
+	})
 	for i := 0; i < iters; i++ {
 		t.Run(fmt.Sprintf("iter%d", i), func(t *testing.T) {
 			tg, d, vaddr, disk := attachAndArm(t, true)
@@ -168,6 +177,7 @@ func TestAttachedRunningKillDetaches(t *testing.T) {
 			// Evidence 1 — the process must no longer be traced.
 			tp := mustTracerPID(t, tg.pid, "after Kill")
 			if tp != 0 {
+				detachLeaks++
 				t.Errorf("U4 CONFIRMED (detach leak): after a successful Kill, target pid %d is STILL TRACED "+
 					"(TracerPid=%d, this process is %d, proc state=%q). PTRACE_DETACH requires the tracee to be "+
 					"in a ptrace-stop; on a running tracee it fails with ESRCH and killProcess discards the error.",
@@ -180,6 +190,7 @@ func TestAttachedRunningKillDetaches(t *testing.T) {
 				t.Fatalf("post-Kill memory read: %v", err)
 			}
 			if idx := diffBytes(disk, got, 8); len(idx) != 0 {
+				trapLeaks++
 				t.Errorf("U4 CONFIRMED (trap leak): after a successful Kill, main.gated still differs from the ELF "+
 					"at offsets %v (first byte in memory = 0x%02x, want 0x%02x). bps.clearAll writes via "+
 					"PTRACE_POKEDATA, which needs a ptrace-stop; on a running tracee it fails with ESRCH and "+
@@ -190,13 +201,23 @@ func TestAttachedRunningKillDetaches(t *testing.T) {
 			// breakpoint site normally: no SIGTRAP, no freeze, no crash.
 			tg.openGate(t)
 			if !waitForFile(tg.done, 20*time.Second) {
-				state := procState(tg.pid)
-				tp := mustTracerPID(t, tg.pid, "after gate release")
-				t.Errorf("U4 CONFIRMED (tracee unusable): after a successful Kill the target never completed "+
-					"phase 2 within 20s. proc state=%q, TracerPid=%d. The leftover INT3 raised SIGTRAP, which "+
-					"was routed to the still-attached tracer whose engine had already torn down, leaving the "+
-					"traced thread frozen in a ptrace-stop with nobody to resume it.", state, tp)
+				if dead, how := tg.terminated(2 * time.Second); dead {
+					deaths++
+					t.Errorf("U4 CONFIRMED (tracee destroyed): after a successful Kill the target DIED on reaching "+
+						"the former breakpoint instead of completing phase 2 — %s. The leftover INT3 raised a "+
+						"SIGTRAP that no debugger was left to absorb, so the Go runtime took it as a fatal trap. "+
+						"Killing an ATTACHED process is exactly what the attached branch of killProcess promises "+
+						"not to do.", how)
+				} else {
+					freezes++
+					t.Errorf("U4 CONFIRMED (tracee frozen): after a successful Kill the target never completed "+
+						"phase 2 within 20s and is still alive. proc state=%q, TracerPid=%d. The leftover INT3 "+
+						"raised SIGTRAP into a still-attached tracer whose engine had already torn down, leaving "+
+						"the traced thread parked in a ptrace-stop with nobody to resume it.",
+						procState(tg.pid), mustTracerPID(t, tg.pid, "after gate release"))
+				}
 			} else {
+				completions++
 				b, _ := os.ReadFile(tg.done)
 				if string(b) != fmt.Sprint(gatedExpected) {
 					t.Errorf("target completed phase 2 but computed %q, want %q", b, fmt.Sprint(gatedExpected))
