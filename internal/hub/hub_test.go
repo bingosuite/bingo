@@ -117,6 +117,19 @@ func (f *fakeDebugger) GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, e
 	return f.snapshotResult, nil
 }
 
+type blockingLaunchDebugger struct {
+	*fakeDebugger
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func (f *blockingLaunchDebugger) Launch(string, []string, []string) error {
+	f.record("Launch")
+	close(f.started)
+	<-f.release
+	return f.launchErr
+}
+
 type fakeWSConn struct {
 	mu       sync.Mutex
 	incoming chan []byte // messages written by the server (server → client)
@@ -1239,28 +1252,93 @@ var _ = Describe("Restart", func() {
 	})
 })
 
-// This suite guards Finding 3 of #78: h.dbg is written on the Run goroutine
-// (Launch/Restart) but read by shutdown(), which runs on a separate goroutine
-// when the last client disconnects. Run under -race, the loop exercises that
-// write/read overlap; the dbgMu guard keeps it clean.
-var _ = Describe("dbg access during shutdown", func() {
-	It("has no data race between a mid-flight Launch and last-client shutdown", func() {
-		for i := 0; i < 100; i++ {
-			fd := newFakeDebugger()
-			managed := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
-			cancel := runHub(managed)
-
-			conn := newFakeWSConn()
-			_, err := managed.AddClient(conn, nil)
-			Expect(err).NotTo(HaveOccurred())
-
-			// Launch writes h.dbg on the Run goroutine; closing the only client
-			// spawns `go h.shutdown()`, which reads h.dbg concurrently.
-			conn.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: "x"}))
-			closeFakeWS(conn)
-
-			Eventually(managed.Done(), "1s", "10ms").Should(BeClosed())
-			cancel()
+var _ = Describe("debugger ownership during shutdown", func() {
+	It("discards a restart replacement whose Launch finishes after shutdown", func() {
+		old := newFakeDebugger()
+		releaseLaunch := make(chan struct{})
+		replacement := &blockingLaunchDebugger{
+			fakeDebugger: newFakeDebugger(),
+			started:      make(chan struct{}),
+			release:      releaseLaunch,
 		}
+		factoryCalls := 0
+		managed := hub.NewSession("session", func() debugger.Debugger {
+			factoryCalls++
+			if factoryCalls == 1 {
+				return old
+			}
+			return replacement
+		}, nil)
+		cancel := runHub(managed)
+		defer cancel()
+
+		conn := newFakeWSConn()
+		mustAddClient(managed, conn)
+		_, _ = recvEvent(conn)
+		launchManaged(conn, old, "myapp")
+
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		Eventually(replacement.started, "500ms").Should(BeClosed())
+
+		closeFakeWS(conn)
+		Eventually(managed.ExportedShutdownCh(), "500ms").Should(BeClosed())
+		close(releaseLaunch)
+
+		Eventually(managed.Done(), "500ms").Should(BeClosed())
+		Expect(replacement.recordedCalls()).To(ContainElements("Launch", "Kill"))
+	})
+
+	It("discards an initial debugger constructed after shutdown", func() {
+		candidate := newFakeDebugger()
+		factoryStarted := make(chan struct{})
+		releaseFactory := make(chan struct{})
+		managed := hub.NewSession("session", func() debugger.Debugger {
+			close(factoryStarted)
+			<-releaseFactory
+			return candidate
+		}, nil)
+		cancel := runHub(managed)
+		defer cancel()
+
+		conn := newFakeWSConn()
+		mustAddClient(managed, conn)
+		_, _ = recvEvent(conn)
+		conn.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: "myapp"}))
+		Eventually(factoryStarted, "500ms").Should(BeClosed())
+
+		closeFakeWS(conn)
+		Eventually(managed.ExportedShutdownCh(), "500ms").Should(BeClosed())
+		close(releaseFactory)
+
+		Eventually(managed.Done(), "500ms").Should(BeClosed())
+		Expect(candidate.recordedCalls()).To(ContainElement("Kill"))
+		Expect(candidate.recordedCalls()).NotTo(ContainElement("Launch"))
+	})
+
+	It("discards an initial debugger whose Launch finishes after shutdown", func() {
+		releaseLaunch := make(chan struct{})
+		candidate := &blockingLaunchDebugger{
+			fakeDebugger: newFakeDebugger(),
+			started:      make(chan struct{}),
+			release:      releaseLaunch,
+		}
+		managed := hub.NewSession("session", func() debugger.Debugger {
+			return candidate
+		}, nil)
+		cancel := runHub(managed)
+		defer cancel()
+
+		conn := newFakeWSConn()
+		mustAddClient(managed, conn)
+		_, _ = recvEvent(conn)
+		conn.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: "myapp"}))
+		Eventually(candidate.started, "500ms").Should(BeClosed())
+
+		closeFakeWS(conn)
+		Eventually(managed.ExportedShutdownCh(), "500ms").Should(BeClosed())
+		close(releaseLaunch)
+
+		Eventually(managed.Done(), "500ms").Should(BeClosed())
+		Expect(candidate.recordedCalls()).To(ContainElements("Launch", "Kill"))
 	})
 })

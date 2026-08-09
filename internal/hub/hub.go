@@ -56,18 +56,13 @@ type Hub struct {
 	// newDebugger creates a debugger on Launch/Attach. nil for raw hubs.
 	newDebugger func() debugger.Debugger
 
-	// dbg is the active debugger. nil while idle (no process launched).
-	//
-	// All writes happen on the Run goroutine (executeCommand, handleRestart,
-	// handleDebuggerClosed, teardownFailedStart). shutdown() may read it from a
-	// DIFFERENT goroutine (removeClient spawns `go h.shutdown()` when the last
-	// client leaves), so writes go through setDbg and shutdown's read takes
-	// dbgMu — otherwise a mid-flight Launch/Restart racing the last disconnect
-	// is an unsynchronized interface read. Run-goroutine reads need no lock:
-	// they only ever contend with same-goroutine writes (sequential) or with
-	// shutdown's read (read-read).
-	dbgMu    sync.Mutex
-	dbg      debugger.Debugger
+	// dbg and closing are guarded by dbgMu. Factory results and shutdown race
+	// through that lock so every debugger is owned either by the running hub or
+	// by the path responsible for discarding it.
+	dbgMu   sync.Mutex
+	dbg     debugger.Debugger
+	closing bool
+
 	registry *registry
 	log      *slog.Logger
 
@@ -202,19 +197,59 @@ func (h *Hub) Run(ctx context.Context) {
 // A nil channel blocks forever in select — correct behaviour while waiting
 // for Launch/Attach.
 func (h *Hub) eventsCh() <-chan protocol.Event {
-	if h.dbg == nil {
+	dbg := h.currentDebugger()
+	if dbg == nil {
 		return nil
 	}
-	return h.dbg.Events()
+	return dbg.Events()
 }
 
-// setDbg replaces the active debugger. Called only on the Run goroutine, but
-// takes dbgMu so a concurrent shutdown() on another goroutine reads a
-// consistent value (see the dbg field comment).
-func (h *Hub) setDbg(d debugger.Debugger) {
+func (h *Hub) currentDebugger() debugger.Debugger {
 	h.dbgMu.Lock()
-	h.dbg = d
-	h.dbgMu.Unlock()
+	defer h.dbgMu.Unlock()
+	return h.dbg
+}
+
+func (h *Hub) installDebugger(dbg debugger.Debugger) bool {
+	h.dbgMu.Lock()
+	defer h.dbgMu.Unlock()
+	if h.closing {
+		return false
+	}
+	h.dbg = dbg
+	return true
+}
+
+func (h *Hub) detachDebugger() (debugger.Debugger, bool) {
+	h.dbgMu.Lock()
+	defer h.dbgMu.Unlock()
+	if h.closing {
+		return nil, false
+	}
+	dbg := h.dbg
+	h.dbg = nil
+	return dbg, true
+}
+
+func (h *Hub) isClosing() bool {
+	h.dbgMu.Lock()
+	defer h.dbgMu.Unlock()
+	return h.closing
+}
+
+func (h *Hub) beginShutdown() debugger.Debugger {
+	h.dbgMu.Lock()
+	defer h.dbgMu.Unlock()
+	h.closing = true
+	dbg := h.dbg
+	h.dbg = nil
+	return dbg
+}
+
+func discardDebugger(dbg debugger.Debugger) {
+	if dbg != nil {
+		_ = dbg.Kill()
+	}
 }
 
 // AddClient registers conn as a new client. Safe from any goroutine. Admission
@@ -370,11 +405,17 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 // handleDebuggerClosed: transition through exited (if not already) to idle,
 // ready for a new Launch/Attach cycle.
 func (h *Hub) handleDebuggerClosed() {
-	if h.State() != protocol.StateExited {
-		h.transitionState(protocol.StateExited)
+	if _, open := h.detachDebugger(); !open {
+		return
 	}
-	h.setDbg(nil)
-	h.transitionState(protocol.StateIdle)
+	if h.State() != protocol.StateExited {
+		if !h.transitionState(protocol.StateExited) {
+			return
+		}
+	}
+	if !h.transitionState(protocol.StateIdle) {
+		return
+	}
 	h.log.Info("debugger closed — session idle, ready for re-launch")
 }
 
@@ -387,8 +428,10 @@ func (h *Hub) executeCommand(cmd protocol.Command) {
 		return
 	}
 
+	dbg := h.currentDebugger()
+	candidate := false
 	if h.sessionID != "" && (cmd.Kind == protocol.CmdLaunch || cmd.Kind == protocol.CmdAttach) {
-		if h.dbg != nil {
+		if dbg != nil {
 			h.broadcastError(cmd.Kind, fmt.Errorf("debugger already active (state: %s)", h.State()))
 			return
 		}
@@ -396,10 +439,18 @@ func (h *Hub) executeCommand(cmd protocol.Command) {
 			h.broadcastError(cmd.Kind, fmt.Errorf("no debugger factory configured"))
 			return
 		}
-		h.setDbg(h.newDebugger())
+		dbg = h.newDebugger()
+		if h.isClosing() {
+			discardDebugger(dbg)
+			return
+		}
+		// Keep the candidate caller-owned through startup. Installing it first
+		// would let shutdown Kill an idle debugger before Launch/Attach creates
+		// a process, leaving that later process outside either owner's teardown.
+		candidate = true
 	}
 
-	if h.dbg == nil {
+	if dbg == nil {
 		// Kill with no active debugger is a benign no-op: there is nothing to
 		// terminate, so report success rather than an error. This keeps Kill
 		// idempotent across the running/idle/exited states now that it is
@@ -411,29 +462,50 @@ func (h *Hub) executeCommand(cmd protocol.Command) {
 		return
 	}
 
-	result, err := dispatch(h.dbg, cmd)
+	result, err := dispatch(dbg, cmd)
+	if candidate {
+		if err != nil {
+			discardDebugger(dbg)
+			if h.isClosing() {
+				return
+			}
+			h.log.Warn("command failed", "kind", cmd.Kind, "err", err)
+			h.broadcastError(cmd.Kind, err)
+			return
+		}
+		if !h.installDebugger(dbg) {
+			discardDebugger(dbg)
+			return
+		}
+	}
+	if h.isClosing() {
+		return
+	}
 	if err != nil {
 		h.log.Warn("command failed", "kind", cmd.Kind, "err", err)
-		if h.sessionID != "" && (cmd.Kind == protocol.CmdLaunch || cmd.Kind == protocol.CmdAttach) {
-			h.teardownFailedStart()
-		}
 		h.broadcastError(cmd.Kind, err)
 		return
 	}
 
 	switch cmd.Kind {
 	case protocol.CmdLaunch:
-		h.transitionState(protocol.StateRunning)
+		if !h.transitionState(protocol.StateRunning) {
+			return
+		}
 		h.rememberLaunch(cmd)
 		h.restartBreakpoints = make(map[int]protocol.Location)
 	case protocol.CmdAttach:
-		h.transitionState(protocol.StateRunning)
+		if !h.transitionState(protocol.StateRunning) {
+			return
+		}
 		// Restart only makes sense for a process bingo itself launched —
 		// mirrors Delve's canRestart check.
 		h.lastLaunch = nil
 		h.restartBreakpoints = make(map[int]protocol.Location)
 	case protocol.CmdContinue, protocol.CmdStepOver, protocol.CmdStepInto, protocol.CmdStepOut:
-		h.transitionState(protocol.StateRunning)
+		if !h.transitionState(protocol.StateRunning) {
+			return
+		}
 	case protocol.CmdSetBreakpoint:
 		h.rememberBreakpoint(result)
 	case protocol.CmdClearBreakpoint:
@@ -443,17 +515,6 @@ func (h *Hub) executeCommand(cmd protocol.Command) {
 	if result.event != nil {
 		result.event.Seq = h.seq.Add(1)
 		h.broadcast(*result.event)
-	}
-}
-
-func (h *Hub) teardownFailedStart() {
-	dbg := h.dbg
-	h.setDbg(nil)
-	if dbg != nil {
-		_ = dbg.Kill()
-	}
-	if h.State() != protocol.StateIdle {
-		h.transitionState(protocol.StateIdle)
 	}
 }
 
@@ -551,20 +612,36 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 
 	saved := h.sortedRestartLocations()
 
-	if h.dbg != nil {
-		_ = h.dbg.Kill()
-		h.setDbg(nil)
+	oldDbg, open := h.detachDebugger()
+	if !open {
+		return
 	}
+	discardDebugger(oldDbg)
 
+	if h.isClosing() {
+		return
+	}
 	newDbg := h.newDebugger()
+	if h.isClosing() {
+		discardDebugger(newDbg)
+		return
+	}
 	if err := newDbg.Launch(program, args, env); err != nil {
+		if h.isClosing() {
+			return
+		}
 		h.broadcastError(cmd.Kind, fmt.Errorf("restart: relaunch failed: %w", err))
 		h.transitionState(protocol.StateIdle)
 		return
 	}
-	h.setDbg(newDbg)
+	if !h.installDebugger(newDbg) {
+		discardDebugger(newDbg)
+		return
+	}
 	h.lastLaunch = &protocol.LaunchPayload{Program: program, Args: args, Env: env}
-	h.transitionState(protocol.StateRunning)
+	if !h.transitionState(protocol.StateRunning) {
+		return
+	}
 
 	installed := make([]protocol.Breakpoint, 0, len(saved))
 	discarded := make([]protocol.DiscardedBreakpoint, 0)
@@ -621,22 +698,31 @@ func (h *Hub) drainResumeCh() {
 	}
 }
 
-// transitionState updates state and, for managed sessions, broadcasts.
-func (h *Hub) transitionState(newState protocol.SessionState) {
+// transitionState updates state and, for managed sessions, broadcasts. State
+// changes linearize before shutdown so a closed hub cannot be resurrected.
+func (h *Hub) transitionState(newState protocol.SessionState) bool {
+	h.dbgMu.Lock()
+	if h.closing {
+		h.dbgMu.Unlock()
+		return false
+	}
 	h.stateMu.Lock()
 	old := h.state
 	if old == newState {
 		h.stateMu.Unlock()
-		return
+		h.dbgMu.Unlock()
+		return true
 	}
 	h.state = newState
 	h.stateMu.Unlock()
+	h.dbgMu.Unlock()
 
 	h.log.Info("state transition", "from", old, "to", newState)
 
 	if h.sessionID != "" {
 		h.broadcastSessionState()
 	}
+	return true
 }
 
 func (h *Hub) broadcastSessionState() {
@@ -711,16 +797,9 @@ func (h *Hub) broadcastError(kind protocol.CommandKind, err error) {
 func (h *Hub) shutdown() {
 	h.shutdownOnce.Do(func() {
 		h.log.Info("hub shutting down")
+		dbg := h.beginShutdown()
 		close(h.shutdownCh)
 		h.registry.closeAll()
-		// shutdown may run on a non-Run goroutine (go h.shutdown() from
-		// removeClient), so snapshot dbg under dbgMu to avoid racing a
-		// mid-flight Launch/Restart on the Run goroutine.
-		h.dbgMu.Lock()
-		dbg := h.dbg
-		h.dbgMu.Unlock()
-		if dbg != nil {
-			_ = dbg.Kill()
-		}
+		discardDebugger(dbg)
 	})
 }

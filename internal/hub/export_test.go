@@ -7,3 +7,7 @@ import "time"
 func ExportedSetSuspendTimeout(h *Hub, timeout time.Duration) {
 	h.suspendTimeout = timeout
 }
+
+func (h *Hub) ExportedShutdownCh() <-chan struct{} {
+	return h.shutdownCh
+}
