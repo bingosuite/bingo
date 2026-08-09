@@ -587,6 +587,22 @@ func declareStepOverlapPauseSpec() {
 
 			AddReportEntry("overlap-pause-iterations", iters)
 			AddReportEntry("overlap-pause-accepted", paused)
+			if parked, ok := debugger.LinuxParkedStopCount(p.h.d); ok {
+				AddReportEntry("overlap-pause-parked-stops", parked)
+			}
+
+			// Non-vacuity. Every assertion above also holds on a run where
+			// every Pause was rejected, which is just a plain step loop that
+			// never exercises the race this spec exists for. An accepted Pause
+			// is the proof that the engine was still running — i.e. that the
+			// interrupt genuinely landed against an in-flight step. Note the
+			// converse is deliberately NOT asserted: an accepted Pause need not
+			// produce EventPaused, because a step that self-completes first
+			// clears manualStopPending and the leftover signal is suppressed.
+			Expect(paused).To(BeNumerically(">", 0),
+				"no Pause was accepted across %d cycles: every one raced a step that had already "+
+					"suspended, so this spec degenerated into a plain step loop and proved nothing "+
+					"about Pause racing an in-flight step", iters)
 		})
 }
 
