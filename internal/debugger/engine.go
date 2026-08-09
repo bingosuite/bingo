@@ -323,6 +323,18 @@ func (e *engine) holdForDeferred(stop StopEvent) {
 	e.resumeWait()
 }
 
+// parkedResumeTarget reports the thread releaseParked would spend the TID-less
+// continue on, or 0 when releasing costs nothing. resumeTracee has to know this
+// before releasing, because any memory write it still needs to make targets the
+// backend's current stop thread — which is exactly the parked one.
+func (e *engine) parkedResumeTarget(current int) int {
+	parked := e.parkedTID
+	if parked == 0 || parked == current || parked != e.lastWaitTID {
+		return 0
+	}
+	return parked
+}
+
 // releaseParked discharges the resume owed to a thread held by holdForDeferred.
 // It reports whether it consumed the TID-less continue doing so, in which case
 // the caller still has to resume current by some other means.
@@ -331,25 +343,37 @@ func (e *engine) releaseParked(current int) (bool, error) {
 	if parked == 0 {
 		return false, nil
 	}
+	target := e.parkedResumeTarget(current)
 	e.parkedTID = 0
-	if parked == current {
-		// The caller is about to resume this very thread anyway.
+	if target == 0 {
+		if parked != current {
+			// ContinueProcess cannot name a thread, so it can only resume the
+			// backend's current one. Losing that window is not fatal — the
+			// thread stays stopped and a later resume of it will pick it up —
+			// but it is a bookkeeping bug worth surfacing.
+			e.log.Warn("parked thread is no longer the backend's current stop thread",
+				"parked", parked, "lastWait", e.lastWaitTID)
+		}
 		return false, nil
 	}
-	if parked != e.lastWaitTID {
-		// ContinueProcess cannot name a thread, so it can only resume the
-		// backend's current one. Losing that window is not fatal — the thread
-		// stays stopped and a later resume of it will pick it up — but it is a
-		// bookkeeping bug worth surfacing.
-		e.log.Warn("parked thread is no longer the backend's current stop thread",
-			"parked", parked, "lastWait", e.lastWaitTID)
-		return false, nil
-	}
-	e.log.Debug("releasing parked thread", "tid", parked)
+	e.log.Debug("releasing parked thread", "tid", target)
 	if err := e.backend.ContinueProcess(); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// armedBreakpointAt reports the breakpoint tid is parked directly on, if any.
+// A register read failure is not fatal here: it only costs the caller the
+// trap-safe resume path, which it degrades out of rather than erroring a stop.
+func (e *engine) armedBreakpointAt(tid int) *breakpointEntry {
+	regs, err := e.backend.GetRegisters(tid)
+	if err != nil {
+		e.log.Warn("cannot read registers to check for an armed trap under a thread",
+			"tid", tid, "err", err)
+		return nil
+	}
+	return e.bps.atAddr(regs.PC)
 }
 
 // resumeTracee performs a plain (non-single-step) resume on behalf of the
@@ -361,8 +385,17 @@ func (e *engine) releaseParked(current int) (bool, error) {
 // holdForDeferred for why the backend's current-stop thread has to stay
 // stopped). Otherwise any thread owed a resume is released first; because that
 // consumes the TID-less continue, current is then brought back with the only
-// TID-explicit resume primitive the Backend interface offers — a single step
-// whose completion is swallowed and followed by an ordinary continue.
+// TID-explicit resume primitive the Backend interface offers, a single step.
+//
+// That step is not safe to issue blindly. If current sits ON an armed trap the
+// step EXECUTES it, and the backend classifies the resulting SIGTRAP as the
+// step's own completion (it keys on stepping && tid == stepTID, which cannot
+// tell the two apart), so the hit would be swallowed and the thread resumed
+// from mid-instruction. So when a trap is armed under current the resume goes
+// through the ordinary step-over sequence — disarm, step, reinstall in the
+// StopSingleStep handler, then continue — which is both correct and already the
+// well-travelled path. The disarming write has to happen BEFORE the parked
+// thread is released, because it targets the backend's current stop thread.
 func (e *engine) resumeTracee(current int) error {
 	if len(e.deferredStops) > 0 {
 		if e.parkedTID != 0 && e.parkedTID != current {
@@ -373,14 +406,39 @@ func (e *engine) resumeTracee(current int) error {
 		e.parkedTID = current
 		return nil
 	}
+
+	var sob *breakpointEntry
+	if current != 0 && e.parkedResumeTarget(current) != 0 {
+		if sob = e.armedBreakpointAt(current); sob != nil {
+			e.steppingOverBP = sob
+			e.bpResume = bpResumeContinue
+			e.bpRetAddr = 0
+			e.bps.removeFromTable(sob)
+			if err := e.backend.WriteMemory(sob.addr, sob.originalBytes); err != nil {
+				e.bps.addToTable(sob)
+				e.steppingOverBP = nil
+				return fmt.Errorf("internal resume: restore bytes: %w", err)
+			}
+		}
+	}
+
 	released, err := e.releaseParked(current)
 	if err != nil {
+		e.rearmInternalStepOver(sob)
 		return err
 	}
 	if !released {
+		e.rearmInternalStepOver(sob)
 		return e.backend.ContinueProcess()
 	}
 	if current == 0 {
+		return nil
+	}
+	if sob != nil {
+		if err := e.stepThreadOverBP(current, sob.addr); err != nil {
+			e.rearmInternalStepOver(sob)
+			return fmt.Errorf("internal resume: single step over 0x%x: %w", sob.addr, err)
+		}
 		return nil
 	}
 	e.internalStepTID = current
@@ -391,6 +449,17 @@ func (e *engine) resumeTracee(current int) error {
 		return err
 	}
 	return nil
+}
+
+// rearmInternalStepOver undoes the speculative disarm resumeTracee performs
+// before releasing a parked thread, for the paths that end up not stepping.
+func (e *engine) rearmInternalStepOver(sob *breakpointEntry) {
+	if sob == nil {
+		return
+	}
+	e.steppingOverBP = nil
+	_ = e.backend.WriteMemory(sob.addr, archTrapInstruction())
+	e.bps.addToTable(sob)
 }
 
 func newEngine(b Backend, log *slog.Logger) *engine {
@@ -863,6 +932,12 @@ func (e *engine) handleStop(stop StopEvent) {
 		}
 		if stop.TID != 0 && stop.TID == e.stepTID {
 			e.stepTID = 0
+		}
+		if stop.Reason != StopSingleStep && stop.TID != 0 && stop.TID == e.internalStepTID {
+			// The internal resume step ended by another route (a signal landed
+			// on the stepped thread). Drop the marker, or it would later
+			// swallow a legitimate user-visible step completion.
+			e.internalStepTID = 0
 		}
 	}
 
