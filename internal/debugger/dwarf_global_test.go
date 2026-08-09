@@ -20,12 +20,16 @@ go 1.25
 
 import (
 	"example.com/scopedglobals/asmfixture"
+	"example.com/scopedglobals/generic"
+	"example.com/scopedglobals/inline"
 	"example.com/scopedglobals/left"
 	"example.com/scopedglobals/right"
 )
 
 var buildVersion = "v1.2.3"
 var initValue string
+var Collide = "main"
+var GenGlobal = "main"
 
 func init() {
 	initValue = buildVersion
@@ -49,10 +53,20 @@ func makeClosure() func() string {
 	}
 }
 
+//go:noinline
+func inlineFrame() string {
+	return inline.Small()
+}
+
+//go:noinline
+func genericFrame() string {
+	return generic.Identity("value")
+}
+
 var closure = makeClosure()
 
 func main() {
-	println(frame(), receiver{}.method(), closure(), left.Frame(), right.Frame(), right.Fallback(), asmfixture.Read(), initValue)
+	println(frame(), receiver{}.method(), closure(), inlineFrame(), genericFrame(), left.Frame(), right.Frame(), right.Fallback(), asmfixture.Read(), initValue)
 }
 `,
 	"left/left.go": `package left
@@ -95,6 +109,30 @@ func Read() string {
 
 TEXT ·AssemblyFrame(SB),NOSPLIT,$0-0
 	RET
+`,
+	"generic/generic.go": `package generic
+
+var GenGlobal = "generic"
+
+//go:noinline
+func Identity[T any](value T) T {
+	if GenGlobal == "" {
+		panic("missing generic global")
+	}
+	return value
+}
+`,
+	"inline/inline.go": `package inline
+
+var Collide = "inline"
+
+func Small() string {
+	value := Collide
+	if len(value) == 0 {
+		return "missing"
+	}
+	return value
+}
 `,
 }
 
@@ -162,6 +200,76 @@ func subprogramPC(t *testing.T, r *dwarfReader, suffix string) uint64 {
 	}
 	t.Fatalf("no subprogram ending in %q; names include %v", suffix, names)
 	return 0
+}
+
+func subprogramPCContaining(t *testing.T, r *dwarfReader, fragment string) uint64 {
+	t.Helper()
+	rd := r.data.Reader()
+	for {
+		entry, err := rd.Next()
+		if err != nil {
+			t.Fatalf("scan subprograms: %v", err)
+		}
+		if entry == nil {
+			break
+		}
+		if entry.Tag != dwarf.TagSubprogram {
+			continue
+		}
+		name, _ := entry.Val(dwarf.AttrName).(string)
+		if !strings.Contains(name, fragment) {
+			continue
+		}
+		lowPC, ok := entry.Val(dwarf.AttrLowpc).(uint64)
+		if ok {
+			return uint64(int64(lowPC) + r.slide)
+		}
+	}
+	t.Fatalf("no subprogram containing %q", fragment)
+	return 0
+}
+
+func inlinedSubprogramPC(t *testing.T, r *dwarfReader, originSuffix string) uint64 {
+	t.Helper()
+	rd := r.data.Reader()
+	for {
+		entry, err := rd.Next()
+		if err != nil {
+			t.Fatalf("scan inlined subprograms: %v", err)
+		}
+		if entry == nil {
+			break
+		}
+		if entry.Tag != dwarf.TagInlinedSubroutine {
+			continue
+		}
+		name, ok := r.abstractOriginName(entry)
+		if !ok || !strings.HasSuffix(name, originSuffix) {
+			continue
+		}
+		ranges, err := r.data.Ranges(entry)
+		if err != nil {
+			t.Fatalf("read inline ranges for %q: %v", name, err)
+		}
+		if len(ranges) > 0 {
+			return uint64(int64(ranges[0][0]) + r.slide)
+		}
+	}
+	t.Fatalf("no inlined subprogram ending in %q", originSuffix)
+	return 0
+}
+
+func physicalPackageForPC(t *testing.T, r *dwarfReader, pc uint64) string {
+	t.Helper()
+	cu, err := r.data.Reader().SeekPC(uint64(int64(pc) - r.slide))
+	if err != nil {
+		t.Fatalf("SeekPC(%#x): %v", pc, err)
+	}
+	name, _ := cu.Val(dwarf.AttrName).(string)
+	if name == "" {
+		t.Fatalf("CU containing %#x has no package name", pc)
+	}
+	return name
 }
 
 func exactGlobalAddress(t *testing.T, r *dwarfReader, name string) uint64 {
@@ -246,5 +354,48 @@ func TestPackageForPCUsesRuntimeSlide(t *testing.T) {
 	}
 	if pc < uint64(r.slide) {
 		t.Fatalf("test fixture PC %#x does not include slide %#x", pc, r.slide)
+	}
+}
+
+func TestEvaluateNameUsesLogicalCodePackage(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		gcflags   string
+		optimized bool
+	}{
+		{name: "optimized", optimized: true},
+		{name: "no_optimize_no_inline", gcflags: "all=-N -l"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := buildScopedGlobalsFixture(t, tc.gcflags)
+
+			genericPC := subprogramPCContaining(t, r, "/generic.Identity[")
+			genericLocation := r.locationForPC(genericPC)
+			if want := scopedGlobalsModule + "/generic.Identity["; !strings.Contains(genericLocation.Function, want) {
+				t.Fatalf("generic Frame.Function = %q, want function containing %q", genericLocation.Function, want)
+			}
+			if got := physicalPackageForPC(t, r, genericPC); got != "main" {
+				t.Fatalf("generic physical CU = %q, want main to exercise instantiator-CU regression", got)
+			}
+			assertEvaluatesGlobal(t, r, genericPC, "GenGlobal", scopedGlobalsModule+"/generic.GenGlobal")
+
+			var inlinePC uint64
+			if tc.optimized {
+				inlinePC = inlinedSubprogramPC(t, r, "/inline.Small")
+				inlineLocation := r.locationForPC(inlinePC)
+				if inlineLocation.Function != "main.inlineFrame" {
+					t.Fatalf("inline Frame.Function = %q, want physical main.inlineFrame", inlineLocation.Function)
+				}
+				if !strings.HasSuffix(inlineLocation.File, "/inline/inline.go") {
+					t.Fatalf("inline current-PC file = %q, want inline/inline.go", inlineLocation.File)
+				}
+				if got := physicalPackageForPC(t, r, inlinePC); got != "main" {
+					t.Fatalf("inline physical CU = %q, want main to exercise caller-CU regression", got)
+				}
+			} else {
+				inlinePC = subprogramPC(t, r, "/inline.Small")
+			}
+			assertEvaluatesGlobal(t, r, inlinePC, "Collide", scopedGlobalsModule+"/inline.Collide")
+		})
 	}
 }
