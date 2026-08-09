@@ -588,6 +588,25 @@ func (e *engine) handleStop(stop StopEvent) {
 
 	case StopBreakpoint:
 		e.setState(stateSuspended)
+		// A stop on a thread OTHER than the one being stepped can still reach
+		// here on a backend that reaps any thread's status mid-step-over (the
+		// darwin BINGO_DARWIN_ATOMIC_STEPOVER=0 ablation path does; linux's
+		// targeted wait normally prevents it). At that moment the stepped-over
+		// breakpoint is disarmed and out of the table, and only StopSingleStep
+		// would put it back — so without this it is orphaned for good, and a
+		// sibling parked on that same address finds no table entry below and is
+		// resumed one byte into the restored instruction. Rearming BEFORE the
+		// lookup avoids both. Mirrors the StopSignal branch. See #198.
+		if sob := e.steppingOverBP; sob != nil {
+			e.steppingOverBP = nil
+			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
+				e.endThreadStep()
+				e.emitError(protocol.CmdNone,
+					fmt.Errorf("reinstall breakpoint 0x%x after a sibling stop: %w", sob.addr, rerr))
+				return
+			}
+			e.endThreadStep()
+		}
 		var err error
 		stop, err = e.populateBreakpointStop(stop)
 		if err != nil {

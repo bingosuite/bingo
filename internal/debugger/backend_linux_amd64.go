@@ -419,6 +419,10 @@ func (b *linuxBackend) Threads() ([]int, error) {
 // PTRACE_EVENT stops (clone/exec/exit) are handled internally and don't
 // surface to the engine.
 //
+// While a single-step is in flight the wait is TARGETED at the stepping thread
+// rather than at any thread. See the waitTarget comment: a step-over must be
+// atomic with respect to the breakpoint it has disarmed.
+//
 // wait4 runs on the calling (waitLoop) thread, NOT the tracer thread: waiting
 // for a tracee is legal from any thread of the tracer process, and keeping it
 // off the tracer thread lets the engine issue control ops concurrently. Every
@@ -430,8 +434,19 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 	for {
 		var ws syscall.WaitStatus
 		// WALL includes clone()d threads.
-		tid, err := syscall.Wait4(-1, &ws, syscall.WALL, nil)
+		target := b.waitTarget()
+		tid, err := syscall.Wait4(target, &ws, syscall.WALL, nil)
 		if err != nil {
+			// The stepping thread is gone (it died, or a Kill already reaped
+			// it), so the targeted wait can never complete. Drop back to the
+			// process-wide wait rather than reporting the whole tracee exited:
+			// on a Kill the waitLoop is the sole legitimate reaper of every
+			// thread's death (#111), and it can only do that with pid -1.
+			if target != -1 && isNoChildProcess(err) {
+				b.stepping = false
+				b.stepTID = 0
+				continue
+			}
 			if isNoChildProcess(err) {
 				return StopEvent{Reason: StopExited, TID: b.pid}, nil
 			}
@@ -605,6 +620,31 @@ func (b *linuxBackend) recordStop(tid int) {
 	if tid != 0 {
 		b.lastStopTID = tid
 	}
+}
+
+// waitTarget is the pid argument for wait4: the stepping thread while a
+// single-step is in flight, otherwise -1 (any thread).
+//
+// A step-over must be ATOMIC with respect to the breakpoint it has disarmed.
+// engine.resumeFromBreakpoint restores the original bytes, drops the entry from
+// the breakpoint table and single-steps one thread; only the resulting
+// StopSingleStep puts the trap back. ptrace stops are per-thread and bingo does
+// not stop the world, so sibling threads keep running and can be sitting in
+// their own unreaped INT3 stops. A process-wide wait4 during that window
+// CONSUMES such a status and hands the engine a StopBreakpoint it cannot act on
+// yet: the half-stepped breakpoint is disarmed and untabled, so it is silently
+// orphaned, and a sibling parked on that same address finds no table entry and
+// is resumed one byte into the restored instruction (#198).
+//
+// Waiting on the stepping thread specifically leaves those sibling statuses
+// queued in the kernel — nothing is lost. They surface on the very next
+// process-wide wait, by which time the trap has been reinstalled and the engine
+// reports them normally.
+func (b *linuxBackend) waitTarget() int {
+	if b.stepping && b.stepTID != 0 {
+		return b.stepTID
+	}
+	return -1
 }
 
 func isNoSuchProcess(err error) bool {
