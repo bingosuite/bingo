@@ -148,6 +148,37 @@ func TestStepQueueReleasesFIFO(t *testing.T) {
 	}
 }
 
+// TestStepQueuePreservesEveryStopField pins that a held stop is delivered whole.
+// The signal in particular travels inside the parked StopEvent rather than in
+// backend state, which is why the queue has no pending-signal ordering problem
+// to solve (see issue #204): there is no separate signal record that could be
+// written when the stop is parked and read against a different thread later.
+// If a refactor ever moves the signal out of the event, this test fails.
+func TestStepQueuePreservesEveryStopField(t *testing.T) {
+	want := []StopEvent{
+		{Reason: StopSignal, TID: 21, Signal: 11},
+		{Reason: StopBreakpoint, TID: 22},
+		{Reason: StopSignal, TID: 23, Signal: 17},
+	}
+
+	var q stepQueue
+	q.beginStep(11)
+	for _, ev := range want {
+		q.park(ev)
+	}
+	q.endStep()
+
+	for i, w := range want {
+		got, ok := q.releasable()
+		if !ok {
+			t.Fatalf("releasable() ran dry at index %d", i)
+		}
+		if got != w {
+			t.Fatalf("released %+v at index %d, want %+v", got, i, w)
+		}
+	}
+}
+
 func TestStepQueuePurgeDiscardsHeldStops(t *testing.T) {
 	var q stepQueue
 	q.park(StopEvent{Reason: StopBreakpoint, TID: 21})
