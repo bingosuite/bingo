@@ -284,11 +284,75 @@ func TestLinuxBackendDrainParkedRecordsOnDeliveryOnly(t *testing.T) {
 	if !ok {
 		t.Fatal("drainParked() dropped the second held stop")
 	}
+	if ev.Reason != StopSignal || ev.Signal != 11 {
+		t.Fatalf("second drained stop = {%v, signal %d}, want {StopSignal, signal 11}", ev.Reason, ev.Signal)
+	}
 	if got := b.traceTID(); got != second {
 		t.Fatalf("traceTID() = %d, want the delivered thread %d", got, second)
 	}
 	if _, ok := b.drainParked(); ok {
 		t.Fatal("drainParked() returned a stop from an empty queue")
+	}
+}
+
+// TestLinuxBackendHeldSignalSurfacesOnlyWithItsOwnStop pins the ordering issue
+// #204 raises for pending signals. A held stop's signal must not become
+// observable before the stop it belongs to, and it must arrive in the same
+// operation that repoints traceTID at the signalled thread — otherwise the
+// engine would report or suppress a signal against whichever thread happened to
+// be the resume target at the time.
+//
+// The queue is immune to that class by construction rather than by ordering
+// discipline: the signal is a field of the parked StopEvent, so there is no
+// separate signal record that could be written at park time and later
+// overwritten. This test is what stops a future refactor from hoisting the
+// signal into backend state, where it would need — and could silently lose —
+// that discipline.
+func TestLinuxBackendHeldSignalSurfacesOnlyWithItsOwnStop(t *testing.T) {
+	const (
+		pid      = 2001
+		stepped  = 2002
+		signaled = 2003
+		later    = 2004
+	)
+
+	b := &linuxBackend{pid: pid}
+	b.beginStep(stepped)
+	b.recordStop(stepped)
+
+	b.park(StopEvent{Reason: StopSignal, TID: signaled, Signal: 11})
+	b.park(StopEvent{Reason: StopBreakpoint, TID: later})
+
+	// While the step is in flight the signalled thread is invisible: the engine
+	// is still working on, and must still resume, the stepped thread.
+	if got := b.traceTID(); got != stepped {
+		t.Fatalf("traceTID() = %d with a signal held, want stepped tid %d", got, stepped)
+	}
+
+	b.endStep()
+
+	ev, ok := b.drainParked()
+	if !ok {
+		t.Fatal("drainParked() withheld the signal stop after the step completed")
+	}
+	if ev.TID != signaled || ev.Reason != StopSignal || ev.Signal != 11 {
+		t.Fatalf("delivered %+v, want {StopSignal, tid %d, signal 11}", ev, signaled)
+	}
+	// The signal and the resume target must move together. If traceTID still
+	// named the stepped thread here, the engine would handle signalled's stop
+	// but resume — or POKEDATA into — the wrong thread.
+	if got := b.traceTID(); got != signaled {
+		t.Fatalf("traceTID() = %d when delivering the signal, want the signalled thread %d", got, signaled)
+	}
+
+	// The next held stop carries no signal, and delivering it must not leave the
+	// previous signal attached to it.
+	ev, ok = b.drainParked()
+	if !ok {
+		t.Fatal("drainParked() dropped the stop queued behind the signal")
+	}
+	if ev.TID != later || ev.Reason != StopBreakpoint || ev.Signal != 0 {
+		t.Fatalf("delivered %+v, want {StopBreakpoint, tid %d, signal 0}", ev, later)
 	}
 }
 
