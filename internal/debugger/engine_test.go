@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"syscall"
 	"testing"
@@ -1220,9 +1221,9 @@ var _ = Describe("Engine", func() {
 			// Goroutines (same code path).
 			gs, err := d.Goroutines()
 			Expect(err).NotTo(HaveOccurred())
-			Expect(gs).To(HaveLen(1))
-			Expect(gs[0].ID).To(BeZero())
-			Expect(gs[0].Status).To(Equal("unknown"))
+			Expect(gs.Goroutines).To(HaveLen(1))
+			Expect(gs.Goroutines[0].ID).To(BeZero())
+			Expect(gs.Goroutines[0].Status).To(Equal("unknown"))
 		})
 	})
 
@@ -1234,10 +1235,10 @@ var _ = Describe("Engine", func() {
 		It("returns one synthetic unknown goroutine", func() {
 			gs, err := d.Goroutines()
 			Expect(err).NotTo(HaveOccurred())
-			Expect(gs).To(HaveLen(1))
-			Expect(gs[0].ID).To(BeZero())
-			Expect(gs[0].Status).To(Equal("unknown"))
-			Expect(gs[0].Current).To(BeTrue())
+			Expect(gs.Goroutines).To(HaveLen(1))
+			Expect(gs.Goroutines[0].ID).To(BeZero())
+			Expect(gs.Goroutines[0].Status).To(Equal("unknown"))
+			Expect(gs.Goroutines[0].Current).To(BeTrue())
 		})
 	})
 
@@ -1328,3 +1329,66 @@ var _ = Describe("Engine", func() {
 		})
 	})
 })
+
+// The wire contract is only real if the PRODUCER honours it. Without DWARF the
+// engine degrades to a single synthetic goroutine, which is exactly the shape
+// these specs can assert on the fakeBackend — the point is that the packed path
+// is the one that runs, not a bypass. See issue #194.
+var _ = Describe("goroutine events go through the wire contract", func() {
+	var d debugger.Debugger
+
+	BeforeEach(func() {
+		d = debugger.NewWithBackend(newFakeBackend(), nil)
+		debugger.ExportedForceSuspended(d)
+	})
+
+	AfterEach(func() {
+		_ = d.Kill()
+	})
+
+	It("returns a packed goroutine list, not a bare slice", func() {
+		gs, err := d.Goroutines()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(gs.Goroutines).NotTo(BeEmpty())
+		Expect(len(gs.Goroutines)).To(BeNumerically("<=", protocol.MaxSnapshotGoroutines))
+		// The fake has no DWARF, so this is a degraded lower-bound result rather
+		// than an exact one-goroutine runtime.
+		Expect(gs.Totals).NotTo(BeNil())
+		Expect(gs.Totals.GoroutinesClipped).To(BeTrue())
+	})
+
+	It("keeps every emitted goroutine event inside the byte budget", func() {
+		gs, err := d.Goroutines()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(eventSize(protocol.EventGoroutines, gs)).
+			To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
+
+		snap, err := d.GoroutineSnapshot()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(eventSize(protocol.EventGoroutineSnapshot, snap)).
+			To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
+		Expect(len(snap.Goroutines)).To(BeNumerically("<=", protocol.MaxSnapshotGoroutines))
+		Expect(len(snap.Threads)).To(BeNumerically("<=", protocol.MaxSnapshotThreads))
+	})
+
+	It("keeps current consistent with what it delivered", func() {
+		snap, err := d.GoroutineSnapshot()
+		Expect(err).NotTo(HaveOccurred())
+		if snap.Current == 0 {
+			return
+		}
+		ids := make([]int, 0, len(snap.Goroutines))
+		for _, g := range snap.Goroutines {
+			ids = append(ids, g.ID)
+		}
+		Expect(ids).To(ContainElement(snap.Current))
+	})
+})
+
+// eventSize measures the event exactly as the contract does: the real envelope
+// at the widest sequence number the hub can stamp.
+func eventSize(kind protocol.EventKind, payload any) int {
+	raw, err := protocol.MarshalEvent(protocol.MustEvent(kind, math.MaxUint64, payload))
+	Expect(err).NotTo(HaveOccurred())
+	return len(raw)
+}

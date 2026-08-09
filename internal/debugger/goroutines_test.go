@@ -127,7 +127,7 @@ func expectDegradedSnapshotPreservesBaseline(degraded, recovered protocol.Gorout
 	}).To(Equal([]snapshotObservation{
 		{Goroutines: []int{0}},
 		{
-			Goroutines: []int{101, 102},
+			Goroutines: []int{102, 101},
 			Threads:    2,
 			Current:    102,
 			Selected:   102,
@@ -155,7 +155,7 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 
 		baseline := debugger.ExportedGoroutineSnapshot(d)
 		Expect(observeSnapshot(baseline)).To(Equal(snapshotObservation{
-			Goroutines: []int{101, 102, 103},
+			Goroutines: []int{102, 101, 103},
 			Threads:    2,
 			Current:    102,
 			Selected:   102,
@@ -233,14 +233,14 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 			observeSnapshot(liveAgain),
 		}).To(Equal([]snapshotObservation{
 			{
-				Goroutines: []int{101, 102},
+				Goroutines: []int{102, 101},
 				Threads:    2,
 				Current:    102,
 				Selected:   102,
 				Exited:     []int{103},
 			},
 			{
-				Goroutines: []int{101, 102, 103},
+				Goroutines: []int{102, 101, 103},
 				Threads:    2,
 				Current:    102,
 				Selected:   102,
@@ -256,7 +256,7 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 			snap := debugger.ExportedGoroutineSnapshot(d)
 
 			Expect(observeSnapshot(snap)).To(Equal(snapshotObservation{
-				Goroutines: []int{101, 102, 103},
+				Goroutines: []int{102, 101, 103},
 				Threads:    2,
 				Current:    102,
 				Selected:   102,
@@ -276,8 +276,8 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 
 			gs, err := d.Goroutines()
 			Expect(err).NotTo(HaveOccurred())
-			Expect(goroutineIDs(gs)).To(Equal([]int{0}))
-			Expect(gs[0].Current).To(BeTrue())
+			Expect(goroutineIDs(gs.Goroutines)).To(Equal([]int{0}))
+			Expect(gs.Goroutines[0].Current).To(BeTrue())
 		},
 		Entry("for an unreadable allgs slot", func() uint64 {
 			return allgsArrayAddr + 8
@@ -356,9 +356,12 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 
 		baseline := debugger.ExportedGoroutineSnapshot(d)
 		Expect(baseline.Current).To(Equal(104))
-		Expect(baseline.Goroutines).To(HaveLen(richCount + 1))
+		Expect(baseline.Goroutines).To(HaveLen(protocol.MaxSnapshotGoroutines))
 		Expect(baseline.Goroutines[0].ID).To(Equal(104))
 		Expect(baseline.Goroutines[0].Current).To(BeTrue())
+		Expect(baseline.Totals).NotTo(BeNil())
+		Expect(baseline.Totals.Goroutines).To(Equal(richCount + 1))
+		Expect(baseline.Totals.GoroutinesClipped).To(BeTrue())
 		Expect(baseline.Created).To(BeNil())
 		Expect(baseline.Exited).To(BeNil())
 		currentGoroutines := 0

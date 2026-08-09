@@ -5,7 +5,7 @@ import { sessionDAPEventVersion } from "./sessionEvent.js";
 
 export const bingoServiceIdentity = "bingo";
 export const managementApiVersion = 1;
-export const wireProtocolVersion = "1.3";
+export const wireProtocolVersion = "1.4";
 export const dapSessionEventVersion = sessionDAPEventVersion;
 export const minimumHealthProbeTimeoutMs = 25;
 

@@ -1298,35 +1298,32 @@ func withCurrent(gs []protocol.Goroutine, id int) []protocol.Goroutine {
 	return out
 }
 
-// The bounded-event work is additive and DORMANT: the packers exist but nothing
-// calls them, so the bytes on the wire must be indistinguishable from the
-// release before them. These specs are the merge-safety gate — if any of them
-// fails, this change is no longer safe to land ahead of the producer.
-var _ = Describe("dormant until the producer packs", func() {
-	It("emits no new keys on an unpacked snapshot", func() {
-		raw, err := json.Marshal(protocol.GoroutineSnapshotPayload{
-			Goroutines: []protocol.Goroutine{sampleGoroutine},
-			Threads:    []protocol.Thread{sampleThread},
-			Current:    1,
-			Created:    []int{7},
-			Exited:     []int{3},
-		})
-		Expect(err).NotTo(HaveOccurred())
-		Expect(string(raw)).NotTo(ContainSubstring("totals"),
-			"an untouched payload must serialise exactly as it did at 1.2")
+// The contract is now IN FORCE: both producers pack, the version advertises it,
+// and consumers enforce it. These specs pin the activation as a whole, because
+// the halves are only safe together — a version that promises boundedness while
+// a producer still emits unbounded events lets a conforming client reject valid
+// output, and enforcement without the bump rejects peers that never agreed.
+var _ = Describe("the contract is active", func() {
+	It("advertises the version that carries it", func() {
+		Expect(protocol.Version).To(Equal("1.4"))
 	})
 
-	It("emits no new keys on an unpacked goroutine list", func() {
-		raw, err := json.Marshal(protocol.GoroutinesPayload{
-			Goroutines: []protocol.Goroutine{sampleGoroutine},
-		})
+	It("still omits totals from a complete result", func() {
+		out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+			Goroutines: packGoroutines(4),
+			Threads:    packThreads(2),
+			Current:    1,
+		}, false, false)
+		Expect(report.Omitted()).To(BeFalse())
+
+		raw, err := json.Marshal(out)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(string(raw)).NotTo(ContainSubstring("totals"))
+		Expect(string(raw)).NotTo(ContainSubstring("totals"),
+			"a complete result must stay byte-identical to the pre-1.4 shape")
 	})
 
 	It("still decodes a payload written without the new field", func() {
-		// Forward compatibility in the other direction: a 1.2 peer's bytes must
-		// keep decoding into the extended struct with Totals absent.
+		// A peer that omits the optional field must keep decoding cleanly.
 		var snap protocol.GoroutineSnapshotPayload
 		Expect(json.Unmarshal([]byte(
 			`{"goroutines":[],"threads":[],"current":1,"created":[7],"exited":[3]}`,

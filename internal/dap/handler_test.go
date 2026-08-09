@@ -261,8 +261,8 @@ func (*gatedBreakpointDebugger) Evaluate(int, string) (protocol.Variable, error)
 func (*gatedBreakpointDebugger) StackFrames() ([]protocol.Frame, error) {
 	return nil, nil
 }
-func (*gatedBreakpointDebugger) Goroutines() ([]protocol.Goroutine, error) {
-	return nil, nil
+func (*gatedBreakpointDebugger) Goroutines() (protocol.GoroutinesPayload, error) {
+	return protocol.GoroutinesPayload{}, nil
 }
 func (*gatedBreakpointDebugger) GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error) {
 	return protocol.GoroutineSnapshotPayload{}, nil

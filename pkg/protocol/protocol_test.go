@@ -838,8 +838,8 @@ var _ = Describe("Version", func() {
 		decoded, _ := protocol.UnmarshalEvent(wire)
 		Expect(decoded.Version).To(Equal(protocol.Version))
 	})
-	It("is 1.3 — synthetic unknown goroutine identity", func() {
-		Expect(protocol.Version).To(Equal("1.3"))
+	It("is 1.4 — the goroutine event budget and totals reshape", func() {
+		Expect(protocol.Version).To(Equal("1.4"))
 	})
 })
 
