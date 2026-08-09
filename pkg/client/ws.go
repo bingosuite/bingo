@@ -1,9 +1,11 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"sync"
 	"time"
 
@@ -58,10 +60,31 @@ type wsClient struct {
 }
 
 // dial opens the WebSocket and waits for the server's welcome SessionState.
-func dial(addr, query string) (Client, error) {
+func dial(ctx context.Context, addr, query string) (Client, error) {
 	url := fmt.Sprintf("ws://%s/ws?%s", addr, query)
 
-	conn, _, err := websocket.DefaultDialer.Dial(url, nil)
+	dialer := *websocket.DefaultDialer
+	var stopDialCancel func() bool
+	dialer.NetDialContext = func(dialCtx context.Context, network, address string) (net.Conn, error) {
+		rawConn, err := (&net.Dialer{}).DialContext(dialCtx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		// gorilla applies context deadlines to the upgrade but does not close an
+		// established socket when a deadline-free context is canceled.
+		stopDialCancel = context.AfterFunc(ctx, func() { _ = rawConn.Close() })
+		return rawConn, nil
+	}
+	conn, _, err := dialer.DialContext(ctx, url, nil)
+	if stopDialCancel != nil {
+		stopDialCancel()
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return nil, fmt.Errorf("dial %s: %w", url, ctxErr)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", url, err)
 	}
@@ -81,6 +104,8 @@ func dial(addr, query string) (Client, error) {
 
 	go c.readPump()
 
+	timer := time.NewTimer(dialTimeout)
+	defer timer.Stop()
 	select {
 	case evt, ok := <-c.events:
 		if !ok {
@@ -89,11 +114,16 @@ func dial(addr, query string) (Client, error) {
 			}
 			return nil, fmt.Errorf("connection closed before receiving session state")
 		}
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("wait for session state: %w", err)
+		}
 		if evt.Kind != protocol.EventSessionState {
 			return nil, fmt.Errorf("expected SessionState event, got %s", evt.Kind)
 		}
-	case <-time.After(dialTimeout):
+	case <-timer.C:
 		return nil, fmt.Errorf("timeout waiting for session state from server")
+	case <-ctx.Done():
+		return nil, fmt.Errorf("wait for session state: %w", ctx.Err())
 	}
 
 	cleanup = false

@@ -19,17 +19,23 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
+	"github.com/bingosuite/bingo/cmd/internal/repl"
 	"github.com/bingosuite/bingo/internal/dapclient"
 	"github.com/bingosuite/bingo/pkg/protocol"
 	"github.com/chzyer/readline"
@@ -41,10 +47,17 @@ const (
 	replyTimeout = 15 * time.Second
 )
 
+var errDAPDisconnected = errors.New("DAP connection closed")
+
 type breakpoint struct {
 	line     int
 	id       int
 	verified bool
+}
+
+type pendingResult struct {
+	message godap.Message
+	err     error
 }
 
 // dapCLI is a minimal interactive DAP client: a demuxing read loop matches
@@ -54,10 +67,11 @@ type dapCLI struct {
 	conn   net.Conn
 	reader *bufio.Reader
 
-	// mu guards seq and pending (the response-waiter registry).
-	mu      sync.Mutex
-	seq     int
-	pending map[int]chan godap.Message
+	// mu guards seq, pending (the response-waiter registry), and terminalErr.
+	mu          sync.Mutex
+	seq         int
+	pending     map[int]chan pendingResult
+	terminalErr error
 
 	// writeMu serialises WriteProtocolMessage across the REPL goroutine, the
 	// initialized-handler goroutine, and any command handler — concurrent writes
@@ -73,31 +87,100 @@ type dapCLI struct {
 
 	// printMu serialises console output so async event prints don't interleave.
 	printMu sync.Mutex
+	out     io.Writer
+
+	closeEditor  func()
+	disconnected chan struct{}
+	readDone     chan struct{}
+	readMu       sync.Mutex
+	readErr      error
+	readClosing  bool
+
+	transportOnce  sync.Once
+	disconnectOnce sync.Once
+	intentional    atomic.Bool
 }
 
 func main() {
+	os.Exit(mainExitCode())
+}
+
+func mainExitCode() int {
+	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
 	addr := flag.String("addr", "localhost:4711", "DAP server address (host:port)")
 	sessionID := flag.String("session", "", "existing bingo session ID to join (omit to create on launch)")
 	flag.Parse()
 
-	conn, err := net.Dial("tcp4", *addr)
+	if err := runDAPCLI(ctx, *addr, *sessionID); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, errDAPDisconnected) {
+			return 0
+		}
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+func runDAPCLI(ctx context.Context, addr, sessionID string) error {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp4", addr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: dial DAP %s: %v\n", *addr, err)
-		os.Exit(1)
+		return fmt.Errorf("dial DAP %s: %w", addr, err)
+	}
+	if err := ctx.Err(); err != nil {
+		_ = conn.Close()
+		return err
 	}
 
+	rl, err := repl.NewEditor(&readline.Config{
+		Prompt:          prompt,
+		HistoryFile:     os.ExpandEnv("$HOME/.bingo_dap_history"),
+		InterruptPrompt: "^C",
+		EOFPrompt:       "exit",
+	})
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("initialize readline: %w", err)
+	}
+
+	var closeEditorOnce sync.Once
+	closeEditor := func() {
+		closeEditorOnce.Do(func() { _ = rl.Close() })
+	}
 	h := &dapCLI{
-		conn:      conn,
-		reader:    bufio.NewReader(conn),
-		pending:   make(map[int]chan godap.Message),
-		bpsByFile: make(map[string][]breakpoint),
+		conn:         conn,
+		reader:       bufio.NewReader(conn),
+		pending:      make(map[int]chan pendingResult),
+		bpsByFile:    make(map[string][]breakpoint),
+		out:          rl.Stdout(),
+		closeEditor:  closeEditor,
+		disconnected: make(chan struct{}),
+		readDone:     make(chan struct{}),
 	}
-	go h.readLoop()
 
-	if *sessionID != "" {
-		fmt.Printf("joining session %s on %s over DAP...\n", *sessionID, *addr)
+	runCtx, cancel := context.WithCancel(ctx)
+	go h.readLoop()
+	stopShutdown := context.AfterFunc(runCtx, func() {
+		h.close()
+		closeEditor()
+	})
+	var finishOnce sync.Once
+	finish := func() {
+		finishOnce.Do(func() {
+			cancel()
+			h.close()
+			closeEditor()
+			stopShutdown()
+			<-h.readDone
+		})
+	}
+	defer finish()
+
+	if sessionID != "" {
+		fmt.Printf("joining session %s on %s over DAP...\n", sessionID, addr)
 	} else {
-		fmt.Printf("connecting to %s over DAP (session created on launch)...\n", *addr)
+		fmt.Printf("connecting to %s over DAP (session created on launch)...\n", addr)
 	}
 
 	// initialize handshake — block for the capabilities response.
@@ -112,52 +195,29 @@ func main() {
 			SupportsRunInTerminalRequest: false,
 		},
 	}); err != nil {
-		fmt.Fprintf(os.Stderr, "error: initialize: %v\n", err)
-		os.Exit(1)
+		if errors.Is(err, errDAPDisconnected) || runCtx.Err() != nil {
+			return nil
+		}
+		return fmt.Errorf("initialize: %w", err)
 	}
 
-	if *sessionID != "" {
+	if sessionID != "" {
 		// Join: attach carrying the session id and no pid. The response arrives
 		// after our auto-configurationDone, so fire it and let the read loop
 		// drive the rest of the handshake.
-		args, _ := json.Marshal(map[string]any{"session": *sessionID})
-		h.setSessionID(*sessionID)
+		args, _ := json.Marshal(map[string]any{"session": sessionID})
+		h.setSessionID(sessionID)
 		h.fire("attach", &godap.AttachRequest{Arguments: args})
 	}
 
-	rl, err := readline.NewEx(&readline.Config{
-		Prompt:          prompt,
-		HistoryFile:     os.ExpandEnv("$HOME/.bingo_dap_history"),
-		InterruptPrompt: "^C",
-		EOFPrompt:       "exit",
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error initializing readline: %v\n", err)
-		os.Exit(1)
-	}
-	defer func() { _ = rl.Close() }()
-
 	printHelp()
-	for {
-		line, err := rl.Readline()
-		if err != nil {
-			if err == readline.ErrInterrupt || err == io.EOF {
-				fmt.Println("bye")
-				h.close()
-				return
-			}
-			break
-		}
-
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if h.dispatch(strings.Fields(line)) {
-			h.close()
-			return
-		}
+	repl.Loop(runCtx, rl, closeEditor, h.disconnected, h.dispatch)
+	finish()
+	readErr, intentional := h.readOutcome()
+	if ctx.Err() != nil {
+		return nil
 	}
+	return sessionEndError(readErr, intentional)
 }
 
 // dispatch runs one REPL command, returning true when the CLI should exit.
@@ -204,7 +264,7 @@ func (h *dapCLI) dispatch(args []string) bool {
 
 	case "restart":
 		if _, err := h.request("restart", &godap.RestartRequest{}); err != nil {
-			printErr(err)
+			h.printRequestError("", err)
 		} else {
 			fmt.Println("  restarted (breakpoints reinstalled)")
 		}
@@ -249,9 +309,10 @@ func (h *dapCLI) dispatch(args []string) bool {
 		h.clearBreakpoint(id)
 
 	case "locals":
-		frame := 0
-		if len(args) > 1 {
-			frame, _ = strconv.Atoi(args[1])
+		frame, err := repl.FrameIndex(args[1:])
+		if err != nil {
+			fmt.Printf("  %s\n", err)
+			return false
 		}
 		h.showLocals(frame)
 
@@ -265,7 +326,6 @@ func (h *dapCLI) dispatch(args []string) bool {
 		printHelp()
 
 	case "quit", "q", "exit":
-		fmt.Println("bye")
 		return true
 
 	default:
@@ -279,15 +339,11 @@ func (h *dapCLI) dispatch(args []string) bool {
 // readLoop demuxes responses (to waiters, by request seq) and events (printed /
 // handshake-driven) until the connection closes.
 func (h *dapCLI) readLoop() {
+	defer close(h.readDone)
 	for {
 		msg, err := readDAPMessage(h.reader)
 		if err != nil {
-			h.failPending()
-			if !isClosed(err) {
-				h.printAsync("connection closed: " + err.Error())
-			} else {
-				h.printAsync("disconnected")
-			}
+			h.endConnection(err)
 			return
 		}
 		switch m := msg.(type) {
@@ -309,7 +365,10 @@ func (h *dapCLI) onResponse(rm godap.ResponseMessage, msg godap.Message) {
 	ch := h.pending[rs.RequestSeq]
 	h.mu.Unlock()
 	if ch != nil {
-		ch <- msg
+		select {
+		case ch <- pendingResult{message: msg}:
+		default:
+		}
 		return
 	}
 	// No waiter (a fire-and-forget command): surface failures so they aren't
@@ -323,43 +382,62 @@ func (h *dapCLI) onResponse(rm godap.ResponseMessage, msg godap.Message) {
 // ack we don't surface). Errors still surface via onResponse.
 func (h *dapCLI) fire(command string, m godap.RequestMessage) {
 	h.mu.Lock()
+	if h.terminalErr != nil {
+		h.mu.Unlock()
+		return
+	}
 	h.seq++
 	seq := h.seq
 	h.mu.Unlock()
-	h.write(command, seq, m)
+	if err := h.write(command, seq, m); err != nil {
+		h.endConnection(err)
+	}
 }
 
 // request sends a request and blocks for its response (or a timeout).
 func (h *dapCLI) request(command string, m godap.RequestMessage) (godap.Message, error) {
 	h.mu.Lock()
+	if h.terminalErr != nil {
+		err := h.terminalErr
+		h.mu.Unlock()
+		return nil, err
+	}
 	h.seq++
 	seq := h.seq
-	ch := make(chan godap.Message, 1)
+	ch := make(chan pendingResult, 1)
 	h.pending[seq] = ch
 	h.mu.Unlock()
 
-	h.write(command, seq, m)
-
-	select {
-	case msg := <-ch:
+	defer func() {
 		h.mu.Lock()
 		delete(h.pending, seq)
 		h.mu.Unlock()
-		if rm, ok := msg.(godap.ResponseMessage); ok {
+	}()
+
+	if err := h.write(command, seq, m); err != nil {
+		h.endConnection(err)
+		return nil, connectionError(err)
+	}
+
+	timer := time.NewTimer(replyTimeout)
+	defer timer.Stop()
+	select {
+	case result := <-ch:
+		if result.err != nil {
+			return nil, result.err
+		}
+		if rm, ok := result.message.(godap.ResponseMessage); ok {
 			if rs := rm.GetResponse(); !rs.Success {
-				return msg, fmt.Errorf("%s", rs.Message)
+				return result.message, fmt.Errorf("%s", rs.Message)
 			}
 		}
-		return msg, nil
-	case <-time.After(replyTimeout):
-		h.mu.Lock()
-		delete(h.pending, seq)
-		h.mu.Unlock()
+		return result.message, nil
+	case <-timer.C:
 		return nil, fmt.Errorf("timeout awaiting %s response", command)
 	}
 }
 
-func (h *dapCLI) write(command string, seq int, m godap.RequestMessage) {
+func (h *dapCLI) write(command string, seq int, m godap.RequestMessage) error {
 	req := m.GetRequest()
 	req.Seq = seq
 	req.Type = "request"
@@ -367,22 +445,71 @@ func (h *dapCLI) write(command string, seq int, m godap.RequestMessage) {
 	h.writeMu.Lock()
 	err := godap.WriteProtocolMessage(h.conn, m)
 	h.writeMu.Unlock()
-	if err != nil {
-		h.printAsync(fmt.Sprintf("[error] write %s: %v", command, err))
-	}
+	return err
 }
 
 // failPending unblocks every outstanding waiter when the connection drops.
-func (h *dapCLI) failPending() {
+func (h *dapCLI) failPending(err error) {
 	h.mu.Lock()
+	if h.terminalErr == nil {
+		h.terminalErr = err
+	}
+	err = h.terminalErr
+	pending := make([]chan pendingResult, 0, len(h.pending))
 	for seq, ch := range h.pending {
-		close(ch)
+		pending = append(pending, ch)
 		delete(h.pending, seq)
 	}
 	h.mu.Unlock()
+	for _, ch := range pending {
+		select {
+		case ch <- pendingResult{err: err}:
+		default:
+		}
+	}
 }
 
-func (h *dapCLI) close() { _ = h.conn.Close() }
+func (h *dapCLI) close() {
+	h.intentional.Store(true)
+	h.failPending(errDAPDisconnected)
+	h.closeTransport()
+}
+
+func (h *dapCLI) closeTransport() {
+	h.transportOnce.Do(func() { _ = h.conn.Close() })
+}
+
+func (h *dapCLI) endConnection(err error) {
+	h.disconnectOnce.Do(func() {
+		intentional := h.intentional.Load()
+		h.readMu.Lock()
+		h.readErr = err
+		h.readClosing = intentional
+		h.readMu.Unlock()
+
+		if !intentional {
+			close(h.disconnected)
+		}
+		h.failPending(connectionError(err))
+		h.closeTransport()
+		if intentional {
+			return
+		}
+
+		if isClosed(err) {
+			h.printAsync("disconnected")
+		} else {
+			h.printAsync("connection closed: " + err.Error())
+		}
+		h.closeEditor()
+	})
+}
+
+func (h *dapCLI) readOutcome() (error, bool) {
+	h.readMu.Lock()
+	defer h.readMu.Unlock()
+	return h.readErr, h.readClosing
+}
 
 // --- event handling ------------------------------------------------------------
 
@@ -408,11 +535,7 @@ func (h *dapCLI) onEvent(em godap.EventMessage) {
 		h.printAsync("[continued]")
 	case *godap.OutputEvent:
 		h.captureSession(e.Body.Output)
-		cat := e.Body.Category
-		if cat == "" {
-			cat = "output"
-		}
-		h.printAsync(fmt.Sprintf("[%s] %s", cat, strings.TrimRight(e.Body.Output, "\n")))
+		h.printOutput(e.Body.Category, e.Body.Output)
 	case *godap.ExitedEvent:
 		h.printAsync(fmt.Sprintf("[exited] code=%d", e.Body.ExitCode))
 	case *godap.TerminatedEvent:
@@ -527,7 +650,7 @@ func (h *dapCLI) sendBreakpoints(file string, announce bool) {
 		},
 	})
 	if err != nil {
-		h.printAsync("[error] setBreakpoints: " + err.Error())
+		h.printRequestError("setBreakpoints", err)
 		return
 	}
 	resp, ok := msg.(*godap.SetBreakpointsResponse)
@@ -562,7 +685,7 @@ func (h *dapCLI) sendBreakpoints(file string, announce bool) {
 func (h *dapCLI) showThreads() {
 	msg, err := h.request("threads", &godap.ThreadsRequest{})
 	if err != nil {
-		printErr(err)
+		h.printRequestError("", err)
 		return
 	}
 	resp, ok := msg.(*godap.ThreadsResponse)
@@ -580,7 +703,7 @@ func (h *dapCLI) showStackTrace() {
 		Arguments: godap.StackTraceArguments{ThreadId: h.thread()},
 	})
 	if err != nil {
-		printErr(err)
+		h.printRequestError("", err)
 		return
 	}
 	resp, ok := msg.(*godap.StackTraceResponse)
@@ -603,7 +726,7 @@ func (h *dapCLI) showLocals(frame int) {
 		Arguments: godap.VariablesArguments{VariablesReference: frame + 1},
 	})
 	if err != nil {
-		printErr(err)
+		h.printRequestError("", err)
 		return
 	}
 	resp, ok := msg.(*godap.VariablesResponse)
@@ -636,12 +759,43 @@ func (h *dapCLI) setSessionID(id string) {
 	h.stateMu.Unlock()
 }
 
-// printAsync writes an out-of-band line (event / async result) and redraws the
-// prompt, mirroring cmd/cli's event printer.
 func (h *dapCLI) printAsync(msg string) {
 	h.printMu.Lock()
-	fmt.Printf("\n  %s\n%s", msg, prompt)
+	repl.PrintAsync(h.output(), msg)
 	h.printMu.Unlock()
+}
+
+func (h *dapCLI) printOutput(category, content string) {
+	h.printMu.Lock()
+	repl.PrintOutput(h.output(), category, content)
+	h.printMu.Unlock()
+}
+
+func (h *dapCLI) output() io.Writer {
+	if h.out != nil {
+		return h.out
+	}
+	return os.Stdout
+}
+
+func (h *dapCLI) printRequestError(command string, err error) {
+	if h.intentional.Load() || h.connectionEnded() || errors.Is(err, errDAPDisconnected) {
+		return
+	}
+	if command != "" {
+		h.printAsync(fmt.Sprintf("[error] %s: %v", command, err))
+		return
+	}
+	fmt.Printf("  error: %v\n", err)
+}
+
+func (h *dapCLI) connectionEnded() bool {
+	select {
+	case <-h.disconnected:
+		return true
+	default:
+		return false
+	}
 }
 
 func parseFileLine(s string) (string, int, bool) {
@@ -657,14 +811,27 @@ func parseFileLine(s string) (string, int, bool) {
 }
 
 func isClosed(err error) bool {
-	return err == io.EOF || errStringContains(err, "closed")
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.EPIPE)
 }
 
-func errStringContains(err error, sub string) bool {
-	return err != nil && strings.Contains(err.Error(), sub)
+func connectionError(err error) error {
+	if isClosed(err) {
+		return errDAPDisconnected
+	}
+	return fmt.Errorf("DAP connection failed: %w", err)
 }
 
-func printErr(err error) { fmt.Printf("  error: %v\n", err) }
+func sessionEndError(err error, intentional bool) error {
+	if err == nil || intentional || isClosed(err) {
+		return nil
+	}
+	return fmt.Errorf("DAP connection ended: %w", err)
+}
 
 func printHelp() {
 	fmt.Println(`commands (Debug Adapter Protocol):

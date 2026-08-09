@@ -4,6 +4,7 @@
 package client
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -103,10 +104,19 @@ type SessionInfo struct {
 
 // ListSessions queries the server's REST API for all active sessions.
 func ListSessions(addr string) ([]SessionInfo, error) {
+	return ListSessionsContext(context.Background(), addr)
+}
+
+// ListSessionsContext queries the server's REST API for all active sessions.
+func ListSessionsContext(ctx context.Context, addr string) ([]SessionInfo, error) {
 	url := fmt.Sprintf("http://%s/api/sessions", addr)
 
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) //nolint:gosec // no auth by design
+	if err != nil {
+		return nil, fmt.Errorf("list sessions: request: %w", err)
+	}
 	httpClient := http.Client{Timeout: listSessionsTimeout}
-	resp, err := httpClient.Get(url) //nolint:gosec // no auth by design
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
 	}
@@ -125,10 +135,20 @@ func ListSessions(addr string) ([]SessionInfo, error) {
 
 // Create connects to the server and creates a new debug session.
 func Create(addr string) (Client, error) {
-	return dial(addr, "create=1")
+	return CreateContext(context.Background(), addr)
+}
+
+// CreateContext connects to the server and creates a new debug session.
+func CreateContext(ctx context.Context, addr string) (Client, error) {
+	return dial(ctx, addr, "create=1")
 }
 
 // Join connects to the server and joins an existing session by UUID.
 func Join(addr, sessionID string) (Client, error) {
-	return dial(addr, fmt.Sprintf("session=%s", sessionID))
+	return JoinContext(context.Background(), addr, sessionID)
+}
+
+// JoinContext connects to the server and joins an existing session by UUID.
+func JoinContext(ctx context.Context, addr, sessionID string) (Client, error) {
+	return dial(ctx, addr, fmt.Sprintf("session=%s", sessionID))
 }

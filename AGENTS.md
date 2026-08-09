@@ -91,6 +91,7 @@ follow them so reviews stay about substance, not style.
 | [cmd/bingo](cmd/bingo/) | Server entry point — flag parsing, signal handler, calls into `internal/server`. |
 | [cmd/cli](cmd/cli/) | Interactive readline client. |
 | [cmd/dapcli](cmd/dapcli/) | Interactive readline client that drives a session over DAP (mirrors `cmd/cli`'s UX). Talks to the server's `-dap-addr` listener; can create a session or `-session` join an existing one. |
+| [cmd/internal/repl](cmd/internal/repl/) | Shared interactive-client loop: readline interrupt/cancellation semantics, refresh-safe async output, and frame-index validation. |
 | [cmd/wsmon](cmd/wsmon/) | Read-only terminal telemetry observer. `-session`-joins a running session over WebSocket and live-renders the goroutine spawn tree + OS threads + created/exited lifecycle deltas from the `EventGoroutineSnapshot` stream, reporting included/total honestly and distinguishing wire omission from a clipped runtime scan. Never drives execution — the WS-observes half of the DAP-drives/WS-observes demo. |
 | [editors/vscode](editors/vscode/) | Platform-packaged TypeScript companion extension. Owns debugger type `bingo`, manages the shared server, and hosts the read-only Bingo Concurrency Activity Bar WebSocket observer. |
 | [cmd/target](cmd/target/) | Trivial target program for manual testing. |
@@ -3123,7 +3124,12 @@ the announced id from the `console` output for `state`/discovery; with `-session
 `stopOnEntry:true` so the interactive user always gets control and the tracee
 stays alive for others to join. It buffers `break`s set before launch and flushes
 them on `initialized`. Any mix of `dapcli` and `cli` clients can drive/observe
-one session concurrently.
+one session concurrently. Both clients use `cmd/internal/repl`: Ctrl-C cancels a
+non-empty edit but exits on an empty line; signals cancel connection setup and
+in-flight management requests before closing readline/transport; remote
+disconnects close readline to unblock the terminal; async events write through
+readline's redraw-aware writer; malformed/negative `locals` frame indexes are
+rejected before transport dispatch.
 
 **Option Y (rejected).** The alternative was teaching the hub about DAP directly
 (a second protocol path through `internal/hub`). Rejected: it would fork the most
