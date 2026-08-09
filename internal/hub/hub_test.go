@@ -114,7 +114,13 @@ type fakeWSConn struct {
 	mu       sync.Mutex
 	incoming chan []byte // messages written by the server (server → client)
 	outgoing chan []byte // messages injected by the test  (client → server)
+	writes   []fakeWSWrite
 	closed   bool
+}
+
+type fakeWSWrite struct {
+	messageType int
+	data        []byte
 }
 
 func newFakeWSConn() *fakeWSConn {
@@ -158,7 +164,7 @@ func (f *fakeWSConn) ReadMessage() (int, []byte, error) {
 	return hub.TextMessage, data, nil
 }
 
-func (f *fakeWSConn) WriteMessage(_ int, data []byte) error {
+func (f *fakeWSConn) WriteMessage(messageType int, data []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.closed {
@@ -166,7 +172,10 @@ func (f *fakeWSConn) WriteMessage(_ int, data []byte) error {
 	}
 	cp := make([]byte, len(data))
 	copy(cp, data)
-	f.incoming <- cp
+	f.writes = append(f.writes, fakeWSWrite{messageType: messageType, data: cp})
+	if messageType == hub.TextMessage {
+		f.incoming <- cp
+	}
 	return nil
 }
 
@@ -183,6 +192,20 @@ func (f *fakeWSConn) Close() error {
 		close(f.outgoing)
 	}
 	return nil
+}
+
+func (f *fakeWSConn) closeFrame() (int, string, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i := len(f.writes) - 1; i >= 0; i-- {
+		write := f.writes[i]
+		if write.messageType != hub.CloseMessage || len(write.data) < 2 {
+			continue
+		}
+		code := int(write.data[0])<<8 | int(write.data[1])
+		return code, string(write.data[2:]), true
+	}
+	return 0, "", false
 }
 
 type connClosedErr struct{}
@@ -324,6 +347,79 @@ var _ = Describe("Hub", func() {
 				}
 				return count
 			}, "500ms", "10ms").Should(Equal(2))
+		})
+	})
+
+	Describe("wire protocol version enforcement", func() {
+		It("rejects an incompatible command before execution without affecting another client", func() {
+			bad := newFakeWSConn()
+			good := newFakeWSConn()
+			mustAddClient(h, bad)
+			mustAddClient(h, good)
+			fd.setBPResult = protocol.Breakpoint{ID: 1}
+
+			cmd := mustCommand(protocol.CmdSetBreakpoint,
+				protocol.SetBreakpointPayload{File: "main.go", Line: 42})
+			cmd.Version = "999.0"
+			bad.inject(cmd)
+
+			Eventually(h.ClientCount, "500ms", "10ms").Should(Equal(1))
+			Eventually(func() bool {
+				_, _, ok := bad.closeFrame()
+				return ok
+			}, "500ms", "10ms").Should(BeTrue())
+			code, reason, _ := bad.closeFrame()
+			Expect(code).To(Equal(1002))
+			Expect(reason).To(Equal(protocol.ValidateVersion("999.0").Error()))
+			Consistently(fd.recordedCalls, "100ms", "10ms").
+				ShouldNot(ContainElement("SetBreakpoint"))
+			Expect(len(good.incoming)).To(Equal(0),
+				"an incompatible peer must not broadcast an error to other clients")
+
+			good.inject(mustCommand(protocol.CmdSetBreakpoint,
+				protocol.SetBreakpointPayload{File: "main.go", Line: 42}))
+			Eventually(fd.recordedCalls, "500ms", "10ms").
+				Should(ContainElement("SetBreakpoint"))
+			evt, ok := recvEvent(good)
+			Expect(ok).To(BeTrue())
+			Expect(evt.Kind).To(Equal(protocol.EventBreakpointSet))
+			Expect(evt.Seq).To(Equal(uint64(1)),
+				"rejecting one peer must not consume a shared hub sequence")
+		})
+
+		It("cannot resume a suspended session with an incompatible command", func() {
+			bad := newFakeWSConn()
+			good := newFakeWSConn()
+			mustAddClient(h, bad)
+			mustAddClient(h, good)
+
+			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+			_, ok := recvEvent(bad)
+			Expect(ok).To(BeTrue())
+			stop, ok := recvEvent(good)
+			Expect(ok).To(BeTrue())
+
+			cmd := mustCommand(protocol.CmdContinue, struct{}{})
+			cmd.Version = "999.0"
+			bad.inject(cmd)
+
+			Eventually(h.ClientCount, "500ms", "10ms").Should(Equal(1))
+			Consistently(fd.recordedCalls, "100ms", "10ms").
+				ShouldNot(ContainElement("Continue"))
+			Expect(h.State()).To(Equal(protocol.StateSuspended))
+
+			good.inject(mustCommand(protocol.CmdContinue, struct{}{}))
+			Eventually(fd.recordedCalls, "500ms", "10ms").
+				Should(ContainElement("Continue"))
+
+			fd.push(protocol.MustEvent(protocol.EventOutput, 2,
+				protocol.OutputPayload{Content: "still connected"}))
+			next, ok := recvEvent(good)
+			Expect(ok).To(BeTrue())
+			Expect(next.Kind).To(Equal(protocol.EventOutput))
+			Expect(next.Seq).To(Equal(stop.Seq+1),
+				"rejecting a resume must not create a private event or sequence gap")
 		})
 	})
 

@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bingosuite/bingo/pkg/client"
 	"github.com/bingosuite/bingo/pkg/protocol"
@@ -82,6 +83,36 @@ func (fs *fakeServer) lastCommand() (protocol.Command, bool) {
 	return fs.commands[len(fs.commands)-1], true
 }
 
+func newScriptedServer(t *testing.T, script func(*websocket.Conn)) (*httptest.Server, <-chan struct{}) {
+	t.Helper()
+	done := make(chan struct{})
+	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade WebSocket: %v", err)
+			close(done)
+			return
+		}
+		defer close(done)
+		defer func() { _ = conn.Close() }()
+		script(conn)
+	}))
+	return ts, done
+}
+
+func writeServerEvent(t *testing.T, conn *websocket.Conn, event protocol.Event) {
+	t.Helper()
+	data, err := protocol.MarshalEvent(event)
+	if err != nil {
+		t.Errorf("marshal event: %v", err)
+		return
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		t.Errorf("write event: %v", err)
+	}
+}
+
 func replyEvent(kind protocol.EventKind, payload any) protocol.Event {
 	return protocol.MustEvent(kind, 2, payload)
 }
@@ -93,6 +124,125 @@ func dialTestClient(t *testing.T, fs *fakeServer) client.Client {
 		t.Fatalf("Create: %v", err)
 	}
 	return c
+}
+
+func TestCreateRejectsIncompatibleWelcomeVersion(t *testing.T) {
+	ts, handlerDone := newScriptedServer(t, func(conn *websocket.Conn) {
+		welcome := protocol.MustEvent(protocol.EventSessionState, 1, protocol.SessionStatePayload{
+			SessionID: "test-session",
+			State:     protocol.StateIdle,
+			Clients:   1,
+		})
+		welcome.Version = "999.0"
+		writeServerEvent(t, conn, welcome)
+		_, _, _ = conn.ReadMessage()
+	})
+	defer ts.Close()
+
+	c, err := client.Create(strings.TrimPrefix(ts.URL, "http://"))
+	if c != nil {
+		_ = c.Close()
+		t.Fatal("Create returned a client for an incompatible welcome")
+	}
+	if err == nil ||
+		!strings.Contains(err.Error(), `expected "`+protocol.Version+`"`) ||
+		!strings.Contains(err.Error(), `received "999.0"`) {
+		t.Fatalf("Create error does not identify both versions: %v", err)
+	}
+
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client did not close the incompatible welcome connection")
+	}
+}
+
+func TestMidstreamVersionMismatchFailsPendingRequest(t *testing.T) {
+	ts, handlerDone := newScriptedServer(t, func(conn *websocket.Conn) {
+		writeServerEvent(t, conn, protocol.MustEvent(
+			protocol.EventSessionState,
+			1,
+			protocol.SessionStatePayload{
+				SessionID: "test-session",
+				State:     protocol.StateIdle,
+				Clients:   1,
+			},
+		))
+
+		_, data, err := conn.ReadMessage()
+		if err != nil {
+			t.Errorf("read SetBreakpoint: %v", err)
+			return
+		}
+		cmd, err := protocol.UnmarshalCommand(data)
+		if err != nil {
+			t.Errorf("unmarshal SetBreakpoint: %v", err)
+			return
+		}
+		if cmd.Kind != protocol.CmdSetBreakpoint {
+			t.Errorf("command kind = %s, want %s", cmd.Kind, protocol.CmdSetBreakpoint)
+			return
+		}
+
+		reply := protocol.MustEvent(
+			protocol.EventBreakpointSet,
+			2,
+			protocol.BreakpointSetPayload{Breakpoint: protocol.Breakpoint{ID: 1}},
+		)
+		reply.Version = "999.0"
+		writeServerEvent(t, conn, reply)
+		_, _, _ = conn.ReadMessage()
+	})
+	defer ts.Close()
+
+	c, err := client.Create(strings.TrimPrefix(ts.URL, "http://"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := c.SetBreakpoint("main.go", 42)
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		if err == nil ||
+			!strings.Contains(err.Error(), `expected "`+protocol.Version+`"`) ||
+			!strings.Contains(err.Error(), `received "999.0"`) {
+			t.Fatalf("SetBreakpoint error does not preserve the terminal version error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SetBreakpoint waited instead of failing on the terminal version error")
+	}
+
+	select {
+	case _, ok := <-c.Events():
+		if ok {
+			t.Fatal("Events remained open after a terminal version mismatch")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("client read pump did not terminate after a version mismatch")
+	}
+
+	start := time.Now()
+	_, err = c.SetBreakpoint("main.go", 43)
+	if err == nil ||
+		!strings.Contains(err.Error(), `expected "`+protocol.Version+`"`) ||
+		!strings.Contains(err.Error(), `received "999.0"`) {
+		t.Fatalf("later request did not preserve the terminal version error: %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("later request waited instead of reusing the terminal version error")
+	}
+
+	select {
+	case <-handlerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("client did not close the mid-stream incompatible connection")
+	}
 }
 
 // TestRestartEmptyArgsOverrideReachesWire is the client-side regression for

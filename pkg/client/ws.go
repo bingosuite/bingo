@@ -49,6 +49,9 @@ type wsClient struct {
 	// writeMu: gorilla allows one concurrent reader and one concurrent writer.
 	writeMu sync.Mutex
 
+	readErrMu sync.RWMutex
+	readErr   error
+
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -80,6 +83,9 @@ func dial(addr, query string) (Client, error) {
 	select {
 	case evt, ok := <-c.events:
 		if !ok {
+			if err := c.terminalReadError(); err != nil {
+				return nil, err
+			}
 			return nil, fmt.Errorf("connection closed before receiving session state")
 		}
 		if evt.Kind != protocol.EventSessionState {
@@ -109,6 +115,10 @@ func (c *wsClient) readPump() {
 		if err != nil {
 			c.log.Warn("invalid event from server", "err", err)
 			continue
+		}
+		if err := protocol.ValidateVersion(evt.Version); err != nil {
+			c.terminateRead(fmt.Errorf("server event: %w", err))
+			return
 		}
 
 		if evt.Kind == protocol.EventSessionState {
@@ -159,13 +169,20 @@ func (c *wsClient) routeToPending(evt protocol.Event) bool {
 }
 
 func (c *wsClient) send(cmd protocol.Command) error {
+	if err := c.terminalReadError(); err != nil {
+		return err
+	}
 	data, err := json.Marshal(cmd)
 	if err != nil {
 		return fmt.Errorf("marshal command: %w", err)
 	}
 	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	return c.conn.WriteMessage(websocket.TextMessage, data)
+	writeErr := c.conn.WriteMessage(websocket.TextMessage, data)
+	c.writeMu.Unlock()
+	if err := c.terminalReadError(); err != nil {
+		return err
+	}
+	return writeErr
 }
 
 // sendAndWait sends cmd and blocks for the matching confirmation event or an
@@ -202,8 +219,26 @@ func (c *wsClient) sendAndWait(cmd protocol.Command, wantKind protocol.EventKind
 	case <-time.After(syncTimeout):
 		return protocol.Event{}, fmt.Errorf("timeout waiting for %s response", wantKind)
 	case <-c.done:
+		if err := c.terminalReadError(); err != nil {
+			return protocol.Event{}, err
+		}
 		return protocol.Event{}, fmt.Errorf("client closed")
 	}
+}
+
+func (c *wsClient) terminateRead(err error) {
+	c.readErrMu.Lock()
+	if c.readErr == nil {
+		c.readErr = err
+	}
+	c.readErrMu.Unlock()
+	_ = c.conn.Close()
+}
+
+func (c *wsClient) terminalReadError() error {
+	c.readErrMu.RLock()
+	defer c.readErrMu.RUnlock()
+	return c.readErr
 }
 
 func newCommand(kind protocol.CommandKind, payload any) (protocol.Command, error) {

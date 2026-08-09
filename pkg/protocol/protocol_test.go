@@ -2,6 +2,7 @@ package protocol_test
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -752,6 +753,25 @@ var _ = Describe("Version", func() {
 	It("is non-empty", func() {
 		Expect(protocol.Version).NotTo(BeEmpty())
 	})
+	It("accepts the exact current version", func() {
+		Expect(protocol.ValidateVersion(protocol.Version)).To(Succeed())
+	})
+	DescribeTable("rejects every other version",
+		func(received string) {
+			err := protocol.ValidateVersion(received)
+			Expect(err).To(HaveOccurred())
+
+			var versionErr *protocol.VersionError
+			Expect(errors.As(err, &versionErr)).To(BeTrue())
+			Expect(versionErr.Expected).To(Equal(protocol.Version))
+			Expect(versionErr.Received).To(Equal(received))
+			Expect(err.Error()).To(ContainSubstring(`expected "` + protocol.Version + `"`))
+			Expect(err.Error()).To(ContainSubstring(`received "` + received + `"`))
+		},
+		Entry("newer", "999.0"),
+		Entry("older", "1.1"),
+		Entry("omitted", ""),
+	)
 	It("is stamped on every event", func() {
 		e, err := protocol.NewEvent(protocol.EventOutput, 1, protocol.OutputPayload{Content: "x"})
 		Expect(err).NotTo(HaveOccurred())

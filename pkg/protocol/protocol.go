@@ -2,9 +2,30 @@
 // between the bingo server and its clients over WebSocket.
 package protocol
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 const Version = "1.2"
+
+// VersionError reports that a peer used a wire version other than Version.
+type VersionError struct {
+	Expected string
+	Received string
+}
+
+func (e *VersionError) Error() string {
+	return fmt.Sprintf("protocol version mismatch: expected %q, received %q", e.Expected, e.Received)
+}
+
+// ValidateVersion requires exact wire-version equality.
+func ValidateVersion(received string) error {
+	if received != Version {
+		return &VersionError{Expected: Version, Received: received}
+	}
+	return nil
+}
 
 // Event is the envelope for all server-to-client messages.
 type Event struct {

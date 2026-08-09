@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
@@ -13,6 +14,9 @@ const (
 	pongTimeout    = 60 * time.Second
 	pingInterval   = 54 * time.Second
 	maxMessageSize = 64 * 1024
+
+	closeProtocolError = 1002
+	maxCloseReasonSize = 123
 )
 
 // WSConn is the subset of a WebSocket connection the Client needs. Abstracted
@@ -46,6 +50,10 @@ type Client struct {
 	send   chan []byte
 	sendMu sync.Mutex
 	closed bool
+
+	// writeMu serialises the normal write pump with a protocol close emitted by
+	// the read pump when an incompatible peer must be rejected immediately.
+	writeMu sync.Mutex
 }
 
 func newClient(conn WSConn, h *Hub, log *slog.Logger) *Client {
@@ -82,23 +90,52 @@ func (c *Client) writePump() {
 	for {
 		select {
 		case msg, ok := <-c.send:
-			_ = c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 			if !ok {
-				_ = c.conn.WriteMessage(CloseMessage, []byte{})
+				_ = c.writeMessage(CloseMessage, nil)
 				return
 			}
-			if err := c.conn.WriteMessage(TextMessage, msg); err != nil {
+			if err := c.writeMessage(TextMessage, msg); err != nil {
 				c.log.Warn("write error", "err", err)
 				return
 			}
 
 		case <-ticker.C:
-			_ = c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
-			if err := c.conn.WriteMessage(PingMessage, []byte{}); err != nil {
+			if err := c.writeMessage(PingMessage, nil); err != nil {
 				return
 			}
 		}
 	}
+}
+
+func (c *Client) writeMessage(messageType int, data []byte) error {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	return c.conn.WriteMessage(messageType, data)
+}
+
+func (c *Client) closeWithProtocolError(err error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
+	c.closeSend()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	_ = c.conn.WriteMessage(CloseMessage, formatCloseMessage(closeProtocolError, err.Error()))
+	_ = c.conn.Close()
+}
+
+func formatCloseMessage(code int, reason string) []byte {
+	if len(reason) > maxCloseReasonSize {
+		reason = reason[:maxCloseReasonSize]
+		for !utf8.ValidString(reason) {
+			reason = reason[:len(reason)-1]
+		}
+	}
+	msg := make([]byte, 2+len(reason))
+	msg[0] = byte(code >> 8)
+	msg[1] = byte(code)
+	copy(msg[2:], reason)
+	return msg
 }
 
 // readPump reads inbound messages and routes them to the hub. One goroutine
@@ -127,6 +164,11 @@ func (c *Client) readPump() {
 		if err != nil {
 			c.log.Warn("invalid command", "err", err, "raw", string(data))
 			continue
+		}
+		if err := protocol.ValidateVersion(cmd.Version); err != nil {
+			c.log.Warn("incompatible command", "err", err)
+			c.closeWithProtocolError(err)
+			return
 		}
 
 		c.hub.injectCommand(c, cmd)
