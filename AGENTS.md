@@ -1114,6 +1114,15 @@ context; arrow navigation moves DOM focus with selection.
    (`pendingContinues++`). Restart reuses a `restarting` flag so the post-restart
    entry `EventStepped` is treated as a fresh entry.
 
+`restartReqSeq` separately gates only an unanswered DAP restart. A second
+request before `EventRestarted`/`EventError` is rejected without enqueueing
+another destructive `CmdRestart`; once the response is sent, a new restart is
+allowed even if the prior process's entry stop has not arrived yet. In that
+race, `onStop` suppresses the superseded entry while a newer `restartReqSeq` is
+pending and preserves `restarting` for the replacement process. This relies on
+the hub/client FIFO ordering each restart's `EventRestarted` before its own
+entry `EventStepped`.
+
 ### Joining an existing session (no relaunch)
 
 A DAP `attach` carrying a `session` argument and **no** `pid` means "join an
