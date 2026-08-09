@@ -1667,6 +1667,10 @@ session must not report every goroutine as "created"). A **degraded** snapshot
 for both automatic and on-demand snapshots: neither kind may clear or adopt a
 baseline from an incomplete walk.
 
+A current goroutine anchored from beyond the capped rich scan is also excluded
+from this baseline: it is present for stop identity, but switching between two
+still-live tail goroutines must not fabricate created/exited deltas.
+
 **Automatic snapshots alone own the baseline.** `prevGoids` is the *only*
 lifecycle memory, so whoever advances it decides what the next automatic
 snapshot can report. The on-demand `CmdGoroutineSnapshot` path is therefore a
@@ -1736,15 +1740,28 @@ Worst case under the correct order is missing a goroutine created during the
 read, which the runtime explicitly sanctions for lock-free readers. See #235.
 
 **Current goroutine = SP-containment** (platform-independent): the stopped
-thread's SP within `[g.stack.lo, g.stack.hi)`. The current *thread* is the M
-whose `curg` goid equals the current goid. A non-current goroutine's
-`CurrentLoc` uses `gobuf.pc` (where it resumes); the current one uses the live
-PC. If a complete but clipped scan has not found the current goroutine, stop
-events report unknown rather than substituting the first unrelated entry.
-Status strings are hardcoded (stable across Go versions); wait-reason strings
-are read dynamically from `runtime.waitReasonStrings`. Goroutines with goid<=0
-or status `_Gdead` (scan bit stripped) are filtered out — their exit surfaces
-in the next Exited delta.
+thread's SP within `[g.stack.lo, g.stack.hi)`. Discovery is independent of the
+`maxGoroutineScan=8192` rich `runtime.allgs` prefix, so a large target cannot
+make BreakpointHit/Paused identify the prefix's first unrelated goroutine while
+frames come from the real stopped TID. The engine first resolves an O(1)
+architecture candidate where the ABI provides a stable one (arm64: X28 is
+`*g`) and accepts it only after the same SP-containment check. On linux/amd64,
+`FS_BASE` is not a stable `*g` address under external linking, so the reader
+walks the bounded `runtime.allm` list and tests each `m.curg` by SP containment
+instead of hardcoding an ELF TLS offset. If neither path resolves the current
+goroutine, a final pass examines at most one additional `maxGoroutineScan`
+`allgs` entry range, reading only pointer + stack bounds until a match. A
+beyond-prefix match is fully decoded once and prepended as the current anchor;
+the rich scan and both fallbacks remain bounded under corrupt metadata.
+Unreadable required data in either the rich walk or a targeted anchor lookup
+degrades the whole snapshot and leaves `prevGoids` unchanged; a bounded miss is
+complete and reports unknown rather than substituting the first unrelated
+entry. The current *thread* is the M whose `curg` goid equals the current goid. A
+non-current goroutine's `CurrentLoc` uses `gobuf.pc` (where it resumes); the
+current one uses the live PC. Status strings are hardcoded (stable across Go
+versions); wait-reason strings are read dynamically from
+`runtime.waitReasonStrings`. Goroutines with goid<=0 or status `_Gdead` (scan
+bit stripped) are filtered out — their exit surfaces in the next Exited delta.
 
 **Note on `go f(args)` wrappers.** A goroutine started with arguments gets a
 compiler-generated `<caller>.gowrapN` closure as its startpc, so `StartLoc`
@@ -2803,8 +2820,12 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   debugger did not launch — then breakpoint it), `concurrency` (the
   goroutine/thread snapshot data foundation — drives a known spawn-tree target
   and asserts parent linkage, start/created locations, the thread set with a
-  single current thread, and created/exited lifecycle deltas across stops), and
-  `restart` (hub-level
+  single current thread, and created/exited lifecycle deltas across stops),
+  `current-goroutine` (a small native stop/frame/snapshot/thread coherence
+  control plus an opt-in over-cap proof selected by
+  `BINGO_E2E_CURRENT_GOROUTINES`; the 20,000-goroutine proof is deliberately not
+  part of every suite because the existing 8,192-entry rich decode is costly
+  under `-race`), and `restart` (hub-level
   kill+relaunch reinstalls
   breakpoints and reruns from the top), all driving `debugger.Debugger`
   in-process (except `restart`/`fullstack`/`dap`, which go through the stack); plus
@@ -2830,7 +2851,7 @@ side `chan error` — every debugger outcome, failures included, rides the singl
 
   **Platform scoping — both containers run the shared set.** The darwin container
   wires the same shared specs as linux: `basic`, `stepping`, `breakpoints`, `churn`,
-  `kill`, `exit`, `attach`, `concurrency`, `pause`, `inspect`, `restart`,
+  `kill`, `exit`, `attach`, `concurrency`, `current-goroutine`, `pause`, `inspect`, `restart`,
   `fullstack`, and `dap`. Linux additionally runs `signals` and `overlap`;
   darwin additionally runs the
   `hygiene` Mach exception port-right leak regression. This was NOT
