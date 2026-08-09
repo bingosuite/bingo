@@ -24,6 +24,13 @@ const (
 
 	stepOverNextFile  = "<stepover-next>"
 	stepOutReturnFile = "<stepout-return>"
+
+	// maxDeferredStops caps the foreign-thread stop queue. One entry per live
+	// thread is the natural ceiling (a stopped thread cannot stop again), so
+	// this is only ever reached if the bookkeeping itself has gone wrong.
+	// Overflow degrades to the pre-deferral behaviour rather than dropping a
+	// stop, because a dropped stop parks its thread forever.
+	maxDeferredStops = 256
 )
 
 type engineState uint8
@@ -87,6 +94,34 @@ type engine struct {
 	bpResume  bpResumeAction
 	bpRetAddr uint64 // bpResumeStepOut only
 
+	// Foreign-thread stop deferral (issue #199). All four fields are
+	// loop-thread-only and need no synchronization, like manualStopPending.
+	//
+	// stepTID is the exact thread a single-step is armed on, 0 when none is in
+	// flight. It is set by every exact-TID step the engine issues — the
+	// breakpoint step-over, a plain StepInto, the StepOver machine-instruction
+	// fallback, and the internal resume step — NOT only the step-over, because
+	// all of them are equally corrupted by a sibling stop landing mid-step.
+	stepTID int
+	// deferredStops holds raw stops that surfaced from Backend.Wait for a
+	// thread other than stepTID while that step was in flight. They are
+	// replayed FIFO by resumeWait once it is safe. See deferForeignStop.
+	deferredStops []StopEvent
+	// lastWaitTID mirrors the backend's own "most recent stop" bookkeeping: it
+	// is the thread of the last stop Wait actually delivered, and therefore the
+	// thread the TID-less ContinueProcess (and, on linux, POKEDATA/PEEKDATA)
+	// targets. Replayed deferred stops deliberately do not update it — the
+	// backend never saw them a second time.
+	lastWaitTID int
+	// parkedTID is a thread deliberately left ptrace-stopped so the backend's
+	// current-stop thread stays valid while a deferred stop is delivered and
+	// handled. It owes a resume, discharged by releaseParked.
+	parkedTID int
+	// internalStepTID is a thread being single-stepped purely to make it the
+	// backend's current-stop thread again so a TID-less continue can resume it.
+	// Its completion produces no user-visible event.
+	internalStepTID int
+
 	// Source-line target remembered from the previous step-over. More
 	// reliable than re-querying locationForPC, which can land on a DWARF
 	// boundary with line==0. Zeroed on each sourceStepOver and on user-BP hits.
@@ -138,11 +173,22 @@ type threadStepper interface {
 // darwin it holds all other threads and steps tid specifically; elsewhere it
 // falls back to a plain per-process single-step (ptrace stops are per-thread
 // there).
+//
+// It records tid as the engine's in-flight step thread so handleStop can park
+// any stop that surfaces for a different thread until the step has completed
+// and its breakpoint has been reinstalled (issue #199).
 func (e *engine) stepThreadOverBP(tid int, addr uint64) error {
+	e.stepTID = tid
+	var err error
 	if ts, ok := e.backend.(threadStepper); ok {
-		return ts.singleStepThread(tid, addr)
+		err = ts.singleStepThread(tid, addr)
+	} else {
+		err = e.backend.SingleStep(tid)
 	}
-	return e.backend.SingleStep(tid)
+	if err != nil {
+		e.stepTID = 0
+	}
+	return err
 }
 
 // endThreadStep releases the threads held for an atomic step-over. No-op on
@@ -172,6 +218,179 @@ func (e *engine) activeTID() (int, error) {
 type stopResult struct {
 	evt StopEvent
 	err error
+	// deferred marks a stop replayed from deferredStops rather than freshly
+	// delivered by Backend.Wait, so the loop does not re-stamp lastWaitTID.
+	deferred bool
+}
+
+// deferForeignStop parks a raw stop that belongs to a thread other than the one
+// the engine is currently single-stepping, and returns true when it did.
+//
+// This is the fix for issue #199. On linux Wait4(-1, …, WALL) reports any
+// thread's stop, so a sibling breakpoint can surface in the middle of the
+// restore → single-step → reinstall sequence. Handling it there is destructive:
+// the stepped-over breakpoint is disarmed and out of the table at that moment,
+// so a distinct sibling breakpoint overwrites lastBP and — on the next resume —
+// the one-slot steppingOverBP, permanently losing the entry with its trap still
+// removed; and a sibling stopped at the SAME address finds no entry, takes the
+// spurious-SIGTRAP path, and calls ContinueProcess, which clears the backend's
+// step bookkeeping so the real completion is later misclassified.
+//
+// Parking the stop instead is safe because nothing else in the system holds a
+// reference to it: it has already been consumed from the kernel, the thread
+// stays ptrace-stopped, and the engine replays it (resumeWait) once the step
+// has completed and the trap is back in place. Only StopBreakpoint and
+// StopSignal are parked; process death must never be postponed.
+func (e *engine) deferForeignStop(stop StopEvent) bool {
+	if e.stepTID == 0 || stop.TID == 0 || stop.TID == e.stepTID {
+		return false
+	}
+	switch stop.Reason {
+	case StopBreakpoint, StopSignal:
+	default:
+		return false
+	}
+	if len(e.deferredStops) >= maxDeferredStops {
+		e.log.Warn("deferral queue full — handling a foreign-thread stop mid-step",
+			"tid", stop.TID, "stepTID", e.stepTID, "queued", len(e.deferredStops))
+		return false
+	}
+	e.deferredStops = append(e.deferredStops, stop)
+	e.log.Debug("deferring foreign-thread stop during single-step",
+		"tid", stop.TID, "stepTID", e.stepTID, "reason", stop.Reason,
+		"queued", len(e.deferredStops))
+	// The stop that was waiting on has been consumed, so a fresh one-shot wait
+	// must replace it. State is deliberately untouched: the step is still in
+	// flight and nothing user-visible happened.
+	e.resumeWait()
+	return true
+}
+
+// discardDeferred drops every parked stop. Used on teardown: the threads they
+// belong to are gone, so replaying them would drive ptrace/Mach calls at dead
+// TIDs.
+func (e *engine) discardDeferred() {
+	if len(e.deferredStops) > 0 {
+		e.log.Debug("discarding deferred stops on teardown", "queued", len(e.deferredStops))
+	}
+	e.deferredStops = nil
+	e.stepTID = 0
+	e.parkedTID = 0
+	e.internalStepTID = 0
+}
+
+// resumeWait arranges for the next stop to reach the loop. A parked stop is
+// replayed ahead of a fresh Backend.Wait, because the backend already delivered
+// it once and will never surface it again. Exactly one stop source is
+// outstanding at a time either way, preserving the one-waitLoop invariant.
+//
+// Nothing is replayed while a step is in flight: the step's own completion must
+// be handled (and its breakpoint reinstalled) before any parked stop is allowed
+// to run through handleStop.
+func (e *engine) resumeWait() {
+	if e.stepTID == 0 && len(e.deferredStops) > 0 {
+		evt := e.deferredStops[0]
+		select {
+		case e.stopCh <- stopResult{evt: evt, deferred: true}:
+			e.deferredStops = e.deferredStops[1:]
+			return
+		default:
+			// stopCh already holds Kill's synthetic exit; that wins.
+			e.log.Debug("stop channel busy — postponing a deferred stop")
+		}
+	}
+	go e.waitLoop()
+}
+
+// holdForDeferred postpones the resume action of a completed step-over so the
+// stops parked during that step can be delivered first, and leaves the stepped
+// thread ptrace-stopped.
+//
+// Holding, rather than resuming and then replaying, is load-bearing on linux.
+// ContinueProcess and the ptrace memory ops take no TID: they act on the
+// backend's most recent stop thread. Replaying a parked stop never goes through
+// Backend.Wait, so it does not make its own thread current. If the stepped
+// thread were resumed first, the deferred stop would be handled while the
+// backend's current thread is running, and the very next resume-from-breakpoint
+// would fail its restore write with ESRCH. Keeping the stepped thread parked
+// keeps that thread valid for every ptrace op the deferred stop's handling
+// issues; the owed resume is discharged by releaseParked at the next resume.
+func (e *engine) holdForDeferred(stop StopEvent) {
+	e.parkedTID = stop.TID
+	e.log.Debug("holding stepped thread while deferred stops drain",
+		"tid", stop.TID, "queued", len(e.deferredStops))
+	e.setState(stateRunning)
+	e.resumeWait()
+}
+
+// releaseParked discharges the resume owed to a thread held by holdForDeferred.
+// It reports whether it consumed the TID-less continue doing so, in which case
+// the caller still has to resume current by some other means.
+func (e *engine) releaseParked(current int) (bool, error) {
+	parked := e.parkedTID
+	if parked == 0 {
+		return false, nil
+	}
+	e.parkedTID = 0
+	if parked == current {
+		// The caller is about to resume this very thread anyway.
+		return false, nil
+	}
+	if parked != e.lastWaitTID {
+		// ContinueProcess cannot name a thread, so it can only resume the
+		// backend's current one. Losing that window is not fatal — the thread
+		// stays stopped and a later resume of it will pick it up — but it is a
+		// bookkeeping bug worth surfacing.
+		e.log.Warn("parked thread is no longer the backend's current stop thread",
+			"parked", parked, "lastWait", e.lastWaitTID)
+		return false, nil
+	}
+	e.log.Debug("releasing parked thread", "tid", parked)
+	if err := e.backend.ContinueProcess(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// resumeTracee performs a plain (non-single-step) resume on behalf of the
+// thread the engine is stopped on, honouring the deferral bookkeeping.
+//
+// When parked stops are still queued the tracee is NOT resumed at all: those
+// stops were already consumed from the backend and must be delivered before the
+// world runs on, so current is parked in place of the resume (see
+// holdForDeferred for why the backend's current-stop thread has to stay
+// stopped). Otherwise any thread owed a resume is released first; because that
+// consumes the TID-less continue, current is then brought back with the only
+// TID-explicit resume primitive the Backend interface offers — a single step
+// whose completion is swallowed and followed by an ordinary continue.
+func (e *engine) resumeTracee(current int) error {
+	if len(e.deferredStops) > 0 {
+		if e.parkedTID != 0 && e.parkedTID != current {
+			if _, err := e.releaseParked(current); err != nil {
+				return err
+			}
+		}
+		e.parkedTID = current
+		return nil
+	}
+	released, err := e.releaseParked(current)
+	if err != nil {
+		return err
+	}
+	if !released {
+		return e.backend.ContinueProcess()
+	}
+	if current == 0 {
+		return nil
+	}
+	e.internalStepTID = current
+	e.stepTID = current
+	if err := e.backend.SingleStep(current); err != nil {
+		e.internalStepTID = 0
+		e.stepTID = 0
+		return err
+	}
+	return nil
 }
 
 func newEngine(b Backend, log *slog.Logger) *engine {
@@ -243,6 +462,9 @@ func (e *engine) Kill() error {
 		// Release any threads held for an in-flight atomic step-over first, so
 		// a detach (attached-process Kill) never leaves them Mach-suspended.
 		e.endThreadStep()
+		// Parked stops belong to threads that are about to die; replaying one
+		// after teardown would drive backend calls at a dead TID.
+		e.discardDeferred()
 		e.clearAllBreakpoints()
 		if killErr := e.proc.kill(e.backend, running); killErr != nil {
 			return killErr
@@ -335,11 +557,11 @@ func (e *engine) Continue() error {
 			e.emitContinued()
 			return nil
 		}
-		if err := e.backend.ContinueProcess(); err != nil {
+		if err := e.resumeTracee(e.curTID); err != nil {
 			return err
 		}
 		e.setState(stateRunning)
-		go e.waitLoop()
+		e.resumeWait()
 		e.emitContinued()
 		return nil
 	})
@@ -376,11 +598,14 @@ func (e *engine) StepInto() error {
 		// the runtime's sysmon can't observe it and inject a preemption, and any
 		// Mach breakpoint exception seen mid-step is unambiguously this thread's
 		// (#92); elsewhere it degrades to a plain per-thread single-step.
+		if _, err := e.releaseParked(tid); err != nil {
+			return fmt.Errorf("StepInto: release parked thread: %w", err)
+		}
 		if err := e.stepThreadOverBP(tid, regs.PC); err != nil {
 			return err
 		}
 		e.setState(stateRunning)
-		go e.waitLoop()
+		e.resumeWait()
 		return nil
 	})
 }
@@ -577,6 +802,7 @@ func (e *engine) loop() {
 
 		case result := <-e.stopCh:
 			if result.err != nil {
+				e.discardDeferred()
 				if errors.Is(result.err, ErrProcessExited) {
 					e.emitProcessExited(0)
 				} else {
@@ -595,6 +821,12 @@ func (e *engine) loop() {
 			if e.getState() == stateExited {
 				e.drainCmds()
 				return
+			}
+			if !result.deferred && result.evt.TID != 0 {
+				// Mirror the backend's own record of the thread its TID-less
+				// operations act on. Replayed stops never reached Wait a second
+				// time, so they must not move it.
+				e.lastWaitTID = result.evt.TID
 			}
 			e.handleStop(result.evt)
 			if e.getState() == stateExited {
@@ -619,6 +851,21 @@ func (e *engine) waitLoop() {
 
 //nolint:gocognit,gocyclo // Stop handling is a single serialized debugger state machine.
 func (e *engine) handleStop(stop StopEvent) {
+	switch stop.Reason {
+	case StopExited, StopKilled:
+		// The tracee is gone: every parked stop belongs to a dead thread, so
+		// replaying one would drive backend calls at a TID that no longer
+		// exists.
+		e.discardDeferred()
+	default:
+		if e.deferForeignStop(stop) {
+			return
+		}
+		if stop.TID != 0 && stop.TID == e.stepTID {
+			e.stepTID = 0
+		}
+	}
+
 	switch stop.Reason {
 	case StopExited:
 		if e.getState() == stateExited {
@@ -663,9 +910,9 @@ func (e *engine) handleStop(stop StopEvent) {
 				regs.PC = stop.PC + uint64(len(archTrapInstruction()))
 				_ = e.backend.SetRegisters(stop.TID, regs)
 			}
-			_ = e.backend.ContinueProcess()
+			_ = e.resumeTracee(stop.TID)
 			e.setState(stateRunning)
-			go e.waitLoop()
+			e.resumeWait()
 			return
 		}
 		e.log.Debug("StopBreakpoint matched", "file", bp.file, "line", bp.line,
@@ -690,6 +937,24 @@ func (e *engine) handleStop(stop StopEvent) {
 		e.emitBreakpointHit(bp, stop)
 
 	case StopSingleStep:
+		e.stepTID = 0
+		if e.internalStepTID != 0 {
+			// An internal resume step (see resumeTracee): its only purpose was
+			// to make this thread the backend's current one so the TID-less
+			// continue can now release it. No user-visible event.
+			tid := e.internalStepTID
+			e.internalStepTID = 0
+			e.log.Debug("internal resume step completed", "tid", tid)
+			if err := e.backend.ContinueProcess(); err != nil {
+				e.setState(stateSuspended)
+				e.haltOnError(protocol.CmdNone, fmt.Errorf(
+					"release thread %d after internal resume step: %w", tid, err), stop)
+				return
+			}
+			e.setState(stateRunning)
+			e.resumeWait()
+			return
+		}
 		var err error
 		stop, err = e.populateStopPC(stop, false)
 		if err != nil {
@@ -730,11 +995,18 @@ func (e *engine) handleStop(stop StopEvent) {
 			// The original instruction is executable now: either the live trap
 			// was reinstalled or a clear cancelled it while the step was in flight.
 			e.endThreadStep()
+			if len(e.deferredStops) > 0 {
+				// The step-over's trap state is settled. Deliver the parked
+				// stops before this step's own resume action; the stepped thread
+				// stays put (see holdForDeferred).
+				e.holdForDeferred(stop)
+				return
+			}
 			switch e.bpResume {
 			case bpResumeContinue:
-				_ = e.backend.ContinueProcess()
+				_ = e.resumeTracee(stop.TID)
 				e.setState(stateRunning)
-				go e.waitLoop()
+				e.resumeWait()
 			case bpResumeStep:
 				e.setState(stateSuspended)
 				e.emitStepped(stop)
@@ -751,9 +1023,9 @@ func (e *engine) handleStop(stop StopEvent) {
 						if setErr == nil || errors.Is(setErr, errBreakpointExists) {
 							e.stepOverFile = sob.file
 							e.stepOverLine = nextLine
-							if cerr := e.backend.ContinueProcess(); cerr == nil {
+							if cerr := e.resumeTracee(stop.TID); cerr == nil {
 								e.setState(stateRunning)
-								go e.waitLoop()
+								e.resumeWait()
 								return
 							} else if entry != nil {
 								_ = e.bps.clear(e.backend, entry.id)
@@ -789,9 +1061,9 @@ func (e *engine) handleStop(stop StopEvent) {
 						fmt.Errorf("StepOut: set return breakpoint: %w", setErr), stop)
 					return
 				}
-				_ = e.backend.ContinueProcess()
+				_ = e.resumeTracee(stop.TID)
 				e.setState(stateRunning)
-				go e.waitLoop()
+				e.resumeWait()
 			}
 			return
 		}
@@ -836,15 +1108,15 @@ func (e *engine) handleStop(stop StopEvent) {
 			// manualStopPending), leaving the signal queued. Suppress it
 			// silently — surfacing it as output or EventPaused would be bogus.
 			// Continue discards it (ContinueProcess resumes with signal 0).
-			_ = e.backend.ContinueProcess()
+			_ = e.resumeTracee(stop.TID)
 			e.setState(stateRunning)
-			go e.waitLoop()
+			e.resumeWait()
 			return
 		}
 		e.emitOutput("stderr", fmt.Sprintf("signal %d", stop.Signal))
-		_ = e.backend.ContinueProcess()
+		_ = e.resumeTracee(stop.TID)
 		e.setState(stateRunning)
-		go e.waitLoop()
+		e.resumeWait()
 	}
 }
 
@@ -1036,7 +1308,7 @@ func (e *engine) sourceStepOver() error {
 				if setErr == nil || errors.Is(setErr, errBreakpointExists) {
 					e.stepOverFile = file
 					e.stepOverLine = nextLine
-					if cerr := e.backend.ContinueProcess(); cerr != nil {
+					if cerr := e.resumeTracee(e.curTID); cerr != nil {
 						if entry != nil {
 							_ = e.bps.clear(e.backend, entry.id)
 						}
@@ -1045,7 +1317,7 @@ func (e *engine) sourceStepOver() error {
 						return cerr
 					}
 					e.setState(stateRunning)
-					go e.waitLoop()
+					e.resumeWait()
 					return nil
 				}
 			}
@@ -1062,11 +1334,14 @@ func (e *engine) sourceStepOver() error {
 	// No DWARF next-line target (e.g. stopped outside known source): fall back
 	// to a single machine-instruction step of the user thread via the atomic
 	// path, same rationale as StepInto (#92).
+	if _, err := e.releaseParked(tid); err != nil {
+		return fmt.Errorf("StepOver: release parked thread: %w", err)
+	}
 	if err := e.stepThreadOverBP(tid, regs.PC); err != nil {
 		return err
 	}
 	e.setState(stateRunning)
-	go e.waitLoop()
+	e.resumeWait()
 	return nil
 }
 
@@ -1103,11 +1378,11 @@ func (e *engine) stepOut() error {
 	if setErr != nil && !errors.Is(setErr, errBreakpointExists) {
 		return fmt.Errorf("StepOut: set return breakpoint: %w", setErr)
 	}
-	if err := e.backend.ContinueProcess(); err != nil {
+	if err := e.resumeTracee(tid); err != nil {
 		return fmt.Errorf("StepOut: continue: %w", err)
 	}
 	e.setState(stateRunning)
-	go e.waitLoop()
+	e.resumeWait()
 	return nil
 }
 
@@ -1142,6 +1417,17 @@ func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) err
 		tid = threads[0]
 	}
 	e.lastBPTID = 0
+	// Release a thread held by a deferral hold only AFTER the restore write
+	// above: that write targets the backend's current stop thread, which is
+	// exactly the parked one. Releasing first would let it run and the write
+	// would fail against a live thread. Afterwards the step below names its
+	// thread explicitly, so the two resumes cannot collide.
+	if _, err := e.releaseParked(tid); err != nil {
+		_ = e.backend.WriteMemory(bp.addr, archTrapInstruction())
+		e.bps.addToTable(bp)
+		e.steppingOverBP = nil
+		return fmt.Errorf("resume BP: release parked thread: %w", err)
+	}
 	if err := e.stepThreadOverBP(tid, bp.addr); err != nil {
 		_ = e.backend.WriteMemory(bp.addr, archTrapInstruction())
 		e.bps.addToTable(bp)
@@ -1149,7 +1435,7 @@ func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) err
 		return fmt.Errorf("resume BP: single step: %w", err)
 	}
 	e.setState(stateRunning)
-	go e.waitLoop()
+	e.resumeWait()
 	return nil
 }
 
