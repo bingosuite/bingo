@@ -34,7 +34,7 @@ run OS=os_name ARCH=arch_name *ARGS="":
 	./build/bingo/bingo_{{OS}}_{{ARCH}} {{ARGS}}
 
 # Default WS (-addr) and DAP (-dap-addr) listen addresses for the server recipes.
-# Override on the CLI, e.g. `just server darwin arm64 :7070 :4712`.
+# Override on the CLI, e.g. `just server darwin arm64 127.0.0.1:7070 127.0.0.1:4712`.
 ws_addr := "127.0.0.1:6060"
 dap_addr := "127.0.0.1:4711"
 
