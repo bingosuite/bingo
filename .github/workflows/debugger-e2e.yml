@@ -60,6 +60,9 @@ jobs:
       - name: Show ptrace policy
         run: cat /proc/sys/kernel/yama/ptrace_scope || true
 
+      - name: E2E stepping-thread SIGURG forwarding
+        run: go test -tags e2e -race -count=1 -v -timeout 60s ./internal/debugger -run '^TestLinuxBackendSteppingThreadSIGURGIsRedelivered$'
+
       - name: E2E basic (continue + step-over correctness)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=basic
 
