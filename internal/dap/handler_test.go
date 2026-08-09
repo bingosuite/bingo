@@ -1047,11 +1047,16 @@ func TestSetBreakpointsBurstThroughHubPreservesFIFO(t *testing.T) {
 	if len(resp.Body.Breakpoints) != breakpointCount {
 		t.Fatalf("got %d breakpoints, want %d", len(resp.Body.Breakpoints), breakpointCount)
 	}
+	ids := make(map[int]struct{}, breakpointCount+1)
 	for i, bp := range resp.Body.Breakpoints {
 		wantLine := i + 1
-		if !bp.Verified || bp.Id != wantLine || bp.Line != wantLine {
-			t.Fatalf("breakpoint %d = %+v, want verified line/id %d", i, bp, wantLine)
+		if !bp.Verified || bp.Id <= 0 || bp.Line != wantLine {
+			t.Fatalf("breakpoint %d = %+v, want verified line %d with a positive id", i, bp, wantLine)
 		}
+		if _, duplicate := ids[bp.Id]; duplicate {
+			t.Fatalf("breakpoint %d reused id %d", i, bp.Id)
+		}
+		ids[bp.Id] = struct{}{}
 	}
 	if got := dbg.setCount(); got != breakpointCount {
 		t.Fatalf("SetBreakpoint calls = %d, want %d", got, breakpointCount)
@@ -1069,8 +1074,11 @@ func TestSetBreakpointsBurstThroughHubPreservesFIFO(t *testing.T) {
 		t.Fatalf("next setBreakpoints request seq = %d, want %d", next.RequestSeq, nextSeq)
 	}
 	last := next.Body.Breakpoints[len(next.Body.Breakpoints)-1]
-	if !last.Verified || last.Id != 1000 || last.Line != 1000 {
-		t.Fatalf("next breakpoint = %+v, want verified line/id 1000", last)
+	if !last.Verified || last.Id <= 0 || last.Line != 1000 {
+		t.Fatalf("next breakpoint = %+v, want verified line 1000 with a positive id", last)
+	}
+	if _, duplicate := ids[last.Id]; duplicate {
+		t.Fatalf("next breakpoint reused id %d", last.Id)
 	}
 
 	hh.handler.mu.Lock()

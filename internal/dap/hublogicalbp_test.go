@@ -237,10 +237,10 @@ func (s *hubSession) AddClient(conn hub.WSConn, log *slog.Logger) (*hub.Client, 
 	return s.hb.AddClient(s.gate, log)
 }
 
-type hubProvider struct{ sess *hubSession }
+type raceHubProvider struct{ sess *hubSession }
 
-func (p *hubProvider) CreateSession() (Session, error)   { return p.sess, nil }
-func (p *hubProvider) GetSession(string) (Session, bool) { return p.sess, true }
+func (p *raceHubProvider) CreateSession() (Session, error)   { return p.sess, nil }
+func (p *raceHubProvider) GetSession(string) (Session, bool) { return p.sess, true }
 
 // observer is a plain WebSocket client on the same hub: it both drives Restart
 // and records the bingo events every client sees, so the test can assert that
@@ -370,7 +370,7 @@ func newRaceRig(t *testing.T) *raceRig {
 	}()
 
 	gate := &gatingConn{}
-	prov := &hubProvider{sess: &hubSession{hb: hb, gate: gate}}
+	prov := &raceHubProvider{sess: &hubSession{hb: hb, gate: gate}}
 
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -487,6 +487,33 @@ func (r *raceRig) setBreakpoints(lines ...int) *godap.SetBreakpointsResponse {
 	return r.recvUntil("setBreakpoints").(*godap.SetBreakpointsResponse)
 }
 
+// setBreakpointsAsync issues a setBreakpoints from its own goroutine, which is
+// what lets a test hold that request's command at the gate while driving the
+// session from a second client.
+//
+// Joining the returned channel is not optional: setBreakpoints reports failures
+// through t, and doing that once the test has returned panics the whole package
+// run. The registered cleanup releases the gate before waiting so every exit
+// path joins — including a t.Fatalf on the test goroutine, which would
+// otherwise leave this one parked at the gate forever.
+func (r *raceRig) setBreakpointsAsync(lines ...int) <-chan struct{} {
+	r.t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = r.setBreakpoints(lines...)
+	}()
+	r.t.Cleanup(func() {
+		r.gate.release()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			r.t.Error("the held setBreakpoints goroutine never finished")
+		}
+	})
+	return done
+}
+
 // handshake runs initialize -> launch(stopOnEntry) -> initialized ->
 // configurationDone against the real hub, leaving the session suspended at the
 // entry stop (where the hub still drains ordinary commands).
@@ -550,7 +577,7 @@ func TestStaleClearAcrossRestartHitsTheRightBreakpoint(t *testing.T) {
 	// Ask the handler to remove A. Its ClearBreakpoint is held at the
 	// ReadMessage -> readPump boundary, before the hub ever sees it.
 	rig.gate.arm()
-	go func() { _ = rig.setBreakpoints(20) }()
+	held := rig.setBreakpointsAsync(20)
 	rig.gate.waitHeld(t)
 
 	// A second client restarts the session. The replacement engine allocates
@@ -580,6 +607,7 @@ func TestStaleClearAcrossRestartHitsTheRightBreakpoint(t *testing.T) {
 	}
 
 	rig.gate.release()
+	<-held
 
 	// The delayed clear must land on A in the *new* process.
 	deadline := time.Now().Add(3 * time.Second)

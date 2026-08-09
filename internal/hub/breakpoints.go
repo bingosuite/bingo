@@ -51,19 +51,36 @@ type breakpointIDs struct {
 	byLogical  map[int]*breakpointMapping
 	byPhysical map[int]int
 
-	// retired remembers physical ids this engine's breakpoints were removed
-	// under, so an event the engine had already queued when the removal ran
-	// still reports the identity the client held. Engine ids are never reused
-	// within one engine, and reset() drops the whole record with the engine.
-	retired      map[int]int
-	retiredOrder []int
+	// The tombstone record for breakpoints this engine has removed, kept in
+	// BOTH directions:
+	//
+	//   - retiredLogical (physical→logical) lets an event the engine had
+	//     already queued when the removal ran still report the identity the
+	//     client held, rather than a number it was never told about.
+	//   - retiredPhysical (logical→physical) keeps that reported id CLEARABLE.
+	//     Clearing the breakpoint the process is currently parked on is undone
+	//     by the engine's step-off: resumeFromBreakpoint replays the entry
+	//     pointer it stashed at hit time, and reinstall re-adds it under the
+	//     SAME physical id. Without this direction the resurrected trap would
+	//     be reported under a logical id the hub had already forgotten, so no
+	//     client could ever remove it again — and the location could not be
+	//     re-set either, since the engine still has it armed.
+	//
+	// Physical ids are monotonic within one engine (breakpointTable.nextID
+	// only ever increments), and reset() drops the whole record whenever the
+	// engine is replaced, so a tombstone can only ever name the breakpoint it
+	// was created for — never a later one, and never one in another generation.
+	retiredLogical  map[int]int
+	retiredPhysical map[int]int
+	retiredOrder    []int
 }
 
 func newBreakpointIDs() *breakpointIDs {
 	return &breakpointIDs{
-		byLogical:  make(map[int]*breakpointMapping),
-		byPhysical: make(map[int]int),
-		retired:    make(map[int]int),
+		byLogical:       make(map[int]*breakpointMapping),
+		byPhysical:      make(map[int]int),
+		retiredLogical:  make(map[int]int),
+		retiredPhysical: make(map[int]int),
 	}
 }
 
@@ -113,17 +130,22 @@ func (b *breakpointIDs) untrack(logical int) {
 	b.retire(m.physicalID, logical)
 }
 
-// retire records a removed breakpoint's physical id, evicting the oldest entry
-// once the record is full.
+// retire records a removed breakpoint's physical id in both directions,
+// evicting the oldest entry once the record is full.
 func (b *breakpointIDs) retire(physicalID, logical int) {
-	if _, dup := b.retired[physicalID]; dup {
+	if _, dup := b.retiredLogical[physicalID]; dup {
 		return
 	}
 	if len(b.retiredOrder) >= retiredCap {
-		delete(b.retired, b.retiredOrder[0])
+		oldest := b.retiredOrder[0]
+		if staleLogical, ok := b.retiredLogical[oldest]; ok {
+			delete(b.retiredPhysical, staleLogical)
+		}
+		delete(b.retiredLogical, oldest)
 		b.retiredOrder = b.retiredOrder[1:]
 	}
-	b.retired[physicalID] = logical
+	b.retiredLogical[physicalID] = logical
+	b.retiredPhysical[logical] = physicalID
 	b.retiredOrder = append(b.retiredOrder, physicalID)
 }
 
@@ -148,10 +170,28 @@ func (b *breakpointIDs) logicalFor(physicalID int, loc protocol.Location) int {
 	if logical, ok := b.byPhysical[physicalID]; ok {
 		return logical
 	}
-	if logical, ok := b.retired[physicalID]; ok {
+	if logical, ok := b.retiredLogical[physicalID]; ok {
 		return logical
 	}
 	return b.adopt(physicalID, loc)
+}
+
+// physicalForClear resolves a logical id to the physical id the active engine
+// knows it by.
+//
+// A retired id still resolves, because a removal the hub confirmed can be undone
+// by the engine: stepping off the breakpoint the process is parked on reinstalls
+// it under the same physical id. Refusing the retired id would strand that
+// resurrected trap — unremovable (the hub forgot the mapping) and unsettable
+// (the engine still has the address armed). Resolving it instead is safe because
+// a physical id is never reused within an engine and the record dies with the
+// engine.
+func (b *breakpointIDs) physicalForClear(logical int) (int, bool) {
+	if m, ok := b.byLogical[logical]; ok {
+		return m.physicalID, true
+	}
+	physicalID, ok := b.retiredPhysical[logical]
+	return physicalID, ok
 }
 
 // installedLogical returns the logical ids the hub itself installed, ascending
@@ -171,12 +211,14 @@ func (b *breakpointIDs) installedLogical() []int {
 }
 
 // reset drops every mapping for a target that no longer exists, keeping next
-// where it is. Called on a fresh Launch/Attach, never on Restart — Restart's
-// whole point is that the logical identities survive.
+// where it is. Called on a fresh Launch/Attach and by Restart before it re-homes
+// the surviving identities: both replace the engine, and every physical id —
+// live or retired — becomes meaningless the moment that happens.
 func (b *breakpointIDs) reset() {
 	b.byLogical = make(map[int]*breakpointMapping)
 	b.byPhysical = make(map[int]int)
-	b.retired = make(map[int]int)
+	b.retiredLogical = make(map[int]int)
+	b.retiredPhysical = make(map[int]int)
 	b.retiredOrder = nil
 }
 
@@ -215,15 +257,18 @@ func (h *Hub) clearBreakpoint(dbg debugger.Debugger, cmd protocol.Command) (disp
 		return dispatchResult{}, err
 	}
 	logicalID := p.ID
-	m, ok := h.bps.lookup(logicalID)
+	physicalID, ok := h.bps.physicalForClear(logicalID)
 	if !ok {
 		return dispatchResult{}, fmt.Errorf("breakpoint %d not found", logicalID)
 	}
-	if err := dbg.ClearBreakpoint(m.physicalID); err != nil {
+	if err := dbg.ClearBreakpoint(physicalID); err != nil {
 		// Retain the mapping: a failed clear leaves the trap armed (see
 		// breakpointTable.clear), so the client must keep being able to name it.
 		return dispatchResult{}, err
 	}
+	// A no-op when the id was already retired, which is what makes clearing a
+	// step-off-resurrected breakpoint repeatable: the tombstone survives so the
+	// next resurrection is still reported — and removable — under the same id.
 	h.bps.untrack(logicalID)
 	evt, err := protocol.NewEvent(protocol.EventBreakpointCleared, 0, protocol.BreakpointClearedPayload{
 		ID: logicalID,

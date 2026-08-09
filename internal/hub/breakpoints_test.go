@@ -83,6 +83,17 @@ func (d *tableDebugger) setNextID(n int) {
 	d.mu.Unlock()
 }
 
+// rearm models the engine's step-off resurrection: resuming from the breakpoint
+// the process is parked on replays the entry pointer stashed at hit time and
+// reinstalls it under the SAME physical id, even though the client's clear had
+// already removed it (internal/debugger: resumeFromBreakpoint →
+// breakpointTable.reinstall → addToTable).
+func (d *tableDebugger) rearm(physicalID int, loc protocol.Location) {
+	d.mu.Lock()
+	d.armed[physicalID] = loc
+	d.mu.Unlock()
+}
+
 func (d *tableDebugger) setClearErr(err error) {
 	d.mu.Lock()
 	d.clearErr = err
@@ -391,12 +402,89 @@ var _ = Describe("logical breakpoint ids", func() {
 		Expect(hit.Breakpoint.ID).To(Equal(logical),
 			"a late hit must name the breakpoint the client knew, not a new id")
 
+		// Having reported that id, the hub must still accept it: a client that
+		// reacts to the hit by clearing it again has to reach the debugger
+		// rather than be told the id does not exist.
+		conn.inject(mustCommand(protocol.CmdClearBreakpoint,
+			protocol.ClearBreakpointPayload{ID: logical}))
+		Eventually(func() []string { return fleet.at(0).recordedCalls() }).
+			Should(ContainElement(fmt.Sprintf("ClearBreakpoint(%d)", physical)),
+				"a reported id must stay resolvable to this engine's breakpoint")
+
 		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
 		var restarted protocol.RestartedPayload
 		waitForEventKind(conn, protocol.EventRestarted, &restarted)
 		Expect(restarted.Breakpoints).To(BeEmpty())
 		Expect(fleet.at(1).armedLines()).To(BeEmpty(),
 			"restart must not re-arm a breakpoint the client removed")
+	})
+
+	// The engine undoes a clear issued while the process is parked on that very
+	// breakpoint: stepping off replays the entry stashed at hit time and
+	// reinstalls it under the same physical id. The hub had already retired the
+	// mapping, so without a tombstone the resurrected trap is reported under an
+	// id the hub no longer accepts — permanently unremovable, and unsettable too
+	// because the engine still has the address armed.
+	It("keeps a step-off-resurrected breakpoint clearable", func() {
+		startManaged(nil)
+
+		logical := setBP(conn, "main.go", 10)
+		physical := fleet.at(0).physicalIDFor(10)
+
+		conn.inject(mustCommand(protocol.CmdClearBreakpoint,
+			protocol.ClearBreakpointPayload{ID: logical}))
+		waitForEventKind(conn, protocol.EventBreakpointCleared, nil)
+		Expect(fleet.at(0).armedLines()).To(BeEmpty())
+
+		fleet.at(0).rearm(physical, protocol.Location{File: "main.go", Line: 10})
+		fleet.at(0).events <- protocol.MustEvent(protocol.EventBreakpointHit, 1,
+			protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{
+				ID:       physical,
+				Location: protocol.Location{File: "main.go", Line: 10},
+			}})
+
+		var hit protocol.BreakpointHitPayload
+		waitForEventKind(conn, protocol.EventBreakpointHit, &hit)
+		Expect(hit.Breakpoint.ID).To(Equal(logical))
+
+		conn.inject(mustCommand(protocol.CmdClearBreakpoint,
+			protocol.ClearBreakpointPayload{ID: logical}))
+		var cleared protocol.BreakpointClearedPayload
+		waitForEventKind(conn, protocol.EventBreakpointCleared, &cleared)
+		Expect(cleared.ID).To(Equal(logical))
+		Expect(fleet.at(0).armedLines()).To(BeEmpty(),
+			"the resurrected trap must actually be removed from the engine")
+	})
+
+	// The tombstone that keeps a resurrected id clearable must not outlive its
+	// engine, or it would reintroduce the aliasing this whole layer prevents.
+	It("does not let a retired id survive into a replacement engine", func() {
+		startManaged(nil)
+
+		logical := setBP(conn, "main.go", 10)
+		conn.inject(mustCommand(protocol.CmdClearBreakpoint,
+			protocol.ClearBreakpointPayload{ID: logical}))
+		waitForEventKind(conn, protocol.EventBreakpointCleared, nil)
+
+		// A breakpoint the restart DOES carry over, so the fresh engine hands
+		// out the physical id the retired one used to hold.
+		survivor := setBP(conn, "main.go", 20)
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		waitForEventKind(conn, protocol.EventRestarted, nil)
+
+		fresh := fleet.at(1)
+		Expect(fresh.armedLines()).To(Equal([]int{20}))
+
+		conn.inject(mustCommand(protocol.CmdClearBreakpoint,
+			protocol.ClearBreakpointPayload{ID: logical}))
+		var errPayload protocol.ErrorPayload
+		waitForEventKind(conn, protocol.EventError, &errPayload)
+		Expect(fresh.armedLines()).To(Equal([]int{20}),
+			"a retired id from the previous engine must not disarm anything")
+		Expect(fresh.recordedCalls()).NotTo(ContainElement(
+			ContainSubstring("ClearBreakpoint")),
+			"the replacement engine must never see a retired id")
+		Expect(survivor).NotTo(Equal(logical))
 	})
 
 	It("never re-arms a breakpoint the hub did not install", func() {
