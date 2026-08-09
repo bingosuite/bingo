@@ -44,23 +44,3 @@ func LinuxParkedSignalCount(d Debugger) (int, bool) {
 	}
 	return b.parkedSignalCount(), true
 }
-
-// LinuxStaleParkedStopCount reports how many held stops were dropped because
-// the engine cleared their trap before they could be released.
-//
-// Holding a stop is what makes this possible at all: the `<stepover-next>`
-// sentinel is cleared by whichever thread reaches it first, stranding any
-// sibling parked at the same address. The count lets the native regression test
-// prove that recovery path actually ran rather than assuming it. Returns
-// (0, false) for a non-engine Debugger.
-func LinuxStaleParkedStopCount(d Debugger) (int, bool) {
-	e, ok := d.(*engine)
-	if !ok {
-		return 0, false
-	}
-	b, ok := e.backend.(*linuxBackend)
-	if !ok {
-		return 0, false
-	}
-	return b.staleParkedCount(), true
-}
