@@ -104,13 +104,15 @@ var sink int64
 
 //go:noinline
 func markerA(i int) int {
-	v := i*2 + 1 // MARK_A
+	v := i * 2
+	atomic.AddInt64(&sink, int64(v)) // MARK_A
 	return v
 }
 
 //go:noinline
 func markerB(i int) int {
-	v := i*3 + 2 // MARK_B
+	v := i * 3
+	atomic.AddInt64(&sink, int64(v)) // MARK_B
 	return v
 }
 
@@ -145,7 +147,7 @@ func main() {
 		close(ready)
 		for i := 0; i < iters; i++ {
 			waitFile(filepath.Join(dir, "goA."+strconv.Itoa(i)))
-			atomic.AddInt64(&sink, int64(markerA(i)))
+			markerA(i)
 		}
 	}()
 	<-ready
@@ -159,7 +161,7 @@ func main() {
 			for i := 0; i < iters; i++ {
 				waitFile(filepath.Join(dir, "gateB."+strconv.Itoa(i)))
 				touch(filepath.Join(dir, "ackB."+strconv.Itoa(i)+"."+strconv.Itoa(k)))
-				atomic.AddInt64(&sink, int64(markerB(i)))
+				markerB(i)
 			}
 		}(k)
 		time.Sleep(30 * time.Millisecond)
