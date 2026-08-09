@@ -27,7 +27,6 @@
 package detachproof
 
 import (
-	"bytes"
 	"debug/elf"
 	"fmt"
 	"os"
@@ -36,7 +35,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -160,20 +158,26 @@ type target struct {
 	waited chan struct{}
 	state  atomic.Pointer[os.ProcessState]
 
-	// errMu guards errBuf. The target's stderr is captured because a Go
-	// process killed by an unabsorbed SIGTRAP prints a runtime fatal-error
-	// banner naming the signal — direct evidence of the leftover INT3 that
-	// does not depend on winning the wait-status race against the engine's
-	// leaked waitLoop.
-	errMu  sync.Mutex
-	errBuf bytes.Buffer
+	// errPath receives the target's stderr. A Go process killed by an
+	// unabsorbed SIGTRAP prints a runtime fatal-error banner naming the
+	// signal, which is direct evidence of the leftover INT3 and does not
+	// depend on winning the wait-status race against the engine's leaked
+	// waitLoop. This is a plain FILE, never an io.Writer: an io.Writer makes
+	// os/exec interpose a pipe plus a copier goroutine, and a traced target
+	// frozen mid-write on that pipe wedged the harness.
+	errPath string
 }
 
 // stderr returns whatever the target has written to stderr so far.
 func (tg *target) stderr() string {
-	tg.errMu.Lock()
-	defer tg.errMu.Unlock()
-	return strings.TrimSpace(tg.errBuf.String())
+	b, err := os.ReadFile(tg.errPath)
+	if err != nil {
+		return fmt.Sprintf("<stderr unavailable: %v>", err)
+	}
+	if s := strings.TrimSpace(string(b)); s != "" {
+		return s
+	}
+	return "<empty>"
 }
 
 // startTarget launches bin as an INDEPENDENT OS process (never under the
@@ -191,8 +195,14 @@ func startTarget(t *testing.T, bin string) *target {
 		beat:   filepath.Join(dir, "beat"),
 		waited: make(chan struct{}),
 	}
+	tg.errPath = filepath.Join(dir, "stderr")
+	errFile, err := os.Create(tg.errPath)
+	if err != nil {
+		t.Fatalf("create stderr file: %v", err)
+	}
+	defer func() { _ = errFile.Close() }()
 	tg.cmd = exec.Command(bin, tg.gate, tg.ready, tg.done, tg.beat)
-	tg.cmd.Stderr = &lockedWriter{mu: &tg.errMu, w: &tg.errBuf}
+	tg.cmd.Stderr = errFile
 	if err := tg.cmd.Start(); err != nil {
 		t.Fatalf("start target: %v", err)
 	}
@@ -219,13 +229,22 @@ func startTarget(t *testing.T, bin string) *target {
 	// pid. Unless the target's locked main thread is the group leader
 	// (tid == pid), the heartbeat would come from an untraced M and would not
 	// prove the traced thread resumed.
-	b, err := os.ReadFile(tg.ready)
-	if err != nil {
-		t.Fatalf("read readiness marker: %v", err)
-	}
-	tid, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil {
-		t.Fatalf("parse readiness marker %q: %v", b, err)
+	// waitForFile returns on creation, which can precede the write, so poll
+	// for parseable content rather than reading once.
+	var tid int
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		b, rerr := os.ReadFile(tg.ready)
+		if rerr == nil {
+			if n, perr := strconv.Atoi(strings.TrimSpace(string(b))); perr == nil {
+				tid = n
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("readiness marker never became parseable within 5s")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 	if tid != tg.pid {
 		t.Fatalf("target's locked main thread is tid %d but the process is pid %d; "+
@@ -235,19 +254,6 @@ func startTarget(t *testing.T, bin string) *target {
 	// attach harness) so the attach stop is not racing process startup.
 	time.Sleep(200 * time.Millisecond)
 	return tg
-}
-
-// lockedWriter serialises writes from the exec copier goroutine against test
-// goroutines reading the buffer.
-type lockedWriter struct {
-	mu *sync.Mutex
-	w  *bytes.Buffer
-}
-
-func (l *lockedWriter) Write(p []byte) (int, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.w.Write(p)
 }
 
 // terminated reports whether the target died within timeout and, if so, how.
