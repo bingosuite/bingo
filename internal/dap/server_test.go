@@ -3,13 +3,65 @@ package dap
 import (
 	"bufio"
 	"context"
+	"errors"
 	"log/slog"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
 	godap "github.com/google/go-dap"
 )
+
+type temporaryAcceptError struct{}
+
+func (temporaryAcceptError) Error() string   { return "temporary accept failure" }
+func (temporaryAcceptError) Timeout() bool   { return false }
+func (temporaryAcceptError) Temporary() bool { return true }
+
+type retryListener struct {
+	mu       sync.Mutex
+	attempts int
+	retried  chan struct{}
+	closed   chan struct{}
+	once     sync.Once
+}
+
+func newRetryListener() *retryListener {
+	return &retryListener{
+		retried: make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+}
+
+func (l *retryListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	l.attempts++
+	attempt := l.attempts
+	l.mu.Unlock()
+	if attempt == 1 {
+		return nil, temporaryAcceptError{}
+	}
+	l.once.Do(func() { close(l.retried) })
+	<-l.closed
+	return nil, net.ErrClosed
+}
+
+func (l *retryListener) Close() error {
+	select {
+	case <-l.closed:
+	default:
+		close(l.closed)
+	}
+	return nil
+}
+
+func (l *retryListener) Addr() net.Addr { return retryAddr("retry") }
+
+type retryAddr string
+
+func (a retryAddr) Network() string { return "test" }
+func (a retryAddr) String() string  { return string(a) }
 
 func quietServer(t *testing.T) *Server {
 	t.Helper()
@@ -99,6 +151,26 @@ func TestServeContextRejectsCanceledStartup(t *testing.T) {
 		t.Fatal("ServeContext succeeded after cancellation")
 	}
 	if err := s.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+}
+
+func TestAcceptLoopRetriesTemporaryErrors(t *testing.T) {
+	s := quietServer(t)
+	listener := newRetryListener()
+	s.mu.Lock()
+	s.listener = listener
+	s.wg.Add(1)
+	s.mu.Unlock()
+	go s.acceptLoop(listener)
+
+	select {
+	case <-listener.retried:
+	case <-time.After(time.Second):
+		t.Fatal("accept loop did not retry a temporary error")
+	}
+
+	if err := s.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("close: %v", err)
 	}
 }

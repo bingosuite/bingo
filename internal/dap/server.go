@@ -5,7 +5,10 @@ import (
 	"log/slog"
 	"net"
 	"sync"
+	"time"
 )
+
+const maxAcceptRetryDelay = time.Second
 
 // Server accepts DAP connections on a TCP listener and hands each one to a
 // Handler bound to the given Provider. One goroutine per connection.
@@ -21,6 +24,7 @@ type Server struct {
 	// it down, so its Serve goroutine would otherwise block forever in
 	// ReadProtocolMessage and wedge wg.Wait().
 	handlers map[*Handler]struct{}
+	closing  chan struct{}
 	wg       sync.WaitGroup
 }
 
@@ -29,7 +33,12 @@ func NewServer(provider Provider, log *slog.Logger) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Server{provider: provider, log: log, handlers: make(map[*Handler]struct{})}
+	return &Server{
+		provider: provider,
+		log:      log,
+		handlers: make(map[*Handler]struct{}),
+		closing:  make(chan struct{}),
+	}
 }
 
 // Serve binds addr (host:port) and accepts connections until Close. It returns
@@ -75,6 +84,7 @@ func (s *Server) ServeContext(ctx context.Context, addr string) (net.Addr, error
 
 func (s *Server) acceptLoop(ln net.Listener) {
 	defer s.wg.Done()
+	var retryDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -84,9 +94,34 @@ func (s *Server) acceptLoop(ln net.Listener) {
 			if closed {
 				return
 			}
+			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
+				if retryDelay == 0 {
+					retryDelay = 5 * time.Millisecond
+				} else {
+					retryDelay *= 2
+				}
+				if retryDelay > maxAcceptRetryDelay {
+					retryDelay = maxAcceptRetryDelay
+				}
+				s.log.Warn("dap accept error; retrying", "err", err, "delay", retryDelay)
+				timer := time.NewTimer(retryDelay)
+				select {
+				case <-timer.C:
+				case <-s.closing:
+					if !timer.Stop() {
+						select {
+						case <-timer.C:
+						default:
+						}
+					}
+					return
+				}
+				continue
+			}
 			s.log.Warn("dap accept error", "err", err)
 			return
 		}
+		retryDelay = 0
 		h := NewHandler(conn, s.provider, s.log)
 		if !s.register(h) {
 			// Server closed between Accept and registration; drop the conn so
@@ -134,6 +169,7 @@ func (s *Server) Close() error {
 		return nil
 	}
 	s.closed = true
+	close(s.closing)
 	ln := s.listener
 	handlers := make([]*Handler, 0, len(s.handlers))
 	for h := range s.handlers {

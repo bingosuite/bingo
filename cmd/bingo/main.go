@@ -97,7 +97,7 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	var cfg config
 	flags := flag.NewFlagSet("bingo", flag.ContinueOnError)
 	flags.SetOutput(output)
-	flags.StringVar(&cfg.addr, "addr", ":6060", "listen address (host:port)")
+	flags.StringVar(&cfg.addr, "addr", "127.0.0.1:6060", "listen address (host:port)")
 	flags.StringVar(&cfg.dapAddr, "dap-addr", "", "DAP listen address (host:port); empty disables the DAP server")
 	flags.DurationVar(&cfg.idleTimeout, "idle-timeout", 0, "exit after no managed sessions for this duration; 0 disables")
 	flags.BoolVar(&cfg.verbose, "v", false, "enable verbose (debug) logging")
