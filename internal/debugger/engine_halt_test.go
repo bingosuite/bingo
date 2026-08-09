@@ -194,6 +194,37 @@ var _ = Describe("asynchronous halts in handleStop", func() {
 			"the last free slot must carry the suspend, not the cause")
 	})
 
+	// A halt whose stop never resolved a thread must not overwrite curTID with
+	// the Threads()[0] guess. curTID is what every later step primitive
+	// targets, and on darwin threads[0] is frequently an idle runtime M.
+	It("keeps the previous current thread when the stop's TID is unresolved", func() {
+		const bpAddr = uint64(0x4600)
+		const stoppedTID = 7
+
+		Expect(fb.tids).To(Equal([]int{1}), "threads[0] must differ from the stopped thread")
+
+		fb.seedMem(bpAddr, []byte{0x90, 0x90, 0x90, 0x90, 0x90})
+		debugger.ExportedForceSuspended(d)
+		debugger.ExportedSetBreakpointAt(d, bpAddr)
+		runWithWaitLoop(d)
+		fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: stoppedTID, PC: bpAddr})
+		Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventBreakpointHit))
+
+		Expect(d.StepInto()).To(Succeed())
+
+		// The step's stop carries no TID, and resolving one fails.
+		fb.failRegisters(errInjected)
+		fb.pushStop(debugger.StopEvent{Reason: debugger.StopSingleStep})
+		expectHaltReported(d, "get stop PC")
+
+		fb.clearFaults()
+		before := len(fb.singleStepCalls)
+		Expect(d.StepInto()).To(Succeed())
+		Expect(fb.singleStepCalls).To(HaveLen(before+1), "a step must have been issued")
+		Expect(fb.singleStepCalls[before]).To(Equal(stoppedTID),
+			"the guessed thread leaked into curTID")
+	})
+
 	// Site F — StopSignal/manual Pause: populateStopPC failure.
 	It("reports a halt when a Pause stop's PC cannot be read", func() {
 		runWithWaitLoop(d)
