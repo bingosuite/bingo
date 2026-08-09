@@ -270,6 +270,203 @@ var _ = Describe("goroutine event packing", func() {
 		})
 	})
 
+	Describe("exact budget boundaries", func() {
+		// padTo builds a snapshot whose marshalled Event is EXACTLY size bytes,
+		// by widening one Location string. Only exact accounting can satisfy it.
+		padTo := func(size int) protocol.GoroutineSnapshotPayload {
+			snap := protocol.GoroutineSnapshotPayload{
+				Goroutines: []protocol.Goroutine{{ID: 1, Status: "running", Current: true}},
+				Threads:    []protocol.Thread{},
+				Current:    1,
+			}
+			base := eventBytes(protocol.EventGoroutineSnapshot, snap)
+			pad := size - base
+			Expect(pad).To(BeNumerically(">=", 0))
+			snap.Goroutines[0].WaitReason = strings.Repeat("w", pad-len(`,"waitReason":""`))
+			Expect(eventBytes(protocol.EventGoroutineSnapshot, snap)).To(Equal(size))
+			return snap
+		}
+
+		It("keeps everything one byte below the cap", func() {
+			snap := padTo(protocol.MaxGoroutineEventBytes - 1)
+			out, report := protocol.PackSnapshot(snap, false)
+
+			Expect(report.Degraded).To(BeFalse())
+			Expect(out.Goroutines).To(HaveLen(1))
+			Expect(out.Totals).To(BeNil(), "nothing was omitted")
+			Expect(report.Bytes).To(Equal(protocol.MaxGoroutineEventBytes - 1))
+		})
+
+		It("keeps everything exactly at the cap", func() {
+			snap := padTo(protocol.MaxGoroutineEventBytes)
+			out, report := protocol.PackSnapshot(snap, false)
+
+			Expect(report.Degraded).To(BeFalse())
+			Expect(out.Goroutines).To(HaveLen(1), "the cap is inclusive")
+			Expect(out.Totals).To(BeNil())
+			Expect(report.Bytes).To(Equal(protocol.MaxGoroutineEventBytes))
+		})
+
+		It("drops the element one byte above the cap", func() {
+			snap := padTo(protocol.MaxGoroutineEventBytes + 1)
+			out, report := protocol.PackSnapshot(snap, false)
+
+			// The single goroutine is the anchor, so it cannot be dropped in
+			// isolation: the whole result degrades.
+			Expect(report.Degraded).To(BeTrue())
+			Expect(out.Goroutines).To(BeEmpty())
+			Expect(report.Bytes).To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
+		})
+
+		It("drops only the over-budget non-anchor at the boundary", func() {
+			anchor := protocol.Goroutine{ID: 1, Status: "running", Current: true}
+			snap := protocol.GoroutineSnapshotPayload{
+				Goroutines: []protocol.Goroutine{anchor, {ID: 2, Status: "waiting"}},
+				Threads:    []protocol.Thread{},
+				Current:    1,
+			}
+			base := eventBytes(protocol.EventGoroutineSnapshot, snap)
+			// Widen the non-anchor by exactly one byte more than the headroom.
+			snap.Goroutines[1].WaitReason = strings.Repeat("w",
+				protocol.MaxGoroutineEventBytes-base+1-len(`,"waitReason":""`))
+
+			out, report := protocol.PackSnapshot(snap, false)
+			Expect(report.Degraded).To(BeFalse())
+			Expect(goroutineIDs(out.Goroutines)).To(Equal([]int{1}))
+			Expect(out.Totals).NotTo(BeNil())
+			Expect(out.Totals.Goroutines).To(Equal(2))
+			Expect(report.Bytes).To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
+		})
+
+		It("keeps the non-anchor that lands exactly on the cap", func() {
+			anchor := protocol.Goroutine{ID: 1, Status: "running", Current: true}
+			snap := protocol.GoroutineSnapshotPayload{
+				Goroutines: []protocol.Goroutine{anchor, {ID: 2, Status: "waiting"}},
+				Threads:    []protocol.Thread{},
+				Current:    1,
+			}
+			base := eventBytes(protocol.EventGoroutineSnapshot, snap)
+			snap.Goroutines[1].WaitReason = strings.Repeat("w",
+				protocol.MaxGoroutineEventBytes-base-len(`,"waitReason":""`))
+
+			out, report := protocol.PackSnapshot(snap, false)
+			Expect(report.Degraded).To(BeFalse())
+			Expect(goroutineIDs(out.Goroutines)).To(Equal([]int{1, 2}))
+			Expect(report.Bytes).To(Equal(protocol.MaxGoroutineEventBytes))
+			Expect(out.Totals).To(BeNil())
+		})
+	})
+
+	Describe("required anchors", func() {
+		// chain builds current -> parent -> ... -> root of the given depth.
+		chain := func(depth int, padding int) []protocol.Goroutine {
+			gs := make([]protocol.Goroutine, 0, depth)
+			for i := 1; i <= depth; i++ {
+				g := protocol.Goroutine{
+					ID: i, Status: "waiting",
+					WaitReason: strings.Repeat("w", padding),
+				}
+				if i > 1 {
+					g.ParentID = i - 1
+				}
+				gs = append(gs, g)
+			}
+			gs[depth-1].Current = true // deepest goroutine is the current one
+			return gs
+		}
+
+		It("retains the entire ancestor chain, nearest-first", func() {
+			gs := chain(40, 0)
+			// Bury the chain among many unrelated goroutines competing for room.
+			for i := 100; i < 4000; i++ {
+				gs = append(gs, packGoroutine(i, 0))
+			}
+			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+				Goroutines: gs, Current: 40,
+			}, false)
+
+			Expect(report.Degraded).To(BeFalse())
+			ids := goroutineIDs(out.Goroutines)
+			Expect(ids[0]).To(Equal(40), "current goroutine first")
+			Expect(ids[1:40]).To(Equal([]int{
+				39, 38, 37, 36, 35, 34, 33, 32, 31, 30, 29, 28, 27, 26, 25, 24, 23, 22, 21, 20,
+				19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1,
+			}), "every ancestor, nearest-first")
+		})
+
+		It("degrades rather than dropping an ancestor that cannot fit", func() {
+			// A chain whose own bytes exceed the budget: no conforming result
+			// can keep every anchor, so nothing is emitted rather than a tree
+			// with a hole in it.
+			gs := chain(600, 4096)
+			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+				Goroutines: gs, Current: 600,
+			}, false)
+
+			Expect(report.Degraded).To(BeTrue())
+			Expect(out.Goroutines).To(BeEmpty())
+			Expect(out.Totals).NotTo(BeNil())
+			Expect(out.Totals.Goroutines).To(Equal(600))
+		})
+
+		It("does not require ancestors in the flat list shape", func() {
+			// EventGoroutines is rendered by DAP as a flat thread list — there
+			// is no hierarchy to break. Degrading it to empty would make the DAP
+			// translator fabricate a synthetic "main" thread, which is exactly
+			// the lie issue #194 exists to stop.
+			gs := chain(600, 4096)
+			out, report := protocol.PackGoroutines(gs, false)
+
+			Expect(report.Degraded).To(BeFalse())
+			Expect(out.Goroutines).NotTo(BeEmpty())
+			Expect(out.Goroutines[0].ID).To(Equal(600), "the current goroutine is still required")
+			Expect(out.Totals).NotTo(BeNil())
+			Expect(out.Totals.Goroutines).To(Equal(600))
+		})
+
+		It("keeps ancestor ordering in the flat list shape", func() {
+			gs := chain(40, 0)
+			for i := 100; i < 500; i++ {
+				gs = append(gs, packGoroutine(i, 0))
+			}
+			out, _ := protocol.PackGoroutines(gs, false)
+
+			ids := goroutineIDs(out.Goroutines)
+			Expect(ids[0]).To(Equal(40))
+			Expect(ids[1:5]).To(Equal([]int{39, 38, 37, 36}), "ancestors are still ordered first")
+		})
+
+		It("degrades when the ancestor chain exceeds the count cap", func() {
+			gs := chain(protocol.MaxSnapshotGoroutines+1, 0)
+			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+				Goroutines: gs, Current: protocol.MaxSnapshotGoroutines + 1,
+			}, false)
+
+			Expect(report.Degraded).To(BeTrue())
+			Expect(out.Goroutines).To(BeEmpty())
+		})
+
+		It("keeps an ancestor chain that exactly fills the count cap", func() {
+			gs := chain(protocol.MaxSnapshotGoroutines, 0)
+			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+				Goroutines: gs, Current: protocol.MaxSnapshotGoroutines,
+			}, false)
+
+			Expect(report.Degraded).To(BeFalse())
+			Expect(out.Goroutines).To(HaveLen(protocol.MaxSnapshotGoroutines))
+		})
+
+		It("stops the anchor chain at an unknown parent", func() {
+			gs := []protocol.Goroutine{
+				{ID: 5, ParentID: 999, Status: "running", Current: true},
+				{ID: 6, Status: "waiting"},
+			}
+			out, report := protocol.PackGoroutines(gs, false)
+			Expect(report.Degraded).To(BeFalse())
+			Expect(goroutineIDs(out.Goroutines)).To(Equal([]int{5, 6}))
+		})
+	})
+
 	Describe("deterministic selection", func() {
 		It("keeps the current goroutine, its ancestors nearest-first, then ascending goid", func() {
 			gs := packGoroutines(8192)
@@ -558,15 +755,39 @@ var _ = Describe("goroutine event packing", func() {
 		})
 
 		It("scales linearly rather than quadratically", func() {
+			// Both inputs fit whole, so each does exactly one pass and the
+			// marshal count tracks the input size directly. (A truncating input
+			// costs two passes — the exact-reserve retry — which is a constant
+			// factor, not a change of order.)
+			lean := func(n int) []protocol.Goroutine {
+				out := make([]protocol.Goroutine, 0, n)
+				for i := 1; i <= n; i++ {
+					out = append(out, protocol.Goroutine{ID: i, Status: "runnable"})
+				}
+				return out
+			}
+
 			protocol.ResetPackMarshalCounts()
-			protocol.PackGoroutines(packGoroutines(1000), false)
+			protocol.PackGoroutines(lean(1000), false)
 			small, _ := protocol.PackMarshalCounts()
 
 			protocol.ResetPackMarshalCounts()
-			protocol.PackGoroutines(packGoroutines(4000), false)
+			protocol.PackGoroutines(lean(4000), false)
 			large, _ := protocol.PackMarshalCounts()
 
-			Expect(large).To(BeNumerically("<=", 5*small))
+			Expect(small).To(Equal(1000), "one marshal per element on a single pass")
+			Expect(large).To(Equal(4000))
+		})
+
+		It("costs at most one extra pass when the exact reserve must be retried", func() {
+			gs := packGoroutines(8192)
+			protocol.ResetPackMarshalCounts()
+			_, report := protocol.PackGoroutines(gs, false)
+			elements, envelopes := protocol.PackMarshalCounts()
+
+			Expect(report.Omitted()).To(BeTrue(), "this input must trigger the retry")
+			Expect(elements).To(BeNumerically("<=", 2*len(gs)))
+			Expect(envelopes).To(BeNumerically("<=", 4))
 		})
 	})
 

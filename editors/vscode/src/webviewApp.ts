@@ -209,12 +209,13 @@ function summaryCards(
     ],
     // The thread statistic reports the machine's real thread count from the
     // server totals when they are present; the list below shows only what was
-    // packed, so the two must not silently disagree.
+    // packed, so the two must not silently disagree. `clipped` describes the
+    // GOROUTINE scan, so the thread total is not marked as a lower bound.
     [
       "Threads",
       totals === undefined
         ? shownThreads
-        : formatServerCount(shownThreads, totals.threads, totals.clipped),
+        : formatServerCount(shownThreads, totals.threads, false),
     ],
     ["Clients", session.clients],
     ["Current", session.snapshot?.current || "—"],
@@ -623,24 +624,27 @@ function renderThreads(
 }
 
 // serverOmissionText states what the DEBUGGER left out, in its own words —
-// never mixed with this view's filter or render cap. A clipped scan means even
-// the total is a floor, so it is labelled "at least".
+// never mixed with this view's filter or render cap. The two causes are
+// reported separately because they mean different things: an omission is this
+// event being partial, while a clipped scan means even the total is a floor.
 export function serverOmissionText(
   totals: ServerTotals | undefined,
 ): string | undefined {
   if (totals === undefined) {
     return undefined;
   }
+  const notes: string[] = [];
   if (totals.goroutinesOmitted > 0) {
-    const total = totals.clipped
-      ? `at least ${String(totals.goroutines)}`
-      : String(totals.goroutines);
-    return `${String(totals.goroutinesOmitted)} goroutines were not sent by the debugger (${total} live)`;
+    notes.push(
+      `${String(totals.goroutinesOmitted)} goroutines were not sent in this event (${String(totals.goroutines)} live)`,
+    );
   }
   if (totals.clipped) {
-    return `the debugger stopped scanning at ${String(totals.goroutines)} goroutines, so this is a lower bound`;
+    notes.push(
+      `the debugger stopped scanning at ${String(totals.goroutines)} goroutines, so the total is a lower bound`,
+    );
   }
-  return undefined;
+  return notes.length === 0 ? undefined : notes.join(" · ");
 }
 
 function renderTimeline(

@@ -123,7 +123,8 @@ than a failure:
   stops instead of reconnecting into the identical failure. Ordinary connection
   drops still reconnect as before, and an oversized event that the contract does
   not cover — a very large `Locals`/`Frames`/`Evaluate` broadcast, for
-  instance — stays recoverable rather than ending the view.
+  instance — stays recoverable rather than ending the view. If the view does stop
+  on a protocol error, **Refresh** clears it and reconnects.
 - Events the view does not consume (`Output`, `Locals`, `Frames`, `Goroutines`,
   `Evaluate`, breakpoint confirmations, `Restarted`) have their envelope
   validated but their body skipped, so another client's large data request can

@@ -45,9 +45,11 @@ func (r GoroutinePackReport) Omitted() bool {
 // call, which makes the reported goroutine total a lower bound.
 //
 // Selection is deterministic so every client on one stop sees the same thing:
-// the current goroutine, then its ancestors nearest-first (keeping a spawn tree
-// rooted), then the rest by ascending goid. Threads take an ordered floor
-// before goroutines compete for the budget, then reclaim whatever is left.
+// the current goroutine, then its ancestors nearest-first, then the rest by
+// ascending goid. The current goroutine, its whole ancestor chain, and the
+// current thread are REQUIRED — a result that cannot keep them degrades to empty
+// collections instead. Threads take an ordered floor before goroutines compete
+// for the budget, then reclaim whatever is left.
 func PackSnapshot(snap GoroutineSnapshotPayload, scanClipped bool) (GoroutineSnapshotPayload, GoroutinePackReport) {
 	totals := SnapshotTotals{
 		Goroutines: len(snap.Goroutines),
@@ -71,7 +73,8 @@ func PackSnapshot(snap GoroutineSnapshotPayload, scanClipped bool) (GoroutineSna
 		return shape(gs, ts, totals)
 	}
 
-	gs, ts, report := pack(snap.Goroutines, snap.Threads, snap.Current, totals, EventGoroutineSnapshot, build)
+	// The snapshot shape IS a tree, so the whole spawn chain is required.
+	gs, ts, report := pack(snap.Goroutines, snap.Threads, snap.Current, totals, EventGoroutineSnapshot, build, true)
 	return shape(gs, ts, payloadTotals(totals, report)), report
 }
 
@@ -87,7 +90,11 @@ func PackGoroutines(gs []Goroutine, scanClipped bool) (GoroutinesPayload, Gorout
 		return shape(gs, totals)
 	}
 
-	packed, _, report := pack(gs, nil, 0, totals, EventGoroutines, build)
+	// This shape is a FLAT list — DAP renders it as threads, with no hierarchy to
+	// break — so ancestors are ordered first but not required. Degrading it to
+	// empty would make the DAP translator fabricate a synthetic "main" thread,
+	// which is precisely the lie issue #194 exists to stop.
+	packed, _, report := pack(gs, nil, 0, totals, EventGoroutines, build, false)
 	return shape(packed, payloadTotals(totals, report)), report
 }
 
@@ -106,9 +113,9 @@ func payloadTotals(totals SnapshotTotals, report GoroutinePackReport) *SnapshotT
 // a parameter is what lets both packers share a single exact algorithm.
 type payloadBuilder func(gs []Goroutine, ts []Thread, totals *SnapshotTotals) any
 
-// pack is the shared algorithm. It marshals each candidate at most once and
-// makes a single ordered pass, so cost is O(n) marshals (plus the ordering sort)
-// rather than the O(n²) of re-marshalling the whole payload per candidate.
+// pack is the shared algorithm. It marshals each candidate at most twice and
+// makes at most two ordered passes, so cost is O(n) marshals (plus the ordering
+// sort) rather than the O(n²) of re-marshalling the whole payload per candidate.
 func pack(
 	goroutines []Goroutine,
 	threads []Thread,
@@ -116,9 +123,13 @@ func pack(
 	totals SnapshotTotals,
 	kind EventKind,
 	build payloadBuilder,
+	requireAncestors bool,
 ) ([]Goroutine, []Thread, GoroutinePackReport) {
 	orderedG, anchorG := orderGoroutines(goroutines, current)
 	orderedT, anchorT := orderThreads(threads)
+	if !requireAncestors && anchorG > 1 {
+		anchorG = 1 // ordering is kept; only the current goroutine is required
+	}
 
 	degraded := func() ([]Goroutine, []Thread, GoroutinePackReport) {
 		gs, ts := []Goroutine{}, []Thread{}
@@ -131,14 +142,64 @@ func pack(
 		return gs, ts, report
 	}
 
-	// Reserve assumes Totals is present. That is the larger of the two shapes,
-	// so a result that ends up complete (and therefore drops Totals) can only
-	// shrink. Deriving the reserve from a real marshal of the real skeleton —
-	// envelope, current goid, and the lifecycle deltas that are never trimmed —
-	// keeps the accounting tied to the schema instead of a hard-coded constant.
-	reserve, ok := packBudget(kind, build([]Goroutine{}, []Thread{}, &totals))
-	if !ok || reserve > MaxGoroutineEventBytes {
+	// Whether Totals ends up on the wire changes the reserve, and it is only
+	// known after packing — except when the scan was clipped, which forces it.
+	// So pack optimistically first; if that pass turns out to omit elements,
+	// Totals appears and the reserve was too small, so repack against the true
+	// one.
+	//
+	// Exactly two passes suffice: if pass 2 omitted NOTHING then every element
+	// fit under its smaller budget, so every element would also have fit under
+	// pass 1's larger one — contradicting pass 1 having omitted something. So
+	// pass 2 always omits, Totals stays present, and its reserve was right.
+	// (Note the weaker claim "pass 2 omits at least as many" is false: with
+	// skip-and-continue a tighter budget can reject one big early element and
+	// admit several small later ones.)
+	gs, ts, report, ok := packOnce(orderedG, anchorG, orderedT, anchorT, totals, totals.Clipped, kind, build)
+	if !ok {
 		return degraded()
+	}
+	if !totals.Clipped && report.Omitted() {
+		gs, ts, report, ok = packOnce(orderedG, anchorG, orderedT, anchorT, totals, true, kind, build)
+		if !ok {
+			return degraded()
+		}
+	}
+
+	// The incremental accounting is exact (see packState), but the contract is
+	// the measured size of the payload the caller actually sends, so that is
+	// what is measured. A miss degrades rather than emitting a frame the
+	// transport would reject outright.
+	size, ok := packBudget(kind, build(gs, ts, payloadTotals(totals, report)))
+	if !ok || size > MaxGoroutineEventBytes {
+		return degraded()
+	}
+	report.Bytes = size
+	return gs, ts, report
+}
+
+// packOnce runs one exact pass against a reserve that either includes Totals or
+// does not. ok is false when the required anchors cannot be honoured.
+func packOnce(
+	orderedG []Goroutine,
+	anchorG int,
+	orderedT []Thread,
+	anchorT int,
+	totals SnapshotTotals,
+	withTotals bool,
+	kind EventKind,
+	build payloadBuilder,
+) ([]Goroutine, []Thread, GoroutinePackReport, bool) {
+	// Deriving the reserve from a real marshal of the real skeleton — envelope,
+	// current goid, and the lifecycle deltas that are never trimmed — keeps the
+	// accounting tied to the schema instead of a hard-coded constant.
+	var reserved *SnapshotTotals
+	if withTotals {
+		reserved = &totals
+	}
+	reserve, ok := packBudget(kind, build([]Goroutine{}, []Thread{}, reserved))
+	if !ok || reserve > MaxGoroutineEventBytes {
+		return nil, nil, GoroutinePackReport{}, false
 	}
 
 	// The reserve measured empty (`[]`) collections, so the result must present
@@ -151,17 +212,21 @@ func pack(
 		threads:    []Thread{},
 	}
 
-	// Anchors: the stop is meaningless without the goroutine and thread the
-	// debugger is actually stopped on, so they are placed before anything else
-	// and their failure to fit is what defines a degraded result.
+	// Anchors: the current goroutine, its whole spawn chain, and the thread the
+	// debugger is stopped on. They are placed before anything else, and their
+	// failure to fit is what defines a degraded result. The count caps bind
+	// here too — a result cannot both honour the cap and keep every anchor.
+	if anchorG > MaxSnapshotGoroutines || anchorT > MaxSnapshotThreads {
+		return nil, nil, GoroutinePackReport{}, false
+	}
 	for i := 0; i < anchorG; i++ {
 		if !state.addGoroutine(orderedG[i]) {
-			return degraded()
+			return nil, nil, GoroutinePackReport{}, false
 		}
 	}
 	for i := 0; i < anchorT; i++ {
 		if !state.addThread(orderedT[i]) {
-			return degraded()
+			return nil, nil, GoroutinePackReport{}, false
 		}
 	}
 
@@ -188,20 +253,11 @@ func pack(
 		state.addThread(orderedT[next])
 	}
 
-	report := GoroutinePackReport{
+	return state.goroutines, state.threads, GoroutinePackReport{
 		Totals:     totals,
 		Goroutines: len(state.goroutines),
 		Threads:    len(state.threads),
-	}
-	// The incremental accounting is exact (see packState), but the contract is
-	// the measured size, so it is measured. A miss degrades rather than emitting
-	// a frame the transport would reject outright.
-	size, ok := packBudget(kind, build(state.goroutines, state.threads, payloadTotals(totals, report)))
-	if !ok || size > MaxGoroutineEventBytes {
-		return degraded()
-	}
-	report.Bytes = size
-	return state.goroutines, state.threads, report
+	}, true
 }
 
 // packState threads the one shared byte budget through both element phases.
@@ -286,9 +342,12 @@ func packBudget(kind EventKind, payload any) (int, bool) {
 
 // orderGoroutines returns the deterministic packing order — the current
 // goroutine, its ancestors nearest-first, then the rest by ascending goid — and
-// how many leading entries are anchors that must survive. Only the current
-// goroutine is an anchor; ancestors are merely prioritized so a spawn tree keeps
-// a path to its root when the middle of the list is dropped.
+// how many leading entries are REQUIRED anchors.
+//
+// The whole spawn chain above the current goroutine is an anchor, not merely a
+// preference: a tree missing an interior ancestor cannot be rendered as the
+// hierarchy it actually is, so a result that drops one would be misleading in a
+// way a truncated tail is not.
 func orderGoroutines(gs []Goroutine, current int) ([]Goroutine, int) {
 	if len(gs) == 0 {
 		return nil, 0
@@ -315,6 +374,7 @@ func orderGoroutines(gs []Goroutine, current int) ([]Goroutine, int) {
 				}
 				ordered = append(ordered, gs[pi])
 				placed[pi] = true
+				anchors++
 				parent = gs[pi].ParentID
 			}
 		}

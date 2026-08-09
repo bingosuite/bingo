@@ -80,6 +80,68 @@ describe("telemetry budget contract", () => {
     assert.equal(maximumTransportBytes, maximumEnvelopeBytes + transportSlackBytes);
   });
 
+  it("accepts a frame exactly at the decoder cap and rejects one byte more", () => {
+    // padTo builds a legal envelope of EXACTLY the requested byte length by
+    // widening one payload string, so the boundary is pinned rather than
+    // approximated.
+    const padTo = (size: number): string => {
+      const base = frame(1, "GoroutineSnapshot", {
+        goroutines: [],
+        threads: [],
+        current: 1,
+        pad: "",
+      });
+      const filler = "f".repeat(size - Buffer.byteLength(base));
+      const exact = frame(1, "GoroutineSnapshot", {
+        goroutines: [],
+        threads: [],
+        current: 1,
+        pad: filler,
+      });
+      assert.equal(Buffer.byteLength(exact), size);
+      return exact;
+    };
+
+    // "pad" is not a snapshot key, so these are rejected for schema reasons —
+    // what matters is WHICH rejection fires, i.e. that the size gate does not.
+    assert.throws(
+      () => decodeEvent(padTo(maximumEnvelopeBytes - 1)),
+      /has unknown field "pad"/u,
+      "one byte below the cap must pass the size gate",
+    );
+    assert.throws(
+      () => decodeEvent(padTo(maximumEnvelopeBytes)),
+      /has unknown field "pad"/u,
+      "the cap is inclusive",
+    );
+    assert.throws(
+      () => decodeEvent(padTo(maximumEnvelopeBytes + 1)),
+      /exceeds the 2097152 byte contract/u,
+      "one byte above the cap must fail the size gate",
+    );
+  });
+
+  it("applies the same boundary to every carrier shape", () => {
+    const atCap = "x".repeat(maximumEnvelopeBytes);
+    const overCap = "x".repeat(maximumEnvelopeBytes + 1);
+    for (const [label, at, over] of [
+      ["string", atCap, overCap],
+      ["buffer", Buffer.from(atCap), Buffer.from(overCap)],
+      ["buffer list", [Buffer.from(atCap)], [Buffer.from(overCap)]],
+    ] as const) {
+      assert.throws(
+        () => decodeEvent(at),
+        /not valid JSON/u,
+        `${label} at the cap must reach the parser`,
+      );
+      assert.throws(
+        () => decodeEvent(over),
+        /exceeds the 2097152 byte contract/u,
+        `${label} above the cap must be rejected on size`,
+      );
+    }
+  });
+
   it("pins the wire constants against the Go protocol source", () => {
     const source = goSource("pkg/protocol/protocol.go");
     assert.match(source, new RegExp(`const Version = "${wireProtocolVersion}"`));
@@ -572,18 +634,66 @@ describe("real WebSocket transport", () => {
     live.observer.dispose();
   });
 
-  it("fails once without reconnecting on a frame above the transport slack", async () => {
-    const live = await liveObserver((socket) => {
+  it("reconnects after a frame above the transport slack", async () => {
+    // Above the transport cap the frame is never delivered, so its kind is
+    // unknowable — and a legal, deliberately unbounded Locals/Frames/Evaluate
+    // broadcast can land here. Latching would kill the view over an event the
+    // observer never even reads, so this stays a transport failure.
+    let oversized = 0;
+    const live = await liveObserver((socket, connections) => {
       socket.on("message", () => {
-        socket.send("z".repeat(maximumTransportBytes + 1));
+        if (connections < 3) {
+          oversized += 1;
+          socket.send("z".repeat(maximumTransportBytes + 1));
+          return;
+        }
+        socket.send(frame(1, "GoroutineSnapshot", { goroutines: [], threads: [] }));
       });
     });
     live.observer.start();
     await live.settled();
 
-    assert.equal(live.connections(), 1, "an oversized frame must not be retried");
-    assert.equal(live.observer.model.connection, "error");
-    assert.match(live.observer.model.error, /transport limit/);
+    assert.ok(oversized >= 1, "the oversized frame must actually have been sent");
+    assert.ok(
+      live.connections() >= 3,
+      `an unclassifiable oversized frame must reconnect, got ${String(live.connections())}`,
+    );
+    assert.equal(live.observer.model.connection, "connected");
+    live.observer.dispose();
+  });
+
+  it("recovers from a fatal protocol error on an explicit refresh", async () => {
+    // The fatal latch stops the AUTOMATIC ladder, which would replay the same
+    // bad frame. An explicit user action is not a loop, so Refresh must redial.
+    let stops = 0;
+    const live = await liveObserver((socket) => {
+      socket.on("message", () => {
+        stops += 1;
+        if (stops === 1) {
+          socket.send(
+            JSON.stringify({
+              v: wireProtocolVersion,
+              kind: "GoroutineSnapshot",
+              seq: 1,
+              payload: { goroutines: [], threads: [], filler: "p".repeat(maximumEnvelopeBytes) },
+            }),
+          );
+          return;
+        }
+        socket.send(frame(1, "GoroutineSnapshot", { goroutines: [], threads: [] }));
+      });
+    });
+    live.observer.start();
+    await live.settled();
+
+    assert.equal(live.observer.model.connection, "error", "the violation must latch");
+    assert.equal(live.connections(), 1, "and must not retry on its own");
+
+    live.observer.refresh();
+    await live.settled();
+
+    assert.equal(live.connections(), 2, "an explicit refresh redials");
+    assert.equal(live.observer.model.connection, "connected");
     live.observer.dispose();
   });
 
