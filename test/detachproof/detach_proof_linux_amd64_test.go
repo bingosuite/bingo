@@ -92,8 +92,8 @@ func attachAndArm(t *testing.T, setBP bool) (*target, debugger.Debugger, uint64,
 	// Attach stops the tracee; the engine reports the stop as EventStepped.
 	awaitEvent(t, d.Events(), 15*time.Second, protocol.EventStepped)
 
-	if tp := mustTracerPID(t, tg.pid, "after attach"); tp != os.Getpid() {
-		t.Fatalf("after Attach: TracerPid=%d, want this test process %d", tp, os.Getpid())
+	if tp := mustTracerPID(t, tg.pid, "after attach"); !tracedByThisProcess(tp) {
+		t.Fatalf("after Attach: TracerPid=%d does not belong to this test process (%d)", tp, os.Getpid())
 	}
 
 	if setBP {

@@ -258,6 +258,32 @@ func mustTracerPID(t *testing.T, pid int, when string) int {
 	return tp
 }
 
+// tgidOf resolves a thread id to its owning process id via /proc/<tid>/status.
+// TracerPid names the tracing THREAD (ptrace attaches per-thread and the linux
+// backend attaches from its dedicated tracer thread), so identifying the tracer
+// as "this process" requires this extra hop rather than comparing to os.Getpid.
+func tgidOf(tid int) (int, error) {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", tid))
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if rest, ok := strings.CutPrefix(line, "Tgid:"); ok {
+			return strconv.Atoi(strings.TrimSpace(rest))
+		}
+	}
+	return 0, fmt.Errorf("Tgid not present in /proc/%d/status", tid)
+}
+
+// tracedByThisProcess reports whether tracerTid belongs to the test process.
+func tracedByThisProcess(tracerTid int) bool {
+	if tracerTid == 0 {
+		return false
+	}
+	tgid, err := tgidOf(tracerTid)
+	return err == nil && tgid == os.Getpid()
+}
+
 // procState returns the single-letter state from /proc/<pid>/stat ("t" is
 // tracing-stop, "R"/"S" are runnable/sleeping, "Z" is zombie).
 func procState(pid int) string {

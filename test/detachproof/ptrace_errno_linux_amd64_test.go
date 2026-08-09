@@ -135,8 +135,9 @@ func TestProcSelfCanObserveTracerPid(t *testing.T) {
 			t.Errorf("wait4: %v", err)
 			return
 		}
-		if tp, _ := tracerPID(tg.pid); tp != os.Getpid() {
-			t.Errorf("attached child reports TracerPid=%d, want %d", tp, os.Getpid())
+		tp, _ := tracerPID(tg.pid)
+		if !tracedByThisProcess(tp) {
+			t.Errorf("attached child reports TracerPid=%d, which does not belong to this process (%d)", tp, os.Getpid())
 		}
 		_ = syscall.PtraceDetach(tg.pid)
 	})
