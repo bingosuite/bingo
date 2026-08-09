@@ -38,7 +38,7 @@ func (h *Handler) translateEvent(evt protocol.Event) {
 		// want goroutine data use the threads request; the rich snapshot is a
 		// WebSocket-only concurrency-visualization stream.
 	case protocol.EventRestarted:
-		h.onRestarted()
+		h.onRestarted(evt)
 	case protocol.EventError:
 		h.onError(evt)
 	case protocol.EventSessionState:
@@ -215,7 +215,10 @@ func (h *Handler) onBreakpointSet(evt protocol.Event) {
 		slot := h.setQ[0]
 		h.setQ = h.setQ[1:]
 		if lines := h.bpByFile[slot.file]; lines != nil {
-			lines[slot.line] = p.Breakpoint.ID
+			lines[slot.line] = breakpointState{
+				dapID:      p.Breakpoint.ID,
+				debuggerID: p.Breakpoint.ID,
+			}
 		}
 		slot.resolved = true
 		slot.bp = godap.Breakpoint{
@@ -346,15 +349,61 @@ func (h *Handler) onEvaluated(evt protocol.Event) {
 	})
 }
 
-func (h *Handler) onRestarted() {
+func (h *Handler) onRestarted(evt protocol.Event) {
+	var p protocol.RestartedPayload
+	decoded := protocol.DecodeEventPayload(evt, &p) == nil
+
 	h.mu.Lock()
 	seq := h.restartReqSeq
 	h.restartReqSeq = 0
+	var discarded []godap.Breakpoint
+	if decoded {
+		discarded = h.reconcileRestartBreakpointsLocked(p)
+	}
 	h.mu.Unlock()
 
+	for _, bp := range discarded {
+		h.send(&godap.BreakpointEvent{
+			Event: h.event("breakpoint"),
+			Body: godap.BreakpointEventBody{
+				Reason:     "changed",
+				Breakpoint: bp,
+			},
+		})
+	}
 	if seq != 0 {
 		h.send(&godap.RestartResponse{Response: h.response(seq, "restart")})
 	}
+}
+
+func (h *Handler) reconcileRestartBreakpointsLocked(p protocol.RestartedPayload) []godap.Breakpoint {
+	for _, bp := range p.Breakpoints {
+		lines := h.bpByFile[bp.Location.File]
+		state, ok := lines[bp.Location.Line]
+		if !ok || state.debuggerID == 0 {
+			continue
+		}
+		state.debuggerID = bp.ID
+		lines[bp.Location.Line] = state
+	}
+
+	discarded := make([]godap.Breakpoint, 0, len(p.Discarded))
+	for _, dropped := range p.Discarded {
+		lines := h.bpByFile[dropped.Location.File]
+		state, ok := lines[dropped.Location.Line]
+		if !ok || state.debuggerID == 0 {
+			continue
+		}
+		delete(lines, dropped.Location.Line)
+		discarded = append(discarded, godap.Breakpoint{
+			Id:       state.dapID,
+			Verified: false,
+			Message:  dropped.Reason,
+			Source:   dapSource(dropped.Location),
+			Line:     dropped.Location.Line,
+		})
+	}
+	return discarded
 }
 
 // onError routes a bingo EventError to the DAP request it corresponds to,

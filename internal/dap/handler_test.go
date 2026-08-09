@@ -62,6 +62,27 @@ func (r *cmdRecorder) waitForCommand(t *testing.T, kind protocol.CommandKind) pr
 	return protocol.Command{}
 }
 
+func (r *cmdRecorder) waitForCommands(t *testing.T, kind protocol.CommandKind, count int) []protocol.Command {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		var matches []protocol.Command
+		for _, cmd := range r.cmds {
+			if cmd.Kind == kind {
+				matches = append(matches, cmd)
+			}
+		}
+		r.mu.Unlock()
+		if len(matches) >= count {
+			return matches
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d commands of kind %s; saw %v", count, kind, r.kinds())
+	return nil
+}
+
 type fakeSession struct {
 	id      string
 	cmds    *cmdRecorder
@@ -590,6 +611,140 @@ func TestSetBreakpointsDiffAndFIFO(t *testing.T) {
 	}
 	// A ClearBreakpoint for the removed line 10 must have been enqueued.
 	hh.cmds.waitForCommand(t, protocol.CmdClearBreakpoint)
+}
+
+func TestRestartReconcilesBreakpointCache(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	hh.inject(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{Goroutine: protocol.Goroutine{ID: 1}})
+	_ = recvType[*godap.StoppedEvent](hh)
+
+	source := godap.Source{Path: "/x/main.go", Name: "main.go"}
+	hh.sendReq("setBreakpoints", &godap.SetBreakpointsRequest{Arguments: godap.SetBreakpointsArguments{
+		Source:      source,
+		Breakpoints: []godap.SourceBreakpoint{{Line: 10}, {Line: 20}},
+	}})
+	hh.cmds.waitForCommands(t, protocol.CmdSetBreakpoint, 2)
+	hh.inject(protocol.EventBreakpointSet, protocol.BreakpointSetPayload{
+		Breakpoint: protocol.Breakpoint{ID: 41, Location: protocol.Location{File: source.Path, Line: 10}},
+	})
+	hh.inject(protocol.EventBreakpointSet, protocol.BreakpointSetPayload{
+		Breakpoint: protocol.Breakpoint{ID: 42, Location: protocol.Location{File: source.Path, Line: 20}},
+	})
+	initial := recvType[*godap.SetBreakpointsResponse](hh)
+	if got := []int{initial.Body.Breakpoints[0].Id, initial.Body.Breakpoints[1].Id}; got[0] != 41 || got[1] != 42 {
+		t.Fatalf("initial breakpoint ids = %v, want [41 42]", got)
+	}
+
+	restartSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdRestart)
+	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{
+		Breakpoints: []protocol.Breakpoint{
+			{ID: 101, Location: protocol.Location{File: source.Path, Line: 10}},
+		},
+		Discarded: []protocol.DiscardedBreakpoint{
+			{Location: protocol.Location{File: source.Path, Line: 20}, Reason: "no such line"},
+		},
+	})
+
+	var changed *godap.BreakpointEvent
+	var restarted *godap.RestartResponse
+	for range 2 {
+		switch msg := hh.recv().(type) {
+		case *godap.BreakpointEvent:
+			changed = msg
+		case *godap.RestartResponse:
+			restarted = msg
+		}
+	}
+	if restarted == nil || restarted.RequestSeq != restartSeq || !restarted.Success {
+		t.Fatalf("restart response = %+v, want success for request %d", restarted, restartSeq)
+	}
+	if changed == nil {
+		t.Fatal("discarded breakpoint did not emit a breakpoint event")
+	}
+	if changed.Body.Reason != "changed" ||
+		changed.Body.Breakpoint.Id != 42 ||
+		changed.Body.Breakpoint.Verified ||
+		changed.Body.Breakpoint.Line != 20 ||
+		changed.Body.Breakpoint.Message != "no such line" {
+		t.Fatalf("discarded breakpoint event = %+v", changed.Body)
+	}
+
+	hh.handler.mu.Lock()
+	retained := hh.handler.bpByFile[source.Path][10]
+	_, droppedStillCached := hh.handler.bpByFile[source.Path][20]
+	hh.handler.mu.Unlock()
+	if retained.debuggerID != 101 || retained.dapID != 41 {
+		t.Fatalf("retained breakpoint state = %+v, want debuggerID=101 dapID=41", retained)
+	}
+	if droppedStillCached {
+		t.Fatal("discarded breakpoint remained in cache")
+	}
+
+	hh.sendReq("setBreakpoints", &godap.SetBreakpointsRequest{Arguments: godap.SetBreakpointsArguments{
+		Source:      source,
+		Breakpoints: []godap.SourceBreakpoint{{Line: 10}, {Line: 20}},
+	}})
+	setCommands := hh.cmds.waitForCommands(t, protocol.CmdSetBreakpoint, 3)
+	var retry protocol.SetBreakpointPayload
+	if err := protocol.DecodeCommandPayload(setCommands[2], &retry); err != nil {
+		t.Fatal(err)
+	}
+	if retry.File != source.Path || retry.Line != 20 {
+		t.Fatalf("discarded breakpoint retry = %+v, want %s:20", retry, source.Path)
+	}
+	hh.inject(protocol.EventBreakpointSet, protocol.BreakpointSetPayload{
+		Breakpoint: protocol.Breakpoint{ID: 202, Location: protocol.Location{File: source.Path, Line: 20}},
+	})
+	retried := recvType[*godap.SetBreakpointsResponse](hh)
+	if got := []int{retried.Body.Breakpoints[0].Id, retried.Body.Breakpoints[1].Id}; got[0] != 41 || got[1] != 202 {
+		t.Fatalf("post-restart breakpoint ids = %v, want stable retained id 41 and retried id 202", got)
+	}
+
+	hh.sendReq("setBreakpoints", &godap.SetBreakpointsRequest{Arguments: godap.SetBreakpointsArguments{
+		Source:      source,
+		Breakpoints: []godap.SourceBreakpoint{{Line: 20}},
+	}})
+	clearCommands := hh.cmds.waitForCommands(t, protocol.CmdClearBreakpoint, 1)
+	var clear protocol.ClearBreakpointPayload
+	if err := protocol.DecodeCommandPayload(clearCommands[0], &clear); err != nil {
+		t.Fatal(err)
+	}
+	if clear.ID != 101 {
+		t.Fatalf("clear breakpoint id = %d, want fresh debugger id 101", clear.ID)
+	}
+	_ = recvType[*godap.SetBreakpointsResponse](hh)
+}
+
+func TestRestartedPayloadDecodeFailureStillResponds(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+
+	restartSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdRestart)
+	hh.inject(protocol.EventRestarted, map[string]any{"breakpoints": "invalid"})
+
+	restarted := recvType[*godap.RestartResponse](hh)
+	if restarted.RequestSeq != restartSeq || !restarted.Success {
+		t.Fatalf("restart response = %+v, want success for request %d", restarted.Response, restartSeq)
+	}
+}
+
+func TestRestartPreservesBreakpointCorrelationQueues(t *testing.T) {
+	h := NewHandler(nil, nil, nil)
+	setSlot := &bpSlot{}
+	h.setQ = []*bpSlot{setSlot}
+	h.clearQ = []int{73}
+
+	h.onRestarted(protocol.MustEvent(protocol.EventRestarted, 1, protocol.RestartedPayload{}))
+
+	if len(h.setQ) != 1 || h.setQ[0] != setSlot {
+		t.Fatalf("setQ changed across restart: %+v", h.setQ)
+	}
+	if len(h.clearQ) != 1 || h.clearQ[0] != 73 {
+		t.Fatalf("clearQ changed across restart: %v", h.clearQ)
+	}
 }
 
 func TestStackTraceAndVariablesCorrelation(t *testing.T) {
