@@ -251,9 +251,13 @@ protocol rather than to this change:
 - **Delivery is best-effort.** The answer rides the shared `Events()` buffer,
   which `readPump` drops from when the consumer stops draining, and a rejected
   request answers with `EventError`(`CmdGoroutineSnapshot`) instead of a
-  snapshot. Anything that blocks waiting for a snapshot must handle both — see
-  `cmd/wsmon`'s `-once`, which fails fast on a rejection or a closed stream
-  rather than waiting forever.
+  snapshot. Anything that waits for a snapshot must handle both — and must not
+  treat that error as *its* answer: `EventError` is broadcast and carries no
+  requester, so it may be another client's rejection with a valid snapshot still
+  to come. Correlating it by kind is the same mistake as correlating the
+  snapshot itself. `cmd/wsmon`'s `-once` shows the intended shape: the rejection
+  is advisory, a later snapshot wins, and a `-timeout` deadline (not the error)
+  is what bounds the wait.
 - **The answer is broadcast.** A query is fanned out to every client on the
   session like any other event, and it carries empty `Created`/`Exited`. An
   observer that renders "the latest snapshot's deltas" (as `cmd/wsmon`'s
