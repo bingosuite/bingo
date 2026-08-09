@@ -7,7 +7,32 @@ import (
 	"fmt"
 )
 
-const Version = "1.3"
+const Version = "1.4"
+
+// Size limits for the goroutine event family — EventGoroutineSnapshot and
+// EventGoroutines. They are deliberately NOT generic envelope limits: every
+// other event keeps its existing unbounded behaviour, and neither the hub, the
+// Go client, nor Location strings are capped. Only these two events carry an
+// unbounded runtime collection, so only they are bounded here (see issue #194).
+const (
+	// MaxGoroutineEventBytes is the exact marshalled Event ceiling for the
+	// goroutine event family, matched to the binding consumer's decoder budget
+	// (the VS Code observer). A frame above it is rejected below the decoder by
+	// the WebSocket transport, so it can never be delivered at all.
+	MaxGoroutineEventBytes = 2 * 1024 * 1024
+
+	// MaxSnapshotGoroutines and MaxSnapshotThreads cap element counts
+	// independently of the byte budget: a consumer that walks the collection
+	// pays per element regardless of how compact each element is.
+	MaxSnapshotGoroutines = 5000
+	MaxSnapshotThreads    = 2048
+
+	// MinThreadsRetained is the ordered thread floor packed before goroutines
+	// compete for the budget. Threads are far cheaper than goroutines and a
+	// thread view is useless once it is arbitrarily truncated, so a realistic
+	// machine's worth of threads survives even a saturating goroutine set.
+	MinThreadsRetained = 32
+)
 
 // VersionError reports that a peer used a wire version other than Version.
 type VersionError struct {

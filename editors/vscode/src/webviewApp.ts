@@ -1,7 +1,9 @@
 import type {
   ConcurrencyViewModel,
+  ServerTotals,
   SessionViewModel,
 } from "./model.js";
+import { formatServerCount } from "./model.js";
 import { filterFullTree, type TreeNode } from "./tree.js";
 
 export interface WebviewHost {
@@ -195,9 +197,25 @@ function summaryCards(
   const cards = document.createElement("section");
   cards.className = "cards";
   cards.setAttribute("aria-label", "Concurrency summary");
+  const totals = session.serverTotals;
+  const shownGoroutines = session.snapshot?.goroutines.length ?? 0;
+  const shownThreads = session.snapshot?.threads.length ?? 0;
   const values = [
-    ["Goroutines", session.snapshot?.goroutines.length ?? 0],
-    ["Threads", session.snapshot?.threads.length ?? 0],
+    [
+      "Goroutines",
+      totals === undefined
+        ? shownGoroutines
+        : formatServerCount(shownGoroutines, totals.goroutines, totals.clipped),
+    ],
+    // The thread statistic reports the machine's real thread count from the
+    // server totals when they are present; the list below shows only what was
+    // packed, so the two must not silently disagree.
+    [
+      "Threads",
+      totals === undefined
+        ? shownThreads
+        : formatServerCount(shownThreads, totals.threads, totals.clipped),
+    ],
     ["Clients", session.clients],
     ["Current", session.snapshot?.current || "—"],
   ] as const;
@@ -313,6 +331,13 @@ function renderGraph(
     const note = document.createElement("p");
     note.className = "omitted";
     note.textContent = `${String(session.tree.omitted)} additional goroutines omitted by the filter or visual cap`;
+    panel.append(note);
+  }
+  const serverNote = serverOmissionText(session.serverTotals);
+  if (serverNote !== undefined) {
+    const note = document.createElement("p");
+    note.className = "server-omitted";
+    note.textContent = serverNote;
     panel.append(note);
   }
   viewport.append(svg);
@@ -587,7 +612,35 @@ function renderThreads(
     list.append(emptyState(document, "No thread data", "Runtime thread inspection was unavailable."));
   }
   panel.append(list);
+  const totals = session.serverTotals;
+  if (totals !== undefined && totals.threadsOmitted > 0) {
+    const note = document.createElement("p");
+    note.className = "server-omitted";
+    note.textContent = `${String(totals.threadsOmitted)} more threads were not sent by the debugger`;
+    panel.append(note);
+  }
   return panel;
+}
+
+// serverOmissionText states what the DEBUGGER left out, in its own words —
+// never mixed with this view's filter or render cap. A clipped scan means even
+// the total is a floor, so it is labelled "at least".
+export function serverOmissionText(
+  totals: ServerTotals | undefined,
+): string | undefined {
+  if (totals === undefined) {
+    return undefined;
+  }
+  if (totals.goroutinesOmitted > 0) {
+    const total = totals.clipped
+      ? `at least ${String(totals.goroutines)}`
+      : String(totals.goroutines);
+    return `${String(totals.goroutinesOmitted)} goroutines were not sent by the debugger (${total} live)`;
+  }
+  if (totals.clipped) {
+    return `the debugger stopped scanning at ${String(totals.goroutines)} goroutines, so this is a lower bound`;
+  }
+  return undefined;
 }
 
 function renderTimeline(

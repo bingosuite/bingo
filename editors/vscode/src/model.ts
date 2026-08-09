@@ -35,6 +35,23 @@ export interface SessionModel {
 export interface SessionViewModel extends SessionModel {
   readonly tree: TreeLayout;
   readonly degraded: boolean;
+
+  // What the SERVER left off the wire, kept deliberately separate from
+  // tree.omitted (this view's own filter and render cap). Conflating them would
+  // let a truncated payload masquerade as a local display choice.
+  readonly serverTotals: ServerTotals | undefined;
+}
+
+// ServerTotals restates a snapshot's SnapshotTotals in terms this view renders:
+// the server's original counts and how many elements never reached us. clipped
+// means the server's own runtime scan was cut short, so the totals are
+// themselves lower bounds and must be shown as such.
+export interface ServerTotals {
+  readonly goroutines: number;
+  readonly threads: number;
+  readonly clipped: boolean;
+  readonly goroutinesOmitted: number;
+  readonly threadsOmitted: number;
 }
 
 export interface ConcurrencyViewModel {
@@ -64,7 +81,44 @@ export function toSessionViewModel(model: SessionModel): SessionViewModel {
       model.selectedGoroutine,
     ]),
     degraded: snapshot === undefined ? false : isDegraded(snapshot),
+    serverTotals: serverTotals(snapshot),
   };
+}
+
+export function serverTotals(
+  snapshot: Snapshot | undefined,
+): ServerTotals | undefined {
+  const totals = snapshot?.totals;
+  if (snapshot === undefined || totals === undefined) {
+    return undefined;
+  }
+  // A total can never be below what actually arrived; clamping keeps the view
+  // honest if a peer ever reports otherwise.
+  const goroutines = Math.max(totals.goroutines, snapshot.goroutines.length);
+  const threads = Math.max(totals.threads, snapshot.threads.length);
+  return {
+    goroutines,
+    threads,
+    clipped: totals.clipped,
+    goroutinesOmitted: goroutines - snapshot.goroutines.length,
+    threadsOmitted: threads - snapshot.threads.length,
+  };
+}
+
+// formatServerCount renders a count the server may have understated. A trailing
+// "+" marks a lower bound (the server's scan was clipped), and "n of m" shows
+// how much never reached the wire.
+export function formatServerCount(
+  shown: number,
+  total: number,
+  clipped: boolean,
+): string {
+  const bound = clipped ? "+" : "";
+  return shown >= total && !clipped
+    ? String(shown)
+    : shown >= total
+      ? `${String(shown)}${bound}`
+      : `${String(shown)} of ${String(total)}${bound}`;
 }
 
 export function serializeSnapshot(model: SessionModel): string {

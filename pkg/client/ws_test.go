@@ -381,3 +381,51 @@ func TestCloseUnblocksPendingSyncCall(t *testing.T) {
 		t.Fatal("expected an error after Close, got nil")
 	}
 }
+
+// TestGoroutinesUnwrapsPackedPayload verifies the client unwraps the 1.3
+// GoroutinesPayload — including the optional Totals a bounded list carries —
+// and returns the real truncated list rather than erroring or emptying it.
+// See issue #194.
+func TestGoroutinesUnwrapsPackedPayload(t *testing.T) {
+	raw := make([]protocol.Goroutine, 0, 8192)
+	for i := 1; i <= 8192; i++ {
+		raw = append(raw, protocol.Goroutine{
+			ID:         i,
+			Status:     "waiting",
+			WaitReason: "chan receive",
+			CurrentLoc: protocol.Location{
+				File:     "/home/runner/go/src/github.com/bingosuite/bingo/internal/service/handler.go",
+				Line:     1234,
+				Function: "github.com/bingosuite/bingo/internal/service.(*Handler).Serve.func1",
+			},
+			StartLoc:   protocol.Location{File: "/home/runner/go/src/github.com/bingosuite/bingo/internal/service/handler.go", Line: 88},
+			CreatedLoc: protocol.Location{File: "/home/runner/go/src/github.com/bingosuite/bingo/internal/service/handler.go", Line: 91},
+		})
+	}
+	packed, report := protocol.PackGoroutines(raw, false)
+	if report.Degraded || !report.Omitted() {
+		t.Fatalf("report = %+v; want a real truncated list", report)
+	}
+
+	fs := newFakeServer(func(cmd protocol.Command) (protocol.Event, bool) {
+		if cmd.Kind == protocol.CmdGoroutines {
+			return replyEvent(protocol.EventGoroutines, packed), true
+		}
+		return protocol.Event{}, false
+	})
+	defer fs.close()
+
+	c := dialTestClient(t, fs)
+	defer func() { _ = c.Close() }()
+
+	gs, err := c.Goroutines()
+	if err != nil {
+		t.Fatalf("Goroutines: %v", err)
+	}
+	if len(gs) != len(packed.Goroutines) {
+		t.Fatalf("Goroutines = %d; want the %d packed entries", len(gs), len(packed.Goroutines))
+	}
+	if gs[0].ID != packed.Goroutines[0].ID {
+		t.Errorf("Goroutines[0].ID = %d; want %d", gs[0].ID, packed.Goroutines[0].ID)
+	}
+}
