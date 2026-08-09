@@ -280,3 +280,67 @@ func TestRunTreatsOnlyZeroAsUnbounded(t *testing.T) {
 		t.Fatal("validate() accepted a negative -timeout, which run would treat as unbounded")
 	}
 }
+
+// -timeout 0 documents "wait forever", so run must arm no timer at all. A naive
+// implementation that always created one would call time.NewTimer(0), which
+// fires immediately and would fail this test with "no snapshot within 0s". The
+// snapshot is delivered only after a delay far longer than the deadlines the
+// other tests use, and the whole thing is bounded so a regression reports a
+// failure instead of hanging the suite.
+func TestRunOnceZeroTimeoutArmsNoDeadline(t *testing.T) {
+	events := make(chan protocol.Event)
+	renders := make(chan struct{}, 1)
+	result := make(chan error, 1)
+
+	go func() {
+		result <- m0().run(events, true, 0, func() { renders <- struct{}{} })
+	}()
+
+	select {
+	case err := <-result:
+		t.Fatalf("run returned early with %v; -timeout 0 must not arm a deadline", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	events <- snapshotPushEvent(t, 2, 3)
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("run(-once, timeout 0): %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("run did not return after the snapshot arrived")
+	}
+	if len(renders) != 1 {
+		t.Fatalf("renders = %d, want exactly 1", len(renders))
+	}
+}
+
+// Live mode never arms a deadline either, whatever -timeout says.
+func TestRunLiveIgnoresTimeout(t *testing.T) {
+	events := make(chan protocol.Event)
+	result := make(chan error, 1)
+
+	go func() {
+		result <- m0().run(events, false, time.Nanosecond, func() {})
+	}()
+
+	select {
+	case err := <-result:
+		t.Fatalf("live run returned early with %v; -timeout must not apply without -once", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(events)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("live run after stream close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("live run did not return after the stream closed")
+	}
+}
+
+func m0() *monitor { return &monitor{clients: -1} }
