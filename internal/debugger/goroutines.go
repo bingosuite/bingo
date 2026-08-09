@@ -460,6 +460,15 @@ func (e *engine) syntheticGoroutine(livePC uint64) protocol.Goroutine {
 	}
 }
 
+// degradedSnapshot is the single construction point for an incomplete runtime
+// walk. Downstream reporting must describe every such snapshot as degraded,
+// regardless of whether goroutine or thread traversal failed.
+func (e *engine) degradedSnapshot(livePC uint64) protocol.GoroutineSnapshotPayload {
+	return protocol.GoroutineSnapshotPayload{
+		Goroutines: []protocol.Goroutine{e.syntheticGoroutine(livePC)},
+	}
+}
+
 // readGoroutines returns the live goroutine set, falling back to a single
 // synthetic goroutine when the runtime can't be read. This backs the on-demand
 // Goroutines() query and the DAP threads list.
@@ -498,9 +507,7 @@ func (e *engine) buildSnapshot(trackLifecycle bool) protocol.GoroutineSnapshotPa
 		// Degraded snapshot: still report where we're stopped, but don't touch
 		// the remembered live set — an empty read (e.g. at the entry stop before
 		// runtime init) must not look like every goroutine exited.
-		return protocol.GoroutineSnapshotPayload{
-			Goroutines: []protocol.Goroutine{e.syntheticGoroutine(pc)},
-		}
+		return e.degradedSnapshot(pc)
 	}
 	return e.snapshotFrom(goroutines.Items, pc, trackLifecycle)
 }
@@ -520,9 +527,7 @@ func (e *engine) snapshotFrom(gs []protocol.Goroutine, livePC uint64, trackLifec
 
 	threads := e.readThreads(current, livePC)
 	if !threads.Complete {
-		return protocol.GoroutineSnapshotPayload{
-			Goroutines: []protocol.Goroutine{e.syntheticGoroutine(livePC)},
-		}
+		return e.degradedSnapshot(livePC)
 	}
 
 	snap := protocol.GoroutineSnapshotPayload{
