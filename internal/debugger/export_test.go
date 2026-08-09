@@ -14,6 +14,7 @@ type ExportedGoRuntimeLayout struct {
 	Allm  uint64
 
 	GStack        uint64
+	GM            uint64
 	GAtomicstatus uint64
 	GGoid         uint64
 	GParentGoid   uint64
@@ -88,6 +89,7 @@ func ExportedGoRuntimeLayoutFor(d Debugger) ExportedGoRuntimeLayout {
 			Allm:  allm,
 
 			GStack:        uint64(l.gStack),
+			GM:            uint64(l.gM),
 			GAtomicstatus: uint64(l.gAtomicstatus),
 			GGoid:         uint64(l.gGoid),
 			GParentGoid:   uint64(l.gParentGoid),

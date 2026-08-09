@@ -1612,12 +1612,15 @@ func (e *engine) emitStepped(stop StopEvent) {
 	if e.dw != nil {
 		loc = e.dw.locationForPC(stop.PC)
 	}
-	// Steps are high-frequency and must stay cheap: embed a synthetic goroutine
-	// for the stopped thread rather than scanning runtime.allgs. The rich
-	// snapshot is streamed only on breakpoint/pause/entry stops, protecting the
-	// fragile single-step/step-over path from extra per-step memory reads.
+	currentLoc := loc
+	if len(frames) > 0 {
+		currentLoc = frames[0].Location
+	}
+	// Steps are high-frequency and must stay cheap: identify the stopped
+	// goroutine through bounded register/stopped-M reads without scanning allgs.
+	// The rich snapshot remains limited to breakpoint/pause/entry stops.
 	e.emit(protocol.EventStepped, protocol.SteppedPayload{
-		Goroutine: e.syntheticGoroutine(stop.PC),
+		Goroutine: e.targetedCurrentGoroutine(currentLoc),
 		Location:  loc,
 		Frames:    frames,
 	})

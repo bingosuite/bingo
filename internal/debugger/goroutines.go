@@ -266,22 +266,28 @@ type currentGoroutineResult struct {
 	Complete bool
 }
 
+type goroutineHeader struct {
+	goid   int64
+	status uint32
+}
+
+type currentGoroutineDetail uint8
+
+const (
+	currentGoroutineRich currentGoroutineDetail = iota
+	currentGoroutineIdentity
+)
+
 // readGoroutine reads one runtime.g at gptr. Include is false for intentional
 // freelist/dead entries; Complete is false only when membership or current-
 // identity data is unreadable. liveSP/livePC identify the currently-stopped
 // thread so the goroutine running there is marked Current and gets its live PC.
 func (e *engine) readGoroutine(l *goLayout, gptr, liveSP, livePC uint64) goroutineReadResult {
-	rawStatus, ok := e.readU32(gptr + uint64(l.gAtomicstatus))
+	header, ok := e.readGoroutineHeader(l, gptr)
 	if !ok {
 		return goroutineReadResult{}
 	}
-	status := rawStatus &^ gScanBit
-
-	goid, ok := e.readI64(gptr + uint64(l.gGoid))
-	if !ok {
-		return goroutineReadResult{}
-	}
-	if goid <= 0 || status == gStatusDead {
+	if !header.included() {
 		// Freelist / dead slots carry goid 0 or a stale id; a UI wants only the
 		// live set. Their departure is reported via the exited delta.
 		return goroutineReadResult{Complete: true}
@@ -297,8 +303,8 @@ func (e *engine) readGoroutine(l *goLayout, gptr, liveSP, livePC uint64) gorouti
 	}
 
 	g := protocol.Goroutine{
-		ID:     int(goid),
-		Status: goStatusString(status),
+		ID:     int(header.goid),
+		Status: goStatusString(header.status),
 	}
 	if parent, ok := e.readI64(gptr + uint64(l.gParentGoid)); ok && parent > 0 {
 		g.ParentID = int(parent)
@@ -309,7 +315,7 @@ func (e *engine) readGoroutine(l *goLayout, gptr, liveSP, livePC uint64) gorouti
 	if gopc, ok := e.readU64(gptr + uint64(l.gGopc)); ok {
 		g.CreatedLoc = e.locForPC(gopc)
 	}
-	if status == 4 { // waiting
+	if header.status == 4 { // waiting
 		if wr, ok := e.readU8(gptr + uint64(l.gWaitreason)); ok {
 			g.WaitReason = e.waitReasonString(l, wr)
 		}
@@ -337,6 +343,25 @@ func (e *engine) readGoroutine(l *goLayout, gptr, liveSP, livePC uint64) gorouti
 		Include:  true,
 		Complete: true,
 	}
+}
+
+func (e *engine) readGoroutineHeader(l *goLayout, gptr uint64) (goroutineHeader, bool) {
+	rawStatus, ok := e.readU32(gptr + uint64(l.gAtomicstatus))
+	if !ok {
+		return goroutineHeader{}, false
+	}
+	goid, ok := e.readI64(gptr + uint64(l.gGoid))
+	if !ok {
+		return goroutineHeader{}, false
+	}
+	return goroutineHeader{
+		goid:   goid,
+		status: rawStatus &^ gScanBit,
+	}, true
+}
+
+func (h goroutineHeader) included() bool {
+	return h.goid > 0 && h.status != gStatusDead
 }
 
 func (e *engine) readGoroutineStackBounds(l *goLayout, gptr uint64) (lo, hi uint64, ok bool) {
@@ -535,17 +560,11 @@ func (e *engine) resolveCurrentGoroutineAnchor(
 	ptr, richLength, length, liveSP, livePC, currentGptr uint64,
 	stopTID int,
 ) currentGoroutineResult {
-	if currentGptr != 0 {
-		current := e.currentGoroutineFromRegister(l, currentGptr, liveSP, livePC)
-		if !current.Complete || current.Found {
-			return current
-		}
-	}
-	if procid, ok := e.archRuntimeMProcID(stopTID); ok {
-		current := e.findCurrentGoroutineByProcID(l, procid, livePC)
-		if !current.Complete || current.Found {
-			return current
-		}
+	current := e.resolveTargetedCurrentGoroutine(
+		l, liveSP, livePC, currentGptr, stopTID, currentGoroutineRich,
+	)
+	if !current.Complete || current.Found {
+		return current
 	}
 	if liveSP == 0 {
 		return currentGoroutineResult{Complete: true}
@@ -557,15 +576,42 @@ func (e *engine) resolveCurrentGoroutineAnchor(
 	return e.findCurrentGoroutine(l, ptr, richLength, fallbackEnd, liveSP, livePC)
 }
 
+func (e *engine) resolveTargetedCurrentGoroutine(
+	l *goLayout,
+	liveSP, livePC, currentGptr uint64,
+	stopTID int,
+	detail currentGoroutineDetail,
+) currentGoroutineResult {
+	if currentGptr != 0 {
+		current := e.currentGoroutineFromRegister(
+			l, currentGptr, liveSP, livePC, detail,
+		)
+		if !current.Complete || current.Found {
+			return current
+		}
+	}
+	if procid, ok := e.archRuntimeMProcID(stopTID); ok {
+		current := e.findCurrentGoroutineByProcID(l, procid, livePC, detail)
+		if !current.Complete || current.Found {
+			return current
+		}
+	}
+	return currentGoroutineResult{Complete: true}
+}
+
 func (e *engine) currentGoroutineFromRegister(
 	l *goLayout,
 	gptr, liveSP, livePC uint64,
+	detail currentGoroutineDetail,
 ) currentGoroutineResult {
-	goid, ok := e.readI64(gptr + uint64(l.gGoid))
+	header, ok := e.readGoroutineHeader(l, gptr)
 	if !ok {
 		return currentGoroutineResult{}
 	}
-	if goid > 0 {
+	if header.goid > 0 {
+		if detail == currentGoroutineIdentity {
+			return e.currentGoroutineIdentityFromHeader(l, gptr, liveSP, true, header)
+		}
 		result := e.readGoroutine(l, gptr, liveSP, livePC)
 		if !result.Complete {
 			return currentGoroutineResult{}
@@ -579,7 +625,7 @@ func (e *engine) currentGoroutineFromRegister(
 		}
 		return currentGoroutineResult{Complete: true}
 	}
-	if goid != 0 {
+	if header.goid != 0 {
 		return currentGoroutineResult{Complete: true}
 	}
 	mptr, ok := e.readU64(gptr + uint64(l.gM))
@@ -596,7 +642,7 @@ func (e *engine) currentGoroutineFromRegister(
 	if !schedulerG {
 		return currentGoroutineResult{Complete: true}
 	}
-	return e.readCurrentGoroutineFromM(l, mptr, livePC)
+	return e.readCurrentGoroutineFromM(l, mptr, livePC, detail)
 }
 
 func (e *engine) isSchedulerG(l *goLayout, mptr, gptr uint64) (bool, bool) {
@@ -624,6 +670,7 @@ func (e *engine) isSchedulerG(l *goLayout, mptr, gptr uint64) (bool, bool) {
 func (e *engine) readCurrentGoroutineFromM(
 	l *goLayout,
 	mptr, livePC uint64,
+	detail currentGoroutineDetail,
 ) currentGoroutineResult {
 	gptr, ok := e.readU64(mptr + uint64(l.mCurg))
 	if !ok {
@@ -639,6 +686,9 @@ func (e *engine) readCurrentGoroutineFromM(
 	if owner != mptr {
 		return currentGoroutineResult{Complete: true}
 	}
+	if detail == currentGoroutineIdentity {
+		return e.readCurrentGoroutineIdentity(l, gptr, 0, false)
+	}
 	result := e.readGoroutine(l, gptr, 0, 0)
 	if !result.Complete {
 		return currentGoroutineResult{}
@@ -651,6 +701,47 @@ func (e *engine) readCurrentGoroutineFromM(
 	current.CurrentLoc = e.locForPC(livePC)
 	return currentGoroutineResult{
 		Item:     current,
+		Found:    true,
+		Complete: true,
+	}
+}
+
+func (e *engine) readCurrentGoroutineIdentity(
+	l *goLayout,
+	gptr, liveSP uint64,
+	requireStack bool,
+) currentGoroutineResult {
+	header, ok := e.readGoroutineHeader(l, gptr)
+	if !ok {
+		return currentGoroutineResult{}
+	}
+	return e.currentGoroutineIdentityFromHeader(l, gptr, liveSP, requireStack, header)
+}
+
+func (e *engine) currentGoroutineIdentityFromHeader(
+	l *goLayout,
+	gptr, liveSP uint64,
+	requireStack bool,
+	header goroutineHeader,
+) currentGoroutineResult {
+	if !header.included() {
+		return currentGoroutineResult{Complete: true}
+	}
+	if requireStack {
+		lo, hi, ok := e.readGoroutineStackBounds(l, gptr)
+		if !ok {
+			return currentGoroutineResult{}
+		}
+		if !stackContainsSP(lo, hi, liveSP) {
+			return currentGoroutineResult{Complete: true}
+		}
+	}
+	return currentGoroutineResult{
+		Item: protocol.Goroutine{
+			ID:      int(header.goid),
+			Status:  goStatusString(header.status),
+			Current: true,
+		},
 		Found:    true,
 		Complete: true,
 	}
@@ -705,6 +796,7 @@ func (e *engine) findCurrentGoroutine(
 func (e *engine) findCurrentGoroutineByProcID(
 	l *goLayout,
 	procid, livePC uint64,
+	detail currentGoroutineDetail,
 ) currentGoroutineResult {
 	if e.dw == nil {
 		return currentGoroutineResult{Complete: true}
@@ -720,12 +812,13 @@ func (e *engine) findCurrentGoroutineByProcID(
 	if mptr == 0 {
 		return currentGoroutineResult{Complete: true}
 	}
-	return e.findCurrentGoroutineByProcIDFrom(l, mptr, procid, livePC)
+	return e.findCurrentGoroutineByProcIDFrom(l, mptr, procid, livePC, detail)
 }
 
 func (e *engine) findCurrentGoroutineByProcIDFrom(
 	l *goLayout,
 	mptr, procid, livePC uint64,
+	detail currentGoroutineDetail,
 ) currentGoroutineResult {
 	match, next, complete := e.findMByProcID(l, mptr, procid, maxThreadScan)
 	if !complete {
@@ -740,7 +833,7 @@ func (e *engine) findCurrentGoroutineByProcIDFrom(
 	if match == 0 {
 		return currentGoroutineResult{Complete: true}
 	}
-	return e.readCurrentGoroutineFromM(l, match, livePC)
+	return e.readCurrentGoroutineFromM(l, match, livePC, detail)
 }
 
 func (e *engine) findMByProcID(
@@ -917,6 +1010,27 @@ func unknownGoroutine(loc protocol.Location) protocol.Goroutine {
 		CurrentLoc: loc,
 		Current:    true,
 	}
+}
+
+// targetedCurrentGoroutine identifies the stopped goroutine without walking
+// runtime.allgs. Regular steps use this bounded path to stay cheap while still
+// giving DAP a precise thread id whenever the ABI or stopped M can provide one.
+func (e *engine) targetedCurrentGoroutine(
+	fallbackLoc protocol.Location,
+) protocol.Goroutine {
+	l, ok := e.getGoLayout()
+	if !ok {
+		return unknownGoroutine(fallbackLoc)
+	}
+	tid, sp, pc, currentGptr := e.liveRegisters()
+	current := e.resolveTargetedCurrentGoroutine(
+		l, sp, pc, currentGptr, tid, currentGoroutineIdentity,
+	)
+	if !current.Complete || !current.Found {
+		return unknownGoroutine(fallbackLoc)
+	}
+	current.Item.CurrentLoc = fallbackLoc
+	return current.Item
 }
 
 // syntheticGoroutine represents an unresolved stopped goroutine without
