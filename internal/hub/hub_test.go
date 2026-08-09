@@ -35,6 +35,7 @@ type fakeDebugger struct {
 	setBPGate        chan struct{}
 	setBPStarted     chan struct{}
 	setBPStartOnce   sync.Once
+	setBPFunc        func(file string, line int) (protocol.Breakpoint, error)
 	clearBPErr       error
 	continueErr      error
 	emitContinued    bool
@@ -104,6 +105,9 @@ func (f *fakeDebugger) SetBreakpoint(file string, line int) (protocol.Breakpoint
 	if f.setBPGate != nil {
 		<-f.setBPGate
 	}
+	if f.setBPFunc != nil {
+		return f.setBPFunc(file, line)
+	}
 	return f.setBPResult, f.setBPErr
 }
 func (f *fakeDebugger) Locals(fi int) ([]protocol.Variable, error) {
@@ -138,6 +142,44 @@ func (f *blockingLaunchDebugger) Launch(string, []string, []string) error {
 	close(f.started)
 	<-f.release
 	return f.launchErr
+}
+
+// leakyLaunchDebugger models a partially started engine: Launch acquires a
+// goroutine that only a disposal Kill can release — the same shape as the real
+// engine's LockOSThread'd loop, whose sole exit is Kill driving it to
+// stateExited (internal/debugger/engine.go) — and only then reports failure.
+// A hub that abandons it without killing it strands that goroutine, so exited
+// never closes.
+type leakyLaunchDebugger struct {
+	*fakeDebugger
+	releaseOnce sync.Once
+	released    chan struct{}
+	exited      chan struct{}
+}
+
+func newLeakyLaunchDebugger(launchErr error) *leakyLaunchDebugger {
+	d := &leakyLaunchDebugger{
+		fakeDebugger: newFakeDebugger(),
+		released:     make(chan struct{}),
+		exited:       make(chan struct{}),
+	}
+	d.launchErr = launchErr
+	return d
+}
+
+func (d *leakyLaunchDebugger) Launch(string, []string, []string) error {
+	d.record("Launch")
+	go func() {
+		<-d.released
+		close(d.exited)
+	}()
+	return d.launchErr
+}
+
+func (d *leakyLaunchDebugger) Kill() error {
+	d.record("Kill")
+	d.releaseOnce.Do(func() { close(d.released) })
+	return d.killErr
 }
 
 type fakeWSConn struct {
@@ -1120,13 +1162,68 @@ var _ = Describe("Hub", func() {
 // client, and drains the initial welcome/state event. The returned cancel
 // must be deferred by the caller.
 func newManagedRestartHub(fd *fakeDebugger) (*hub.Hub, *fakeWSConn, context.CancelFunc) {
-	managed := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
+	return newManagedHub(func() debugger.Debugger { return fd })
+}
+
+// newManagedHub starts a managed session driven by an arbitrary factory,
+// connects one client, and drains the initial welcome/state event.
+func newManagedHub(factory func() debugger.Debugger) (*hub.Hub, *fakeWSConn, context.CancelFunc) {
+	managed := hub.NewSession("session", factory, nil)
 	cancel := runHub(managed)
 	conn := newFakeWSConn()
 	_, err := managed.AddClient(conn, nil)
 	Expect(err).NotTo(HaveOccurred())
 	_, _ = recvEvent(conn) // welcome/state event
 	return managed, conn, cancel
+}
+
+// recordingFactory hands out a FRESH fake per call and remembers every one. A
+// Restart replacement must be a distinct instance from the debugger it
+// replaces, otherwise a shared fake's call log cannot say which of the two was
+// killed — exactly the distinction the abandoned-candidate specs assert on.
+type recordingFactory struct {
+	mu    sync.Mutex
+	setup func(n int, fd *fakeDebugger)
+	made  []*fakeDebugger
+}
+
+func newRecordingFactory(setup func(n int, fd *fakeDebugger)) *recordingFactory {
+	return &recordingFactory{setup: setup}
+}
+
+func (r *recordingFactory) create() debugger.Debugger {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fd := newFakeDebugger()
+	if r.setup != nil {
+		r.setup(len(r.made), fd)
+	}
+	r.made = append(r.made, fd)
+	return fd
+}
+
+func (r *recordingFactory) instances() []*fakeDebugger {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]*fakeDebugger(nil), r.made...)
+}
+
+func (r *recordingFactory) instance(n int) *fakeDebugger {
+	made := r.instances()
+	ExpectWithOffset(1, len(made)).To(BeNumerically(">", n))
+	return made[n]
+}
+
+// killCounter reports how many times the nth created debugger was killed,
+// shaped for Eventually.
+func (r *recordingFactory) killCounter(n int) func() int {
+	return func() int {
+		made := r.instances()
+		if len(made) <= n {
+			return -1
+		}
+		return countCalls(made[n].recordedCalls(), "Kill")
+	}
 }
 
 // launchManaged injects a Launch and waits for it to reach the fake debugger
@@ -1144,6 +1241,19 @@ func attachManaged(conn *fakeWSConn, fd *fakeDebugger, pid int) {
 	conn.inject(mustCommand(protocol.CmdAttach, protocol.AttachPayload{PID: pid}))
 	EventuallyWithOffset(1, fd.recordedCalls, "500ms", "10ms").Should(ContainElement("Attach"))
 	_, _ = recvEvent(conn) // state -> running
+}
+
+// launchManagedFactory injects a Launch against a factory-driven hub, waits for
+// the factory to produce the initial debugger, and returns it. The factory only
+// runs when the Launch command reaches the Run loop, so the instance cannot be
+// read before the command is injected.
+func launchManagedFactory(conn *fakeWSConn, factory *recordingFactory, program string) *fakeDebugger {
+	conn.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: program}))
+	EventuallyWithOffset(1, factory.instances, "500ms", "10ms").Should(HaveLen(1))
+	fd := factory.instances()[0]
+	EventuallyWithOffset(1, fd.recordedCalls, "500ms", "10ms").Should(ContainElement("Launch"))
+	_, _ = recvEvent(conn) // state -> running
+	return fd
 }
 
 // waitForEventKind polls conn until an event of the given kind arrives,
@@ -1327,6 +1437,22 @@ func refuseKillWhileSuspended(h *hub.Hub, conn *fakeWSConn, fd *fakeDebugger) {
 	expectRejectedWhileSuspended(h, conn, mustCommand(protocol.CmdKill, struct{}{}))
 }
 
+// bpAtLine resolves a breakpoint whose id IS its line, so a restart's saved
+// locations sort deterministically and each one is identifiable in the
+// reinstall results.
+func bpAtLine(file string, line int) (protocol.Breakpoint, error) {
+	return protocol.Breakpoint{ID: line, Location: protocol.Location{File: file, Line: line}}, nil
+}
+
+// setManagedBreakpoints installs one breakpoint per line and waits for each
+// confirmation, so they are all recorded for a later Restart to reinstall.
+func setManagedBreakpoints(conn *fakeWSConn, lines ...int) {
+	for _, line := range lines {
+		conn.inject(mustCommand(protocol.CmdSetBreakpoint, protocol.SetBreakpointPayload{File: "main.go", Line: line}))
+		waitForEventKind(conn, protocol.EventBreakpointSet, nil)
+	}
+}
+
 var _ = Describe("Restart", func() {
 	var fd *fakeDebugger
 
@@ -1452,6 +1578,275 @@ var _ = Describe("Restart", func() {
 		// A failed relaunch discards the old debugger, so the suspended
 		// process is genuinely gone and the loop must not keep waiting.
 		Eventually(managed.State, "500ms", "10ms").Should(Equal(protocol.StateIdle))
+	})
+})
+
+// A relaunch replacement is never installed in h.dbg until its Launch
+// succeeds, so shutdown's snapshot cannot reach it and Run never selects on its
+// events. handleRestart is therefore its sole owner and must dispose of it on
+// every failure exit — a dropped engine keeps a LockOSThread'd loop goroutine
+// (and, on linux, a tracer thread) alive forever.
+var _ = Describe("Restart relaunch failure", func() {
+	relaunchFails := func(n int, fd *fakeDebugger) {
+		if n > 0 {
+			fd.launchErr = errors.New("relaunch boom")
+		}
+	}
+
+	It("kills the replacement whose relaunch failed", func() {
+		factory := newRecordingFactory(relaunchFails)
+		_, conn, cancel := newManagedHub(factory.create)
+		defer cancel()
+		launchManagedFactory(conn, factory, "myapp")
+
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		waitForEventKind(conn, protocol.EventError, nil)
+
+		Eventually(factory.killCounter(1), "500ms", "10ms").Should(Equal(1),
+			"the abandoned replacement must be killed exactly once")
+		Consistently(factory.killCounter(1), "100ms", "10ms").Should(Equal(1),
+			"no second owner may kill the same replacement")
+		Expect(factory.instance(1).recordedCalls()).To(Equal([]string{"Launch", "Kill"}))
+	})
+
+	It("releases resources a partially started replacement acquired", func() {
+		original := newFakeDebugger()
+		leaky := newLeakyLaunchDebugger(errors.New("relaunch boom"))
+		calls := 0
+		_, conn, cancel := newManagedHub(func() debugger.Debugger {
+			calls++
+			if calls == 1 {
+				return original
+			}
+			return leaky
+		})
+		defer cancel()
+		launchManaged(conn, original, "myapp")
+
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		waitForEventKind(conn, protocol.EventError, nil)
+
+		Eventually(leaky.exited, "500ms", "10ms").Should(BeClosed(),
+			"disposal must let the partially started replacement tear down")
+		Expect(countCalls(leaky.recordedCalls(), "Kill")).To(Equal(1))
+	})
+
+	It("does not accumulate abandoned replacements across repeated failures", func() {
+		const attempts = 3
+		factory := newRecordingFactory(relaunchFails)
+		_, conn, cancel := newManagedHub(factory.create)
+		defer cancel()
+		launchManagedFactory(conn, factory, "myapp")
+
+		for i := 0; i < attempts; i++ {
+			conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+			waitForEventKind(conn, protocol.EventError, nil)
+			Eventually(factory.killCounter(i+1), "500ms", "10ms").Should(Equal(1))
+		}
+
+		Expect(factory.instances()).To(HaveLen(attempts+1),
+			"one debugger per Launch plus one per Restart attempt")
+		for i := 1; i <= attempts; i++ {
+			Expect(countCalls(factory.instance(i).recordedCalls(), "Kill")).To(Equal(1),
+				"replacement %d must be killed exactly once", i)
+		}
+	})
+
+	It("reports the failure and leaves the session relaunchable", func() {
+		factory := newRecordingFactory(func(n int, fd *fakeDebugger) {
+			if n == 1 {
+				fd.launchErr = errors.New("relaunch boom")
+			}
+		})
+		_, conn, cancel := newManagedHub(factory.create)
+		defer cancel()
+		launchManagedFactory(conn, factory, "myapp")
+
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		var errPayload protocol.ErrorPayload
+		waitForEventKind(conn, protocol.EventError, &errPayload)
+		Expect(errPayload.Message).To(ContainSubstring("restart: relaunch failed"))
+		Expect(errPayload.Message).To(ContainSubstring("relaunch boom"))
+
+		var state protocol.SessionStatePayload
+		waitForEventKind(conn, protocol.EventSessionState, &state)
+		Expect(state.State).To(Equal(protocol.StateIdle))
+
+		// lastLaunch survives a failed relaunch, so a retry still works.
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		var restarted protocol.RestartedPayload
+		waitForEventKind(conn, protocol.EventRestarted, &restarted)
+		Expect(restarted.Program).To(Equal("myapp"))
+	})
+
+	It("keeps the original error when disposal of the replacement fails", func() {
+		factory := newRecordingFactory(func(n int, fd *fakeDebugger) {
+			if n > 0 {
+				fd.launchErr = errors.New("relaunch boom")
+				fd.killErr = errors.New("kill boom")
+			}
+		})
+		_, conn, cancel := newManagedHub(factory.create)
+		defer cancel()
+		launchManagedFactory(conn, factory, "myapp")
+
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		var errPayload protocol.ErrorPayload
+		waitForEventKind(conn, protocol.EventError, &errPayload)
+
+		Expect(errPayload.Message).To(ContainSubstring("relaunch boom"))
+		Expect(errPayload.Message).NotTo(ContainSubstring("kill boom"))
+		Eventually(factory.killCounter(1), "500ms", "10ms").Should(Equal(1))
+	})
+
+	It("keeps a successfully relaunched replacement installed and alive", func() {
+		factory := newRecordingFactory(nil)
+		_, conn, cancel := newManagedHub(factory.create)
+		defer cancel()
+		launchManagedFactory(conn, factory, "myapp")
+
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		waitForEventKind(conn, protocol.EventRestarted, nil)
+
+		replacement := factory.instance(1)
+		Expect(replacement.recordedCalls()).To(ContainElement("Launch"))
+		Consistently(func() []string { return replacement.recordedCalls() }, "100ms", "10ms").
+			ShouldNot(ContainElement("Kill"))
+		Expect(factory.instance(0).recordedCalls()).To(ContainElement("Kill"))
+
+		// Only an installed debugger has its events selected on by Run.
+		replacement.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+			protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 7}}))
+		waitForEventKind(conn, protocol.EventBreakpointHit, nil)
+	})
+
+	It("discards a replacement whose failing Launch finishes after shutdown", func() {
+		old := newFakeDebugger()
+		releaseLaunch := make(chan struct{})
+		replacement := &blockingLaunchDebugger{
+			fakeDebugger: newFakeDebugger(),
+			started:      make(chan struct{}),
+			release:      releaseLaunch,
+		}
+		replacement.launchErr = errors.New("relaunch boom")
+		calls := 0
+		managed, conn, cancel := newManagedHub(func() debugger.Debugger {
+			calls++
+			if calls == 1 {
+				return old
+			}
+			return replacement
+		})
+		defer cancel()
+		launchManaged(conn, old, "myapp")
+
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		Eventually(replacement.started, "500ms").Should(BeClosed())
+
+		closeFakeWS(conn)
+		Eventually(managed.ExportedShutdownCh(), "500ms").Should(BeClosed())
+		close(releaseLaunch)
+
+		Eventually(managed.Done(), "500ms").Should(BeClosed())
+		Expect(replacement.recordedCalls()).To(Equal([]string{"Launch", "Kill"}),
+			"a candidate rejected by shutdown is killed once by its caller, not by shutdown")
+	})
+
+	It("kills the replacement when a relaunch with saved breakpoints fails", func() {
+		factory := newRecordingFactory(func(n int, fd *fakeDebugger) {
+			fd.setBPFunc = bpAtLine
+			if n > 0 {
+				fd.launchErr = errors.New("relaunch boom")
+			}
+		})
+		_, conn, cancel := newManagedHub(factory.create)
+		defer cancel()
+		launchManagedFactory(conn, factory, "myapp")
+		setManagedBreakpoints(conn, 10, 20)
+
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		waitForEventKind(conn, protocol.EventError, nil)
+
+		Eventually(factory.killCounter(1), "500ms", "10ms").Should(Equal(1))
+		Expect(factory.instance(1).recordedCalls()).To(Equal([]string{"Launch", "Kill"}),
+			"a replacement that never launched must not be asked to reinstall breakpoints")
+
+		// Saved locations survive a failed relaunch, so a retry disposes of its
+		// own candidate too rather than reusing the abandoned one.
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		waitForEventKind(conn, protocol.EventError, nil)
+		Eventually(factory.killCounter(2), "500ms", "10ms").Should(Equal(1))
+	})
+})
+
+// Reinstall failures are a REPORTED OUTCOME, not a relaunch failure: handleRestart
+// collects them as DiscardedBreakpoint and keeps the relaunched process running,
+// mirroring Delve's Restart. By then the replacement has already been installed
+// via installDebugger, so it is hub-owned — killing it here would terminate a
+// healthy tracee and contradict the documented contract. These specs pin that
+// boundary from the other side of the launch-failure disposal specs above.
+var _ = Describe("Restart breakpoint reinstall failure", func() {
+	It("keeps a partially reinstalled replacement installed and alive", func() {
+		factory := newRecordingFactory(func(n int, fd *fakeDebugger) {
+			if n == 0 {
+				fd.setBPFunc = bpAtLine
+				return
+			}
+			fd.setBPFunc = func(file string, line int) (protocol.Breakpoint, error) {
+				if line == 20 {
+					return protocol.Breakpoint{}, errors.New("no such line")
+				}
+				return bpAtLine(file, line)
+			}
+		})
+		_, conn, cancel := newManagedHub(factory.create)
+		defer cancel()
+		launchManagedFactory(conn, factory, "myapp")
+		setManagedBreakpoints(conn, 10, 20, 30)
+
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		var restarted protocol.RestartedPayload
+		waitForEventKind(conn, protocol.EventRestarted, &restarted)
+
+		Expect(restarted.Breakpoints).To(HaveLen(2))
+		Expect(restarted.Discarded).To(HaveLen(1))
+		Expect(restarted.Discarded[0].Location.Line).To(Equal(20))
+		Expect(restarted.Discarded[0].Reason).To(Equal("no such line"))
+
+		replacement := factory.instance(1)
+		Consistently(func() []string { return replacement.recordedCalls() }, "100ms", "10ms").
+			ShouldNot(ContainElement("Kill"),
+				"a discarded breakpoint must not tear down a successfully relaunched process")
+
+		// Only an installed debugger has its events selected on by Run.
+		replacement.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+			protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 10}}))
+		waitForEventKind(conn, protocol.EventBreakpointHit, nil)
+	})
+
+	It("keeps the replacement alive when no breakpoint reinstalls", func() {
+		factory := newRecordingFactory(func(n int, fd *fakeDebugger) {
+			if n == 0 {
+				fd.setBPFunc = bpAtLine
+				return
+			}
+			fd.setBPErr = errors.New("no such line")
+		})
+		managed, conn, cancel := newManagedHub(factory.create)
+		defer cancel()
+		launchManagedFactory(conn, factory, "myapp")
+		setManagedBreakpoints(conn, 10, 20)
+
+		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		var restarted protocol.RestartedPayload
+		waitForEventKind(conn, protocol.EventRestarted, &restarted)
+
+		Expect(restarted.Breakpoints).To(BeEmpty())
+		Expect(restarted.Discarded).To(HaveLen(2))
+		Expect(managed.State()).To(Equal(protocol.StateRunning),
+			"a total reinstall failure still leaves a running process, not an idle session")
+		Consistently(func() []string { return factory.instance(1).recordedCalls() }, "100ms", "10ms").
+			ShouldNot(ContainElement("Kill"))
 	})
 })
 

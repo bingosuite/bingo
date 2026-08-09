@@ -1656,6 +1656,29 @@ the lock and perform the idempotent `Kill` outside it. State transitions also
 check `closing` under `dbgMu`, preventing a command already in flight from
 resurrecting a session after registry teardown begins.
 
+**A candidate must be disposed of on EVERY exit, not just the shutdown race.**
+Being caller-owned cuts both ways: while a candidate sits outside `h.dbg`,
+shutdown's snapshot cannot see it and `Run` never selects on its events, so if
+the command path abandons it *nothing else ever will*. `debugger.New` is not a
+cheap value — `newEngine` starts `go e.loop()` immediately, that loop
+`runtime.LockOSThread()`s, and its `defer` is the only thing that closes
+`done`/`events` and calls `closeTracer()`; on linux `newBackend` also spins up a
+tracer thread at construction. **Only `Kill` drives that loop to exit**, so a
+dropped candidate permanently strands a goroutine plus a locked OS thread per
+attempt (issue #188: repeated failed Restarts accumulated them). `handleRestart`
+therefore registers a deferred `discardDebugger` the moment the candidate
+exists and clears it at the single ownership-transfer point — immediately after
+`installDebugger` accepts it — so relaunch failure, install rejection, and any
+future early return all dispose exactly once, and a successful restart's now
+hub-owned debugger is never killed by the caller. Disposal targets the captured
+candidate by identity, so it can never kill a newer or currently installed
+debugger.
+
+`discardDebugger` is a `Hub` method because the hub is the last owner of a
+discarded debugger: a failing `Kill` is logged there (the owning top level, per
+[docs/ErrorHandling.md](docs/ErrorHandling.md)) rather than returned, so cleanup
+never replaces the original launch error the client is told about.
+
 ## Restart — hub-level, not engine-level
 
 `CmdRestart` (`internal/hub/hub.go` → `handleRestart`) kills the current
@@ -1721,6 +1744,25 @@ see [Suspend/resume protocol](#suspendresume-protocol).
 suspending one — the new process's suspended state (if any, e.g. break-on-
 entry) is reported the normal way via `EventStepped`/`EventBreakpointHit` once
 the relaunched process actually reaches that point.
+
+**Failed relaunch**: the old debugger is already dead by then, so the session
+falls back to `idle` with no debugger installed and broadcasts an `EventError`
+wrapping the cause as `restart: relaunch failed: …`. `lastLaunch` and
+`restartBreakpoints` are deliberately **kept**, so a retry Restart (or a fresh
+Launch) still works. The replacement that failed to launch is killed by
+`handleRestart` itself — see the candidate-disposal rule in
+[Hub debugger ownership](#hub-debugger-ownership--shutdown-is-a-linearization-point).
+
+**A failed breakpoint reinstall is NOT a failed relaunch** — do not extend the
+disposal rule to it. By the time the reinstall loop runs, `installDebugger` has
+already accepted the replacement, so it is hub-owned and the tracee is running;
+a `SetBreakpoint` error is collected as a `DiscardedBreakpoint` and reported in
+`EventRestarted` (mirroring Delve), and the session stays `running`. Killing the
+replacement there would terminate a healthy process over one unresolvable
+`file:line`. Only locations that *did* resolve are carried into
+`restartBreakpoints`. Both directions are pinned by the `Restart relaunch
+failure` and `Restart breakpoint reinstall failure` specs in
+[hub_test.go](internal/hub/hub_test.go).
 
 ## Breakpoint identity — hub-owned logical ids
 
