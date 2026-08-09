@@ -478,6 +478,9 @@ func (r *dwarfReader) subprogramVars(pc uint64) ([]*dwarf.Entry, error) {
 			continue
 		}
 
+		if !entry.Children {
+			return nil, nil
+		}
 		return r.collectSubprogramVars(rd, dwarfPC)
 	}
 	return nil, nil
@@ -518,28 +521,30 @@ type scopedVariable struct {
 	depth int
 }
 
-func (r *dwarfReader) collectSubprogramVars(rd *dwarf.Reader, dwarfPC uint64) ([]*dwarf.Entry, error) {
-	depth := 1
-	scopeDepth := 0
-	// SkipChildren consumes the skipped subtree's terminator, so only traversed
-	// children get a depth slot.
-	scopeAtDepth := []bool{false, false}
-	vars := make([]scopedVariable, 0)
-	byName := make(map[string]int)
+type subprogramVarCollector struct {
+	depth        int
+	scopeDepth   int
+	scopeAtDepth []bool
+	vars         []scopedVariable
+	byName       map[string]int
+}
 
-	for depth > 0 {
-		entry, err := rd.Next()
-		if err == io.EOF || entry == nil {
+func (r *dwarfReader) collectSubprogramVars(rd *dwarf.Reader, dwarfPC uint64) ([]*dwarf.Entry, error) {
+	collector := subprogramVarCollector{
+		depth:        1,
+		scopeAtDepth: []bool{false, false},
+		byName:       make(map[string]int),
+	}
+	for collector.depth > 0 {
+		entry, done, err := nextSubprogramDIE(rd)
+		if err != nil {
+			return nil, err
+		}
+		if done {
 			break
 		}
-		if err != nil {
-			return nil, fmt.Errorf("DWARF child read: %w", err)
-		}
 		if entry.Tag == 0 {
-			if scopeAtDepth[depth] {
-				scopeDepth--
-			}
-			depth--
+			collector.leaveScope()
 			continue
 		}
 
@@ -548,36 +553,72 @@ func (r *dwarfReader) collectSubprogramVars(rd *dwarf.Reader, dwarfPC uint64) ([
 			rd.SkipChildren()
 			continue
 		}
-
-		if entry.Tag == dwarf.TagVariable || entry.Tag == dwarf.TagFormalParameter {
-			name, _ := entry.Val(dwarf.AttrName).(string)
-			if name != "" {
-				if index, ok := byName[name]; !ok {
-					byName[name] = len(vars)
-					vars = append(vars, scopedVariable{entry: entry, depth: scopeDepth})
-				} else if scopeDepth > vars[index].depth {
-					vars[index] = scopedVariable{entry: entry, depth: scopeDepth}
-				}
-			}
-		}
-
-		if entry.Children {
-			depth++
-			if depth >= len(scopeAtDepth) {
-				scopeAtDepth = append(scopeAtDepth, false)
-			}
-			scopeAtDepth[depth] = isScope
-			if isScope {
-				scopeDepth++
-			}
-		}
+		collector.addVariable(entry)
+		collector.enterScope(entry, isScope)
 	}
 
-	out := make([]*dwarf.Entry, len(vars))
-	for i := range vars {
-		out[i] = vars[i].entry
+	return collector.entries(), nil
+}
+
+func nextSubprogramDIE(rd *dwarf.Reader) (*dwarf.Entry, bool, error) {
+	entry, err := rd.Next()
+	if err != nil && err != io.EOF {
+		return nil, false, fmt.Errorf("DWARF child read: %w", err)
 	}
-	return out, nil
+	if err == io.EOF || entry == nil {
+		return nil, true, nil
+	}
+	return entry, false, nil
+}
+
+func (c *subprogramVarCollector) leaveScope() {
+	if c.scopeAtDepth[c.depth] {
+		c.scopeDepth--
+	}
+	c.depth--
+}
+
+func (c *subprogramVarCollector) addVariable(entry *dwarf.Entry) {
+	if entry.Tag != dwarf.TagVariable && entry.Tag != dwarf.TagFormalParameter {
+		return
+	}
+	name, _ := entry.Val(dwarf.AttrName).(string)
+	if name == "" {
+		return
+	}
+	index, ok := c.byName[name]
+	if !ok {
+		c.byName[name] = len(c.vars)
+		c.vars = append(c.vars, scopedVariable{entry: entry, depth: c.scopeDepth})
+		return
+	}
+	if c.scopeDepth > c.vars[index].depth {
+		c.vars[index] = scopedVariable{entry: entry, depth: c.scopeDepth}
+	}
+}
+
+func (c *subprogramVarCollector) enterScope(entry *dwarf.Entry, isScope bool) {
+	if !entry.Children {
+		return
+	}
+	c.depth++
+	// SkipChildren consumes the skipped subtree's terminator, so only traversed
+	// children get a depth slot.
+	if c.depth >= len(c.scopeAtDepth) {
+		c.scopeAtDepth = append(c.scopeAtDepth, false)
+	}
+	c.scopeAtDepth[c.depth] = isScope
+	if isScope {
+		c.scopeDepth++
+	}
+}
+
+func (c *subprogramVarCollector) entries() []*dwarf.Entry {
+	out := make([]*dwarf.Entry, len(c.vars))
+	for i := range c.vars {
+		out[i] = c.vars[i].entry
+	}
+	return out
 }
 
 // varType resolves a DIE's DW_AT_type to a concrete dwarf.Type (nil on absence
