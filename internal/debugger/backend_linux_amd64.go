@@ -131,10 +131,11 @@ func (b *linuxBackend) drainParked() (StopEvent, bool) {
 
 func (b *linuxBackend) execPtrace(fn func()) { b.tracer.execPtrace(fn) }
 
-// closeTracer releases the dedicated tracer thread. The engine calls this after
-// its loop exits (process gone), when no further ptrace ops can be issued.
+// closeTracer releases the dedicated tracer thread after engine shutdown.
+// A terminal waitLoop may still be unwinding, so its lock-free step queue
+// remains Wait-owned; only synchronized pending-signal state is cleared here.
 func (b *linuxBackend) closeTracer() {
-	b.purge()
+	b.pendingSignals.purge()
 	b.tracer.close()
 }
 
