@@ -1,6 +1,38 @@
 package debugger
 
-import "sync/atomic"
+import (
+	"bytes"
+	"sync/atomic"
+)
+
+// parkedTrapMissing reports whether the trap that produced a held breakpoint
+// stop has since been removed from the tracee.
+//
+// Holding a stop opens a window the engine never had before: it can clear the
+// very trap the held stop refers to. The `<stepover-next>` sentinel is cleared
+// the instant ANY thread reaches it, so a sibling parked at the same address is
+// left holding a stop for a trap that no longer exists. Delivering that stop
+// takes the engine's spurious-SIGTRAP path, which resumes the thread at the
+// trap-return PC — and with the original bytes restored that address is
+// mid-instruction on amd64, so the thread faults on every retry and the tracee
+// silently stops making progress.
+//
+// trap is the architecture's trap encoding and trapAddr the address it occupied
+// (the rewound PC). A byte-for-byte match means the trap is still armed — either
+// still ours, or a genuine foreign trap that is part of the tracee's own code —
+// and the stop is delivered exactly as an unheld one would be. An unreadable
+// address reports "present" so the caller keeps the pre-existing behaviour
+// rather than dropping a stop on a transient read failure.
+func parkedTrapMissing(trapAddr uint64, trap []byte, read func(addr uint64, dst []byte) error) bool {
+	if len(trap) == 0 {
+		return false
+	}
+	got := make([]byte, len(trap))
+	if read(trapAddr, got) != nil {
+		return false
+	}
+	return !bytes.Equal(got, trap)
+}
 
 // stopDisposition is the decision a backend's wait loop makes about a stop that
 // would otherwise be handed straight to the engine.
@@ -88,6 +120,11 @@ type stepQueue struct {
 	// the same test can distinguish a held asynchronous interrupt from a held
 	// sibling trap. Atomic for the same reason.
 	parkedSignalTotal atomic.Int64
+
+	// staleTotal counts held breakpoint stops that were dropped because the
+	// engine cleared their trap while they waited (see parkedTrapMissing).
+	// Atomic for the same reason as the counters above.
+	staleTotal atomic.Int64
 }
 
 // park holds a foreign stop until the in-flight step completes. It deliberately
@@ -115,6 +152,63 @@ func (q *stepQueue) parkedCount() int { return int(q.parkedTotal.Load()) }
 // is a genuine externally-directed interrupt — in practice the SIGSTOP that
 // Pause sends at the main thread.
 func (q *stepQueue) parkedSignalCount() int { return int(q.parkedSignalTotal.Load()) }
+
+// staleParkedCount reports how many held stops were dropped because their trap
+// had been removed by the time they could be released.
+func (q *stepQueue) staleParkedCount() int { return int(q.staleTotal.Load()) }
+
+// trapRestarter is the slice of a backend that stale-stop recovery needs. It
+// exists so the recovery sequence is testable without a live tracee.
+type trapRestarter interface {
+	GetRegisters(tid int) (Registers, error)
+	SetRegisters(tid int, reg Registers) error
+	ReadMemory(addr uint64, dst []byte) error
+	continueIfTraceeExists(tid int, signal int) error
+}
+
+// restartStaleParked resumes a thread whose held breakpoint stop names a trap
+// that was removed while the stop waited, and reports that the stop was dropped
+// rather than delivered.
+//
+// The thread is parked at the trap-return PC. Once the trap is gone that address
+// is mid-instruction wherever the architecture advances past the trap, so the
+// instruction is restarted from its first byte — exactly what would have
+// happened had the breakpoint been cleared while the thread was running.
+//
+// Nothing is recorded as the current stop: the engine never sees this thread, so
+// recording it would repoint every TID-less ptrace op at a thread that is
+// running again. Every failure path leaves the stop deliverable, preserving the
+// behaviour a backend had before stops could be held at all.
+//
+// trap and rewind are passed in rather than read from the arch globals so the
+// rule can be exercised on any host.
+func (q *stepQueue) restartStaleParked(r trapRestarter, ev StopEvent, trap []byte, rewind func(uint64) uint64) bool {
+	if ev.Reason != StopBreakpoint {
+		return false
+	}
+	regs, err := r.GetRegisters(ev.TID)
+	if err != nil {
+		return false
+	}
+	addr := rewind(regs.PC)
+	if addr == regs.PC {
+		// The architecture leaves the PC at the trap, so resuming re-executes
+		// the instruction whether or not the trap is still installed.
+		return false
+	}
+	if !parkedTrapMissing(addr, trap, r.ReadMemory) {
+		return false
+	}
+	regs.PC = addr
+	if err := r.SetRegisters(ev.TID, regs); err != nil {
+		return false
+	}
+	q.staleTotal.Add(1)
+	// A failure here means the thread died between the register write and the
+	// resume; the stop is stale either way and must not reach the engine.
+	_ = r.continueIfTraceeExists(ev.TID, 0)
+	return true
+}
 
 // releasable pops the oldest held stop if one may be surfaced now.
 //
