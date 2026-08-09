@@ -384,134 +384,125 @@ with the engine still `stateRunning`), and the in-flight reinstall and manual
 `populateStopPC` failures (`StopSignal`). The `bpResumeSourceStep` fallback is
 already safe: it emits a suspending `EventStepped`.
 
-## Foreign-thread stop deferral during a single-step
+## Foreign-thread stop parking during a single-step (linux)
 
-Source: `deferForeignStop` / `holdForDeferred` / `releaseParked` /
-`resumeTracee` / `resumeWait` in
-[internal/debugger/engine.go](internal/debugger/engine.go).
+Source: the platform-neutral `classifyUserStop` + `stepQueue` in
+[waitpark.go](internal/debugger/waitpark.go), embedded in `linuxBackend` and
+driven from `Wait` in
+[backend_linux_amd64.go](internal/debugger/backend_linux_amd64.go) (which adds
+only `drainParked`, the one helper that must also move `lastStopTID`). **The
+whole fix lives in `Wait`; there is no engine-side component.**
 
-**The invariant: while an exact-TID single-step is in flight, a raw `StopEvent`
-belonging to any OTHER thread is parked, not handled.** `e.stepTID` records the
-TID `SingleStep` was issued against — set by `stepThreadOverBP`, so it covers
-*every* step (plain `StepInto`, `bpResumeStep`, and the breakpoint step-over
-dance alike). Keying on `steppingOverBP` alone is **not** sufficient: a plain
-`StepInto` has no step-over entry and is equally corruptible.
+`stepQueue` owns the step bookkeeping (`stepping`/`stepTID`, via
+`beginStep`/`endStep`) *and* the held stops, because the two are one state
+machine: the release gate is literally "no step outstanding". It is embedded, so
+every pre-existing `b.stepping` / `b.stepTID` use site is unchanged. It carries
+no build tag and no backend dependency so the ordering/gating rules are
+unit-testable — and mutation-checkable — on any host.
 
-Why it is needed (issue #199, linux only in practice): linux `Wait` uses
-`Wait4(-1, …, WALL)`, so a sibling thread's `SIGTRAP` can surface in the middle
-of the restore→single-step→reinstall sequence, when the stepped-over trap bytes
-are out of the tracee and its entry is out of `bps` (see
-[step-over flow](#software-breakpoint-step-over-flow)). Handling it there
-destroys the step-over state machine two ways: a **distinct** sibling
+**The invariant: while a single-step is outstanding, `Wait` does not return a
+user-visible stop belonging to any other thread.** The sibling stays
+ptrace-stopped exactly where it is and is delivered from a FIFO queue on a later
+`Wait`, once the step has completed and the engine has reinstalled the trap it
+stepped off.
+
+Why it is needed (issue #199, linux only): `Wait` uses `Wait4(-1, …, WALL)`, so
+a sibling thread's `SIGTRAP` can surface in the middle of the
+restore→single-step→reinstall sequence, when the stepped-over trap bytes are out
+of the tracee and its entry is out of `bps` (see
+[step-over flow](#software-breakpoint-step-over-flow)). Handing that to the
+engine destroys the step-over state machine two ways: a **distinct** sibling
 breakpoint overwrites `lastBP` and the next resume overwrites the one-slot
 `steppingOverBP`, permanently losing the original entry with its trap disarmed
 (so its `ClearBreakpoint` id fails); a **same-address** sibling finds no entry,
 takes the spurious-SIGTRAP path, advances PC and calls `ContinueProcess`, which
-clears the backend's `stepping`/`stepTID` bookkeeping so the real step
-completion is misclassified. Darwin is immune by construction — its receive loop
-already loops until the trap belongs to the stepping thread — so its deferral
-queue stays empty.
+clears `stepping`/`stepTID` so the real step completion is misclassified. Darwin
+is immune by construction — its receive loop already loops until the trap belongs
+to the stepping thread — which is why this is a linux-backend fix and darwin has
+no counterpart.
 
-Mechanics, all on the engine loop thread (`deferredStops`, `stepTID`,
-`parkedTID`, `lastWaitTID`, `internalStepTID` are loop-owned and unlocked, like
-`manualStopPending`):
+**Why it must be in the backend and not the engine.** The `Backend` interface has
+exactly one TID-explicit resume, `SingleStep(tid)`. `ContinueProcess`,
+`WriteMemory` (POKEDATA) and the `ReadMemory` PEEKDATA fallback are all TID-less
+and target `traceTID()` == `lastStopTID` == the TID of the stop `Wait` most
+recently **returned**. The engine is written against the implicit invariant
+*"the stop I am handling is the thread I will act on and resume"*, and it has no
+way to restore that pairing for an event it chose to replay later: `recordStop`
+is backend-private, and by the time a deferred event were replayed the exact
+step completion would already have overwritten `lastStopTID`. Parking inside
+`Wait` preserves the invariant instead of trying to reconstruct it — a parked
+event is simply not a stop yet, and `recordStop` runs at **delivery**, never at
+park time. That is why the engine needs no production change at all.
 
-1. `handleStop` runs `deferForeignStop` **before** any user-visible processing.
-   Only `StopBreakpoint`/`StopSignal` from a TID != `stepTID` are parked; exit
-   and kill never are. Parking consumes the stop, so `resumeWait` starts a
-   replacement one-shot `waitLoop`; state stays `running` and nothing is emitted
-   (no phantom stop, no premature reinstall).
-2. The stepping thread's own completion is handled normally: `bps.reinstall`
-   puts the trap back and re-adds the entry **first**. Only then, if
-   `deferredStops` is non-empty, `holdForDeferred` delivers the queue instead of
-   performing the step's `bpResume` action. This ordering is load-bearing — a
-   same-address deferred stop must be replayed after the reinstall so `atAddr`
-   is no longer nil and it resolves to a real breakpoint instead of a spurious
-   trap.
-3. Replay goes through `stopCh` with `deferred: true` so `lastWaitTID` is not
-   restamped, and `resumeWait` guarantees **exactly one outstanding stop
-   source** at all times (either a replay or a fresh `waitLoop`, never both).
+Rules, all enforced inside `Wait` (the queue is `Wait`-owned; see the locking
+note below):
 
-**The stepped thread is HELD, not resumed, while stops are queued.** This is the
-subtle part and is forced by the linux backend: `ContinueProcess`, `WriteMemory`
-(POKEDATA) and the `ReadMemory` PEEKDATA fallback are TID-less and target
-`traceTID()` == the TID of the last stop `Wait` actually **returned**; the only
-TID-explicit resume in the `Backend` interface is `SingleStep(tid)`. Deferral
-consumes a stop that was never the most recent `recordStop`, so if the engine
-resumed the stepped thread before replaying, the session would end up suspended
-on the deferred thread while `traceTID` names a thread that is running — and the
-next breakpoint restore write would fail with `ESRCH`, a hard strand strictly
-worse than the bug. Holding keeps `traceTID` == the parked thread, so the
-subsequent restore write is valid; `releaseParked` then discharges the owed
-resume with the TID-less `ContinueProcess` at exactly the point where it still
-names that thread, immediately before the TID-explicit `SingleStep` of the new
-breakpoint thread. In `resumeFromBreakpoint` that means `releaseParked` sits
-**between** the restore `WriteMemory` and `stepThreadOverBP` — do not move it.
-`resumeTracee` covers the non-breakpoint resumes: it parks the current thread
-when stops are still queued, and otherwise releases the parked one and re-points
-`traceTID` at the current thread with a marker single-step (`internalStepTID`,
-swallowed without a user event).
-
-**That marker single-step must never be issued on a thread sitting on an armed
-trap.** `ContinueProcess` onto a trap is safe (it reports an ordinary
-`StopBreakpoint`), but `SingleStep(tid)` *executes* the trap, and the linux
-backend classifies the resulting `cause==0` SIGTRAP purely by
-`stepping && tid == stepTID` — so a trap hit is indistinguishable from a step
-completion. The `internalStepTID` branch would then swallow a real breakpoint hit
-and continue from `bpaddr+1`, i.e. mid-instruction on amd64. So when
-`resumeTracee` is about to spend the TID-less continue on the parked thread, it
-first checks `armedBreakpointAt(current)` and, if a trap is armed there, disarms
-it and routes the resume through the ordinary step-over machinery
-(`steppingOverBP` + `bpResumeContinue` + `stepThreadOverBP`) instead: the
-existing `StopSingleStep` handler reinstalls the trap and then continues without
-emitting anything. `internalStepTID` is deliberately **not** set on that path, or
-the swallow branch — which runs before the reinstall block — would pre-empt the
-reinstall. The disarming `WriteMemory` must precede `releaseParked` for the same
-`traceTID` reason as everywhere else, and every failure after it rolls back via
-`rearmInternalStepOver`. A register-read failure degrades to "assume no trap"
-(logged) rather than erroring the stop. Landing *on* a trap after the marker step
-is fine — the following `ContinueProcess` executes it and reports a normal hit.
-`internalStepTID` is also cleared if its step ever ends by a non-`StopSingleStep`
-route, so a stale marker cannot swallow an unrelated later stop.
+1. **Park only foreign user-visible stops.** `classifyUserStop` parks a
+   `StopBreakpoint`/`StopSignal` only when a step is in flight (`stepping` **and**
+   a non-zero `stepTID`) and the stopping TID is not `stepTID`. Everything the
+   loop already absorbs inline stays inline: clone/exec events, non-main thread
+   exits, a new thread's initial `SIGSTOP`, `SIGURG`, `SIGCONT`.
+2. **Never park the stepped thread's own stop.** Its trap is the step completing
+   and its signal is the step's outcome; both must reach the engine or the trap
+   is never reinstalled and nothing can ever drain. A `stepping` flag with a zero
+   `stepTID` is treated as no step at all for the same reason — parking against a
+   completion we cannot recognise would block forever.
+3. **Dequeue only when no step is outstanding.** `stepQueue.releasable` refuses
+   to pop while `stepping`; `drainParked` (which wraps it) runs at the top of
+   each `Wait` iteration, before blocking in `wait4`, and returns nothing while
+   `stepping`. This is what guarantees a same-address sibling is delivered only
+   after the reinstall, so it resolves to a real breakpoint rather than the
+   spurious-trap path.
+4. **`recordStop` runs on delivery only.** Never at park time — moving the resume
+   target to a thread the engine is not working on is precisely the corruption
+   being fixed.
+5. **A dead stepped thread lifts the gate.** `clearStepIfStepped` clears
+   `stepping`/`stepTID` when the stepped TID exits or dies by signal, otherwise
+   its completion never arrives and the queue is stranded.
+6. **Teardown purges inside `Wait`.** `stepQueue.purge` runs on the main thread's
+   `PTRACE_EVENT_EXIT`, its real exit, its signal death, and `ECHILD`. There is
+   deliberately **no engine-callable purge**: the queue is not part of the
+   engine's state model.
 
 **Explicit limits — this is NOT an atomic stop-the-world step-over.** Sibling
 threads keep running and keep trapping during a step; the fix only guarantees
-that their stops are *reported later*, after the trap is back. Consequences to
-keep in mind:
+that their stops are *reported later*, after the trap is back:
 
 - The trap really is absent from tracee memory for the duration of the step, so
   a sibling executing that address in the window legitimately does not trap.
   Exact per-cycle sibling hit counts are inherently racy — never assert them.
-- A user `StepOver`/`StepInto` may surface as a sibling's `EventBreakpointHit`
-  rather than `EventStepped` (the deferred stop is delivered as the step's
-  outcome, and the step's own `bpResume` action is skipped). Callers already
-  tolerate this; the `churn` spec has always done so.
-- The queue is capped at `maxDeferredStops` (256). It cannot normally approach
-  that — a ptrace-stopped thread cannot trap again until resumed, so the depth
-  is bounded by the live thread count — and on overflow the engine logs a
-  warning and falls back to pre-deferral behaviour rather than dropping a stop.
-- If a deferred stop's handler does **not** suspend (spurious trap, ordinary
-  signal, leftover pause suppression) *and* another deferred stop is still
-  queued, `resumeTracee` releases the previously parked thread and parks the new
-  current one, which can leave `traceTID` naming a running thread. A later
-  backend op may then fail; that failure is reported through `haltOnError`
-  (suspending `EventPaused`), so the session stays controllable — it is a
-  degraded case, not a strand.
-- Teardown purges the queue: `handleStop`'s `StopExited`/`StopKilled` branch and
-  `Kill()` both call `discardDeferred`, so a parked stop is never replayed
-  against a dead TID.
+- A user `StepOver`/`StepInto` may still surface as a sibling's
+  `EventBreakpointHit` rather than `EventStepped`: the step completes, the trap
+  is reinstalled, and the queued sibling is then delivered as the next stop.
+  Callers already tolerate this; the `churn` spec always has.
+- Queue depth is bounded by the live thread count — a ptrace-stopped thread
+  cannot stop again until it is resumed (G7) — so no cap is needed.
+- Out of scope: a user `ClearBreakpoint` of an address a parked stop refers to
+  still surfaces that stop as a spurious trap when it is finally delivered.
 
-Regression gates: the deterministic `fakeBackend` specs in
-[engine_defer_test.go](internal/debugger/engine_defer_test.go) (distinct
-sibling, same-address sibling, foreign signal, foreign stop during a plain
-`StepInto`, a foreign `Pause` interrupt, a deferred thread parked on an armed
-trap, teardown with a non-empty queue) and the linux-only `overlap`
-E2E label in
-[debugger_e2e_linux_amd64_test.go](test/integration/debugger_e2e_linux_amd64_test.go),
-which asserts only invariants the fix guarantees — both logical breakpoints
-remain tracked at every observable stop, every hit belongs to a known id, no
-error or unexpected exit, both ids still clearable at the end — plus
-non-vacuity (hits on both lines from more than one goroutine).
+**No lock, and none is needed.** `parked` is touched only inside `Wait`.
+Successive `Wait` calls run on different one-shot `waitLoop` goroutines that the
+engine starts with `go e.waitLoop()` **after** consuming the previous `Wait`'s
+result from `stopCh`, so no two ever overlap; that channel-and-goroutine-start
+chain is also what orders the `stepping`/`stepTID` writes the engine makes in
+between (`SingleStep` sets them, `ContinueProcess` clears them) against the next
+`Wait`'s reads. Do not add a mutex, and do not call these helpers from anywhere
+but `Wait`.
+
+Regression gates: the classifier table **and** the queue-mechanics tests in
+[waitpark_test.go](internal/debugger/waitpark_test.go) — both host-agnostic, so
+they run and can be mutation-checked on macOS — plus the three backend-specific
+tests in
+[backend_linux_amd64_test.go](internal/debugger/backend_linux_amd64_test.go)
+that pin *when `lastStopTID` moves* (not on park, only on delivery, and `Wait`
+drains before blocking), plus the linux-only `overlap` E2E label in
+[debugger_e2e_linux_amd64_test.go](test/integration/debugger_e2e_linux_amd64_test.go):
+step-over overlap, machine-step (`StepInto`) overlap, a foreign ordinary-signal
+storm, `Pause` racing an in-flight step, and kill with stops held. Those assert
+only invariants the fix guarantees — both logical breakpoints remain tracked at
+every observable stop, every hit belongs to a known id, no error or unexpected
+exit, both ids still clearable, threads still making progress at the end of the
+run — plus non-vacuity. The `churn` label runs five rounds in CI.
 
 ## Architecture-specific traps
 
@@ -694,6 +685,10 @@ are detected by a `mach_msg` receive loop.
   matters because `Wait4(-1, …)` can return a sibling thread's concurrent
   breakpoint (or SIGURG) while a step is in flight — keying off `stepping`
   alone would misclassify it and corrupt the engine's step-over state machine.
+  Correct classification is necessary but not sufficient: a correctly-labelled
+  foreign breakpoint handed to the engine mid-step is still corrupting, so `Wait`
+  also **parks** it until the step completes — see
+  [foreign-thread stop parking](#foreign-thread-stop-parking-during-a-single-step-linux).
 - `g` pointer for goroutine inspection lives at `FS_BASE` on amd64.
 - `killProcess` never reaps the zombie itself while the engine's `waitLoop` is
   in flight (a *running* tracee). That waitLoop is blocked in `Wait4(-1, WALL)`
@@ -1757,12 +1752,12 @@ through the justfile.
   `EventPaused`) with the engine in `stateSuspended`. A bare `EventError` is
   non-suspending and strands the session permanently — see
   [step-over flow](#software-breakpoint-step-over-flow).
-- **New resume path in the engine**: arm `e.stepTID` through `stepThreadOverBP`
-  (never call `SingleStep` directly), resume through `resumeTracee`/
-  `releaseParked` rather than a bare `ContinueProcess`, and start the next wait
-  through `resumeWait` — otherwise a foreign-thread stop can be handled
-  mid-step, or the owed resume for a parked thread is lost. See
-  [foreign-thread stop deferral](#foreign-thread-stop-deferral-during-a-single-step).
+- **New stop classification in the linux `Wait` loop**: decide deliberately
+  whether the new case is user-visible. Anything the engine would act on must go
+  through `classifyUserStop` so it is parked when it belongs to a thread other
+  than the one being single-stepped, and its `recordStop` must happen only when
+  the event is actually returned. See
+  [foreign-thread stop parking](#foreign-thread-stop-parking-during-a-single-step-linux).
 - **New `EventKind`/`CommandKind`**: if it should reach an IDE, add its
   translation to [internal/dap](internal/dap/) (`translateEvent`/event handlers
   for events, `dispatchRequest` for the reverse). Events with no DAP equivalent
