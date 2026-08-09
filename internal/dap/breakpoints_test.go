@@ -582,6 +582,185 @@ func TestLargeSetBreakpointsDeliversEveryCommandInOrder(t *testing.T) {
 	}
 }
 
+// discardUnderPendingClear installs a breakpoint, starts removing it, then has a
+// restart discard the line while that clear is still in flight. The removal is
+// satisfied by the discard itself, so its request completes successfully and the
+// line is forgotten — leaving the clear abandoned, still queued, still owed an
+// answer by the debugger.
+func discardUnderPendingClear(t *testing.T, hh *harness) int {
+	t.Helper()
+	hh.installBreakpoint(bpSource, []int{10}, []int{101})
+
+	removeSeq := hh.sendReq("setBreakpoints", setBreakpointsFor(bpSource))
+	hh.clearIDs(1)
+
+	restartSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdRestart)
+	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{
+		Discarded: []protocol.DiscardedBreakpoint{
+			{Location: protocol.Location{File: bpSource.Path, Line: 10}, Reason: "no such line"},
+		},
+	})
+
+	var removed *godap.SetBreakpointsResponse
+	var restarted *godap.RestartResponse
+	for range 3 {
+		switch msg := hh.recv().(type) {
+		case *godap.SetBreakpointsResponse:
+			removed = msg
+		case *godap.RestartResponse:
+			restarted = msg
+		case *godap.ErrorResponse:
+			t.Fatalf("removal failed although the discard already satisfied it: %+v", msg.Response)
+		}
+	}
+	if removed == nil || removed.RequestSeq != removeSeq || len(removed.Body.Breakpoints) != 0 {
+		t.Fatalf("removal response = %+v, want empty success for %d", removed, removeSeq)
+	}
+	if restarted == nil || restarted.RequestSeq != restartSeq {
+		t.Fatalf("restart response = %+v, want %d", restarted, restartSeq)
+	}
+	if st, ok := hh.lineState(bpSource.Path, 10); ok {
+		t.Fatalf("discarded line survived as %+v, want it forgotten", st)
+	}
+	return restartSeq
+}
+
+func (hh *harness) staleClearIsStillQueued() bool {
+	hh.handler.mu.Lock()
+	defer hh.handler.mu.Unlock()
+	return len(hh.handler.clearQ) == 1
+}
+
+// After a discard abandons its clear, a later request that wants the line back
+// must converge immediately, and the stale clear's rejection must not touch it.
+func TestDiscardedLineAcceptsLaterSetAndIgnoresStaleClearError(t *testing.T) {
+	hh := suspendedHarness(t)
+	discardUnderPendingClear(t, hh)
+	if !hh.staleClearIsStillQueued() {
+		t.Fatal("abandoned clear lost its FIFO slot")
+	}
+
+	// The abandoned operation must not latch the line: this has to issue a Set.
+	readdSeq := hh.sendReq("setBreakpoints", setBreakpointsFor(bpSource, 10))
+	hh.cmds.waitForCommands(t, protocol.CmdSetBreakpoint, 2)
+
+	hh.inject(protocol.EventError, protocol.ErrorPayload{
+		Command: protocol.CmdClearBreakpoint,
+		Message: "breakpoint 101 not found",
+	})
+	// The stale rejection belongs to nobody: it must not fail or resolve the
+	// request now waiting on this line.
+	hh.expectNoResponse()
+
+	hh.confirmSet(bpSource, 10, 7)
+	resp := recvType[*godap.SetBreakpointsResponse](hh)
+	if resp.RequestSeq != readdSeq {
+		t.Fatalf("response seq = %d, want %d", resp.RequestSeq, readdSeq)
+	}
+	requireBreakpointIDs(t, resp, 7)
+	if !resp.Body.Breakpoints[0].Verified {
+		t.Fatalf("re-added breakpoint = %+v, want verified", resp.Body.Breakpoints[0])
+	}
+}
+
+// A removal the discard already satisfied must not be failed by the stale
+// rejection that arrives afterwards.
+func TestDiscardedLineDoesNotFailAlreadySatisfiedRemoval(t *testing.T) {
+	hh := suspendedHarness(t)
+	discardUnderPendingClear(t, hh)
+
+	// Nothing is armed, so this replace-all owns no removal and answers at once.
+	emptySeq := hh.sendReq("setBreakpoints", setBreakpointsFor(bpSource))
+	resp := recvType[*godap.SetBreakpointsResponse](hh)
+	if resp.RequestSeq != emptySeq || len(resp.Body.Breakpoints) != 0 {
+		t.Fatalf("empty response = %+v (seq %d), want empty success for %d", resp.Body, resp.RequestSeq, emptySeq)
+	}
+
+	hh.inject(protocol.EventError, protocol.ErrorPayload{
+		Command: protocol.CmdClearBreakpoint,
+		Message: "breakpoint 101 not found",
+	})
+	hh.expectNoResponse()
+
+	if n := hh.countCommands(protocol.CmdClearBreakpoint); n != 1 {
+		t.Fatalf("ClearBreakpoint commands = %d, want no retry of the discarded line", n)
+	}
+}
+
+// A stale clear that succeeds late must also be a pure FIFO pop: it must not
+// disarm the line's new identity, and the next real removal must still
+// correlate to its own confirmation.
+func TestStaleClearSuccessDoesNotDisturbReidentifiedLine(t *testing.T) {
+	hh := suspendedHarness(t)
+	discardUnderPendingClear(t, hh)
+
+	hh.sendReq("setBreakpoints", setBreakpointsFor(bpSource, 10))
+	hh.cmds.waitForCommands(t, protocol.CmdSetBreakpoint, 2)
+	hh.confirmSet(bpSource, 10, 7)
+	_ = recvType[*godap.SetBreakpointsResponse](hh)
+
+	// The abandoned clear finally succeeds against the old process.
+	hh.inject(protocol.EventBreakpointCleared, protocol.BreakpointClearedPayload{ID: 101})
+	hh.expectNoResponse()
+	st, ok := hh.lineState(bpSource.Path, 10)
+	if !ok || st.installedID != 7 {
+		t.Fatalf("line state = %+v (present=%v), want the new identity 7 intact", st, ok)
+	}
+
+	// The FIFO is still aligned: a real removal targets the new id and is
+	// answered by its own confirmation.
+	removeSeq := hh.sendReq("setBreakpoints", setBreakpointsFor(bpSource))
+	ids := hh.clearIDs(2)
+	if ids[1] != 7 {
+		t.Fatalf("clear id = %d, want the current identity 7", ids[1])
+	}
+	hh.expectNoResponse()
+	hh.inject(protocol.EventBreakpointCleared, protocol.BreakpointClearedPayload{ID: 7})
+	resp := recvType[*godap.SetBreakpointsResponse](hh)
+	if resp.RequestSeq != removeSeq || len(resp.Body.Breakpoints) != 0 {
+		t.Fatalf("removal response = %+v (seq %d), want empty success for %d", resp.Body, resp.RequestSeq, removeSeq)
+	}
+	if _, ok := hh.lineState(bpSource.Path, 10); ok {
+		t.Fatal("confirmed clear left the line in the cache")
+	}
+}
+
+// A rejected clear is only un-retryable while its breakpoint is still armed.
+// With nothing armed there is nothing to retry and nothing to report: the
+// removal did happen, so its requests complete rather than fail, and the line
+// resumes converging on the newest intent instead of stalling.
+func TestFailedClearWithNothingArmedCompletesAndResumes(t *testing.T) {
+	h := NewHandler(nil, nil, nil)
+
+	removal := &bpRequest{reqSeq: 1, openClears: 1}
+	readd := &bpRequest{reqSeq: 2}
+	slot := &bpSlot{req: readd, line: 10, source: bpSource}
+	readd.slots = []*bpSlot{slot}
+	h.bpByFile[bpSource.Path] = map[int]*bpLine{10: {
+		desired:     true,
+		setWaiters:  []*bpSlot{slot},
+		clearOwners: []*bpRequest{removal},
+	}}
+
+	h.mu.Lock()
+	ready := h.failClearLocked(bpSource.Path, 10, "breakpoint 101 not found")
+	h.mu.Unlock()
+
+	if len(ready) != 1 || ready[0] != removal {
+		t.Fatalf("ready = %+v, want only the removal request", ready)
+	}
+	if removal.clearFailure != "" {
+		t.Fatalf("removal reported %q, want success — nothing was armed to fail on", removal.clearFailure)
+	}
+	if len(h.setQ) != 1 || len(h.outbox) != 1 {
+		t.Fatalf("setQ=%d outbox=%d, want the desired line to resume converging", len(h.setQ), len(h.outbox))
+	}
+	if slot.resolved {
+		t.Fatal("waiting slot was resolved before its breakpoint was installed")
+	}
+}
+
 // Confirmations the adapter did not ask for must never produce a second
 // response for an already-answered request.
 func TestSetBreakpointsRespondsExactlyOnce(t *testing.T) {
