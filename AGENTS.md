@@ -1097,6 +1097,9 @@ session.
   `joinedState=suspended` before the following state frame, so reconciliation
   does not duplicate its `stopped` even if a zero-latency client has already
   sent Continue/Step and optimistically cleared the separate `suspended` flag.
+  `EventRestarted` begins a new process lifecycle only after relaunch succeeds,
+  resetting the termination latch so the next exit emits `terminated` once
+  without reopening duplicates for the previous exit.
   Normal launch/attach connections have `joining=false`, so their
   entry/configurationDone handshake remains the sole initial-state path.
 - `onConfigurationDone`'s `joining` branch responds to the attach but does NOT

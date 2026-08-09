@@ -43,6 +43,18 @@ func (r *cmdRecorder) kinds() []protocol.CommandKind {
 	return out
 }
 
+func (r *cmdRecorder) count(kind protocol.CommandKind) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	count := 0
+	for _, cmd := range r.cmds {
+		if cmd.Kind == kind {
+			count++
+		}
+	}
+	return count
+}
+
 // waitForCommand polls until a command of kind appears or the deadline passes.
 func (r *cmdRecorder) waitForCommand(t *testing.T, kind protocol.CommandKind) protocol.Command {
 	t.Helper()
@@ -60,6 +72,18 @@ func (r *cmdRecorder) waitForCommand(t *testing.T, kind protocol.CommandKind) pr
 	}
 	t.Fatalf("timed out waiting for command %s; saw %v", kind, r.kinds())
 	return protocol.Command{}
+}
+
+func (r *cmdRecorder) waitForCommandCount(t *testing.T, kind protocol.CommandKind, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if r.count(kind) >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %d %s commands; saw %d", want, kind, r.count(kind))
 }
 
 type fakeSession struct {
@@ -1064,5 +1088,100 @@ func TestLaunchSessionStateDoesNotBypassConfigurationDone(t *testing.T) {
 	}
 
 	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateSuspended})
+	expectNoDAPMessage(t, hh)
+}
+
+func TestLaunchRestartEmitsTerminatedForEachExit(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+
+	hh.inject(protocol.EventProcessExited, protocol.ProcessExitedPayload{ExitCode: 11})
+	firstExit := recvType[*godap.ExitedEvent](hh)
+	if firstExit.Body.ExitCode != 11 {
+		t.Fatalf("first exit code = %d, want 11", firstExit.Body.ExitCode)
+	}
+	_ = recvType[*godap.TerminatedEvent](hh)
+
+	restartSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdRestart)
+	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{})
+	restarted := recvType[*godap.RestartResponse](hh)
+	if restarted.RequestSeq != restartSeq {
+		t.Fatalf("restart response seq = %d, want %d", restarted.RequestSeq, restartSeq)
+	}
+
+	continueCount := hh.cmds.count(protocol.CmdContinue)
+	hh.inject(protocol.EventStepped, protocol.SteppedPayload{Goroutine: protocol.Goroutine{ID: 2}})
+	hh.cmds.waitForCommandCount(t, protocol.CmdContinue, continueCount+1)
+	hh.inject(protocol.EventContinued, protocol.ContinuedPayload{})
+
+	hh.inject(protocol.EventProcessExited, protocol.ProcessExitedPayload{ExitCode: 22})
+	secondExit := recvType[*godap.ExitedEvent](hh)
+	if secondExit.Body.ExitCode != 22 {
+		t.Fatalf("second exit code = %d, want 22", secondExit.Body.ExitCode)
+	}
+	_ = recvType[*godap.TerminatedEvent](hh)
+}
+
+func TestJoinRestartResetsTerminationForNextExit(t *testing.T) {
+	hh := startJoinWithoutWelcome(t)
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateExited})
+	_ = recvType[*godap.TerminatedEvent](hh)
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateExited})
+	expectNoDAPMessage(t, hh)
+
+	restartSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdRestart)
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateRunning})
+	expectNoDAPMessage(t, hh)
+	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{})
+	restarted := recvType[*godap.RestartResponse](hh)
+	if restarted.RequestSeq != restartSeq {
+		t.Fatalf("restart response seq = %d, want %d", restarted.RequestSeq, restartSeq)
+	}
+
+	continueCount := hh.cmds.count(protocol.CmdContinue)
+	hh.inject(protocol.EventStepped, protocol.SteppedPayload{Goroutine: protocol.Goroutine{ID: 3}})
+	hh.cmds.waitForCommandCount(t, protocol.CmdContinue, continueCount+1)
+	hh.inject(protocol.EventContinued, protocol.ContinuedPayload{})
+
+	hh.inject(protocol.EventProcessExited, protocol.ProcessExitedPayload{ExitCode: 33})
+	exited := recvType[*godap.ExitedEvent](hh)
+	if exited.Body.ExitCode != 33 {
+		t.Fatalf("exit code = %d, want 33", exited.Body.ExitCode)
+	}
+	_ = recvType[*godap.TerminatedEvent](hh)
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateExited})
+	expectNoDAPMessage(t, hh)
+}
+
+func TestJoinedObserverRestartResetsTerminationForNextExit(t *testing.T) {
+	hh := startJoinWithoutWelcome(t)
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateExited})
+	_ = recvType[*godap.TerminatedEvent](hh)
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateRunning})
+	expectNoDAPMessage(t, hh)
+	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{})
+	expectNoDAPMessage(t, hh)
+
+	hh.inject(protocol.EventStepped, protocol.SteppedPayload{Goroutine: protocol.Goroutine{ID: 4}})
+	_ = recvType[*godap.StoppedEvent](hh)
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateSuspended})
+	expectNoDAPMessage(t, hh)
+	hh.inject(protocol.EventContinued, protocol.ContinuedPayload{})
+	_ = recvType[*godap.ContinuedEvent](hh)
+
+	hh.inject(protocol.EventProcessExited, protocol.ProcessExitedPayload{ExitCode: 44})
+	exited := recvType[*godap.ExitedEvent](hh)
+	if exited.Body.ExitCode != 44 {
+		t.Fatalf("exit code = %d, want 44", exited.Body.ExitCode)
+	}
+	_ = recvType[*godap.TerminatedEvent](hh)
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{State: protocol.StateExited})
 	expectNoDAPMessage(t, hh)
 }

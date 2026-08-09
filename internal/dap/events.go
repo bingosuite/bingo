@@ -372,6 +372,7 @@ func (h *Handler) onRestarted() {
 	h.mu.Lock()
 	seq := h.restartReqSeq
 	h.restartReqSeq = 0
+	h.terminated = false
 	h.mu.Unlock()
 
 	if seq != 0 {
