@@ -402,15 +402,29 @@ func (r *dwarfReader) FramesForStack(pcs []uint64) []protocol.Frame {
 	return frames
 }
 
-// frameLookupPC converts a saved return PC to the call instruction it belongs
-// to. DWARF ranges are byte intervals, so subtracting one works for both amd64's
-// variable-width CALL and arm64's fixed-width BL. The top frame carries a live
-// PC rather than a return address and must remain unchanged.
-func frameLookupPC(pc uint64, frameIndex int) uint64 {
-	if frameIndex > 0 && pc > 0 {
-		return pc - 1
+// returnLookupPC converts a saved return address into a PC that lies inside the
+// call instruction which produced it. DWARF ranges and line rows are byte-
+// granular half-open intervals, so a raw return address can sit exactly on an
+// exclusive upper bound and resolve to the *following* statement; backing up one
+// byte lands inside the call on both amd64's variable-width CALL and arm64's
+// fixed-width BL. A zero PC means "no call site recorded" (a runtime-created or
+// cgo-callback goroutine has no `go` statement) and must stay zero rather than
+// underflow to the top of the address space.
+func returnLookupPC(pc uint64) uint64 {
+	if pc == 0 {
+		return 0
 	}
-	return pc
+	return pc - 1
+}
+
+// frameLookupPC applies returnLookupPC to every non-top frame. Frame 0 carries a
+// live PC rather than a return address and must remain unchanged; a negative
+// index is not a caller frame either, so it is left alone too.
+func frameLookupPC(pc uint64, frameIndex int) uint64 {
+	if frameIndex <= 0 {
+		return pc
+	}
+	return returnLookupPC(pc)
 }
 
 // LocalsForFrame returns type-aware, bounded variable trees for every local and

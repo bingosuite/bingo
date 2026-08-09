@@ -1089,6 +1089,8 @@ func bpID(evt protocol.Event) int {
 func declareConcurrencySpec() {
 	It("streams a goroutine spawn tree, threads, and lifecycle deltas", Label("concurrency"), func() {
 		lineTick := markerLine(concurrencyTargetSrc, "// BP_TICK")
+		lineSpawnWorker := markerLine(concurrencyTargetSrc, "// SPAWN_WORKER")
+		lineSpawnLeaf := markerLine(concurrencyTargetSrc, "// SPAWN_LEAF")
 		bin := buildTarget("concurrency_target", concurrencyTargetSrc)
 
 		h := newE2EHarness(bin)
@@ -1161,10 +1163,15 @@ func declareConcurrencySpec() {
 			"leaf parent is the worker goroutine")
 
 		// Creation site (the `go` statement) and start function per goroutine.
+		// The line assertions are the regression gate for gopc normalization:
+		// the runtime records gopc as the `go` call's return address, so an
+		// unadjusted lookup resolves to the statement AFTER the spawn.
 		Expect(worker.StartLoc.Function).To(Equal("main.worker"), "worker start function")
 		Expect(worker.CreatedLoc.Function).To(Equal("main.spawnAll"), "worker created in spawnAll")
+		Expect(worker.CreatedLoc.Line).To(Equal(lineSpawnWorker), "worker created at the go statement")
 		Expect(leaf.StartLoc.Function).To(Equal("main.leaf"), "leaf start function")
 		Expect(leaf.CreatedLoc.Function).To(Equal("main.worker"), "leaf created in worker")
+		Expect(leaf.CreatedLoc.Line).To(Equal(lineSpawnLeaf), "leaf created at the go statement")
 
 		// Lifecycle: both children are new since the baseline stop.
 		Expect(spawned.Created).To(ContainElement(worker.ID), "worker in created delta")
