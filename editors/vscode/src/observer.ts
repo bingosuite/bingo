@@ -14,10 +14,13 @@ import {
 const socketOpenState = 1;
 const reconnectDelays = [100, 250, 500, 1000, 2000, 4000] as const;
 
-// `ws` reports a frame above maxPayload with this code. Because the transport
-// ceiling sits above the decoder contract, hitting it means the peer sent
-// something far outside the contract — deterministic, not flaky, so retrying it
-// just burns the ladder. See issue #194.
+// `ws` reports a frame above maxPayload with this code. It is NOT treated as a
+// contract violation: at that layer the frame has already been discarded, so its
+// kind is unknowable — and the byte contract covers only two kinds, while
+// Locals/Frames/Evaluate are deliberately unbounded and are broadcast to every
+// client. So this is classified transient and takes the reconnect ladder. The
+// 64 KiB slack lets a frame just over the decoder budget still be delivered and
+// classified by kind; it cannot make an unbounded family fit. See issue #194.
 const oversizedFrameCode = "WS_ERR_UNSUPPORTED_MESSAGE_LENGTH";
 
 export interface Socket {
