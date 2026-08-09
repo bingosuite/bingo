@@ -9,7 +9,12 @@ import { after, describe, it } from "node:test";
 import type WebSocket from "ws";
 import { WebSocketServer } from "ws";
 
-import { toSessionViewModel, type SessionModel } from "../src/model.js";
+import {
+  formatServerCount,
+  toSessionViewModel,
+  type SessionModel,
+} from "../src/model.js";
+import { serverOmissionText } from "../src/webviewApp.js";
 import {
   observerDependencies,
   TelemetryObserver,
@@ -269,13 +274,19 @@ describe("snapshot totals", () => {
       frame(1, "GoroutineSnapshot", {
         goroutines: [{ id: 1, status: "running", current: true, currentLoc: { file: "a.go", line: 1 } }],
         threads: [],
-        totals: { goroutines: 41203, threads: 64, clipped: true },
+        totals: {
+          goroutines: 41203,
+          threads: 64,
+          goroutinesClipped: true,
+          threadsClipped: false,
+        },
       }),
     );
     assert.deepEqual(decoded.snapshot?.totals, {
       goroutines: 41203,
       threads: 64,
-      clipped: true,
+      goroutinesClipped: true,
+      threadsClipped: false,
     });
   });
 
@@ -290,7 +301,8 @@ describe("snapshot totals", () => {
     assert.deepEqual(decoded.snapshot?.totals, {
       goroutines: 9001,
       threads: 0,
-      clipped: false,
+      goroutinesClipped: false,
+      threadsClipped: false,
     });
   });
 
@@ -321,10 +333,15 @@ describe("snapshot totals", () => {
   it("decodes the 1.3 goroutine list shape with totals", () => {
     const list = decodeGoroutineList({
       goroutines: [{ id: 3, status: "running", currentLoc: { file: "a.go", line: 1 } }],
-      totals: { goroutines: 8192, clipped: true },
+      totals: { goroutines: 8192, goroutinesClipped: true },
     });
     assert.equal(list.goroutines.length, 1);
-    assert.deepEqual(list.totals, { goroutines: 8192, threads: 0, clipped: true });
+    assert.deepEqual(list.totals, {
+      goroutines: 8192,
+      threads: 0,
+      goroutinesClipped: true,
+      threadsClipped: false,
+    });
   });
 
   it("rejects unknown keys in the goroutine list shape", () => {
@@ -914,14 +931,20 @@ describe("truthful omission surfacing", () => {
       baseModel({
         snapshot: {
           ...snapshot([goroutine(1, 0, { current: true }), goroutine(2, 1)], [thread(10, 1)]),
-          totals: { goroutines: 41203, threads: 64, clipped: false },
+          totals: {
+            goroutines: 41203,
+            threads: 64,
+            goroutinesClipped: false,
+            threadsClipped: false,
+          },
         },
       }),
     );
     assert.deepEqual(view.serverTotals, {
       goroutines: 41203,
       threads: 64,
-      clipped: false,
+      goroutinesClipped: false,
+      threadsClipped: false,
       goroutinesOmitted: 41201,
       threadsOmitted: 63,
     });
@@ -938,7 +961,12 @@ describe("truthful omission surfacing", () => {
       baseModel({
         snapshot: {
           ...snapshot([goroutine(1, 0, { current: true }), goroutine(2, 1)]),
-          totals: { goroutines: 1, threads: 0, clipped: false },
+          totals: {
+            goroutines: 1,
+            threads: 0,
+            goroutinesClipped: false,
+            threadsClipped: false,
+          },
         },
       }),
     );
@@ -946,17 +974,64 @@ describe("truthful omission surfacing", () => {
     assert.equal(view.serverTotals?.goroutinesOmitted, 0);
   });
 
-  it("marks a clipped scan as a lower bound", () => {
-    const view = toSessionViewModel(
-      baseModel({
-        snapshot: {
-          ...snapshot([goroutine(1, 0, { current: true })], [thread(10, 1)]),
-          totals: { goroutines: 8192, threads: 64, clipped: true },
-        },
-      }),
-    );
-    assert.equal(view.serverTotals?.clipped, true);
-    assert.equal(view.serverTotals?.threads, 64);
+  // The four scan-clipping combinations: each count must be marked a lower bound
+  // only when ITS OWN scan clipped. The ceilings are independent, so a shared
+  // flag necessarily lies about one of them.
+  for (const [label, goroutinesClipped, threadsClipped] of [
+    ["neither", false, false],
+    ["goroutines only", true, false],
+    ["threads only", false, true],
+    ["both", true, true],
+  ] as const) {
+    it(`marks lower bounds independently: ${label}`, () => {
+      const view = toSessionViewModel(
+        baseModel({
+          snapshot: {
+            ...snapshot([goroutine(1, 0, { current: true })], [thread(10, 1)]),
+            totals: {
+              goroutines: 8192,
+              threads: 64,
+              goroutinesClipped,
+              threadsClipped,
+            },
+          },
+        }),
+      );
+      assert.equal(view.serverTotals?.goroutinesClipped, goroutinesClipped);
+      assert.equal(view.serverTotals?.threadsClipped, threadsClipped);
+      assert.equal(view.serverTotals?.goroutines, 8192);
+      assert.equal(view.serverTotals?.threads, 64);
+
+      // And the rendered statistic follows each flag, not a shared one.
+      assert.equal(
+        formatServerCount(1, 8192, goroutinesClipped).endsWith("+"),
+        goroutinesClipped,
+      );
+      assert.equal(
+        formatServerCount(1, 64, threadsClipped).endsWith("+"),
+        threadsClipped,
+      );
+    });
+  }
+
+  it("names each clipped scan separately in the omission note", () => {
+    const note = (goroutinesClipped: boolean, threadsClipped: boolean): string =>
+      serverOmissionText({
+        goroutines: 8192,
+        threads: 2048,
+        goroutinesClipped,
+        threadsClipped,
+        goroutinesOmitted: 0,
+        threadsOmitted: 0,
+      }) ?? "";
+
+    assert.equal(note(false, false), "", "nothing to report");
+    assert.match(note(true, false), /8192 goroutines/u);
+    assert.doesNotMatch(note(true, false), /threads, so that total/u);
+    assert.match(note(false, true), /2048 threads/u);
+    assert.doesNotMatch(note(false, true), /goroutines, so that total/u);
+    assert.match(note(true, true), /8192 goroutines/u);
+    assert.match(note(true, true), /2048 threads/u);
   });
 
   it("keeps a goroutine whose parent was omitted as a root", () => {
@@ -969,7 +1044,12 @@ describe("truthful omission surfacing", () => {
             [goroutine(1, 0, { current: true }), goroutine(99, 4242)],
             [thread(10, 1)],
           ),
-          totals: { goroutines: 5000, threads: 2, clipped: false },
+          totals: {
+            goroutines: 5000,
+            threads: 2,
+            goroutinesClipped: false,
+            threadsClipped: false,
+          },
         },
       }),
     );
@@ -1056,7 +1136,12 @@ describe("real WebSocket transport", () => {
               goroutines: richGoroutines(1250),
               threads: [],
               current: 1,
-              totals: { goroutines: 41203, threads: 64, clipped: true },
+              totals: {
+                goroutines: 41203,
+                threads: 64,
+                goroutinesClipped: true,
+                threadsClipped: false,
+              },
             }),
           );
         }
@@ -1069,7 +1154,7 @@ describe("real WebSocket transport", () => {
     assert.equal(live.observer.model.connection, "connected");
     assert.equal(live.observer.model.error, "");
     assert.equal(live.observer.model.snapshot?.goroutines.length, 1250);
-    assert.equal(live.observer.model.snapshot?.totals?.clipped, true);
+    assert.equal(live.observer.model.snapshot?.totals?.goroutinesClipped, true);
     assert.equal(live.observer.model.lastSeq, stops);
     live.observer.dispose();
   });

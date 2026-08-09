@@ -43,13 +43,15 @@ export interface SessionViewModel extends SessionModel {
 }
 
 // ServerTotals restates a snapshot's SnapshotTotals in terms this view renders:
-// the server's original counts and how many elements never reached us. clipped
-// means the server's own runtime scan was cut short, so the totals are
-// themselves lower bounds and must be shown as such.
+// the server's original counts and how many elements never reached us. The
+// clipped flags are per collection — the debugger's goroutine and thread scans
+// have independent ceilings — so each count is marked a lower bound only when
+// its OWN scan was cut short.
 export interface ServerTotals {
   readonly goroutines: number;
   readonly threads: number;
-  readonly clipped: boolean;
+  readonly goroutinesClipped: boolean;
+  readonly threadsClipped: boolean;
   readonly goroutinesOmitted: number;
   readonly threadsOmitted: number;
 }
@@ -99,7 +101,8 @@ export function serverTotals(
   return {
     goroutines,
     threads,
-    clipped: totals.clipped,
+    goroutinesClipped: totals.goroutinesClipped,
+    threadsClipped: totals.threadsClipped,
     goroutinesOmitted: goroutines - snapshot.goroutines.length,
     threadsOmitted: threads - snapshot.threads.length,
   };

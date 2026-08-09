@@ -700,10 +700,16 @@ synthetic id above it would be rejected by the consumer, not merely rounded.
 **Totals = the honesty channel.** `SnapshotTotals{Goroutines, Threads, Clipped}`
 is present **iff** the wire omits elements or the runtime scan was clipped, and
 absent on a complete unclipped result, so its mere presence means "this is not
-everything". `Clipped` means `maxGoroutineScan` was hit before packing started,
-which makes the goroutine count a **lower bound** — consumers must render it as
-such (the VS Code view appends `+`). A total below the delivered count is a
-contradiction, not a truncation report, and the consumer rejects it. Layer A owns the contract and the packers;
+everything". The clipped flags are **per collection** — `GoroutinesClipped` and
+`ThreadsClipped` — because the debugger walks goroutines and threads under
+independent ceilings (`maxGoroutineScan`, `maxThreadScan`). A single shared flag
+cannot say which one fired, so a consumer is forced to guess and will mark an
+exact count approximate (or an approximate one exact). Each flag means only
+"this count is a lower bound"; the counts themselves stay the original scanned
+totals, and each is rendered independently (the VS Code view and `wsmon` append
+`+` per count). `PackGoroutines` takes only the goroutine flag — that shape
+carries no threads. A total below the delivered count is a contradiction, not a
+truncation report, and the consumer rejects it. Layer A owns the contract and the packers;
 producer wiring in `internal/debugger` is layer B and does not exist yet.
 
 **Streaming cadence (the load-bearing invariant).** `EventGoroutineSnapshot` is
