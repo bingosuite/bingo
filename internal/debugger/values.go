@@ -21,7 +21,7 @@ import (
 // erroring the stop. See AGENTS.md → DWARF reader notes.
 
 // Bounds on the eager tree. The per-node depth (maxValueDepth) and per-aggregate
-// width (maxChildren) caps plus the visited-address cycle guard stop any single
+// width (maxChildren) caps plus the active-pointer cycle guard stop any single
 // path from running away, but a collection-of-collections is still bounded only
 // by their product (e.g. [][][][]int ≈ maxChildren⁴ nodes, each doing its own
 // ReadMemory). maxTotalNodes/maxTotalBytes add a SHARED ceiling across the whole
@@ -64,15 +64,17 @@ const (
 )
 
 // formatCtx carries the per-inspection state shared across the whole recursive
-// walk. b and visited are shared; depth/ptrDepth are passed by value so a
-// sibling's recursion budget is independent. nodesLeft and bytesLeft are the
-// shared GLOBAL ceiling (see the bounds block): decremented once per formatNode
-// and by each read, so a collection-of-collections can't fan out unboundedly.
+// walk. activePointers contains only the current recursion path; entries are
+// removed while unwinding so sibling aliases expand independently. depth and
+// ptrDepth are passed by value so a sibling's recursion budget is independent.
+// nodesLeft and bytesLeft are the shared GLOBAL ceiling (see the bounds block):
+// decremented once per formatNode and by each read, so a
+// collection-of-collections can't fan out unboundedly.
 type formatCtx struct {
-	b         Backend
-	visited   map[uint64]bool // addresses whose formatting has begun (cycle guard)
-	nodesLeft int             // remaining nodes for this inspection (shared)
-	bytesLeft int             // remaining bytes to read for this inspection (shared)
+	b              Backend
+	activePointers map[uint64]bool
+	nodesLeft      int // remaining nodes for this inspection (shared)
+	bytesLeft      int // remaining bytes to read for this inspection (shared)
 }
 
 // read fetches n bytes at addr like readMem, additionally debiting the shared
@@ -91,10 +93,25 @@ func (ctx *formatCtx) budgetExhausted() bool {
 	return ctx.nodesLeft <= 0 || ctx.bytesLeft <= 0
 }
 
+// enterPointer claims addr for the current recursion path. A rejected claim
+// returns no cleanup function, so a cycle cannot remove its ancestor's entry.
+func (ctx *formatCtx) enterPointer(addr uint64) (leave func(), ok bool) {
+	if ctx.activePointers[addr] {
+		return nil, false
+	}
+	ctx.activePointers[addr] = true
+	return func() { delete(ctx.activePointers, addr) }, true
+}
+
 // formatTyped renders the value of type typ stored at addr into a bounded
 // protocol.Variable tree rooted at name.
 func (r *dwarfReader) formatTyped(b Backend, name string, typ dwarf.Type, addr uint64) protocol.Variable {
-	ctx := &formatCtx{b: b, visited: map[uint64]bool{}, nodesLeft: maxTotalNodes, bytesLeft: maxTotalBytes}
+	ctx := &formatCtx{
+		b:              b,
+		activePointers: map[uint64]bool{},
+		nodesLeft:      maxTotalNodes,
+		bytesLeft:      maxTotalBytes,
+	}
 	return r.formatNode(name, typ, addr, 0, 0, ctx)
 }
 
@@ -218,13 +235,17 @@ func (r *dwarfReader) formatPointer(out *protocol.Variable, t *dwarf.PtrType, ad
 	}
 	out.Value = fmt.Sprintf("0x%x", p)
 	// One bounded dereference as a child, guarded against cycles and budget.
-	if ptrDepth >= maxPtrDeref || depth >= maxValueDepth || ctx.visited[p] {
+	if ptrDepth >= maxPtrDeref || depth >= maxValueDepth {
 		return
 	}
 	if _, ok := t.Type.(*dwarf.VoidType); ok {
 		return // unsafe.Pointer — nothing typed to deref
 	}
-	ctx.visited[p] = true
+	leave, ok := ctx.enterPointer(p)
+	if !ok {
+		return
+	}
+	defer leave()
 	child := r.formatNode("*"+out.Name, t.Type, p, depth+1, ptrDepth+1, ctx)
 	out.Children = []protocol.Variable{child}
 }
