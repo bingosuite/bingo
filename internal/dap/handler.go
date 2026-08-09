@@ -169,10 +169,13 @@ type bpSlot struct {
 	bp       godap.Breakpoint
 }
 
-// bpOp is one in-flight debugger command for a single file:line. At most one
-// exists per line at a time, which is what keeps the id-less FIFO correlation
-// unambiguous: the head of setQ/clearQ is the operation the next confirmation
-// belongs to — and which queue it sits in is what makes it a set or a clear.
+// bpOp is one in-flight debugger command for a single file:line. A line has at
+// most one LIVE operation at a time, which is what keeps the id-less FIFO
+// correlation unambiguous: the head of setQ/clearQ is the operation the next
+// confirmation belongs to — and which queue it sits in is what makes it a set or
+// a clear. An operation whose line was discarded by a restart is abandoned and
+// no longer speaks for that line, but stays queued so its answer still pops the
+// head it reserved (see liveLineLocked).
 type bpOp struct {
 	file string
 	line int
@@ -183,7 +186,7 @@ type bpOp struct {
 // legitimately disagree. installedID is a fact — set only by a confirmed
 // SetBreakpoint, dropped only by a confirmed ClearBreakpoint — while desired is
 // the latest-wins intent of the most recent request for the source. A line with
-// the two in agreement is converged; otherwise exactly one op is in flight and
+// the two in agreement is converged; otherwise exactly one operation is live and
 // every waiter parks here until it completes. dapID is the stable client-facing
 // identity, which deliberately outlives a debugger id change across restart.
 type bpLine struct {

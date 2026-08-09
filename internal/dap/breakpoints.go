@@ -156,28 +156,32 @@ func (h *Handler) settleLineLocked(file string, line int) []*bpRequest {
 }
 
 // failClearLocked completes the removal obligations on a line whose clear could
-// not be issued or was rejected, failing their requests. It deliberately does
-// NOT re-enter the convergence loop: the line is still armed and still unwanted,
-// so advancing it again would retry a failing clear forever. The retained
-// mapping means the next setBreakpoints for the source can retry it.
+// not be issued or was rejected.
 //
-// Slots parked on the line are answered here too, unconditionally. A failed
-// clear ends the line's only in-flight operation, so this is the last thing that
-// will happen to it until a new request arrives — anything still waiting would
-// otherwise wait forever. That includes an earlier pipelined request whose Set
-// this clear was cancelling: its breakpoint really is armed, so the line's
-// current identity is a truthful answer for it. Caller MUST hold h.mu.
+// While the line is still armed this is the end of the road for it: re-entering
+// the convergence loop would retry a failing clear forever, so the rejection is
+// reported to the requests that asked for the removal and the mapping is
+// retained (the next setBreakpoints for the source can retry it). Slots parked
+// on the line are answered from that armed identity — including an earlier
+// pipelined request whose Set this clear was cancelling, whose breakpoint really
+// is armed. Nothing else will touch the line until a new request arrives, so
+// anything left waiting here would wait forever.
+//
+// If nothing is armed there is neither anything to retry nor anything to report:
+// the removal these requests asked for did happen, so they are completed rather
+// than failed, and the line is free to converge on whatever the newest request
+// wants. Caller MUST hold h.mu.
 func (h *Handler) failClearLocked(file string, line int, msg string) []*bpRequest {
 	st := h.bpByFile[file][line]
 	if st == nil {
 		return nil
 	}
-	ready := st.dischargeOwners(msg)
-	ready = append(ready, st.resolveSlots()...)
-	// Only reachable when the line is no longer armed (a restart discarded it
-	// under the in-flight clear); a still-armed line is retained by gc.
-	h.gcLineLocked(file, line)
-	return ready
+	if st.installedID != 0 {
+		ready := st.dischargeOwners(msg)
+		return append(ready, st.resolveSlots()...)
+	}
+	ready := st.dischargeOwners("")
+	return append(ready, h.advanceLineLocked(file, line)...)
 }
 
 // gcLineLocked forgets a line the adapter has no reason to remember: unwanted,
