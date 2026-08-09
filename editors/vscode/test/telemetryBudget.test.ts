@@ -20,6 +20,7 @@ import {
   decodeGoroutineList,
   maximumEnvelopeBytes,
   maximumGoroutines,
+  maximumLifecycleIDs,
   maximumStringLength,
   maximumThreads,
   maximumTransportBytes,
@@ -336,13 +337,14 @@ describe("snapshot totals", () => {
 
 describe("lifecycle deltas are not capped like packed elements", () => {
   // The packer never trims created/exited, and the debugger's runtime scan
-  // reaches 8192 — well past the 5000 packed-element cap. Rejecting those was a
-  // false positive that, now that protocol errors are terminal, killed the view
-  // permanently on exactly the workload this contract exists for.
-  function deltaFrame(count: number): string {
+  // reaches maximumLifecycleIDs — well past the 5000 packed-element cap.
+  // Rejecting those was a false positive that, now that protocol errors are
+  // terminal, killed the view permanently on exactly the workload this contract
+  // exists for.
+  function deltaFrame(count: number, start = 1): string {
     const ids: number[] = [];
-    for (let id = 1; id <= count; id += 1) {
-      ids.push(id);
+    for (let i = 0; i < count; i += 1) {
+      ids.push(start + i);
     }
     return frame(1, "GoroutineSnapshot", {
       goroutines: [
@@ -351,19 +353,75 @@ describe("lifecycle deltas are not capped like packed elements", () => {
       threads: [],
       current: 1,
       created: ids,
-      exited: ids.map((id) => id + 1_000_000),
+      exited: ids.map((id) => id + 10_000_000),
     });
   }
 
-  it("accepts a delta larger than the packed-element cap", () => {
+  it("accepts a delta one past the packed-element cap", () => {
+    // The exact count that used to be rejected.
     const decoded = decodeEvent(deltaFrame(maximumGoroutines + 1));
     assert.equal(decoded.snapshot?.created.length, maximumGoroutines + 1);
     assert.equal(decoded.snapshot?.exited.length, maximumGoroutines + 1);
   });
 
-  it("accepts the largest delta the runtime scan can produce", () => {
-    const decoded = decodeEvent(deltaFrame(8192));
-    assert.equal(decoded.snapshot?.created.length, 8192);
+  // The ceiling is written out rather than taken from the constant: a test that
+  // reads the value it is checking would silently follow it down and stop
+  // catching the very regression this exists for.
+  const scanCeiling = 8192;
+
+  it("accepts a delta at exactly the scan ceiling", () => {
+    assert.equal(maximumLifecycleIDs, scanCeiling);
+    const decoded = decodeEvent(deltaFrame(scanCeiling));
+    assert.equal(decoded.snapshot?.created.length, scanCeiling);
+    assert.equal(decoded.snapshot?.exited.length, scanCeiling);
+  });
+
+  it("rejects a delta one past the scan ceiling", () => {
+    assert.throws(
+      () => decodeEvent(deltaFrame(scanCeiling + 1)),
+      /created exceeds the 8192 item limit/u,
+    );
+  });
+
+  it("accepts the worst-case delta frame within the byte contract", () => {
+    // Both deltas at the ceiling with maximum-width safe-integer ids: the
+    // largest lifecycle payload the producer can ever emit.
+    const maxSafe = Number.MAX_SAFE_INTEGER;
+    const created: number[] = [];
+    const exited: number[] = [];
+    for (let i = 0; i < scanCeiling; i += 1) {
+      created.push(maxSafe - i);
+      exited.push(maxSafe - scanCeiling - i);
+    }
+    const raw = frame(1, "GoroutineSnapshot", {
+      goroutines: [
+        { id: 1, status: "running", current: true, currentLoc: { file: "a.go", line: 1 } },
+      ],
+      threads: [],
+      current: 1,
+      created,
+      exited,
+    });
+    assert.ok(
+      Buffer.byteLength(raw) < maximumEnvelopeBytes,
+      "the worst-case delta frame must stay inside the byte contract",
+    );
+    const decoded = decodeEvent(raw);
+    assert.equal(decoded.snapshot?.created.length, scanCeiling);
+  });
+
+  it("mirrors the producer's lifecycle-delta ceiling", () => {
+    const source = goSource("pkg/protocol/protocol.go");
+    assert.match(
+      source,
+      new RegExp(`MaxLifecycleDeltaIDs\\s*=\\s*${String(scanCeiling)}\\b`),
+      "producer and consumer must agree on the delta ceiling",
+    );
+    assert.notEqual(
+      maximumLifecycleIDs,
+      maximumGoroutines,
+      "deltas must not be bounded by the packed-element cap",
+    );
   });
 
   it("still rejects duplicate ids inside a delta", () => {

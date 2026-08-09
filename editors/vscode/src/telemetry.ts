@@ -18,14 +18,15 @@ export const maximumThreads = 2048;
 export const maximumStringLength = 4096;
 
 // created/exited are lifecycle DELTAS, not packed elements. The packer never
-// trims them — a truncated delta would silently corrupt a consumer's lifecycle
-// state — so they can legitimately exceed the packed-element caps (the
-// debugger's runtime scan reaches 8192). A count cap here could therefore only
-// ever falsely reject a legal frame. The real bound is the byte contract
-// already enforced before parse: a delta id costs at least two bytes on the
-// wire (a digit plus its separator), so this ceiling can never reject a frame
-// that passed that check, while still bounding the array explicitly.
-const maximumLifecycleIDs = maximumEnvelopeBytes / 2;
+// trims them — a truncated delta would silently corrupt this observer's
+// lifecycle state — so they can legitimately exceed the packed-element caps and
+// must NOT be validated against maximumGoroutines. What actually bounds them is
+// the producer's runtime walk: both are set differences over the live goroutine
+// set, which the debugger caps at its scan ceiling. This mirrors the producer's
+// MaxLifecycleDeltaIDs and is drift-checked against it, because a producer that
+// raised its scan ceiling without raising this would have every large snapshot
+// deterministically rejected here.
+export const maximumLifecycleIDs = 8192;
 
 const maximumPayloadNodes = 20_000;
 const utf8 = new TextDecoder("utf-8", { fatal: true });

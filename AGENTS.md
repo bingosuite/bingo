@@ -678,6 +678,20 @@ byte- or rune-counting would disagree exactly at the boundary. Invalid UTF-8
 bytes count as one unit each, matching both Go's range loop and `encoding/json`'s
 one-U+FFFD-per-bad-byte substitution.
 
+`MaxLifecycleDeltaIDs` (8192) is the same idea applied to `Created`/`Exited`.
+Those are NEVER trimmed, so they carry no packing limit — what bounds them is the
+producer's own walk (both are set differences over the live goroutine set, capped
+by `maxGoroutineScan`). The constant restates that ceiling as a wire contract and
+is drift-checked against `internal/debugger`'s `maxGoroutineScan` from the
+protocol tests, and mirrored + drift-checked again in the VS Code decoder. It
+deliberately does NOT reuse `MaxSnapshotGoroutines`: that caps how many elements
+are *packed*, and validating a delta against it rejects legal snapshots — which,
+with terminal protocol errors, killed the view on exactly the busy targets this
+contract exists for. Worst case (both deltas at the ceiling, maximum-width ids)
+is well under half the byte budget, so deltas can never starve the elements. A
+delta beyond the ceiling is *reported* via `GoroutinePackReport.Oversized`, never
+silently trimmed.
+
 The same rule binds anything else the two sides both validate. Goids and
 lifecycle-delta ids must stay inside JavaScript's safe-integer range (2^53−1);
 the runtime's sequential goid counter guarantees that in practice, but a
