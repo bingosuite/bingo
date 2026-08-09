@@ -10,8 +10,8 @@ import (
 // GoroutinePackReport describes what a Pack call put on the wire. Producers use
 // it to log or surface truncation; it is never serialized.
 type GoroutinePackReport struct {
-	// Totals are the original untrimmed counts plus the scan-clipped flag,
-	// regardless of whether they were attached to the payload.
+	// Totals are the original untrimmed counts plus each collection's
+	// scan-clipped flag, regardless of whether they reached the payload.
 	Totals SnapshotTotals
 
 	// Goroutines and Threads are the counts that survived onto the wire.

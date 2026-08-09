@@ -1668,9 +1668,15 @@ empty collections (with the deltas intact) and reports it — never a panic.
 Whether `Totals` lands on the wire changes the reserve and is only known after
 packing, so the pass is run optimistically and retried once against the true
 reserve if it turns out to omit anything (a clipped scan forces totals up front,
-so it needs no retry). The retry can only omit more, never fewer, so it settles —
-and it is what keeps a payload that exactly fills the budget from being falsely
-degraded. Hence "each candidate marshalled at most twice".
+so it needs no retry). Exactly two passes suffice, but NOT because the retry
+omits at least as much — with skip-and-continue a tighter budget can reject one
+big early element and admit several small later ones, so that property is false.
+The argument is by contradiction: if pass 2 omitted nothing, every element fit
+under its smaller budget and so would have fit under pass 1's larger one,
+contradicting pass 1 having omitted something. So pass 2 always omits, Totals
+stays present, and the reserve it was measured against was right. The retry is
+what keeps a payload that exactly fills the budget from being falsely degraded.
+Hence "each candidate marshalled at most twice".
 
 **Producer and consumer constraints must agree EXACTLY.** The budget alone is
 not enough: `MaxGoroutineStringLength` (4096) caps every string inside a packed
@@ -1704,8 +1710,9 @@ lifecycle-delta ids must stay inside JavaScript's safe-integer range (2^53−1);
 the runtime's sequential goid counter guarantees that in practice, but a
 synthetic id above it would be rejected by the consumer, not merely rounded.
 
-**Totals = the honesty channel.** `SnapshotTotals{Goroutines, Threads, Clipped}`
-is present **iff** the wire omits elements or the runtime scan was clipped, and
+**Totals = the honesty channel.**
+`SnapshotTotals{Goroutines, Threads, GoroutinesClipped, ThreadsClipped}`
+is present **iff** the wire omits elements or a runtime scan was clipped, and
 absent on a complete unclipped result, so its mere presence means "this is not
 everything". The clipped flags are **per collection** — `GoroutinesClipped` and
 `ThreadsClipped` — because the debugger walks goroutines and threads under
