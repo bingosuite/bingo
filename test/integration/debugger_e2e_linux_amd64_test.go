@@ -187,9 +187,6 @@ func main() {
 	for atomic.LoadInt64(&signalledProgress) == 0 || atomic.LoadInt64(&siblingProgress) == 0 {
 		runtime.Gosched()
 	}
-	signalledBefore := atomic.LoadInt64(&signalledProgress)
-	siblingBefore := atomic.LoadInt64(&siblingProgress)
-
 	if err := syscall.Tgkill(os.Getpid(), signalledTID, syscall.SIGUSR1); err != nil {
 		os.Exit(91)
 	}
@@ -198,6 +195,8 @@ func main() {
 	case <-time.After(5 * time.Second):
 		os.Exit(92)
 	}
+	signalledBefore := atomic.LoadInt64(&signalledProgress)
+	siblingBefore := atomic.LoadInt64(&siblingProgress)
 
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -787,6 +786,8 @@ func declareStepOverlapSignalSpec() {
 	It("resumes the thread that stopped when a foreign signal lands mid-step",
 		Label("overlap"), func() {
 			p, bpA, bpB := setupOverlap("overlap_signal_target", overlapSignalTargetSrc)
+			parkedSignalsBefore, ok := debugger.LinuxParkedSignalCount(p.h.d)
+			Expect(ok).To(BeTrue(), "parked-signal hook unavailable")
 
 			iters := envInt("BINGO_E2E_OVERLAP_SIGNAL_ITERS", 40)
 			// Machine steps per cycle. A foreign signal is only *held* if it
@@ -876,7 +877,7 @@ func declareStepOverlapSignalSpec() {
 			// a lost signal number could not have shown up.
 			parkedSignals, ok := debugger.LinuxParkedSignalCount(p.h.d)
 			Expect(ok).To(BeTrue(), "parked-signal hook unavailable")
-			Expect(parkedSignals).To(BeNumerically(">", 0),
+			Expect(parkedSignals).To(BeNumerically(">", parkedSignalsBefore),
 				"no signal stop was ever held back across %d cycles x %d steps: "+
 					"the queued signal path was not exercised", iters, steps)
 			// Liveness: threads are still making progress at the end of the
@@ -902,7 +903,7 @@ func declareStepOverlapSignalSpec() {
 			Expect(ok).To(BeTrue(), "step-rearm hook unavailable")
 
 			AddReportEntry("overlap-signal-parked-stops", parked)
-			AddReportEntry("overlap-signal-parked-signal-stops", parkedSignals)
+			AddReportEntry("overlap-signal-parked-signal-stops", parkedSignals-parkedSignalsBefore)
 			AddReportEntry("overlap-signal-values", fmt.Sprintf("%v", p.signalValues))
 			AddReportEntry("overlap-signal-step-rearms", rearms)
 		})
