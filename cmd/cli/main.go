@@ -240,14 +240,12 @@ func main() {
 			}
 
 		case "goroutines", "grs":
-			grs, err := c.Goroutines()
+			grs, err := c.GoroutineList()
 			if err != nil {
 				printErr(err)
 				continue
 			}
-			for _, g := range grs {
-				printGoroutine(g)
-			}
+			fmt.Print(formatGoroutineList(grs))
 
 		case "snapshot", "snap":
 			// Fire-and-forget: the snapshot answers on the event stream, where
@@ -393,7 +391,25 @@ func printAuxEvent(evt protocol.Event) {
 
 // printGoroutine renders one goroutine line, marking the current one and
 // showing parent linkage and its start function so a spawn tree is visible.
+// formatGoroutineList renders the listing plus what it does not show. Without
+// the trailing count the listing itself is the claim: the reader sees the
+// delivered set with no way to tell the whole runtime from a packed subset or a
+// scan that stopped early. Returns a string so the honesty line is testable.
+func formatGoroutineList(list protocol.GoroutinesPayload) string {
+	var b strings.Builder
+	for _, g := range list.Goroutines {
+		b.WriteString(formatGoroutine(g) + "\n")
+	}
+	fmt.Fprintf(&b, "  (%s)\n",
+		countOf(len(list.Goroutines), list.Totals, totalGoroutines))
+	return b.String()
+}
+
 func printGoroutine(g protocol.Goroutine) {
+	fmt.Println(formatGoroutine(g))
+}
+
+func formatGoroutine(g protocol.Goroutine) string {
 	marker := " "
 	if g.Current {
 		marker = "*"
@@ -409,7 +425,7 @@ func printGoroutine(g protocol.Goroutine) {
 	if g.WaitReason != "" {
 		line += fmt.Sprintf("  (%s)", g.WaitReason)
 	}
-	fmt.Println(line)
+	return line
 }
 
 // printSnapshot renders a full concurrency snapshot: goroutines (with spawn

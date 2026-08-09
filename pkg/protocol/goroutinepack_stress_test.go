@@ -497,3 +497,99 @@ func TestPackMaxShapedPayload(t *testing.T) {
 			len(out.Goroutines), len(out.Threads))
 	}
 }
+
+// TestFastPathEmissionsAreUnderTheCap targets the only region where an unsound
+// bound can actually do damage: when boundedSize proves a fit, the packer
+// returns WITHOUT marshalling, so nothing downstream would notice an over-cap
+// event. A max-shaped payload does not exercise this — its bound correctly
+// exceeds the cap and falls through to measurement. So this sweeps shapes up to
+// and across the point where the fast path stops being taken, and for every
+// pack that skipped measurement it marshals the real event and holds it to the
+// cap. Most cases here do take the fast path; the guard below keeps the test
+// honest if a future change moves that boundary.
+// snapshotOfWidth builds a snapshot of n goroutines whose eight string fields
+// each carry width control characters — the adversarial fill, since they escape
+// to six bytes, exactly what the bound charges, leaving it no slack.
+func snapshotOfWidth(n, width int) protocol.GoroutineSnapshotPayload {
+	fill := strings.Repeat("\x1f", width)
+	loc := protocol.Location{File: fill, Line: math.MaxInt64, Function: fill}
+	gs := make([]protocol.Goroutine, 0, n)
+	for i := 1; i <= n; i++ {
+		gs = append(gs, protocol.Goroutine{
+			ID: math.MaxInt64 - i, ParentID: math.MaxInt64 - i, ThreadID: math.MaxInt64,
+			Status: fill, WaitReason: fill, Current: i == 1,
+			CurrentLoc: loc, StartLoc: loc, CreatedLoc: loc,
+		})
+	}
+	ts := make([]protocol.Thread, 0, 64)
+	for i := 0; i < 64; i++ {
+		ts = append(ts, protocol.Thread{
+			ID: math.MaxInt64, MID: math.MaxInt64, GoID: math.MaxInt64,
+			Current: i == 0, CurrentLoc: loc,
+		})
+	}
+	return protocol.GoroutineSnapshotPayload{Goroutines: gs, Threads: ts, Current: gs[0].ID}
+}
+
+// packedOnFastPath reports whether the pack skipped measurement entirely.
+func packedOnFastPath(in protocol.GoroutineSnapshotPayload) (protocol.GoroutineSnapshotPayload, protocol.GoroutinePackReport, bool) {
+	protocol.ResetPackMarshalCounts()
+	out, report := protocol.PackSnapshot(in, false, false)
+	elements, envelopes := protocol.PackMarshalCounts()
+	return out, report, elements == 0 && envelopes == 0
+}
+
+// TestFastPathEmissionsAreUnderTheCap targets the only region where an unsound
+// bound can do damage: when boundedSize proves a fit, the packer returns WITHOUT
+// marshalling, so nothing downstream would notice an over-cap event.
+//
+// It searches for the boundary rather than sampling a grid. The dangerous band
+// is narrow in both element count and string width, and the two trade off
+// against each other, so any fixed sample steps over it: with one under-estimate
+// a width sweep put adjacent points 52 KB below the cap and far above it, and a
+// two-dimensional grid still straddled the violation at n between its 400 and
+// 1000 rungs. The largest element count that still takes the fast path is
+// exactly where bound approaches the cap, which is where any under-estimate
+// shows up, so each width is bisected for that count and checked there.
+func TestFastPathEmissionsAreUnderTheCap(t *testing.T) {
+	checked := 0
+	for _, width := range []int{0, 1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 256, 512} {
+		// The fast path is taken while the bound holds, and the bound rises
+		// monotonically with the element count, so the frontier is bisectable.
+		lo, hi := 1, protocol.MaxSnapshotGoroutines
+		if _, _, fast := packedOnFastPath(snapshotOfWidth(lo, width)); !fast {
+			continue // even one element is measured at this width
+		}
+		for lo < hi {
+			mid := (lo + hi + 1) / 2
+			if _, _, fast := packedOnFastPath(snapshotOfWidth(mid, width)); fast {
+				lo = mid
+			} else {
+				hi = mid - 1
+			}
+		}
+
+		// Check at the frontier and just inside it: an under-estimate that only
+		// bites a little below the edge would otherwise slip through.
+		for _, n := range []int{lo, lo * 9 / 10, lo / 2} {
+			if n < 1 {
+				continue
+			}
+			out, report, fast := packedOnFastPath(snapshotOfWidth(n, width))
+			if !fast {
+				continue
+			}
+			checked++
+			if report.Degraded {
+				t.Fatalf("fast path degraded (n=%d, width=%d)", n, width)
+			}
+			if size := eventBytesPlain(t, protocol.EventGoroutineSnapshot, out); size > protocol.MaxGoroutineEventBytes {
+				t.Fatalf("fast path emitted %d bytes, over the cap (n=%d, width=%d)",
+					size, n, width)
+			}
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no case took the fast path, so this proved nothing")
+	}
+}
