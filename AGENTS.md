@@ -515,6 +515,18 @@ every observable stop, every hit belongs to a known id, no error or unexpected
 exit, both ids still clearable, threads still making progress at the end of the
 run — plus non-vacuity. The `churn` label runs five rounds in CI.
 
+**Non-vacuity is asserted, not assumed.** The overlap those specs provoke is
+inherently racy, so a run that never actually parked a stop proves nothing about
+the rule. `LinuxParkedStopCount`
+([park_diag_linux_amd64.go](internal/debugger/park_diag_linux_amd64.go)) exposes
+the backend's cumulative park counter through the public `Debugger` surface —
+the same test-hook shape as darwin's `DarwinTaskPortSendRefs` — and the
+step-over and foreign-signal specs **fail** if it never advanced. Without that
+gate a build with the parking rule deleted still passes every other assertion in
+those specs. The counter is cumulative and `atomic` because the test reads it
+from its own goroutine; draining and purging describe what is still held, not
+what was ever held, so neither rolls it back.
+
 **Sizing rule for these specs — they race their own target's watchdog.** Every
 E2E target self-terminates with `go func() { time.Sleep(180 * time.Second);
 os.Exit(0) }()`. A `-race` cycle costs ~0.8–1.05s and hosted runners vary by
