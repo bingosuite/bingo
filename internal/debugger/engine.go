@@ -15,6 +15,13 @@ const (
 	eventBufSize  = 64
 	maxStackDepth = 64
 
+	// eventBufReserve is extra channel capacity on top of eventBufSize that
+	// ORDINARY events may never occupy. It is held back so a suspending halt
+	// event always has somewhere to go: emit is non-blocking and drops on a
+	// full buffer, and dropping the halt's EventPaused is what strands a
+	// session for good (issue #183). See haltOnError and emitReserved.
+	eventBufReserve = 1
+
 	stepOverNextFile  = "<stepover-next>"
 	stepOutReturnFile = "<stepout-return>"
 )
@@ -174,7 +181,7 @@ func newEngine(b Backend, log *slog.Logger) *engine {
 	e := &engine{
 		backend: b,
 		bps:     newBreakpointTable(),
-		events:  make(chan protocol.Event, eventBufSize),
+		events:  make(chan protocol.Event, eventBufSize+eventBufReserve),
 		cmdCh:   make(chan engineCmd, 8),
 		stopCh:  make(chan stopResult, 1),
 		done:    make(chan struct{}),
@@ -1214,7 +1221,31 @@ func (e *engine) nextSeq() uint64 {
 	return s
 }
 
+// emit queues an ordinary event. It refuses to touch the reserved tail slot,
+// which exists solely so a suspending halt event can always be delivered — see
+// emitReserved.
 func (e *engine) emit(kind protocol.EventKind, payload any) {
+	e.emitWithin(kind, payload, eventBufSize)
+}
+
+// emitReserved queues an event that may use the reserved slot on top of
+// eventBufSize. Only suspending halt events use it: they are the one kind whose
+// loss is unrecoverable, because the hub gates on them and drains resumeCh only
+// while gated.
+//
+// One reserved slot is enough because a second halt cannot be queued behind the
+// first. Emitting a halt leaves the engine stateSuspended with the tracee
+// stopped, and a stopped tracee cannot produce the next stop; the only way back
+// to running is a resume, which the hub sends exclusively from inside the
+// suspend wait loop it enters after RECEIVING the suspending event. So the
+// reserved slot is always free again before another halt can be reported. The
+// same argument covers the ordinary suspending events (BreakpointHit/Stepped/
+// Paused/Panic): none can still be queued when a halt is handled.
+func (e *engine) emitReserved(kind protocol.EventKind, payload any) {
+	e.emitWithin(kind, payload, eventBufSize+eventBufReserve)
+}
+
+func (e *engine) emitWithin(kind protocol.EventKind, payload any, limit int) {
 	evt, err := protocol.NewEvent(kind, e.nextSeq(), payload)
 	if err != nil {
 		slog.Error("engine.emit: marshal event failed", "kind", kind, "err", err)
@@ -1224,6 +1255,14 @@ func (e *engine) emit(kind protocol.EventKind, payload any) {
 	// while a reader is gone would deadlock the loop against its own teardown.
 	// The buffer is sized so the continuously-draining hub never fills it, and
 	// the exit path is backstopped by the events channel closing on loop return.
+	//
+	// The length check is race-safe without a lock: the loop thread is the only
+	// writer, so len can only FALL between the check and the send as the hub
+	// drains. Observing room therefore guarantees the send succeeds.
+	if len(e.events) >= limit {
+		slog.Warn("engine.emit: events buffer full — dropping", "kind", kind, "limit", limit)
+		return
+	}
 	select {
 	case e.events <- evt:
 	default:
@@ -1329,18 +1368,18 @@ func (e *engine) emitPaused(stop StopEvent) {
 // detailed cause first, then the suspending EventPaused that puts the hub back
 // into its suspend wait loop. Callers must already have ensured stateSuspended.
 //
-// The Paused is the load-bearing half. emit drops events when the buffer is
-// full, and losing the Paused while the Error got through would recreate
-// exactly the strand this exists to prevent (issue #183) — so when the buffer
-// cannot hold both, the cause is logged rather than emitted and the suspend is
-// kept. Only the loop thread writes e.events, so free capacity observed here
-// cannot be consumed by anyone else; a hub draining concurrently only frees
-// more.
+// The Paused is the load-bearing half, so the two are emitted with different
+// guarantees. The cause is an ordinary event and takes an ordinary slot; when
+// none is free it is logged instead of emitted, since losing detail is far
+// cheaper than losing the suspend. The Paused then goes out through
+// emitReserved, which can always fall back on the slot ordinary events are
+// forbidden to use. That is what stops a saturated buffer from delivering a
+// lone non-suspending EventError and recreating issue #183.
 func (e *engine) haltOnError(cmd protocol.CommandKind, cause error, stop StopEvent) {
-	if cap(e.events)-len(e.events) >= 2 {
+	if len(e.events) < eventBufSize {
 		e.emitError(cmd, cause)
 	} else {
-		e.log.Error("halting: event buffer full — dropping the cause to preserve the suspend",
+		e.log.Error("halting: event buffer full — logging the cause instead of emitting it",
 			"command", cmd, "err", cause)
 	}
 	e.emitHaltedOnError(stop)
@@ -1371,7 +1410,7 @@ func (e *engine) emitHaltedOnError(stop StopEvent) {
 	// This is a suspend like any other self-stop, so it cancels a racing Pause
 	// whose interrupt is still queued in the tracee (see emitBreakpointHit).
 	e.manualStopPending = false
-	e.emit(protocol.EventPaused, protocol.PausedPayload{
+	e.emitReserved(protocol.EventPaused, protocol.PausedPayload{
 		Goroutine: e.syntheticGoroutine(stop.PC),
 		Location:  e.locForPC(stop.PC),
 	})
