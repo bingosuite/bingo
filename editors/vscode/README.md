@@ -20,13 +20,11 @@ just vscode-install
 ```
 
 This builds, verifies, and installs `dist/bingo-<platform>.vsix`. The graphical
-concurrency view debuted in 0.3.0, 0.3.1 added capability-safe managed-server
-reuse, and 0.3.2 added wire 1.3's honest unknown stopped-goroutine rendering;
-**0.4.0** adds wire 1.4's bounded goroutine event contract, which is what keeps
-the concurrency view alive on highly concurrent targets. 0.4.0 is the minimum
-supported version. Rerun the command to update, then run
-**Developer: Reload Window** once so the active extension host loads the new
-bundle. Package without installing with `just vscode-package`. Uninstall with:
+concurrency view debuted in 0.3.0; **0.3.2** adds wire 1.3's honest unknown
+stopped-goroutine rendering and is the minimum supported version. Rerun the
+command to update, then run **Developer: Reload Window** once so the active
+extension host loads the new bundle. Package without installing with
+`just vscode-package`. Uninstall with:
 
 ```sh
 code --uninstall-extension bingosuite.bingo
@@ -101,34 +99,6 @@ nonce CSP, local bundles only, DOM `textContent` for tracee strings, VS Code
 theme/high-contrast colors, labelled controls, and keyboard selection.
 Treeitems expose hierarchy level, parent context, sibling position, selection,
 and synchronized keyboard focus to assistive technology.
-
-### Large targets and the 1.4 telemetry contract
-
-A highly concurrent target can hold far more goroutines than fit in one
-telemetry frame. Wire protocol 1.4 makes that a bounded, honest contract rather
-than a failure:
-
-- The debugger packs `GoroutineSnapshot` and `Goroutines` to a **2 MiB** budget
-  scoped to those two events only, keeping the current goroutine, its ancestors,
-  and the current thread first so the tree you are looking at stays intact.
-- When anything is left out, the payload carries the server's **original**
-  totals. The view then shows `shown of total` rather than presenting a
-  truncated set as the whole picture, and notes server-side omissions separately
-  from the view's own filter and 500-node render cap.
-- If the debugger's runtime scan itself hit its ceiling, the totals are a lower
-  bound and are marked with a trailing `+`.
-- The WebSocket transport limit sits deliberately **above** the decoder limit, so
-  a frame that breaks the contract is reported as a protocol error instead of
-  looking like a dropped connection. Protocol errors are terminal: the observer
-  stops instead of reconnecting into the identical failure. Ordinary connection
-  drops still reconnect as before, and an oversized event that the contract does
-  not cover — a very large `Locals`/`Frames`/`Evaluate` broadcast, for
-  instance — stays recoverable rather than ending the view. If the view does stop
-  on a protocol error, **Refresh** clears it and reconnects.
-- Events the view does not consume (`Output`, `Locals`, `Frames`, `Goroutines`,
-  `Evaluate`, breakpoint confirmations, `Restarted`) have their envelope
-  validated but their body skipped, so another client's large data request can
-  never take the view down.
 
 ## Configurations
 

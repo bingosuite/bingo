@@ -91,7 +91,7 @@ follow them so reviews stay about substance, not style.
 | [cmd/bingo](cmd/bingo/) | Server entry point — flag parsing, signal handler, calls into `internal/server`. |
 | [cmd/cli](cmd/cli/) | Interactive readline client. |
 | [cmd/dapcli](cmd/dapcli/) | Interactive readline client that drives a session over DAP (mirrors `cmd/cli`'s UX). Talks to the server's `-dap-addr` listener; can create a session or `-session` join an existing one. |
-| [cmd/wsmon](cmd/wsmon/) | Read-only terminal telemetry observer. `-session`-joins a running session over WebSocket and live-renders the goroutine spawn tree + OS threads + created/exited lifecycle deltas from the `EventGoroutineSnapshot` stream, reporting included/total honestly and distinguishing wire omission from a clipped runtime scan. Never drives execution — the WS-observes half of the DAP-drives/WS-observes demo. |
+| [cmd/wsmon](cmd/wsmon/) | Read-only terminal telemetry observer. `-session`-joins a running session over WebSocket and live-renders the goroutine spawn tree + OS threads + created/exited lifecycle deltas from the `EventGoroutineSnapshot` stream. Never drives execution — the WS-observes half of the DAP-drives/WS-observes demo. |
 | [editors/vscode](editors/vscode/) | Platform-packaged TypeScript companion extension. Owns debugger type `bingo`, manages the shared server, and hosts the read-only Bingo Concurrency Activity Bar WebSocket observer. |
 | [cmd/target](cmd/target/) | Trivial target program for manual testing. |
 | [examples/level1-loop](examples/level1-loop/) … [examples/level5-workflow](examples/level5-workflow/) | Progressive debugger targets, selected by the root VS Code launch picker and built together with `just build-examples` (see [examples/README.md](examples/README.md)). |
@@ -1627,113 +1627,40 @@ stop to a real goid; DAP omits its optional `stopped.threadId`.
 new `Thread`, new `GoroutineSnapshotPayload`, new `EventGoroutineSnapshot` +
 `CmdGoroutineSnapshot`.
 
-**Size budget — scoped to this event family only (1.4, issue #194).** These are
-the only two events that carry an unbounded runtime collection, so they are the
-only two that are bounded. `protocol.MaxGoroutineEventBytes` (2 MiB) is the exact
-marshalled-`Event` ceiling for `EventGoroutineSnapshot` and `EventGoroutines`;
-`MaxSnapshotGoroutines` (5000) and `MaxSnapshotThreads` (2048) cap element counts
-independently, and `MinThreadsRetained` (32) is an ordered thread floor. There is
-deliberately **no** generic hub message cap, **no** generic client read cap, and
-**no** `Location` truncation, chunking, or compression — those have different
-blast radii and are not this contract.
+**Size contract — DEFINED BUT NOT YET IN FORCE (issue #194).** These two events
+are the only ones carrying an unbounded runtime collection, and on a concurrent
+target they outgrow what a consumer can accept. `pkg/protocol` now defines the
+contract and the pure packers that implement it — `MaxGoroutineEventBytes`
+(2 MiB, scoped to `EventGoroutineSnapshot` + `EventGoroutines` only),
+`MaxSnapshotGoroutines`, `MaxSnapshotThreads`, `MinThreadsRetained`,
+`MaxGoroutineStringLength`, `MaxLifecycleDeltaIDs`, `SnapshotTotals`, and
+`PackSnapshot`/`PackGoroutines` in
+[goroutinepack.go](pkg/protocol/goroutinepack.go).
 
-The pure packers `protocol.PackSnapshot` / `protocol.PackGoroutines`
-([goroutinepack.go](pkg/protocol/goroutinepack.go)) share one algorithm. Both
-measure the **real** `Event` envelope at `Seq = math.MaxUint64` (the hub
-re-stamps seq at broadcast time, so anything narrower under-counts), derive the
-reserve from a real marshal of the skeleton — current goid, lifecycle deltas,
-totals — rather than a hard-coded overhead, and charge each element its
-standalone marshal length. That accounting is exact because JSON arrays are
-additive: escaping is per-value and context-free, and `encoding/json` emits a
-`json.RawMessage` payload verbatim. Each candidate is marshalled once, so the
-pass is O(n) — never a re-marshal of the whole payload per candidate, and never a
-binary search. A final exact `MarshalEvent` at max seq is the enforced contract.
+**Nothing calls them yet, and that is deliberate.** `Version` stays **1.3**,
+`Totals` is never populated, and no client enforces the budget. A version bump or
+consumer enforcement landing ahead of the producer would be worse than the bug:
+the server would advertise a contract it still violates, and a conforming client
+would reject perfectly valid output — permanently, if it treated the violation as
+deterministic. Bump the version, wire both producers, and activate consumer
+enforcement **in one change**; a dormant contract is safe to merge, a half-active
+one is not. There is deliberately **no** generic hub cap, no client read cap, no
+`Location` truncation, no chunking, and no compression.
 
-Selection is deterministic so every client on one stop sees the same bytes:
-current goroutine, then its ancestors nearest-first, then the rest by ascending
-goid; current thread first, then ascending MID. In the SNAPSHOT shape the
-**anchors** — the current goroutine, its ENTIRE ancestor chain, and the current
-thread — are required in every non-degraded result: a tree missing an interior
-ancestor cannot be rendered as the hierarchy it actually is, which is misleading
-in a way a truncated tail is not. `PackGoroutines` does NOT require the chain:
-that shape is a flat list DAP renders as threads, with no hierarchy to break, and
-degrading it to empty would make `dapThreads` fabricate a synthetic `main` — the
-exact lie this work exists to stop. Ancestors stay ordered first either way. Created/Exited are reserved first and **never** trimmed. An oversized
-non-anchor is skipped and packing continues — one pathological element must not
-hide every element after it. Threads take their ordered floor, then goroutines
-compete, then leftover budget is reclaimed for the remaining threads. If the
-anchors cannot all fit (by bytes or by the count cap — the anchor COUNT is
-checked before any anchor is placed, so a spawn chain longer than
-`MaxSnapshotGoroutines` degrades instead of producing a small-but-over-cap
-payload the consumer must reject), the result degrades to empty collections
-(with the deltas intact) and reports it — never a panic.
-
-**`Current` is either zero or delivered.** A degraded snapshot drops it, and a
-caller whose current goid names no goroutine in the input gets zero — naming a
-goroutine the payload does not carry is a dangling reference the consumer would
-have to guess about. Because the current goroutine is a required anchor, every
-non-degraded snapshot does carry it. The consumer validates the invariant.
-
-Whether `Totals` lands on the wire changes the reserve and is only known after
-packing, so the pass is run optimistically and retried once against the true
-reserve if it turns out to omit anything (a clipped scan forces totals up front,
-so it needs no retry). Exactly two passes suffice, but NOT because the retry
-omits at least as much — with skip-and-continue a tighter budget can reject one
-big early element and admit several small later ones, so that property is false.
-The argument is by contradiction: if pass 2 omitted nothing, every element fit
-under its smaller budget and so would have fit under pass 1's larger one,
-contradicting pass 1 having omitted something. So pass 2 always omits, Totals
-stays present, and the reserve it was measured against was right. The retry is
-what keeps a payload that exactly fills the budget from being falsely degraded.
-Hence "each candidate marshalled at most twice".
-
-**Producer and consumer constraints must agree EXACTLY.** The budget alone is
-not enough: `MaxGoroutineStringLength` (4096) caps every string inside a packed
-`Goroutine`/`Thread` — status, wait reason, and each `Location`'s file and
-function — because the consumer already enforces that per string. One over-long
-string is nowhere near the byte budget, so budgeting alone would emit an element
-the consumer is *obliged* to reject, killing that connection deterministically on
-every retry. The element is dropped whole (skip-and-continue for a non-anchor,
-degrade for an anchor); strings and Locations are NEVER truncated. The count is
-in **UTF-16 code units**, matching JavaScript — an astral character costs two, so
-byte- or rune-counting would disagree exactly at the boundary. Invalid UTF-8
-bytes count as one unit each, matching both Go's range loop and `encoding/json`'s
-one-U+FFFD-per-bad-byte substitution.
-
-`MaxLifecycleDeltaIDs` (8192) is the same idea applied to `Created`/`Exited`.
-Those are NEVER trimmed, so they carry no packing limit — what bounds them is the
-producer's own walk (both are set differences over the live goroutine set, capped
-by `maxGoroutineScan`). The constant restates that ceiling as a wire contract and
-is drift-checked against `internal/debugger`'s `maxGoroutineScan` from the
-protocol tests, and mirrored + drift-checked again in the VS Code decoder. It
-deliberately does NOT reuse `MaxSnapshotGoroutines`: that caps how many elements
-are *packed*, and validating a delta against it rejects legal snapshots — which,
-with terminal protocol errors, killed the view on exactly the busy targets this
-contract exists for. Worst case (both deltas at the ceiling, maximum-width ids)
-is well under half the byte budget, so deltas can never starve the elements. A
-delta beyond the ceiling is *reported* via `GoroutinePackReport.Oversized`, never
-silently trimmed.
-
-The same rule binds anything else the two sides both validate. Goids and
-lifecycle-delta ids must stay inside JavaScript's safe-integer range (2^53−1);
-the runtime's sequential goid counter guarantees that in practice, but a
-synthetic id above it would be rejected by the consumer, not merely rounded.
-
-**Totals = the honesty channel.**
-`SnapshotTotals{Goroutines, Threads, GoroutinesClipped, ThreadsClipped}`
-is present **iff** the wire omits elements or a runtime scan was clipped, and
-absent on a complete unclipped result, so its mere presence means "this is not
-everything". The clipped flags are **per collection** — `GoroutinesClipped` and
-`ThreadsClipped` — because the debugger walks goroutines and threads under
-independent ceilings (`maxGoroutineScan`, `maxThreadScan`). A single shared flag
-cannot say which one fired, so a consumer is forced to guess and will mark an
-exact count approximate (or an approximate one exact). Each flag means only
-"this count is a lower bound"; the counts themselves stay the original scanned
-totals, and each is rendered independently (the VS Code view and `wsmon` append
-`+` per count). `PackGoroutines` takes only the goroutine flag — that shape
-carries no threads. A total below the delivered count is a contradiction, not a
-truncation report, and the consumer rejects it. Layer A owns the contract and the packers;
-producer wiring in `internal/debugger` is layer B and does not exist yet.
+What the packers guarantee once wired: exact byte accounting from a real marshal
+of the real `Event` at `Seq = math.MaxUint64` (the hub re-stamps seq, so anything
+narrower under-counts), with each element charged its standalone marshal length —
+exact because JSON arrays are additive. Deterministic selection: current
+goroutine, its whole ancestor chain, then ascending goid; current thread, then
+ascending MID. Those anchors are required (the anchor *count* is checked before
+any is placed, so a spawn chain longer than the element cap degrades rather than
+overflowing it); `Created`/`Exited` are never trimmed; an oversized non-anchor is
+skipped and packing continues; strings are capped in **UTF-16 code units** to
+match a JavaScript consumer exactly and an offending element is dropped whole,
+never truncated. `Current` is zero or delivered — a degraded result names no
+goroutine it did not send. `SnapshotTotals` reports the ORIGINAL counts and, per
+collection, whether that scan was clipped, so a consumer can distinguish "this
+event is partial" from "the debugger's own walk stopped early".
 
 **Streaming cadence (the load-bearing invariant).** `EventGoroutineSnapshot` is
 auto-emitted on exactly the suspends that can change the concurrency picture —
@@ -1766,9 +1693,7 @@ graphical consumer; it joins from the DAP discovery event without user input.
 [cmd/wsmon](cmd/wsmon/) is the terminal fallback and joins with `-session`.
 Both are read-only and render the spawn tree / thread set / lifecycle deltas
 from this stream (a UI-agnostic view of exactly the data a spawn-hierarchy
-visualization needs), and both report scale honestly: included/total, with wire
-omission and a clipped runtime scan named as the separate causes they are.
-The end-to-end
+visualization needs). The end-to-end
 DAP-drives + WS-observes walkthrough — server, VS Code (or `cmd/dapcli`) driver,
 and either observer against the [examples/spawntree](examples/spawntree/)
 target — is in [docs/ConcurrencyTelemetry.md](docs/ConcurrencyTelemetry.md).
@@ -2351,7 +2276,7 @@ target metadata, architecture, mode, and entitlements.
 The extension package version is the installed-runtime upgrade boundary:
 material shipped behavior changes must bump both `package.json` and the lockfile
 or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.4.0**) in source and VSIX
+and package verifier pin the current version (**0.3.1**) in source and VSIX
 metadata.
 The root Run and Debug dropdown exposes exactly two `"type":"bingo"` choices:
 launch one of five progressive examples through a `pickString`, and join a
@@ -2428,88 +2353,10 @@ activation and keys observers by `DebugSession.id`, never
 
 **Concurrency webview ownership/security.** The extension host, not the
 webview, owns one bounded WebSocket observer/model per live DAP session. It
-reuses the normalized management endpoint, validates protocol 1.4 envelopes,
+reuses the normalized management endpoint, validates protocol 1.3 envelopes,
 payload/string/count limits and seq gaps, and reconnects only while the DAP
 session lives. It sends `CmdGoroutineSnapshot` once after every successful
 WebSocket join and thereafter only for explicit Refresh—never run control.
-
-**Two limits, deliberately different (issue #194).** `maximumEnvelopeBytes`
-(2 MiB) is the decoder contract and mirrors `protocol.MaxGoroutineEventBytes`;
-`maximumTransportBytes` = that plus 64 KiB slack is what `ws` gets as
-`maxPayload`. The transport MUST stay strictly above the decoder so a frame that
-violates the contract is delivered and rejected *here*, as a deterministic
-`TelemetryProtocolError`, instead of dying below the decoder where it is
-indistinguishable from a flaky link. Byte checking still happens before parse.
-
-**Fatal vs transient — latch only on a PROVEN violation.** A
-`TelemetryProtocolError` names a specific broken rule, so the same peer will
-produce the identical frame again and the observer latches `connection: "error"`
-without reconnecting; that is what stops the 1 + 6-attempt ladder that used to
-kill the view. Everything else stays transient, including `ws`'s
-`WS_ERR_UNSUPPORTED_MESSAGE_LENGTH`: a frame above the TRANSPORT cap is never
-delivered, so its kind is unknowable, and a legal, deliberately-unbounded
-`Locals`/`Frames`/`Evaluate` broadcast — which the hub sends to EVERY client —
-can land there. Latching on it would kill the view over an event the observer
-never even reads. The 64 KiB slack exists so a frame just over the decoder
-budget is still delivered and can be classified by kind; it cannot make an
-unbounded family fit, so it does not make a transport rejection safe to latch.
-
-The full classification, pinned by real-`ws` tests:
-
-| Frame | Kind readable? | Outcome |
-| --- | --- | --- |
-| > transport cap, any kind | no — `ws` discarded it | transient, reconnects |
-| > decoder cap, bounded kind | yes, via prefix scan | **fatal**, no reconnect |
-| > decoder cap, unbounded kind | yes, via prefix scan | transient, reconnects |
-| > decoder cap, unreadable prefix | no | transient, reconnects |
-| decoded, breaks a named rule | n/a | **fatal**, no reconnect |
-
-**Refresh is the manual recovery path.** The latch stops the *automatic* ladder;
-an explicit user Refresh is not a loop, so it clears the latch and redials.
-
-The acceptance invariant, pinned by test: a decode/protocol-contract violation —
-malformed JSON, wrong version, unknown kind, a bad envelope, or any deep failure
-in a *consumed* payload — terminates that connection and view **without consuming
-a reconnect attempt**, while a genuine socket close still consumes one and
-redials. Shallow-parsing an unused-but-valid kind is explicitly NOT a violation:
-it leaves the connection open, sets no error, and still advances the sequence.
-
-**Fatality is scoped to the bounded kinds.** The byte check must stay *before*
-the parse, but the kind is only known *after* it — so an over-budget frame gets a
-bounded scan of its envelope prefix (the server emits `v`,`kind`,`seq`,`payload`
-in that order) and is fatal only for `GoroutineSnapshot`/`Goroutines`. Everything
-else on the wire is deliberately unbounded: `EventLocals`/`EventFrames`/
-`EventEvaluate` are broadcast to **every** client and are capped only by the
-debugger's `maxTotalNodes`, so a big variable expansion in the Variables pane can
-legitimately exceed 2 MiB. Latching the view dead on that would be a regression,
-so it stays transient. An unreadable prefix also falls back to transient — never
-latch on a guess.
-
-**Lifecycle deltas are not packed elements.** `created`/`exited` are never
-trimmed by the packer, and the debugger's scan reaches `maxGoroutineScan` (8192),
-well past `MaxSnapshotGoroutines` (5000). The consumer must therefore NOT apply
-the element cap to them; doing so falsely rejected a legal frame, which — now
-that protocol errors are terminal — killed the view on exactly the workload this
-contract exists for. The byte contract is their real bound.
-
-**Shallow parse for unconsumed kinds.** The envelope is strictly validated for
-every kind (exact keys, `v == 1.4`, known kind, `seq >= 1`, object payload). But
-only the kinds the observer actually reads — `SessionState`, `BreakpointHit`,
-`Paused`, `Stepped`, `Panic`, `Continued`, `ProcessExited`, `Error`,
-`GoroutineSnapshot` — get the deep recursive node walk. Everything else
-(`Output`, `BreakpointSet`/`Cleared`, `Locals`, `Frames`, `Goroutines`,
-`Evaluate`, `Restarted`) returns a **sanitized empty payload** immediately: the
-raw body is never forwarded to `applyEvent`. Keep that set in lockstep with
-`observer.ts` — a broadcast `EventGoroutines` exceeding the 20,000-node budget on
-an event nobody reads is exactly the bug this closes.
-
-**Truthful omission surfacing.** `SnapshotTotals` is decoded (optional, unknown
-keys still rejected) and surfaced as `SessionViewModel.serverTotals`, kept
-separate from `tree.omitted` (this view's own filter and render cap). The thread
-statistic uses `totals.threads` when present, and a clipped scan renders a
-trailing `+` lower-bound marker. A goroutine whose parent was omitted stays a
-root in the tree.
-
 The recreatable webview receives validated view models through a
 ready/rendered-ack protocol. Every document has a generation token; async
 `postMessage` completions may mutate delivery state only while their captured
@@ -2836,7 +2683,7 @@ independent `wireProtocolVersion` from `pkg/protocol.Version`, a per-process
 UUID `instanceId`, the enabled/resolved DAP listener address, managed-idle
 configuration in milliseconds, and the current session count. The DAP object
 also advertises `sessionEventVersion:1`; graphical clients require it before
-reusing a managed server because older API-v1 servers on earlier wire versions do not emit the
+reusing a managed server because older API-v1/wire-v1.2 servers do not emit the
 `bingo/session/v1` discovery event. Management API
 compatibility and WebSocket wire compatibility are separate checks: changing
 one does not implicitly version the other. A DAP bind to `:0` MUST publish the
@@ -3424,27 +3271,14 @@ through the justfile.
 ## When you change something
 
 - **Wire protocol** (`pkg/protocol`): bump `Version` for breaking changes,
-  and update the round-trip table in `protocol_test.go`. Currently **1.4** (the
-  goroutine event family's size contract: `MaxGoroutineEventBytes` /
-  `MaxSnapshotGoroutines` / `MaxSnapshotThreads` / `MinThreadsRetained`,
-  `SnapshotTotals` on both `GoroutineSnapshotPayload` and `GoroutinesPayload`,
-  and the pure `PackSnapshot` / `PackGoroutines` packers). 1.3 reserved
-  goroutine ID 0/status `unknown` as the synthetic unresolved stop identity.
-  1.2 had the reshaped `Variable` — added `Kind` + `Children` for the
-  type-aware expandable tree — and the new `CmdEvaluate`/`EventEvaluate`
-  name-only evaluate command/event with `EvaluatePayloadCmd`/`EvaluatePayload`.
-  1.1 had reshaped
+  and update the round-trip table in `protocol_test.go`. Currently **1.3**
+  (goroutine ID 0/status `unknown` is the synthetic unresolved stop identity).
+  1.2 had the reshaped
+  `Variable` — added `Kind` + `Children` for the type-aware expandable
+  tree — and the new `CmdEvaluate`/`EventEvaluate` name-only evaluate command/
+  event with `EvaluatePayloadCmd`/`EvaluatePayload`. 1.1 had reshaped
   `Goroutine` and added `Thread`/`GoroutineSnapshotPayload` +
   `EventGoroutineSnapshot`/`CmdGoroutineSnapshot`.
-- **Goroutine event budget** (`pkg/protocol/goroutinepack.go`): the budget is
-  scoped to `EventGoroutineSnapshot` + `EventGoroutines` and must stay that way —
-  do not generalise it into a hub or client cap, and do not add `Location`
-  truncation, chunking, or compression. If you change a limit, the selection
-  order, or the totals rule, update the VS Code decoder constants
-  (`editors/vscode/src/telemetry.ts`) in the same commit: the drift test pins
-  them against this Go source. Keep `maximumTransportBytes` strictly **above**
-  `maximumEnvelopeBytes` so a contract violation is delivered and rejected as a
-  deterministic protocol error rather than killed inside `ws`.
 - **Management API** (`internal/server`): `ManagementAPIVersion` is independent
   of the wire protocol. Bump it for incompatible `/api/health` or management
   semantics, keep the response structs/tags and README example aligned, and
