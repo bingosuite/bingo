@@ -113,6 +113,33 @@ jobs:
             -ginkgo.focus='does not accumulate zombie tracees'
           echo "status=$?" >> "$GITHUB_OUTPUT"
 
+      - name: Attribution — who reaps the earlier zombie
+        id: attrib
+        run: |
+          set +e
+          go test -tags e2e -count=1 -v -timeout 300s ./test/integration \
+            -ginkgo.label-filter=reapproof \
+            -ginkgo.focus="shows an earlier session's zombie is cleared"
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Multi-session — each session gets its own exit event
+        id: multi
+        run: |
+          set +e
+          go test -tags e2e -count=1 -v -timeout 300s ./test/integration \
+            -ginkgo.label-filter=reapproof \
+            -ginkgo.focus='delivers each concurrent session its own process-exit event'
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Multi-session — each session gets its own exit event (-race)
+        id: multi_race
+        run: |
+          set +e
+          go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration \
+            -ginkgo.label-filter=reapproof \
+            -ginkgo.focus='delivers each concurrent session its own process-exit event'
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
       - name: Verdict
         run: |
           {
@@ -126,17 +153,20 @@ jobs:
               "subject/no-race:${{ steps.subject_norace.outputs.status }}" \
               "subject/race:${{ steps.subject_race.outputs.status }}" \
               "accumulation/no-race:${{ steps.accum_norace.outputs.status }}" \
-              "accumulation/race:${{ steps.accum_race.outputs.status }}"; do
+              "accumulation/race:${{ steps.accum_race.outputs.status }}" \
+              "attribution:${{ steps.attrib.outputs.status }}" \
+              "multi-session:${{ steps.multi.outputs.status }}" \
+              "multi-session/race:${{ steps.multi_race.outputs.status }}"; do
               name="${pair%%:*}"; st="${pair##*:}"
               if [ "$st" = "0" ]; then
-                echo "| $name | 0 | no persistent zombie — hypothesis NOT reproduced |"
+                echo "| $name | 0 | assertion held — hypothesis NOT reproduced |"
               else
-                echo "| $name | $st | persistent zombie observed — **hypothesis U2 CONFIRMED** |"
+                echo "| $name | $st | assertion violated — **defect reproduced** |"
               fi
             done
             echo
             echo "Settle window: ${BINGO_PROOF_SETTLE_MS}ms · cycles: ${BINGO_PROOF_CYCLES}"
             echo
             echo "See the step logs for the per-sample /proc timelines"
-            echo "(\`subject(debugger-launched)\`, \`positive-control\`, \`negative-control\`, \`cycles\`)."
+            echo "(\`subject(debugger-launched)\`, \`positive-control\`, \`negative-control\`, \`cycles\`, \`sessionN\`)."
           } >> "$GITHUB_STEP_SUMMARY"

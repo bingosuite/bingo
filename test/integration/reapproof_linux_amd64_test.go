@@ -83,6 +83,27 @@ func main() {
 }
 `
 
+// reapProofDelayedTargetSrc is the multi-session variant: argv[1] pid file,
+// argv[2] milliseconds to live after being resumed, argv[3] exit code. The
+// delay lets several sessions be simultaneously resumed — and therefore several
+// waitLoops simultaneously blocked in Wait4(-1, WALL) — when each tracee dies.
+const reapProofDelayedTargetSrc = `package main
+
+import (
+	"os"
+	"strconv"
+	"time"
+)
+
+func main() {
+	_ = os.WriteFile(os.Args[1], []byte(strconv.Itoa(os.Getpid())), 0o600)
+	ms, _ := strconv.Atoi(os.Args[2])
+	code, _ := strconv.Atoi(os.Args[3])
+	time.Sleep(time.Duration(ms) * time.Millisecond)
+	os.Exit(code)
+}
+`
+
 // --- /proc observation primitives ---
 
 // taskState is one sample of a task's kernel state.
@@ -216,6 +237,31 @@ func reapEverything() int {
 
 func proofSettleWindow() time.Duration {
 	return time.Duration(envInt("BINGO_PROOF_SETTLE_MS", 5000)) * time.Millisecond
+}
+
+// awaitExitSoft drains ch for a terminal event WITHOUT failing the spec on
+// timeout — the multi-session experiment needs to record "this session never
+// heard about its own exit" as data rather than aborting at the first victim.
+func awaitExitSoft(ch <-chan protocol.Event, timeout time.Duration) (string, int) {
+	deadline := time.After(timeout)
+	for {
+		select {
+		case evt, ok := <-ch:
+			if !ok {
+				return "channel-closed", 0
+			}
+			switch evt.Kind {
+			case protocol.EventProcessExited:
+				var p protocol.ProcessExitedPayload
+				_ = json.Unmarshal(evt.Payload, &p)
+				return string(evt.Kind), p.ExitCode
+			case protocol.EventError:
+				return string(evt.Kind) + ":" + string(evt.Payload), 0
+			}
+		case <-deadline:
+			return "TIMEOUT", 0
+		}
+	}
 }
 
 // launchAndRunToExit launches bin under a real debugger, drives it to a clean
@@ -385,5 +431,111 @@ var _ = Describe("PROOF U2: linux/amd64 tracee reaping after PTRACE_EVENT_EXIT",
 					"%s after their EventProcessExited. A long-lived server leaks one defunct "+
 					"process per debug session. zombie pids=%v",
 				len(stillZombie), cycles, window, stillZombie)
+		})
+
+		// The accumulation result above is only interpretable once you know who
+		// reaps the ones that DO disappear. This spec isolates that: it proves
+		// that a LATER, unrelated session's waitLoop is what clears an EARLIER
+		// session's zombie, because the linux backend waits on Wait4(-1, WALL)
+		// — every child of the whole process, not just its own tracee — and
+		// silently swallows a foreign child's exit (`ws.Exited() && tid !=
+		// b.pid` → continue). That incidental cross-session reaping is what
+		// masks the leak down to "one zombie per idle server" instead of "one
+		// per session".
+		It("shows an earlier session's zombie is cleared only by a later session's waitLoop", func() {
+			bin := buildTarget("reapproof_attrib", reapProofTargetSrc)
+			dir := GinkgoT().TempDir()
+
+			dA, pidA, codeA := launchAndRunToExit(bin, filepath.Join(dir, "a.pid"))
+			defer func() { _ = dA.Kill() }()
+			Expect(codeA).To(Equal(reapProofExitCode))
+
+			// Session A alone: the zombie must persist for the whole window.
+			vA := classify(observe(pidA, window))
+			AddReportEntry("sessionA-alone", fmt.Sprintf(
+				"pid=%d persistentZombie=%v finalState=%q timeline=[%s]",
+				pidA, vA.persistentZombie, vA.finalState, vA.timeline))
+			Expect(vA.persistentZombie).To(BeTrue(),
+				"precondition: session A's tracee must still be an unreaped zombie")
+
+			// Now run a completely unrelated session B. Its waitLoop calls
+			// Wait4(-1, WALL) and can therefore consume A's pending status.
+			dB, pidB, codeB := launchAndRunToExit(bin, filepath.Join(dir, "b.pid"))
+			defer func() { _ = dB.Kill() }()
+			Expect(codeB).To(Equal(reapProofExitCode))
+
+			_, _, aStillPresent := readTaskState(pidA)
+			AddReportEntry("after-sessionB", fmt.Sprintf(
+				"sessionA pid=%d stillPresent=%v | sessionB pid=%d", pidA, aStillPresent, pidB))
+
+			Expect(aStillPresent).To(BeTrue(),
+				"CROSS-SESSION REAP CONFIRMED: session A's zombie (pid=%d) vanished only after "+
+					"an unrelated session B (pid=%d) ran. Session B's waitLoop is blocked in "+
+					"Wait4(-1, WALL), so it reaps and discards foreign children — masking the "+
+					"per-session leak and, more seriously, consuming wait statuses that do not "+
+					"belong to it.", pidA, pidB)
+		})
+
+		// Direct consequence of the same Wait4(-1, WALL) scope: with several
+		// live sessions, one session's waitLoop can absorb ANOTHER session's
+		// tracee exit (the `tid != b.pid` branches continue the foreign thread
+		// and loop), so the owning session never learns its process died. Each
+		// session here must receive its own EventProcessExited with its own
+		// exit code.
+		It("delivers each concurrent session its own process-exit event", func() {
+			bin := buildTarget("reapproof_multi", reapProofDelayedTargetSrc)
+			dir := GinkgoT().TempDir()
+
+			const sessions = 4
+			type live struct {
+				d    debugger.Debugger
+				want int
+			}
+			running := make([]live, 0, sessions)
+			defer func() {
+				for _, l := range running {
+					_ = l.d.Kill()
+				}
+			}()
+
+			// Resume every session first, so all waitLoops are simultaneously
+			// blocked in Wait4(-1, WALL) when the staggered exits land.
+			for i := 0; i < sessions; i++ {
+				code := 50 + i
+				delay := strconv.Itoa(400 + i*300)
+				d := debugger.New(nil)
+				args := []string{filepath.Join(dir, fmt.Sprintf("m%d.pid", i)), delay, strconv.Itoa(code)}
+				Expect(d.Launch(bin, args, nil)).To(Succeed(), "Launch session %d", i)
+				awaitEvent(d.Events(), 20*time.Second, protocol.EventStepped)
+				Expect(d.Continue()).To(Succeed(), "Continue session %d", i)
+				running = append(running, live{d: d, want: code})
+			}
+
+			type outcome struct {
+				index int
+				got   string
+				code  int
+			}
+			results := make([]outcome, 0, sessions)
+			for i, l := range running {
+				kind, code := awaitExitSoft(l.d.Events(), 25*time.Second)
+				results = append(results, outcome{index: i, got: kind, code: code})
+			}
+
+			lost := []string{}
+			for i, r := range results {
+				AddReportEntry(fmt.Sprintf("session%d", i), fmt.Sprintf(
+					"want=ProcessExited(code=%d) got=%s(code=%d)", running[i].want, r.got, r.code))
+				if r.got != string(protocol.EventProcessExited) || r.code != running[i].want {
+					lost = append(lost, fmt.Sprintf("session%d want=%d got=%s(%d)",
+						i, running[i].want, r.got, r.code))
+				}
+			}
+
+			Expect(lost).To(BeEmpty(),
+				"CROSS-SESSION WAIT THEFT CONFIRMED: %d of %d concurrent sessions did not receive "+
+					"their own EventProcessExited. Wait4(-1, WALL) is process-wide, so a session's "+
+					"waitLoop can absorb another session's tracee status and the owner never learns "+
+					"its process exited. detail=%v", len(lost), sessions, lost)
 		})
 	})
