@@ -596,9 +596,14 @@ are detected by a `mach_msg` receive loop.
   calls `dwarfReader.cfa(pc, sp, fp)` per frame, **chaining outward by
   `SP_{i+1} = CFA_i`** (a callee's CFA is its caller's SP; Go passes args in
   registers so arm64 leaves SP unmoved and amd64's retaddr push is already in the
-  FP rule) and walking the saved-FP chain (`fp = *fp`). Missing/uncovered CFI
-  degrades gracefully to the old `FP + 16` heuristic (`cfaFallbackFromFP`) rather
-  than erroring the stop. The reader is arch-generic (maps SP/FP DWARF register
+  FP rule) and walking the saved-FP chain (`fp = *fp`). `walkStack` preserves
+  saved return PCs, but every non-top frame uses `returnPC-1` for function/line/
+  scope and CFI lookup (underflow guarded): the saved PC is after CALL/BL and can
+  equal an exclusive lexical/FDE boundary, while one byte back lies within the
+  call instruction on both supported architectures. The top frame's live PC is
+  never adjusted. Missing/uncovered CFI degrades gracefully to the old `FP + 16`
+  heuristic (`cfaFallbackFromFP`) rather than erroring the stop. The reader is
+  arch-generic (maps SP/FP DWARF register
   numbers by `runtime.GOARCH` — arm64 SP=31/FP=29, amd64 RSP=7/RBP=6) and
   wrapped in `recover()` so malformed CFI can never crash the engine. Go's DWARF
   sections are zlib-compressed (`__zdebug_frame`/`.zdebug_frame` with a 12-byte

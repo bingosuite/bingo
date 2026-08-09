@@ -404,9 +404,9 @@ func (e *engine) Evaluate(frameIndex int, name string) (protocol.Variable, error
 	return result, err
 }
 
-// frameLocation computes the PC and frame-base address for the given stack frame
-// of the currently-stopped thread. Callers must already be on the engine loop
-// (inside dispatch) and have verified suspension.
+// frameLocation computes the DWARF lookup PC and frame-base address for the
+// given stack frame of the currently-stopped thread. Callers must already be on
+// the engine loop (inside dispatch) and have verified suspension.
 //
 // It inspects the thread the user is stopped on (curTID via activeTID), not
 // threads[0]: on Darwin threads[0] is frequently an idle runtime M, so a
@@ -441,7 +441,7 @@ func (e *engine) frameLocation(frameIndex int) (framePC, frameBase uint64, err e
 	const cfaFallbackFromFP = 16
 	sp, fp := regs.SP, regs.BP
 	for i := 0; i < frameIndex; i++ {
-		cfa, ok := e.dw.cfa(framePCs[i], sp, fp)
+		cfa, ok := e.dw.cfa(frameLookupPC(framePCs[i], i), sp, fp)
 		if !ok {
 			cfa = fp + cfaFallbackFromFP
 		}
@@ -452,11 +452,12 @@ func (e *engine) frameLocation(frameIndex int) (framePC, frameBase uint64, err e
 		sp = cfa
 		fp = binary.LittleEndian.Uint64(buf[:])
 	}
-	frameBase, ok := e.dw.cfa(framePCs[frameIndex], sp, fp)
+	framePC = frameLookupPC(framePCs[frameIndex], frameIndex)
+	frameBase, ok := e.dw.cfa(framePC, sp, fp)
 	if !ok {
 		frameBase = fp + cfaFallbackFromFP
 	}
-	return framePCs[frameIndex], frameBase, nil
+	return framePC, frameBase, nil
 }
 
 func (e *engine) StackFrames() ([]protocol.Frame, error) {
