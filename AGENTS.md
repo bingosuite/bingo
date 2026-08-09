@@ -219,12 +219,31 @@ In [pkg/client](pkg/client/), the `Client` interface splits methods by what
 they wait for:
 
 - **Synchronous** (`Restart`, `SetBreakpoint`, `ClearBreakpoint`, `Locals`,
-  `Evaluate`, `StackFrames`, `Goroutines`, `GoroutineSnapshot`): block until
-  the matching confirmation event (or `EventError` for the same command kind)
-  arrives. Implemented via `sendAndWait` in [pkg/client/ws.go](pkg/client/ws.go).
-- **Fire-and-forget** (`Launch`, `Attach`, `Kill`, `Continue`, `Step*`, `Pause`):
-  return as soon as the command is on the wire. Results arrive asynchronously
-  on the `Events()` channel.
+  `Evaluate`, `StackFrames`, `Goroutines`): block until the matching
+  confirmation event (or `EventError` for the same command kind) arrives.
+  Implemented via `sendAndWait` in [pkg/client/ws.go](pkg/client/ws.go).
+- **Fire-and-forget** (`Launch`, `Attach`, `Kill`, `Continue`, `Step*`, `Pause`,
+  `RequestGoroutineSnapshot`): return as soon as the command is on the wire.
+  Results arrive asynchronously on the `Events()` channel.
+
+`RequestGoroutineSnapshot` is fire-and-forget **for a correctness reason, not
+convenience**: `EventGoroutineSnapshot` is the only dual-purpose frame in the
+protocol — the server also pushes it unsolicited on every entry/breakpoint/pause
+stop — so it can never be correlated to a request by kind. A synchronous
+`GoroutineSnapshot()` has no sound placement in the reply-debt model below, in
+either direction. *Retiring* a timed-out snapshot request as debt lets that debt
+silently swallow the next automatic push, permanently losing that stop's
+lifecycle deltas. *Discarding* it instead re-opens #144 for this kind: a stale
+reply — or any automatic push — then satisfies a later same-kind call. Even
+before any timeout, a plain in-flight call is satisfied by whichever snapshot
+lands first, which is usually a stop's automatic push. All three follow from one
+root: a frame that can exist with **no request** cannot be matched to one.
+
+So the fix is to remove the waiter, not to place it better. The request registers
+**no pending entry and no reply debt**, and every snapshot — requested or
+automatic — is delivered exactly once on `Events()`, where a client treats them
+uniformly as telemetry. It must stay out of the correlated set: never route it
+through `sendAndWait`. See issue #187.
 
 `syncMu` serializes synchronous commands, but a timeout does **not** cancel the
 command already sent to the server. The pending queue therefore retains a
@@ -240,16 +259,15 @@ continue timing out while that reply stream remains one response short. Keep the
 WebSocket open: disconnecting the last client tears down the hub/debuggee, while
 unrelated async events remain valid.
 
-`GoroutineSnapshot` is a temporary exception to timeout debt because
-`EventGoroutineSnapshot` is dual-purpose: it confirms `CmdGoroutineSnapshot`
-and is also pushed automatically after breakpoint, pause, and entry stops. A
-timed-out snapshot request is removed from the pending queue so it cannot consume
-the next unrelated telemetry snapshot. This preserves the stream, not
-correlation: while the legacy synchronous API exists, a genuinely late query
-reply or an unrelated automatic push can still satisfy a later in-flight
-`GoroutineSnapshot` waiter; without a waiter, either falls through to `Events()`.
-Issue #187 and stacked PR #192 remove the synchronous query surface and that
-ambiguity rather than expanding the exception here.
+Every command `sendAndWait` serves is a **genuine confirmation** — one that
+cannot exist without a request — so the timeout path above is uniform, with no
+per-kind exemption. Do not add one. `EventGoroutineSnapshot` is the only frame
+that breaks that property, and while a synchronous snapshot query existed it
+forced exactly such a carve-out (discard instead of retire). That carve-out
+preserved the telemetry stream but could not create correlation: with a waiter
+present, a genuinely late query reply or an unrelated automatic push could still
+satisfy a later in-flight call. Removing the waiter removed the ambiguity — the
+snapshot is now event-driven end to end and out of this model entirely.
 
 This is deliberately bounded by the id-less broadcast protocol. The queue
 preserves this client's ordered command stream; it cannot distinguish an
@@ -647,7 +665,9 @@ auto-emitted on exactly the suspends that can change the concurrency picture —
 single-step/step-over path from extra per-step memory reads. `emitBreakpointHit`
 / `emitPaused` build the snapshot **once**, embed its current goroutine in the
 stop event, then stream the same snapshot — one build, no double scan, no double
-delta pass.
+delta pass. Because the event is dual-purpose (push *and* query answer), the
+SDK's request is fire-and-forget — `Client.RequestGoroutineSnapshot`, never a
+`sendAndWait` — and only the automatic ones carry lifecycle deltas.
 
 **Not a suspending event.** It follows a suspending event (or answers a query)
 and never gates the hub. DAP `translateEvent` **deliberately ignores** it:
@@ -672,6 +692,20 @@ created/exited and adopts the new set. First snapshot returns nil deltas (a fres
 session must not report every goroutine as "created"). A **degraded** snapshot
 (runtime unreadable — e.g. the pre-init entry stop) does **not** touch
 `prevGoids`: an empty read must not look like every goroutine exited.
+
+**Automatic snapshots alone own the baseline.** `prevGoids` is the *only*
+lifecycle memory, so whoever advances it decides what the next automatic
+snapshot can report. The on-demand `CmdGoroutineSnapshot` path is therefore a
+pure observation: `engine.GoroutineSnapshot` calls `goroutineSnapshotQuery`
+(`buildSnapshot(false)`), which reports the same live picture with **empty
+Created/Exited** and leaves `prevGoids` untouched; only `goroutineSnapshot`
+(`buildSnapshot(true)`, used by `emitBreakpointHit` / `emitPaused` /
+`emitGoroutineSnapshot` at the entry stop) diffs and adopts. `snapshotFrom` is
+the single seam where the two differ. Before this split a manual refresh
+consumed the pending deltas — the following automatic snapshot diffed against
+the query, so goroutines created and exited in between appeared in neither
+(issue #187). Do not add a delta-bearing query path back: the wire payload is
+unchanged, and a client that wants deltas must read the automatic stream.
 
 **Graceful fallback.** Every read is best-effort. `resolveGoLayout` marks the
 layout invalid if any required `g`/`gobuf`/`stack`/`m` offset is missing, and any
@@ -1537,8 +1571,10 @@ through the justfile.
   it to `goLayout`/`resolveGoLayout`; a missing *required* offset invalidates the
   layout and falls back to the synthetic goroutine — keep new fields optional
   unless they're truly required. Preserve the streaming-cadence invariant
-  (snapshot on breakpoint/pause/entry, never per-step) and the degraded-snapshot
-  rule (don't touch `prevGoids` on an unreadable read).
+  (snapshot on breakpoint/pause/entry, never per-step), the degraded-snapshot
+  rule (don't touch `prevGoids` on an unreadable read), and the
+  automatic-snapshots-own-the-baseline rule (a `CmdGoroutineSnapshot` query
+  reports no deltas and never advances `prevGoids`).
 - **Suspend/resume sets**: update both `suspendingEvents` and
   `resumingCommands` in [hub.go](internal/hub/hub.go), and the matching
   hub_test cases.

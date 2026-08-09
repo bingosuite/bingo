@@ -57,10 +57,12 @@ type Debugger interface {
 	StackFrames() ([]protocol.Frame, error)
 	Goroutines() ([]protocol.Goroutine, error)
 
-	// GoroutineSnapshot returns the full concurrency picture — every goroutine
-	// (with parent linkage), every OS thread, the current goroutine, and the
-	// created/exited lifecycle deltas since the previous snapshot. Requires the
-	// process to be suspended.
+	// GoroutineSnapshot returns the full concurrency picture on demand — every
+	// goroutine (with parent linkage), every OS thread, and the current
+	// goroutine. Requires the process to be suspended. It is a pure
+	// observation: it reports no created/exited deltas and does not advance the
+	// lifecycle baseline, which the automatic entry/breakpoint/pause snapshots
+	// alone own.
 	GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error)
 
 	// Events delivers async notifications. Closed on shutdown; caller must drain.

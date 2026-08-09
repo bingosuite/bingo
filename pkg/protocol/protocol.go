@@ -59,9 +59,12 @@ const (
 	// with parent linkage, OS threads, current goroutine, and created/exited
 	// lifecycle deltas). It is emitted automatically on every suspend that can
 	// change that picture — breakpoint hit, pause, and launch/attach entry —
-	// and on demand in response to CmdGoroutineSnapshot. It is NOT a suspending
-	// event: it follows a suspending event (or answers a query) and never gates
-	// the hub. See AGENTS.md → goroutine snapshot streaming.
+	// and on demand in response to CmdGoroutineSnapshot. Being dual-purpose it
+	// cannot be correlated to a request: clients must treat every one of them
+	// as an unsolicited push. Only the automatic ones carry lifecycle deltas.
+	// It is NOT a suspending event: it follows a suspending event (or answers a
+	// query) and never gates the hub. See AGENTS.md → goroutine snapshot
+	// streaming.
 	EventGoroutineSnapshot EventKind = "GoroutineSnapshot"
 
 	EventSessionState EventKind = "SessionState"
@@ -114,6 +117,8 @@ const (
 	// (answered with EventGoroutineSnapshot). The same snapshot is also pushed
 	// automatically on each suspend, so a UI only needs this to refresh out of
 	// band (e.g. right after connecting). Requires the process to be suspended.
+	// It is a pure observation: the answer carries no created/exited deltas and
+	// does not advance the lifecycle baseline that the automatic snapshots own.
 	CmdGoroutineSnapshot CommandKind = "GoroutineSnapshot"
 
 	// CmdRestart kills the current process (if any) and relaunches the last

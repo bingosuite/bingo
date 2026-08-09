@@ -72,13 +72,13 @@ func main() {
 		_ = c.Close()
 	}()
 
-	if snap, err := c.GoroutineSnapshot(); err == nil {
-		m.applySnapshot(snap)
-		m.render()
-		if *once {
-			return
-		}
-	} else if !*once {
+	// The snapshot answers on the event stream like every automatic push, so
+	// this is fire-and-forget; the render loop below applies whichever arrives
+	// first. -once therefore waits for the first snapshot event either way.
+	if err := c.RequestGoroutineSnapshot(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: request goroutine snapshot: %v\n", err)
+	}
+	if !*once {
 		m.render()
 	}
 

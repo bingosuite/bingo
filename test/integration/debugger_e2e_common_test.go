@@ -917,9 +917,10 @@ func declareConcurrencySpec() {
 		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint on tick")
 
 		// The auto-streamed EventGoroutineSnapshot that follows each breakpoint
-		// hit is the delta-bearing one (its Created/Exited are computed relative
-		// to the previous auto snapshot). We must NOT call GoroutineSnapshot()
-		// on-demand between hits, as that would advance the delta baseline.
+		// hit is the delta-bearing one: its Created/Exited are computed relative
+		// to the previous AUTOMATIC snapshot, and only those snapshots advance
+		// that baseline. An on-demand GoroutineSnapshot() between hits is a pure
+		// observation and cannot disturb it (asserted below).
 		nextSnapshot := func(stop string) protocol.GoroutineSnapshotPayload {
 			GinkgoHelper()
 			Expect(h.d.Continue()).To(Succeed(), "Continue to %s", stop)
@@ -984,6 +985,19 @@ func declareConcurrencySpec() {
 
 		workerID, leafID := worker.ID, leaf.ID
 
+		// An on-demand query taken BETWEEN two automatic snapshots returns a
+		// coherent live picture but owns no lifecycle state: it reports no
+		// deltas of its own and must leave the next automatic snapshot's deltas
+		// (asserted at stop #3 below) measured against stop #2.
+		onDemand, err := h.d.GoroutineSnapshot()
+		Expect(err).NotTo(HaveOccurred(), "GoroutineSnapshot on demand")
+		Expect(onDemand.Goroutines).NotTo(BeEmpty(), "on-demand snapshot has goroutines")
+		Expect(onDemand.Current).To(BeNumerically(">", 0), "on-demand current goid resolved")
+		Expect(findByStart(onDemand.Goroutines, "main.worker")).NotTo(BeNil(),
+			"on-demand snapshot sees the live worker")
+		Expect(onDemand.Created).To(BeEmpty(), "a query reports no created delta")
+		Expect(onDemand.Exited).To(BeEmpty(), "a query reports no exited delta")
+
 		// --- stop #3: children released and reaped ---
 		exited := nextSnapshot("exited")
 		Expect(exited.Exited).To(ContainElement(workerID), "worker in exited delta")
@@ -992,12 +1006,6 @@ func declareConcurrencySpec() {
 			"worker gone from the live set")
 		Expect(findByStart(exited.Goroutines, "main.leaf")).To(BeNil(),
 			"leaf gone from the live set")
-
-		// The on-demand snapshot command returns a coherent live picture too.
-		onDemand, err := h.d.GoroutineSnapshot()
-		Expect(err).NotTo(HaveOccurred(), "GoroutineSnapshot on demand")
-		Expect(onDemand.Goroutines).NotTo(BeEmpty(), "on-demand snapshot has goroutines")
-		Expect(onDemand.Current).To(BeNumerically(">", 0), "on-demand current goid resolved")
 	})
 }
 

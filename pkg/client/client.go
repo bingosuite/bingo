@@ -58,10 +58,14 @@ type Client interface {
 	StackFrames() ([]protocol.Frame, error)
 	Goroutines() ([]protocol.Goroutine, error)
 
-	// GoroutineSnapshot blocks until the server returns the full concurrency
-	// snapshot: every goroutine (with parent linkage), every OS thread, the
-	// current goroutine, and the created/exited lifecycle deltas.
-	GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error)
+	// RequestGoroutineSnapshot asks the server for a full concurrency snapshot.
+	// Fire-and-forget like Pause: it returns as soon as the command is sent.
+	// EventGoroutineSnapshot is dual-purpose — the server also pushes it
+	// automatically on every entry/breakpoint/pause stop — so it can never be
+	// correlated to a request by kind. Every snapshot, requested or automatic,
+	// is delivered on Events(). Requested snapshots carry no created/exited
+	// deltas; only the automatic ones do.
+	RequestGoroutineSnapshot() error
 
 	Close() error
 }
