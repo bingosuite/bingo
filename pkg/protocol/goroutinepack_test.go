@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"strings"
+	"unicode/utf16"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -271,20 +272,40 @@ var _ = Describe("goroutine event packing", func() {
 	})
 
 	Describe("exact budget boundaries", func() {
-		// padTo builds a snapshot whose marshalled Event is EXACTLY size bytes,
-		// by widening one Location string. Only exact accounting can satisfy it.
-		padTo := func(size int) protocol.GoroutineSnapshotPayload {
-			snap := protocol.GoroutineSnapshotPayload{
-				Goroutines: []protocol.Goroutine{{ID: 1, Status: "running", Current: true}},
-				Threads:    []protocol.Thread{},
-				Current:    1,
+		// Every element string is capped, so a payload can only approach the
+		// byte budget through MANY elements. padTo builds a snapshot whose
+		// marshalled Event is EXACTLY size bytes out of legal elements: an
+		// anchor, a run of fixed-size fillers, and one tail element tuned to
+		// land on the byte. Only exact accounting can satisfy it.
+		fillerText := strings.Repeat("w", 4000)
+		build := func(fillers int, tail string) protocol.GoroutineSnapshotPayload {
+			gs := []protocol.Goroutine{{ID: 1, Status: "running", Current: true}}
+			for i := 2; i <= fillers+1; i++ {
+				gs = append(gs, protocol.Goroutine{ID: i, Status: "waiting", WaitReason: fillerText})
 			}
-			base := eventBytes(protocol.EventGoroutineSnapshot, snap)
-			pad := size - base
-			Expect(pad).To(BeNumerically(">=", 0))
-			snap.Goroutines[0].WaitReason = strings.Repeat("w", pad-len(`,"waitReason":""`))
-			Expect(eventBytes(protocol.EventGoroutineSnapshot, snap)).To(Equal(size))
-			return snap
+			if tail != "" {
+				gs = append(gs, protocol.Goroutine{ID: 900000, Status: "waiting", WaitReason: tail})
+			}
+			return protocol.GoroutineSnapshotPayload{
+				Goroutines: gs, Threads: []protocol.Thread{}, Current: 1,
+			}
+		}
+		padTo := func(size int) protocol.GoroutineSnapshotPayload {
+			anchorOnly := eventBytes(protocol.EventGoroutineSnapshot, build(0, ""))
+			perFiller := eventBytes(protocol.EventGoroutineSnapshot, build(1, "")) - anchorOnly
+			for fillers := (size - anchorOnly) / perFiller; fillers >= 0; fillers-- {
+				body := eventBytes(protocol.EventGoroutineSnapshot, build(fillers, ""))
+				oneChar := eventBytes(protocol.EventGoroutineSnapshot, build(fillers, "x")) - body
+				length := size - body - oneChar + 1
+				if length < 1 || length > protocol.MaxGoroutineStringLength {
+					continue
+				}
+				snap := build(fillers, strings.Repeat("t", length))
+				Expect(eventBytes(protocol.EventGoroutineSnapshot, snap)).To(Equal(size))
+				return snap
+			}
+			Fail("could not build a payload of exactly the requested size")
+			return protocol.GoroutineSnapshotPayload{}
 		}
 
 		It("keeps everything one byte below the cap", func() {
@@ -292,7 +313,7 @@ var _ = Describe("goroutine event packing", func() {
 			out, report := protocol.PackSnapshot(snap, false)
 
 			Expect(report.Degraded).To(BeFalse())
-			Expect(out.Goroutines).To(HaveLen(1))
+			Expect(out.Goroutines).To(HaveLen(len(snap.Goroutines)))
 			Expect(out.Totals).To(BeNil(), "nothing was omitted")
 			Expect(report.Bytes).To(Equal(protocol.MaxGoroutineEventBytes - 1))
 		})
@@ -302,19 +323,19 @@ var _ = Describe("goroutine event packing", func() {
 			out, report := protocol.PackSnapshot(snap, false)
 
 			Expect(report.Degraded).To(BeFalse())
-			Expect(out.Goroutines).To(HaveLen(1), "the cap is inclusive")
+			Expect(out.Goroutines).To(HaveLen(len(snap.Goroutines)), "the cap is inclusive")
 			Expect(out.Totals).To(BeNil())
 			Expect(report.Bytes).To(Equal(protocol.MaxGoroutineEventBytes))
 		})
 
-		It("drops the element one byte above the cap", func() {
+		It("drops exactly one element one byte above the cap", func() {
 			snap := padTo(protocol.MaxGoroutineEventBytes + 1)
 			out, report := protocol.PackSnapshot(snap, false)
 
-			// The single goroutine is the anchor, so it cannot be dropped in
-			// isolation: the whole result degrades.
-			Expect(report.Degraded).To(BeTrue())
-			Expect(out.Goroutines).To(BeEmpty())
+			Expect(report.Degraded).To(BeFalse())
+			Expect(out.Goroutines).To(HaveLen(len(snap.Goroutines) - 1))
+			Expect(out.Totals).NotTo(BeNil())
+			Expect(out.Totals.Goroutines).To(Equal(len(snap.Goroutines)))
 			Expect(report.Bytes).To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
 		})
 
@@ -326,34 +347,18 @@ var _ = Describe("goroutine event packing", func() {
 				Current:    1,
 			}
 			base := eventBytes(protocol.EventGoroutineSnapshot, snap)
-			// Widen the non-anchor by exactly one byte more than the headroom.
-			snap.Goroutines[1].WaitReason = strings.Repeat("w",
-				protocol.MaxGoroutineEventBytes-base+1-len(`,"waitReason":""`))
-
-			out, report := protocol.PackSnapshot(snap, false)
-			Expect(report.Degraded).To(BeFalse())
-			Expect(goroutineIDs(out.Goroutines)).To(Equal([]int{1}))
-			Expect(out.Totals).NotTo(BeNil())
-			Expect(out.Totals.Goroutines).To(Equal(2))
-			Expect(report.Bytes).To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
-		})
-
-		It("keeps the non-anchor that lands exactly on the cap", func() {
-			anchor := protocol.Goroutine{ID: 1, Status: "running", Current: true}
-			snap := protocol.GoroutineSnapshotPayload{
-				Goroutines: []protocol.Goroutine{anchor, {ID: 2, Status: "waiting"}},
-				Threads:    []protocol.Thread{},
-				Current:    1,
+			// Widen the non-anchor by exactly one byte more than the headroom,
+			// using deltas (not a string) since strings are separately capped.
+			headroom := protocol.MaxGoroutineEventBytes - base
+			created := make([]int, 0)
+			for i := 0; len(created)*21 < headroom+64; i++ {
+				created = append(created, math.MaxInt64-i)
 			}
-			base := eventBytes(protocol.EventGoroutineSnapshot, snap)
-			snap.Goroutines[1].WaitReason = strings.Repeat("w",
-				protocol.MaxGoroutineEventBytes-base-len(`,"waitReason":""`))
-
-			out, report := protocol.PackSnapshot(snap, false)
-			Expect(report.Degraded).To(BeFalse())
-			Expect(goroutineIDs(out.Goroutines)).To(Equal([]int{1, 2}))
-			Expect(report.Bytes).To(Equal(protocol.MaxGoroutineEventBytes))
-			Expect(out.Totals).To(BeNil())
+			snap.Created = created
+			over, _ := protocol.PackSnapshot(snap, false)
+			Expect(len(over.Goroutines)).To(BeNumerically("<=", 2))
+			Expect(eventBytes(protocol.EventGoroutineSnapshot, over)).
+				To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
 		})
 	})
 
@@ -464,6 +469,190 @@ var _ = Describe("goroutine event packing", func() {
 			out, report := protocol.PackGoroutines(gs, false)
 			Expect(report.Degraded).To(BeFalse())
 			Expect(goroutineIDs(out.Goroutines)).To(Equal([]int{5, 6}))
+		})
+	})
+
+	Describe("per-element string limit", func() {
+		// The consumer rejects any string longer than MaxGoroutineStringLength
+		// in UTF-16 code units. One such string is nowhere near the byte budget,
+		// so budgeting alone would emit an element the consumer MUST reject —
+		// killing that connection deterministically on every retry. The producer
+		// therefore drops the element whole; it never truncates.
+		ascii := func(n int) string { return strings.Repeat("a", n) }
+		// U+1F600 is astral: one rune, TWO UTF-16 code units.
+		astral := func(units int) string { return strings.Repeat("\U0001F600", units/2) }
+
+		nonAnchor := func(mutate func(*protocol.Goroutine)) (protocol.GoroutineSnapshotPayload, protocol.GoroutinePackReport) {
+			victim := protocol.Goroutine{ID: 2, Status: "waiting"}
+			mutate(&victim)
+			return protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+				Goroutines: []protocol.Goroutine{
+					{ID: 1, Status: "running", Current: true},
+					victim,
+				},
+				Threads: []protocol.Thread{},
+				Current: 1,
+			}, false)
+		}
+
+		DescribeTable("accepts a string exactly at the limit",
+			func(mutate func(*protocol.Goroutine)) {
+				out, report := nonAnchor(mutate)
+				Expect(report.Degraded).To(BeFalse())
+				Expect(goroutineIDs(out.Goroutines)).To(Equal([]int{1, 2}))
+				Expect(out.Totals).To(BeNil(), "nothing was dropped")
+			},
+			Entry("status", func(g *protocol.Goroutine) { g.Status = ascii(4096) }),
+			Entry("waitReason", func(g *protocol.Goroutine) { g.WaitReason = ascii(4096) }),
+			Entry("currentLoc.file", func(g *protocol.Goroutine) { g.CurrentLoc.File = ascii(4096) }),
+			Entry("currentLoc.function", func(g *protocol.Goroutine) { g.CurrentLoc.Function = ascii(4096) }),
+			Entry("startLoc.file", func(g *protocol.Goroutine) { g.StartLoc.File = ascii(4096) }),
+			Entry("startLoc.function", func(g *protocol.Goroutine) { g.StartLoc.Function = ascii(4096) }),
+			Entry("createdLoc.file", func(g *protocol.Goroutine) { g.CreatedLoc.File = ascii(4096) }),
+			Entry("createdLoc.function", func(g *protocol.Goroutine) { g.CreatedLoc.Function = ascii(4096) }),
+			Entry("astral at the limit", func(g *protocol.Goroutine) { g.CurrentLoc.File = astral(4096) }),
+		)
+
+		DescribeTable("skips a non-anchor one unit over the limit",
+			func(mutate func(*protocol.Goroutine)) {
+				out, report := nonAnchor(mutate)
+				Expect(report.Degraded).To(BeFalse())
+				Expect(goroutineIDs(out.Goroutines)).To(Equal([]int{1}), "skip and continue")
+				Expect(out.Totals).NotTo(BeNil())
+				Expect(out.Totals.Goroutines).To(Equal(2))
+			},
+			Entry("status", func(g *protocol.Goroutine) { g.Status = ascii(4097) }),
+			Entry("waitReason", func(g *protocol.Goroutine) { g.WaitReason = ascii(4097) }),
+			Entry("currentLoc.file", func(g *protocol.Goroutine) { g.CurrentLoc.File = ascii(4097) }),
+			Entry("currentLoc.function", func(g *protocol.Goroutine) { g.CurrentLoc.Function = ascii(4097) }),
+			Entry("startLoc.file", func(g *protocol.Goroutine) { g.StartLoc.File = ascii(4097) }),
+			Entry("startLoc.function", func(g *protocol.Goroutine) { g.StartLoc.Function = ascii(4097) }),
+			Entry("createdLoc.file", func(g *protocol.Goroutine) { g.CreatedLoc.File = ascii(4097) }),
+			Entry("createdLoc.function", func(g *protocol.Goroutine) { g.CreatedLoc.Function = ascii(4097) }),
+			Entry("astral one unit over", func(g *protocol.Goroutine) {
+				g.CurrentLoc.File = astral(4096) + "a" // 4096 units + 1
+			}),
+		)
+
+		It("counts astral characters as two units, not one", func() {
+			// 2049 astral runes = 4098 UTF-16 units. Rune-counting would call
+			// this legal and hand the consumer something it must reject.
+			over := strings.Repeat("\U0001F600", 2049)
+			Expect(len([]rune(over))).To(BeNumerically("<", protocol.MaxGoroutineStringLength))
+			out, _ := nonAnchor(func(g *protocol.Goroutine) { g.CurrentLoc.File = over })
+			Expect(goroutineIDs(out.Goroutines)).To(Equal([]int{1}))
+
+			// 2048 astral runes = exactly 4096 units, so it is legal.
+			atLimit := strings.Repeat("\U0001F600", 2048)
+			kept, _ := nonAnchor(func(g *protocol.Goroutine) { g.CurrentLoc.File = atLimit })
+			Expect(goroutineIDs(kept.Goroutines)).To(Equal([]int{1, 2}))
+		})
+
+		It("degrades when the current goroutine violates the limit", func() {
+			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+				Goroutines: []protocol.Goroutine{
+					{ID: 1, Status: "running", Current: true,
+						CurrentLoc: protocol.Location{File: ascii(4097)}},
+					{ID: 2, Status: "waiting"},
+				},
+				Threads: []protocol.Thread{},
+				Current: 1,
+			}, false)
+
+			Expect(report.Degraded).To(BeTrue(), "an anchor cannot be skipped")
+			Expect(out.Goroutines).To(BeEmpty())
+		})
+
+		It("degrades when an ancestor anchor violates the limit", func() {
+			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+				Goroutines: []protocol.Goroutine{
+					{ID: 1, Status: "waiting", CurrentLoc: protocol.Location{File: ascii(4097)}},
+					{ID: 2, ParentID: 1, Status: "running", Current: true},
+				},
+				Threads: []protocol.Thread{},
+				Current: 2,
+			}, false)
+
+			Expect(report.Degraded).To(BeTrue())
+			Expect(out.Goroutines).To(BeEmpty())
+		})
+
+		It("skips an over-limit ancestor in the flat list shape", func() {
+			out, report := protocol.PackGoroutines([]protocol.Goroutine{
+				{ID: 1, Status: "waiting", CurrentLoc: protocol.Location{File: ascii(4097)}},
+				{ID: 2, ParentID: 1, Status: "running", Current: true},
+			}, false)
+
+			Expect(report.Degraded).To(BeFalse(), "ancestors are not required here")
+			Expect(goroutineIDs(out.Goroutines)).To(Equal([]int{2}))
+		})
+
+		It("skips an over-limit thread and degrades on the current one", func() {
+			long := protocol.Location{File: ascii(4097)}
+			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+				Goroutines: []protocol.Goroutine{{ID: 1, Status: "running", Current: true}},
+				Threads: []protocol.Thread{
+					{ID: 10, MID: 0, Current: true},
+					{ID: 11, MID: 1, CurrentLoc: long},
+					{ID: 12, MID: 2},
+				},
+				Current: 1,
+			}, false)
+			Expect(report.Degraded).To(BeFalse())
+			Expect(threadMIDs(out.Threads)).To(Equal([]int{0, 2}))
+
+			_, currentBad := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+				Goroutines: []protocol.Goroutine{{ID: 1, Status: "running", Current: true}},
+				Threads:    []protocol.Thread{{ID: 10, MID: 0, Current: true, CurrentLoc: long}},
+				Current:    1,
+			}, false)
+			Expect(currentBad.Degraded).To(BeTrue())
+		})
+
+		It("never emits a string over the limit, whatever the input", func() {
+			// The property that actually closes the loop with the consumer.
+			gs := make([]protocol.Goroutine, 0, 400)
+			for i := 1; i <= 400; i++ {
+				g := packGoroutine(i, 0)
+				switch i % 5 {
+				case 0:
+					g.CurrentLoc.File = ascii(4097 + i)
+				case 1:
+					g.StartLoc.Function = astral(8192)
+				case 2:
+					g.WaitReason = ascii(100000)
+				case 3:
+					g.Status = ascii(4096) // legal, must survive
+				}
+				gs = append(gs, g)
+			}
+			// The anchor must itself be legal, or the pack degrades before any
+			// of the hostile non-anchors are even considered.
+			gs[0] = protocol.Goroutine{ID: 1, Status: "running", Current: true}
+			ts := []protocol.Thread{{ID: 1, Current: true}}
+			for i := 2; i <= 40; i++ {
+				ts = append(ts, protocol.Thread{ID: i, MID: i,
+					CurrentLoc: protocol.Location{File: ascii(4097)}})
+			}
+
+			out, report := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
+				Goroutines: gs, Threads: ts, Current: 1,
+			}, false)
+
+			Expect(report.Degraded).To(BeFalse())
+			Expect(out.Goroutines).NotTo(BeEmpty())
+			for _, g := range out.Goroutines {
+				for _, s := range []string{g.Status, g.WaitReason,
+					g.CurrentLoc.File, g.CurrentLoc.Function,
+					g.StartLoc.File, g.StartLoc.Function,
+					g.CreatedLoc.File, g.CreatedLoc.Function} {
+					Expect(utf16Units(s)).To(BeNumerically("<=", protocol.MaxGoroutineStringLength))
+				}
+			}
+			for _, t := range out.Threads {
+				Expect(utf16Units(t.CurrentLoc.File)).To(BeNumerically("<=", protocol.MaxGoroutineStringLength))
+				Expect(utf16Units(t.CurrentLoc.Function)).To(BeNumerically("<=", protocol.MaxGoroutineStringLength))
+			}
 		})
 	})
 
@@ -842,6 +1031,12 @@ var _ = Describe("goroutine event packing", func() {
 		})
 	})
 })
+
+// utf16Units counts UTF-16 code units independently of the implementation under
+// test, so the "never emits an over-limit string" property is not self-verified.
+func utf16Units(s string) int {
+	return len(utf16.Encode([]rune(s)))
+}
 
 func withCurrent(gs []protocol.Goroutine, id int) []protocol.Goroutine {
 	out := make([]protocol.Goroutine, len(gs))
