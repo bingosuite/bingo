@@ -415,14 +415,25 @@ func (h *Handler) onRestarted(evt protocol.Event) {
 
 // reconcileRestartBreakpointsLocked adopts the relaunched process's breakpoint
 // identities: retained lines keep their stable DAP id but take the fresh
-// debugger id, and discarded lines are dropped and reported unverified. A line
-// with an operation in flight is left alone — that operation still owns the
-// line's convergence and its confirmation is still queued in setQ/clearQ, so
-// rewriting its state here would desynchronise both. Caller MUST hold h.mu.
+// debugger id, and discarded lines are dropped and reported unverified.
+//
+// A line whose operation is still in flight is re-identified too. FIFO
+// correlation rides the queued *bpOp, not installedID, so adopting the fresh id
+// cannot desynchronise setQ/clearQ — whereas keeping the pre-restart id would
+// strand the line on an identifier the new engine never issued: the in-flight
+// clear (already marshalled with the dead id) fails against the relaunched
+// process, and failClearLocked's deliberate retain-on-failure would then reissue
+// that dead id for every later attempt, leaving the real new breakpoint
+// unremovable. Re-identifying here is what lets the mapping self-heal.
+//
+// A line with nothing installed (installedID == 0) is still skipped: its
+// convergence has not produced an identity of ours yet, so a payload entry for
+// that line describes some other driver's breakpoint, not one we own.
+// Caller MUST hold h.mu.
 func (h *Handler) reconcileRestartBreakpointsLocked(p protocol.RestartedPayload) ([]godap.Breakpoint, []*bpRequest) {
 	for _, bp := range p.Breakpoints {
 		st := h.bpByFile[bp.Location.File][bp.Location.Line]
-		if st == nil || st.installedID == 0 || st.pending != nil {
+		if st == nil || st.installedID == 0 {
 			continue
 		}
 		st.installedID = bp.ID
@@ -433,7 +444,7 @@ func (h *Handler) reconcileRestartBreakpointsLocked(p protocol.RestartedPayload)
 	var ready []*bpRequest
 	for _, dropped := range p.Discarded {
 		st := h.bpByFile[dropped.Location.File][dropped.Location.Line]
-		if st == nil || st.installedID == 0 || st.pending != nil {
+		if st == nil || st.installedID == 0 {
 			continue
 		}
 		dapID := st.dapID
@@ -443,7 +454,9 @@ func (h *Handler) reconcileRestartBreakpointsLocked(p protocol.RestartedPayload)
 		st.loc = protocol.Location{}
 		st.failure = dropped.Reason
 		// The breakpoint is gone, so anyone parked on the line — including a
-		// request still waiting for it to be removed — can be answered now.
+		// request still waiting for it to be removed — can be answered now. Any
+		// in-flight operation is left to run its course; its confirmation finds
+		// a line that no longer has anything to converge.
 		ready = append(ready, h.settleLineLocked(dropped.Location.File, dropped.Location.Line)...)
 		discarded = append(discarded, godap.Breakpoint{
 			Id:       dapID,
