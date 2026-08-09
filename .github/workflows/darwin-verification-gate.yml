@@ -1,62 +1,57 @@
 name: Darwin verification gate
 
-# The darwin/arm64 low-level backend (ptrace + Mach) cannot be *executed* on
-# GitHub-hosted macOS runners: Apple's Sonoma (macOS 14) security model blocks
-# task_for_pid there even with the debugger entitlement, so the real backend
-# never runs in CI (see .github/workflows/debugger-e2e.yml — the darwin E2E jobs
-# only compile + codesign on hosted runners).
+# This workflow is the trusted enforcement path for darwin/arm64 changes that
+# cannot execute on GitHub-hosted runners. `pull_request_target` loads this YAML
+# from the base branch. It checks out only the base SHA policy script, never PR
+# head code, then posts the "Darwin E2E verified" status explicitly to the PR
+# head SHA. The workflow's own check belongs to the base SHA and is not the
+# branch-protection signal.
 #
-# This gate closes that hole with a human-in-the-loop check: when a PR modifies
-# darwin-native code whose runtime behaviour can only be validated on real Apple
-# Silicon, it requires a maintainer to run `just e2e-darwin` locally, confirm it
-# passes, and add the `darwin-e2e-verified` label to the PR. The gate is a
-# no-op (green) for PRs that don't touch that code.
-#
-# On every `synchronize` (new commits pushed), the current head is unverified by
-# definition: a prior verification only covers the commits it was run against.
-# The workflow best-effort removes the stale label for same-repository PRs, but
-# public-fork tokens are read-only and may leave it in place. The synchronize run
-# therefore fails closed without consulting the live label. Removing/toggling
-# and then re-adding the label triggers `unlabeled`/`labeled` runs that evaluate
-# the live label and revalidate the same head without another push.
-# To actually block merges, mark "Darwin E2E verified" as a required status
-# check in branch protection.
+# A separate unprivileged `pull_request` workflow runs the proposed HEAD policy
+# tests. Those tests are useful review feedback but are not enforcement because
+# a fork can modify both that workflow and its test code.
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
   contents: read
   pull-requests: write
+  statuses: write
+
+concurrency:
+  group: darwin-verification-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
-  darwin-e2e-verified:
-    name: Darwin E2E verified
+  publish-darwin-verification:
+    name: Publish Darwin verification status
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    env:
-      GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out trusted gate policy
+        uses: actions/checkout@v4
         with:
-          # The gate must never execute a fork-modified copy of its own policy.
           ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: .github/scripts/darwin-verification-gate.sh
+          sparse-checkout-cone-mode: false
           persist-credentials: false
 
-      - name: Test Darwin verification gate decision
-        run: |
-          if [ -r .github/scripts/darwin-verification-gate_test.sh ]; then
-            bash .github/scripts/darwin-verification-gate_test.sh
-          else
-            echo "Trusted base predates the gate script; the gate will fail closed."
-          fi
-
-      - name: Require local darwin E2E verification when darwin-native code changes
+      - name: Evaluate and publish Darwin verification
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ ! -r .github/scripts/darwin-verification-gate.sh ]; then
-            echo "::error title=Darwin E2E verification policy unavailable::The trusted base does not contain the gate script, so the gate cannot safely evaluate this pull request."
+            head_sha=$(jq -er '.pull_request.head.sha' "$GITHUB_EVENT_PATH")
+            run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head_sha" \
+              -f state=failure \
+              -f context='Darwin E2E verified' \
+              -f description='Trusted Darwin verification policy is unavailable.' \
+              -f target_url="$run_url" >/dev/null
+            echo "::error title=Darwin E2E verification policy unavailable::The trusted base does not contain the gate script, so this head fails closed."
             exit 1
           fi
 

@@ -1425,28 +1425,38 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   runtime behaviour only runs on real Apple Silicon — matched by regex over
   `internal/debugger/*_darwin_*`, `internal/debugger/trap_arm64.go`,
   `test/integration/*_darwin_*_test.go`, and `entitlements.plist`. The "Darwin
-  E2E verified" check fails until the label is present; it re-runs on
-  `labeled`/`unlabeled` so adding the label flips it green without a new push,
-  and is a green no-op for PRs that don't touch those paths. On `synchronize`
-  (new commits pushed), the current head is always unverified: the workflow
-  best-effort removes `darwin-e2e-verified` for same-repository PRs, but public
-  fork `pull_request` tokens are read-only and may leave the stale label in
-  place. The synchronize run therefore warns on cleanup failure and fails
-  closed without consulting or accepting the live label. A maintainer can
-  remove/toggle the stale label and re-add it; the resulting `unlabeled` and
-  `labeled` runs evaluate the live label and revalidate that same head. Keep
-  this on the unprivileged `pull_request` trigger and execute the gate script
-  from the explicitly checked-out base SHA, never the fork-modified merge tree;
-  the trusted script owns the label name, path regex, event parsing, diff, and
-  live-label query rather than accepting policy or decision inputs from the
-  fork-modifiable workflow environment. If that trusted base predates the
-  script, fail the gate unconditionally. Do not run untrusted PR code via
-  `pull_request_target`. Mark it a required status check in branch protection
-  to actually block merges. Reopening a PR invalidates verification just like a
-  push, because commits can be added while the PR is closed. On Darwin-changing
-  PRs, only adding/removing `darwin-e2e-verified` may resolve a label-triggered
-  run; unrelated label events fail closed so a stale label left by denied fork
-  cleanup cannot reactivate the check.
+  E2E verified" **commit status is posted explicitly to the PR head SHA** and
+  fails until the label is present; it is the status to require in branch
+  protection. The `pull_request_target` workflow and its own job run against the
+  base SHA, so that job is deliberately NOT the merge gate. The trusted workflow
+  checks out only the exact base SHA policy script, never the PR head or merge
+  tree, and reads PR files/labels through GitHub APIs. Do not add any step that
+  executes head code, consumes head artifacts, or builds a shell command from PR
+  content in this privileged workflow. The PR-files REST endpoint hard-caps its
+  response at 3,000 files, so the policy cross-checks the returned count against
+  the event's `pull_request.changed_files` and fails closed on any mismatch.
+  Count and path matching operate on the slurped JSON arrays, never line-oriented
+  filename output (Git permits newlines in filenames).
+
+  A separate unprivileged
+  [.github/workflows/darwin-verification-policy-test.yml](.github/workflows/darwin-verification-policy-test.yml)
+  runs the proposed HEAD script/tests on `pull_request` with a read-only token
+  and a distinct check name. It is review feedback only: a fork can modify that
+  workflow, so it never publishes the required status.
+
+  On `synchronize` or `reopened`, the trusted policy best-effort removes
+  `darwin-e2e-verified` and posts failure to the new/current head regardless of
+  label cleanup success. A successful `labeled` event for that exact label posts
+  success to that head; removing it posts failure, with both events re-reading
+  live label state so a remove/re-add race settles to the current truth.
+  Unrelated label events post nothing, preserving either a legitimate success
+  or a stale-cleanup failure already bound to the same head SHA. Relevant runs
+  post `pending` before evaluation, serialize per PR, and post failure on
+  API/decision errors so an old success cannot survive a reopened/error window.
+  If the base policy is missing, the trusted workflow posts failure inline.
+  Keep permissions limited to base checkout/API reads, PR-label cleanup, and
+  head commit statuses; never expose secrets or execute untrusted code through
+  `pull_request_target`.
 
 Build/test commands:
 
