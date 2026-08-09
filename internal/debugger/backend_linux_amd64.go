@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -92,11 +93,15 @@ type tracerExecer interface {
 }
 
 type linuxBackend struct {
-	pid         int
-	stepping    bool // true after SingleStep; classifies the next SIGTRAP
-	stepTID     int  // the exact thread SingleStep was issued against
-	lastStopTID int
-	tracer      *tracerThread
+	pid      int
+	stepping bool // true after SingleStep; classifies the next SIGTRAP
+	stepTID  int  // the exact thread SingleStep was issued against
+	tracer   *tracerThread
+
+	// Wait writes this from a waitLoop while running engine commands may read it
+	// for TID-less memory operations. Atomicity defines that snapshot; it does
+	// not make the selected thread stopped or suppress normal ptrace errors.
+	lastStopTID atomic.Int64
 }
 
 func (b *linuxBackend) execPtrace(fn func()) { b.tracer.execPtrace(fn) }
@@ -591,19 +596,19 @@ var _ Backend = (*linuxBackend)(nil)
 
 func (b *linuxBackend) setPID(pid int) {
 	b.pid = pid
-	b.lastStopTID = pid
+	b.lastStopTID.Store(int64(pid))
 }
 
 func (b *linuxBackend) traceTID() int {
-	if b.lastStopTID != 0 {
-		return b.lastStopTID
+	if tid := b.lastStopTID.Load(); tid != 0 {
+		return int(tid)
 	}
 	return b.pid
 }
 
 func (b *linuxBackend) recordStop(tid int) {
 	if tid != 0 {
-		b.lastStopTID = tid
+		b.lastStopTID.Store(int64(tid))
 	}
 }
 
