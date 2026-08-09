@@ -188,6 +188,9 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 		Entry("when the current g stack upper bound is unreadable", func() uint64 {
 			return fixture.g[1] + fixture.layout.GStack + fixture.layout.StackHi
 		}),
+		Entry("when the allm head pointer is unreadable", func() uint64 {
+			return fixture.layout.Allm
+		}),
 		Entry("when an allm link is unreadable", func() uint64 {
 			return fixture.m[0] + fixture.layout.MAlllink
 		}),
