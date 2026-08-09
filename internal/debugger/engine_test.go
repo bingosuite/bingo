@@ -1371,6 +1371,22 @@ var _ = Describe("goroutine events go through the wire contract", func() {
 		Expect(len(snap.Threads)).To(BeNumerically("<=", protocol.MaxSnapshotThreads))
 	})
 
+	It("packs even the degraded snapshot", func() {
+		// The fakeBackend has no DWARF, so this exercises the degraded path —
+		// the one that returns a single synthetic goroutine. It is packed like
+		// any other: a lone goroutine cannot approach the byte budget, but the
+		// contract also caps per-element strings, and its location comes from
+		// DWARF like any other. Every emitting path must go through the packer.
+		snap, err := d.GoroutineSnapshot()
+		Expect(err).NotTo(HaveOccurred())
+		Expect(snap.Goroutines).To(HaveLen(1))
+		Expect(snap.Goroutines).NotTo(BeNil())
+		Expect(snap.Threads).NotTo(BeNil(),
+			"the packer normalises empty collections to [] rather than null")
+		Expect(eventSize(protocol.EventGoroutineSnapshot, snap)).
+			To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
+	})
+
 	It("keeps current consistent with what it delivered", func() {
 		snap, err := d.GoroutineSnapshot()
 		Expect(err).NotTo(HaveOccurred())
