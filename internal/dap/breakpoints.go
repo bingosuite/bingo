@@ -173,7 +173,11 @@ func (h *Handler) failClearLocked(file string, line int, msg string) []*bpReques
 		return nil
 	}
 	ready := st.dischargeOwners(msg)
-	return append(ready, st.resolveSlots()...)
+	ready = append(ready, st.resolveSlots()...)
+	// Only reachable when the line is no longer armed (a restart discarded it
+	// under the in-flight clear); a still-armed line is retained by gc.
+	h.gcLineLocked(file, line)
+	return ready
 }
 
 // gcLineLocked forgets a line the adapter has no reason to remember: unwanted,
