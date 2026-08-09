@@ -564,8 +564,9 @@ between (`SingleStep` sets them, `ContinueProcess` clears them) against the next
 `Wait`'s reads. Do not add a mutex, and do not call these helpers from anywhere
 but `Wait`.
 
-Regression gates: the classifier table **and** the queue-mechanics tests in
-[waitpark_test.go](internal/debugger/waitpark_test.go) — both host-agnostic, so
+Regression gates: the classifier table, the queue-mechanics tests **and** the
+resume-decision tests covering rules 7–8 in
+[waitpark_test.go](internal/debugger/waitpark_test.go) — all host-agnostic, so
 they run and can be mutation-checked on macOS — plus the three backend-specific
 tests in
 [backend_linux_amd64_test.go](internal/debugger/backend_linux_amd64_test.go)
@@ -577,7 +578,8 @@ storm, `Pause` racing an in-flight step, and kill with stops held. Those assert
 only invariants the fix guarantees — both logical breakpoints remain tracked at
 every observable stop, every hit belongs to a known id, no error or unexpected
 exit, both ids still clearable, threads still making progress at the end of the
-run — plus non-vacuity. The `churn` label runs five rounds in CI.
+run — plus non-vacuity: the park counters, the signal number, and (reported, not
+asserted) the rule-7 re-arm counter. The `churn` label runs five rounds in CI.
 
 **Non-vacuity is asserted, not assumed.** The overlap those specs provoke is
 inherently racy, so a run that never actually parked a stop proves nothing about
