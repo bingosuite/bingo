@@ -14,7 +14,7 @@ name: Darwin verification gate
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened, labeled, unlabeled]
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -31,7 +31,7 @@ permissions:
 # behind — or cancel a queued — `synchronize`/`reopened`/verified-label run. Only
 # events that are authoritative for the current head share the `policy` group.
 concurrency:
-  group: darwin-verification-${{ github.event.pull_request.number }}-${{ (github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'darwin-e2e-verified' && format('unrelated-{0}', github.run_id) || 'policy' }}
+  group: darwin-verification-${{ github.event.pull_request.number }}-${{ ((((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name != 'darwin-e2e-verified') || (github.event.action == 'edited' && github.event.changes.base == null)) && format('unrelated-{0}', github.run_id)) || 'policy' }}
   cancel-in-progress: false
 
 jobs:
