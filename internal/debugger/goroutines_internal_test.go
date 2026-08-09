@@ -20,6 +20,40 @@ func newGoroutineMemoryBackend() *goroutineMemoryBackend {
 	}
 }
 
+func goroutineTestLayout() *goLayout {
+	return &goLayout{
+		valid:         true,
+		gAtomicstatus: 0,
+		gGoid:         8,
+		gStack:        16,
+		stackLo:       0,
+		stackHi:       8,
+		gM:            32,
+		gSched:        40,
+		bufPC:         0,
+		gWaitreason:   48,
+		gParentGoid:   56,
+		gGopc:         64,
+		gStartpc:      72,
+		mCurg:         80,
+		mAlllink:      88,
+	}
+}
+
+func seedTestGoroutine(
+	backend *goroutineMemoryBackend,
+	layout *goLayout,
+	gptr uint64,
+	goid uint64,
+	stackLo uint64,
+	stackHi uint64,
+) {
+	backend.seedU32(gptr+uint64(layout.gAtomicstatus), 2)
+	backend.seedU64(gptr+uint64(layout.gGoid), goid)
+	backend.seedU64(gptr+uint64(layout.gStack)+uint64(layout.stackLo), stackLo)
+	backend.seedU64(gptr+uint64(layout.gStack)+uint64(layout.stackHi), stackHi)
+}
+
 func (b *goroutineMemoryBackend) seedU64(addr, value uint64) {
 	var raw [8]byte
 	binary.LittleEndian.PutUint64(raw[:], value)
@@ -80,21 +114,7 @@ func TestBuildGoroutineListAnchorsCurrentBeyondRichScan(t *testing.T) {
 		gStride  = uint64(0x100)
 		stack    = uint64(0x80000000)
 	)
-	layout := &goLayout{
-		valid:         true,
-		gAtomicstatus: 0,
-		gGoid:         8,
-		gStack:        16,
-		stackLo:       0,
-		stackHi:       8,
-		gM:            32,
-		gSched:        40,
-		bufPC:         0,
-		gWaitreason:   48,
-		gParentGoid:   56,
-		gGopc:         64,
-		gStartpc:      72,
-	}
+	layout := goroutineTestLayout()
 
 	backend := newGoroutineMemoryBackend()
 	length := uint64(maxGoroutineScan + 4)
@@ -102,10 +122,7 @@ func TestBuildGoroutineListAnchorsCurrentBeyondRichScan(t *testing.T) {
 	for i := uint64(0); i < length; i++ {
 		gptr := gBase + i*gStride
 		backend.seedU64(allgsPtr+i*8, gptr)
-		backend.seedU32(gptr+uint64(layout.gAtomicstatus), 2)
-		backend.seedU64(gptr+uint64(layout.gGoid), i+1)
-		backend.seedU64(gptr+uint64(layout.gStack)+uint64(layout.stackLo), stack+i*gStride)
-		backend.seedU64(gptr+uint64(layout.gStack)+uint64(layout.stackHi), stack+(i+1)*gStride)
+		seedTestGoroutine(backend, layout, gptr, i+1, stack+i*gStride, stack+(i+1)*gStride)
 	}
 
 	liveSP := stack + currentIndex*gStride + 8
@@ -148,31 +165,11 @@ func TestBuildGoroutineListUsesDirectCurrentPointerBeyondFallback(t *testing.T) 
 		currentG = uint64(0x300000)
 		stackLo  = uint64(0x90000000)
 	)
-	layout := &goLayout{
-		valid:         true,
-		gAtomicstatus: 0,
-		gGoid:         8,
-		gStack:        16,
-		stackLo:       0,
-		stackHi:       8,
-		gM:            32,
-		gSched:        40,
-		bufPC:         0,
-		gWaitreason:   48,
-		gParentGoid:   56,
-		gGopc:         64,
-		gStartpc:      72,
-	}
+	layout := goroutineTestLayout()
 	backend := newGoroutineMemoryBackend()
 	backend.seedU64(allgsPtr, prefixG)
-	backend.seedU32(prefixG+uint64(layout.gAtomicstatus), 2)
-	backend.seedU64(prefixG+uint64(layout.gGoid), 1)
-	backend.seedU64(prefixG+uint64(layout.gStack)+uint64(layout.stackLo), 0x1000)
-	backend.seedU64(prefixG+uint64(layout.gStack)+uint64(layout.stackHi), 0x2000)
-	backend.seedU32(currentG+uint64(layout.gAtomicstatus), 2)
-	backend.seedU64(currentG+uint64(layout.gGoid), 99)
-	backend.seedU64(currentG+uint64(layout.gStack)+uint64(layout.stackLo), stackLo)
-	backend.seedU64(currentG+uint64(layout.gStack)+uint64(layout.stackHi), stackLo+0x1000)
+	seedTestGoroutine(backend, layout, prefixG, 1, 0x1000, 0x2000)
+	seedTestGoroutine(backend, layout, currentG, 99, stackLo, stackLo+0x1000)
 
 	length := uint64(maxGoroutineScan*3 + 1)
 	e := &engine{backend: backend}
@@ -197,27 +194,10 @@ func TestBuildGoroutineListBoundsFallbackTail(t *testing.T) {
 		allgsPtr = uint64(0x1000)
 		prefixG  = uint64(0x200000)
 	)
-	layout := &goLayout{
-		valid:         true,
-		gAtomicstatus: 0,
-		gGoid:         8,
-		gStack:        16,
-		stackLo:       0,
-		stackHi:       8,
-		gM:            32,
-		gSched:        40,
-		bufPC:         0,
-		gWaitreason:   48,
-		gParentGoid:   56,
-		gGopc:         64,
-		gStartpc:      72,
-	}
+	layout := goroutineTestLayout()
 	backend := newGoroutineMemoryBackend()
 	backend.seedU64(allgsPtr, prefixG)
-	backend.seedU32(prefixG+uint64(layout.gAtomicstatus), 2)
-	backend.seedU64(prefixG+uint64(layout.gGoid), 1)
-	backend.seedU64(prefixG+uint64(layout.gStack)+uint64(layout.stackLo), 0x1000)
-	backend.seedU64(prefixG+uint64(layout.gStack)+uint64(layout.stackHi), 0x2000)
+	seedTestGoroutine(backend, layout, prefixG, 1, 0x1000, 0x2000)
 
 	length := uint64(maxGoroutineScan*3 + 1)
 	e := &engine{backend: backend}
@@ -249,36 +229,14 @@ func TestFindCurrentGoroutineFromThreadList(t *testing.T) {
 		currentG = uint64(0x500100)
 		stackLo  = uint64(0xa0000000)
 	)
-	layout := &goLayout{
-		valid:         true,
-		gAtomicstatus: 0,
-		gGoid:         8,
-		gStack:        16,
-		stackLo:       0,
-		stackHi:       8,
-		gM:            32,
-		gSched:        40,
-		bufPC:         0,
-		gWaitreason:   48,
-		gParentGoid:   56,
-		gGopc:         64,
-		gStartpc:      72,
-		mCurg:         0,
-		mAlllink:      8,
-	}
+	layout := goroutineTestLayout()
 	backend := newGoroutineMemoryBackend()
 	backend.seedU64(firstM+uint64(layout.mCurg), firstG)
 	backend.seedU64(firstM+uint64(layout.mAlllink), secondM)
 	backend.seedU64(secondM+uint64(layout.mCurg), currentG)
 	backend.seedU64(secondM+uint64(layout.mAlllink), 0)
-	backend.seedU32(firstG+uint64(layout.gAtomicstatus), 2)
-	backend.seedU64(firstG+uint64(layout.gGoid), 1)
-	backend.seedU64(firstG+uint64(layout.gStack)+uint64(layout.stackLo), 0x1000)
-	backend.seedU64(firstG+uint64(layout.gStack)+uint64(layout.stackHi), 0x2000)
-	backend.seedU32(currentG+uint64(layout.gAtomicstatus), 2)
-	backend.seedU64(currentG+uint64(layout.gGoid), 99)
-	backend.seedU64(currentG+uint64(layout.gStack)+uint64(layout.stackLo), stackLo)
-	backend.seedU64(currentG+uint64(layout.gStack)+uint64(layout.stackHi), stackLo+0x1000)
+	seedTestGoroutine(backend, layout, firstG, 1, 0x1000, 0x2000)
+	seedTestGoroutine(backend, layout, currentG, 99, stackLo, stackLo+0x1000)
 
 	e := &engine{backend: backend}
 	result := e.findCurrentGoroutineInThreadList(layout, firstM, stackLo+8, 0x1234)

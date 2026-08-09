@@ -446,76 +446,95 @@ func (e *engine) buildGoroutineListFrom(
 	ptr, length, liveSP, livePC, currentGptr uint64,
 ) goroutineWalkResult {
 	richLength := min(length, uint64(maxGoroutineScan))
+	rich, currentFound := e.readRichGoroutines(l, ptr, richLength, liveSP, livePC)
+	if !rich.Complete || len(rich.Items) == 0 {
+		return goroutineWalkResult{}
+	}
 
-	out := make([]protocol.Goroutine, 0, int(richLength)+1)
+	current := currentGoroutineResult{Complete: true}
+	if !currentFound {
+		current = e.resolveCurrentGoroutineAnchor(
+			l, ptr, richLength, length, liveSP, livePC, currentGptr,
+		)
+		if !current.Complete {
+			return goroutineWalkResult{}
+		}
+	}
+
+	anchorID := 0
+	if current.Found {
+		rich.Items = append(rich.Items, protocol.Goroutine{})
+		copy(rich.Items[1:], rich.Items)
+		rich.Items[0] = current.Item
+		anchorID = current.Item.ID
+	}
+	return goroutineWalkResult{
+		Items:    rich.Items,
+		Complete: true,
+		Clipped:  length > richLength,
+		AnchorID: anchorID,
+	}
+}
+
+func (e *engine) readRichGoroutines(
+	l *goLayout,
+	ptr, length, liveSP, livePC uint64,
+) (goroutineWalkResult, bool) {
+	out := make([]protocol.Goroutine, 0, int(length)+1)
 	currentFound := false
-	for i := uint64(0); i < richLength; i++ {
+	for i := uint64(0); i < length; i++ {
 		entryAddr, ok := allgsEntryAddress(ptr, i)
 		if !ok {
-			return goroutineWalkResult{}
+			return goroutineWalkResult{}, false
 		}
 		gptr, ok := e.readU64(entryAddr)
 		if !ok {
-			return goroutineWalkResult{}
+			return goroutineWalkResult{}, false
 		}
 		if gptr == 0 {
 			continue
 		}
 		result := e.readGoroutine(l, gptr, liveSP, livePC)
 		if !result.Complete {
-			return goroutineWalkResult{}
+			return goroutineWalkResult{}, false
 		}
 		if result.Include {
 			out = append(out, result.Item)
 			currentFound = currentFound || result.Item.Current
 		}
 	}
-	if len(out) == 0 {
-		return goroutineWalkResult{}
-	}
+	return goroutineWalkResult{Items: out, Complete: true}, currentFound
+}
 
-	current := currentGoroutineResult{Complete: true}
-	if !currentFound && currentGptr != 0 {
+func (e *engine) resolveCurrentGoroutineAnchor(
+	l *goLayout,
+	ptr, richLength, length, liveSP, livePC, currentGptr uint64,
+) currentGoroutineResult {
+	if currentGptr != 0 {
 		result := e.readGoroutine(l, currentGptr, liveSP, livePC)
 		if !result.Complete {
-			return goroutineWalkResult{}
+			return currentGoroutineResult{}
 		}
 		if result.Include && result.Item.Current {
-			current = currentGoroutineResult{
+			return currentGoroutineResult{
 				Item:     result.Item,
 				Found:    true,
 				Complete: true,
 			}
 		}
 	}
-	if !currentFound && !current.Found && liveSP != 0 {
-		current = e.findCurrentGoroutineFromThreads(l, liveSP, livePC)
-		if !current.Complete {
-			return goroutineWalkResult{}
-		}
+	if liveSP == 0 {
+		return currentGoroutineResult{Complete: true}
 	}
-	if !currentFound && !current.Found && liveSP != 0 && richLength < length {
-		fallbackEnd := min(length, richLength+uint64(maxGoroutineScan))
-		current = e.findCurrentGoroutine(
-			l, ptr, richLength, fallbackEnd, liveSP, livePC,
-		)
-		if !current.Complete {
-			return goroutineWalkResult{}
-		}
+	current := e.findCurrentGoroutineFromThreads(l, liveSP, livePC)
+	if !current.Complete || current.Found {
+		return current
 	}
-	anchorID := 0
-	if current.Found {
-		out = append(out, protocol.Goroutine{})
-		copy(out[1:], out)
-		out[0] = current.Item
-		anchorID = current.Item.ID
+	if richLength >= length {
+		return currentGoroutineResult{Complete: true}
 	}
-	return goroutineWalkResult{
-		Items:    out,
-		Complete: true,
-		Clipped:  length > richLength,
-		AnchorID: anchorID,
-	}
+	fallbackEnd := min(length, richLength+uint64(maxGoroutineScan))
+	return e.findCurrentGoroutine(l, ptr, richLength, fallbackEnd, liveSP, livePC)
 }
 
 // findCurrentGoroutine is the bounded fallback when the architecture-specific
