@@ -107,19 +107,29 @@ type linuxBackend struct {
 	lastStopTID atomic.Int64
 }
 
-// drainParked returns the next held stop if one may be surfaced now, recording
-// it as the current stop.
+// drainParked returns the next held stop that is still meaningful, recording it
+// as the current stop. Stops whose trap the engine cleared while they waited are
+// dropped and their thread restarted (see restartStaleParked).
 //
 // lastStopTID is updated here, on delivery, and never at park time — from this
 // point the delivered thread is the one the engine acts on, and the one the
 // next TID-less ContinueProcess and memory write will target.
-func (b *linuxBackend) drainParked() (StopEvent, bool) {
-	ev, ok := b.releasable()
-	if !ok {
-		return StopEvent{}, false
+func (b *linuxBackend) drainParked() (StopEvent, bool) { return b.drainParkedWith(b) }
+
+// drainParkedWith is drainParked with the restart dependency made explicit so a
+// test can drive the stale-trap branch without a live tracee.
+func (b *linuxBackend) drainParkedWith(r trapRestarter) (StopEvent, bool) {
+	for {
+		ev, ok := b.releasable()
+		if !ok {
+			return StopEvent{}, false
+		}
+		if b.restartStaleParked(r, ev, archTrapInstruction(), archRewindPC) {
+			continue
+		}
+		b.recordStop(ev.TID)
+		return ev, true
 	}
-	b.recordStop(ev.TID)
-	return ev, true
 }
 
 func (b *linuxBackend) execPtrace(fn func()) { b.tracer.execPtrace(fn) }
