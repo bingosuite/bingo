@@ -10,7 +10,9 @@ name: Debugger E2E
 # (correctness), `churn` (multi-thread robustness), `pause` (async interrupt /
 # manual stop), `stepping` (StepInto/StepOut), `inspect`
 # (StackFrames/Locals/Goroutines), `breakpoints` (ClearBreakpoint), `kill`
-# (kill-while-running), `exit` (process exit status), `restart`, `fullstack`
+# (kill-while-running), `exit` (process exit status), `overlap` (linux-only:
+# a foreign thread's breakpoint stop arriving mid-single-step), `restart`,
+# `fullstack`
 # (operations driven through the whole client → WebSocket → hub → debugger stack),
 # and `dap` (a real Debug Adapter Protocol client driving a session over TCP,
 # with WebSocket observers sharing it).
@@ -86,6 +88,12 @@ jobs:
 
       - name: E2E concurrency (goroutine/thread snapshot foundation)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=concurrency
+
+      # linux-only: Wait4(-1, WALL) is what lets a foreign thread's stop arrive
+      # mid-single-step (issue #199). The darwin receive loop parks stragglers
+      # itself, so the engine's deferral queue never fills there.
+      - name: E2E overlap (foreign-thread stop during a single-step)
+        run: go test -tags e2e -race -count=1 -v -timeout 600s ./test/integration -ginkgo.label-filter=overlap
 
   darwin-arm64:
     name: Darwin arm64 (Mach exceptions)
