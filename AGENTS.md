@@ -1184,6 +1184,35 @@ client on the session arrives with the counter at 0 and IS surfaced as
 `continued`, so the IDE learns the tracee is running again. This is exactly why
 the prerequisite PR made the engine emit `EventContinued` on resume.
 
+**Rejected resumes must resynchronize the adapter (`failResume`/`failRestart`).**
+`onContinue`/`onStep`/`onRestart` clear `suspended` *optimistically* and answer
+their request `success` — DAP has no way to retract a successful `continue`/
+`next` response. But the hub only transitions to `running` on success: a rejected
+`Continue`/`StepOver`/`StepInto`/`StepOut`/`Restart` arrives as `EventError` with
+the engine still `stateSuspended` (see [Suspend/resume
+protocol](#suspendresume-protocol) → Rejected resumes). So `onError` MUST restore
+`suspended = true` for every one of those command kinds — all three step kinds
+handled explicitly, never left to the generic console `default`. Otherwise
+`threads`/`stackTrace`/`variables`/`evaluate` take their not-suspended branch
+forever, answering synthetically without reaching the hub, and the IDE shows a
+running program that can never stop again (the routine trigger is `stepOut` at
+the outermost frame, which `engine.stepOut` rejects without resuming or emitting
+any stop).
+
+A rejected Continue/Step also emits ONE `stopped` (reason `exception`, the
+rejection text in `Text`, `AllThreadsStopped`, current thread) — the only DAP
+message that can walk a client back after a successful resume response. Restart
+does NOT: its delayed error response already reports the failure while the client
+is still stopped. Invariants: the `pendingContinues` debt of a rejected Continue
+is settled exactly once (its `EventContinued` never arrives); no second `stopped`
+is emitted while the handler is already `suspended` (a real stop won the race) or
+while the handshake still owes an initial state report — `launching` (the entry
+stop) or a joiner's `awaitingWelcome` (the hub's welcome `EventSessionState`,
+which another client's rejection can race between `AddClient` and delivery); and
+recovery does NOT route through `onStop` — the process never moved, so the
+current suspension's `varCache` stays valid and the `launching`/`restarting`
+latches are untouched.
+
 ### Request → command + the FIFO-correlation limitation
 
 `continue`→Continue; `next/stepIn/stepOut`→StepOver/Into/Out; `pause`→Pause;
