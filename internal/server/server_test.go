@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -173,6 +174,56 @@ var _ = Describe("Server", func() {
 
 				Expect(p1.SessionID).NotTo(Equal(p2.SessionID))
 				Expect(srv.sessions.count()).To(Equal(2))
+			})
+
+			It("closes only a client that sends an incompatible command version", func() {
+				bad, _, err := websocket.DefaultDialer.Dial(toWS(ts, "/ws?create"), nil)
+				Expect(err).NotTo(HaveOccurred())
+				defer closeWS(bad)
+				welcome, err := recvState(bad)
+				Expect(err).NotTo(HaveOccurred())
+
+				good, _, err := websocket.DefaultDialer.Dial(
+					toWS(ts, "/ws?session="+welcome.SessionID), nil)
+				Expect(err).NotTo(HaveOccurred())
+				defer closeWS(good)
+				_, err = recvState(good)
+				Expect(err).NotTo(HaveOccurred())
+
+				cmd := protocol.Command{
+					Version: "999.0",
+					Kind:    protocol.CmdSetBreakpoint,
+					Payload: json.RawMessage(`{"file":"main.go","line":1}`),
+				}
+				data, err := json.Marshal(cmd)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(bad.WriteMessage(websocket.TextMessage, data)).To(Succeed())
+
+				_ = bad.SetReadDeadline(time.Now().Add(time.Second))
+				_, _, err = bad.ReadMessage()
+				var closeErr *websocket.CloseError
+				Expect(errors.As(err, &closeErr)).To(BeTrue())
+				Expect(closeErr.Code).To(Equal(websocket.CloseProtocolError))
+				Expect(closeErr.Text).To(Equal(protocol.ValidateVersion("999.0").Error()))
+
+				session := srv.sessions.get(welcome.SessionID)
+				Expect(session).NotTo(BeNil())
+				Eventually(session.hub.ClientCount, "2s", "10ms").Should(Equal(1))
+
+				cmd.Version = protocol.Version
+				data, err = json.Marshal(cmd)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(good.WriteMessage(websocket.TextMessage, data)).To(Succeed())
+
+				_ = good.SetReadDeadline(time.Now().Add(time.Second))
+				_, response, err := good.ReadMessage()
+				Expect(err).NotTo(HaveOccurred())
+				event, err := protocol.UnmarshalEvent(response)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(event.Kind).To(Equal(protocol.EventError))
+				var payload protocol.ErrorPayload
+				Expect(protocol.DecodeEventPayload(event, &payload)).To(Succeed())
+				Expect(payload.Command).To(Equal(protocol.CmdSetBreakpoint))
 			})
 		})
 
