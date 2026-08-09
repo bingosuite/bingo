@@ -7,19 +7,19 @@ set -Eeuo pipefail
 
 readonly verified_label='darwin-e2e-verified'
 readonly status_context='Darwin E2E verified'
-readonly darwin_native_regex='^(internal/debugger/.*_darwin_.*|internal/debugger/trap_arm64\.go|test/integration/.*_darwin_.*_test\.go|entitlements\.plist)$'
+readonly darwin_native_regex='^(internal/debugger/.*|test/integration/.*|justfile|entitlements\.plist|go\.(mod|sum)|(.*/)?[^/]*_(darwin|arm64)(_[^/.]+)*\.(go|s|S|c|cc|cpp|cxx|h|hh|hpp|hxx|m|mm|syso)|(.*/)?[^/]*\.(c|cc|cpp|cxx|h|hh|hpp|hxx|m|mm|s|S|syso))$'
 
 event_action=$(jq -er '.action' "$GITHUB_EVENT_PATH")
 pr_number=$(jq -er '.pull_request.number' "$GITHUB_EVENT_PATH")
 head_sha=$(jq -er '.pull_request.head.sha | select(test("^[0-9a-fA-F]{40,64}$"))' "$GITHUB_EVENT_PATH")
+base_sha=$(jq -er '.pull_request.base.sha | select(test("^[0-9a-fA-F]{40,64}$"))' "$GITHUB_EVENT_PATH")
 head_repository=$(jq -er '.pull_request.head.repo.full_name // ""' "$GITHUB_EVENT_PATH")
 event_label=$(jq -er '.label.name // ""' "$GITHUB_EVENT_PATH")
-declared_changed_files=$(jq -er \
-  '.pull_request.changed_files | numbers | select(. >= 0 and floor == .)' \
-  "$GITHUB_EVENT_PATH")
+base_changed=$(jq -r '(.changes.base // null) != null' "$GITHUB_EVENT_PATH")
 run_url="${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/${GITHUB_RUN_ID:-0}"
 final_status_posted=false
 decision_file=${DARWIN_GATE_DECISION_FILE:-}
+approval_ready=false
 
 # The workflow treats an absent decision as "interrupted after posting pending"
 # and fails the head closed, so only terminal outcomes may be recorded here.
@@ -66,7 +66,7 @@ fail_closed() {
 trap fail_closed ERR
 
 case "$event_action" in
-  opened | synchronize | reopened | labeled | unlabeled) ;;
+  opened | synchronize | reopened | edited | labeled | unlabeled) ;;
   *)
     echo "Unsupported pull_request_target action: $event_action" >&2
     exit 2
@@ -80,10 +80,40 @@ if { [ "$event_action" = "labeled" ] || [ "$event_action" = "unlabeled" ]; } &&
   exit 0
 fi
 
+if [ "$event_action" = "edited" ] && [ "$base_changed" != "true" ]; then
+  echo "Ignoring pull request edit that did not change the base; the existing head-SHA status remains authoritative."
+  record_decision ignored
+  exit 0
+fi
+
+if [ "$event_action" = "labeled" ] && [ "$event_label" = "$verified_label" ]; then
+  prior_statuses_json=$(trap - ERR; mktemp)
+  trap 'rm -f "$prior_statuses_json"' EXIT
+  gh api --paginate --slurp \
+    "repos/$GITHUB_REPOSITORY/commits/$head_sha/statuses?per_page=100" \
+    > "$prior_statuses_json"
+  approval_ready=$(trap - ERR; jq -r \
+    --arg context "$status_context" \
+    --arg run_prefix "${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/" '
+      [
+        .[][]
+        | select(.context == $context)
+      ][0] as $latest
+      | (
+          $latest.state == "failure"
+          and $latest.creator.login == "github-actions[bot]"
+          and (($latest.target_url // "") | startswith($run_prefix))
+        )
+    ' "$prior_statuses_json")
+  rm -f "$prior_statuses_json"
+fi
+
 post_status pending 'Evaluating Darwin verification policy.'
 
 label_cleanup=not-run
-if [ "$event_action" = "synchronize" ] || [ "$event_action" = "reopened" ]; then
+if [ "$event_action" = "synchronize" ] ||
+  [ "$event_action" = "reopened" ] ||
+  [ "$event_action" = "edited" ]; then
   if output=$(trap - ERR; gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" \
     --remove-label "$verified_label" 2>&1); then
     label_cleanup=cleared
@@ -100,23 +130,95 @@ if [ "$event_action" = "synchronize" ] || [ "$event_action" = "reopened" ]; then
   fi
 fi
 
-files_json=$(trap - ERR; mktemp)
-trap 'rm -f "$files_json"' EXIT
-gh api --paginate --slurp \
-  "repos/$GITHUB_REPOSITORY/pulls/$pr_number/files?per_page=100" > "$files_json"
-listed_changed_files=$(trap - ERR; jq -er '[.[][]] | length' "$files_json")
+base_tree_json=$(trap - ERR; mktemp)
+head_tree_json=$(trap - ERR; mktemp)
+changed_paths_json=$(trap - ERR; mktemp)
+trap 'rm -f "$base_tree_json" "$head_tree_json" "$changed_paths_json"' EXIT
 
-if [ "$listed_changed_files" -ne "$declared_changed_files" ]; then
-  echo "PR files API returned $listed_changed_files of $declared_changed_files changed files; refusing an incomplete gate decision." >&2
+merge_base_sha=$(trap - ERR; gh api \
+  "repos/$GITHUB_REPOSITORY/compare/$base_sha...$head_sha" \
+  --jq '.merge_base_commit.sha')
+case "$merge_base_sha" in
+  '' | *[!0-9a-fA-F]*)
+    echo "Compare API returned an invalid merge-base SHA." >&2
+    false
+    ;;
+esac
+
+merge_base_tree_sha=$(trap - ERR; gh api \
+  "repos/$GITHUB_REPOSITORY/git/commits/$merge_base_sha" --jq '.tree.sha')
+head_tree_sha=$(trap - ERR; gh api \
+  "repos/$GITHUB_REPOSITORY/git/commits/$head_sha" --jq '.tree.sha')
+
+gh api "repos/$GITHUB_REPOSITORY/git/trees/$merge_base_tree_sha?recursive=1" \
+  > "$base_tree_json"
+gh api "repos/$GITHUB_REPOSITORY/git/trees/$head_tree_sha?recursive=1" \
+  > "$head_tree_json"
+
+if ! jq -e '.truncated == false and (.tree | type == "array")' \
+  "$base_tree_json" >/dev/null ||
+  ! jq -e '.truncated == false and (.tree | type == "array")' \
+    "$head_tree_json" >/dev/null; then
+  echo "Git tree API returned a truncated or malformed tree; refusing an incomplete gate decision." >&2
+  false
+fi
+
+jq -n \
+  --slurpfile base "$base_tree_json" \
+  --slurpfile head "$head_tree_json" '
+    def entries($doc):
+      reduce ($doc[0].tree[] | select(.type != "tree")) as $entry
+        ({};
+          .[$entry.path] = {
+            mode: $entry.mode,
+            sha: $entry.sha,
+            type: $entry.type
+          });
+    entries($base) as $before
+    | entries($head) as $after
+    | (($before | keys_unsorted) + ($after | keys_unsorted) | unique)
+    | map(select($before[.] != $after[.]) | {
+        path: .,
+        before: $before[.],
+        after: $after[.]
+      })
+  ' > "$changed_paths_json"
+
+listed_changed_files=$(trap - ERR; jq -er 'length' "$changed_paths_json")
+if [ "$listed_changed_files" -eq 0 ]; then
+  echo "Immutable base/head comparison returned no changed files; refusing an empty gate decision." >&2
   false
 fi
 
 echo "Changed files in this PR:"
-jq -r '.[][] | .filename | @json' "$files_json" | sed 's/^/  /'
+jq -r '.[].path | @json' "$changed_paths_json" | sed 's/^/  /'
 echo
 
 darwin_changed=$(trap - ERR; jq -r --arg regex "$darwin_native_regex" \
-  'any(.[][]; .filename | test($regex))' "$files_json")
+  'any(.[].path; test($regex) or test("[[:cntrl:]]"))' \
+  "$changed_paths_json")
+
+if [ "$darwin_changed" = "false" ]; then
+  blob_shas=$(trap - ERR; jq -r '
+    .[]
+    | select(.path | endswith(".go"))
+    | .before.sha, .after.sha
+    | select(type == "string")
+  ' "$changed_paths_json" | sort -u)
+  while IFS= read -r blob_sha; do
+    [ -n "$blob_sha" ] || continue
+    blob_file=$(trap - ERR; mktemp)
+    gh api "repos/$GITHUB_REPOSITORY/git/blobs/$blob_sha" \
+      --jq '.content' | base64 -d > "$blob_file"
+    if grep -Eq '^[[:space:]]*//[[:space:]]*(go:build|\+build)[[:space:]]' \
+      "$blob_file"; then
+      darwin_changed=true
+      rm -f "$blob_file"
+      break
+    fi
+    rm -f "$blob_file"
+  done <<< "$blob_shas"
+fi
 
 if [ "$darwin_changed" = "false" ]; then
   post_status success 'No Darwin-native files changed.'
@@ -131,16 +233,16 @@ fi
 
 echo "Darwin-native (CI-unexecutable) files changed:"
 jq -r --arg regex "$darwin_native_regex" \
-  '.[][] | .filename | select(test($regex)) | @json' \
-  "$files_json" | sed 's/^/  /'
+  '.[].path | select(test($regex) or test("[[:cntrl:]]")) | @json' \
+  "$changed_paths_json" | sed 's/^/  /'
 echo
 
 case "$event_action" in
-  synchronize | reopened)
+  synchronize | reopened | edited)
     if [ "$label_cleanup" = "failed" ]; then
-      echo "::error title=Darwin E2E re-verification required::The stale '$verified_label' label could not be removed. Run 'just e2e-darwin' locally on Apple Silicon, remove or toggle the stale label, then re-add it to verify this head."
+      echo "::error title=Darwin E2E re-verification required::The stale '$verified_label' label could not be removed. Using the trusted base branch's justfile, run the e2e-darwin recipe against this head on Apple Silicon; then remove or toggle the stale label and re-add it."
     else
-      echo "::error title=Darwin E2E re-verification required::Run 'just e2e-darwin' locally on Apple Silicon, confirm it passes, then add the '$verified_label' label to verify this head."
+      echo "::error title=Darwin E2E re-verification required::Using the trusted base branch's justfile, run the e2e-darwin recipe against this head on Apple Silicon, review any PR changes to the recipe, confirm it passes, then add the '$verified_label' label."
     fi
     post_status failure 'New commits or reopening require Darwin re-verification.'
     trap - ERR
@@ -148,7 +250,7 @@ case "$event_action" in
     ;;
   opened)
     post_status failure 'Darwin E2E verification is required for this head.'
-    echo "::error title=Darwin E2E verification required::Run 'just e2e-darwin' locally on Apple Silicon, confirm it passes, then add the '$verified_label' label to this PR."
+    echo "::error title=Darwin E2E verification required::Using the trusted base branch's justfile, run the e2e-darwin recipe against this head on Apple Silicon, review any PR changes to the recipe, confirm it passes, then add the '$verified_label' label."
     trap - ERR
     exit 1
     ;;
@@ -157,6 +259,12 @@ case "$event_action" in
       "repos/$GITHUB_REPOSITORY/issues/$pr_number/labels?per_page=100" \
       --jq '.[].name')
     if grep -Fxq "$verified_label" <<< "$live_labels"; then
+      if [ "$event_action" = "labeled" ] && [ "$approval_ready" != "true" ]; then
+        post_status failure 'Darwin verification must follow a head evaluation.'
+        echo "::error title=Darwin E2E verification not ready::This head has not completed a trusted failing gate run yet. Wait for that run, then toggle '$verified_label' again."
+        trap - ERR
+        exit 1
+      fi
       post_status success 'Darwin E2E verified for this head SHA.'
       echo "'$verified_label' label present; darwin backend verified locally for $head_sha."
       exit 0

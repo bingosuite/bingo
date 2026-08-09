@@ -31,6 +31,23 @@ if [ "$1" != "api" ]; then
 fi
 
 case "$*" in
+  *"/commits/"*"/statuses?"*)
+    jq -n \
+      --arg state "$MOCK_PRIOR_STATUS_STATE" \
+      --arg creator "$MOCK_PRIOR_STATUS_CREATOR" \
+      --arg target "$MOCK_PRIOR_STATUS_TARGET" '
+        if $state == "" then
+          [[]]
+        else
+          [[{
+            context: "Darwin E2E verified",
+            state: $state,
+            creator: {login: $creator},
+            target_url: $target
+          }]]
+        end
+      '
+    ;;
   *"/statuses/"*)
     state=
     context=
@@ -52,20 +69,72 @@ case "$*" in
     done
     printf '%s|%s|%s\n' "$endpoint" "$state" "$context" >> "$MOCK_STATUS_LOG"
     ;;
-  *"/pulls/"*"/files?"*)
+  *"/compare/"*)
     if [ "$MOCK_DIFF_STATUS" -ne 0 ]; then
       echo "diff API failed" >&2
       exit "$MOCK_DIFF_STATUS"
     fi
-    # `--slurp` yields one array per fetched page; the gate must flatten them.
+    printf '%s\n' "$MOCK_MERGE_BASE_SHA"
+    ;;
+  *"/git/commits/"*)
+    case "$*" in
+      *"/git/commits/$MOCK_MERGE_BASE_SHA"*)
+        printf '%s\n' "$MOCK_BASE_TREE_SHA"
+        ;;
+      *"/git/commits/$MOCK_HEAD_SHA"*)
+        printf '%s\n' "$MOCK_HEAD_TREE_SHA"
+        ;;
+      *)
+        echo "Unexpected commit lookup: $*" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  *"/git/trees/"*)
+    paths='[]'
+    truncated=false
+    case "$*" in
+      *"/git/trees/$MOCK_BASE_TREE_SHA"*)
+        paths=$MOCK_BASE_PATHS_JSON
+        truncated=$MOCK_BASE_TREE_TRUNCATED
+        ;;
+      *"/git/trees/$MOCK_HEAD_TREE_SHA"*)
+        paths=$MOCK_CHANGED_PATHS_JSON
+        truncated=$MOCK_TREE_TRUNCATED
+        ;;
+      *)
+        echo "Unexpected tree lookup: $*" >&2
+        exit 2
+        ;;
+    esac
     jq -n \
-      --argjson filenames "$MOCK_CHANGED_PATHS_JSON" \
-      --argjson pages "$MOCK_PAGES" '
-        [$filenames[] | {filename: .}] as $files
-        | ((($files | length) + $pages - 1) / $pages | floor) as $size
-        | [range(0; $pages) | $files[(. * $size):((. + 1) * $size)]]
-        | map(select(length > 0))
+      --argjson paths "$paths" \
+      --argjson truncated "$truncated" '
+        {
+          truncated: $truncated,
+          tree: [
+            range(0; $paths | length) as $index
+            | {
+                mode: "100644",
+                path: $paths[$index],
+                sha: ($index | tostring),
+                type: "blob"
+              }
+          ]
+        }
       '
+    ;;
+  *"/git/blobs/"*)
+    path=
+    for arg in "$@"; do
+      case "$arg" in
+        repos/*/git/blobs/*) path=$arg ;;
+      esac
+    done
+    sha=${path##*/}
+    content=$(jq -r --arg sha "$sha" '.[$sha] // "package bingo\n"' \
+      <<< "$MOCK_BLOB_CONTENTS_JSON")
+    printf '%s' "$content" | base64
     ;;
   *"/issues/"*"/labels?"*)
     if [ "$MOCK_LABEL_STATUS" -ne 0 ]; then
@@ -101,17 +170,23 @@ fail_case() {
 
 # run_case NAME key=value...
 #
-# Keys: action, label, head_repo, path, paths_json, pages, has_label,
-# edit_status, diff_status, label_status, status_fail, declared_files,
-# exit, state, states, output, label_query, decision, gh_contains, gh_missing.
+# Keys: action, label, head_repo, path, paths_json, base_paths_json,
+# base_changed, tree_truncated, blob_contents_json, prior_status,
+# prior_creator, prior_target, has_label, edit_status, diff_status, label_status,
+# status_fail, exit, state, states, output, label_query, decision, gh_contains,
+# gh_missing.
 run_case() {
   local name=$1
   shift
 
   local action=opened label='' head_repo=contributor/fork
-  local path=entitlements.plist paths_json='' pages=1
+  local path=entitlements.plist paths_json='' base_paths_json='[]'
+  local base_changed=false base_tree_truncated=false tree_truncated=false
+  local blob_contents_json='{}'
+  local prior_status=failure prior_creator='github-actions[bot]'
+  local prior_target='https://github.com/bingosuite/bingo/actions/runs/122'
   local has_label=false edit_status=0 diff_status=0 label_status=0
-  local status_fail='' declared_files='' expect_exit=0 expect_state=none
+  local status_fail='' expect_exit=0 expect_state=none
   local expect_states=''
   local expect_output='' expect_label_query=any expect_decision=''
   local gh_contains='' gh_missing=''
@@ -126,13 +201,19 @@ run_case() {
       head_repo) head_repo=$value ;;
       path) path=$value ;;
       paths_json) paths_json=$value ;;
-      pages) pages=$value ;;
+      base_paths_json) base_paths_json=$value ;;
+      base_changed) base_changed=$value ;;
+      base_tree_truncated) base_tree_truncated=$value ;;
+      tree_truncated) tree_truncated=$value ;;
+      blob_contents_json) blob_contents_json=$value ;;
+      prior_status) prior_status=$value ;;
+      prior_creator) prior_creator=$value ;;
+      prior_target) prior_target=$value ;;
       has_label) has_label=$value ;;
       edit_status) edit_status=$value ;;
       diff_status) diff_status=$value ;;
       label_status) label_status=$value ;;
       status_fail) status_fail=$value ;;
-      declared_files) declared_files=$value ;;
       exit) expect_exit=$value ;;
       state) expect_state=$value ;;
       states) expect_states=$value ;;
@@ -153,14 +234,19 @@ run_case() {
   local decision_file="$tmpdir/decision-$case_id.txt"
   local head_sha
   head_sha=$(printf '%040x' "$case_id")
+  local base_sha
+  base_sha=$(printf 'f%039x' "$case_id")
+  local merge_base_sha
+  merge_base_sha=$(printf 'e%039x' "$case_id")
+  local base_tree_sha
+  base_tree_sha=$(printf 'c%039x' "$case_id")
+  local head_tree_sha
+  head_tree_sha=$(printf 'd%039x' "$case_id")
   local output
   local status=0
 
   if [ -z "$paths_json" ]; then
     paths_json=$(jq -n --arg path "$path" '[$path]')
-  fi
-  if [ -z "$declared_files" ]; then
-    declared_files=$(jq -n --argjson paths "$paths_json" '$paths | length')
   fi
   : > "$gh_log"
   : > "$status_log"
@@ -171,13 +257,22 @@ run_case() {
     --arg event_label "$label" \
     --arg head_repository "$head_repo" \
     --arg head_sha "$head_sha" \
-    --argjson changed_files "$declared_files" \
+    --arg base_sha "$base_sha" \
+    --argjson base_changed "$base_changed" \
+    --argjson changed_files "$(jq -n --argjson paths "$paths_json" '$paths | length')" \
     '{
       action: $action,
       label: {name: $event_label},
+      changes: (
+        if $base_changed
+        then {base: {ref: {from: "previous-base"}}}
+        else {}
+        end
+      ),
       pull_request: {
         number: 17,
         changed_files: $changed_files,
+        base: {sha: $base_sha},
         head: {sha: $head_sha, repo: {full_name: $head_repository}}
       }
     }' > "$event_path"
@@ -192,7 +287,17 @@ run_case() {
       MOCK_GH_LOG="$gh_log" \
       MOCK_STATUS_LOG="$status_log" \
       MOCK_CHANGED_PATHS_JSON="$paths_json" \
-      MOCK_PAGES="$pages" \
+      MOCK_BASE_PATHS_JSON="$base_paths_json" \
+      MOCK_BASE_TREE_TRUNCATED="$base_tree_truncated" \
+      MOCK_TREE_TRUNCATED="$tree_truncated" \
+      MOCK_MERGE_BASE_SHA="$merge_base_sha" \
+      MOCK_BASE_TREE_SHA="$base_tree_sha" \
+      MOCK_HEAD_TREE_SHA="$head_tree_sha" \
+      MOCK_HEAD_SHA="$head_sha" \
+      MOCK_BLOB_CONTENTS_JSON="$blob_contents_json" \
+      MOCK_PRIOR_STATUS_STATE="$prior_status" \
+      MOCK_PRIOR_STATUS_CREATOR="$prior_creator" \
+      MOCK_PRIOR_STATUS_TARGET="$prior_target" \
       MOCK_HAS_LABEL="$has_label" \
       MOCK_EDIT_STATUS="$edit_status" \
       MOCK_DIFF_STATUS="$diff_status" \
@@ -221,6 +326,17 @@ run_case() {
 
   if grep -Eq 'attacker-controlled|attacker/repository| 999 ' "$gh_log"; then
     fail_case "$name" "hostile environment reached gh" "$(cat "$gh_log")"
+  fi
+
+  if grep -Fq "/pulls/17/files" "$gh_log"; then
+    fail_case "$name" "gate consulted the live pull request file list" \
+      "$(cat "$gh_log")"
+  fi
+
+  if grep -Fq '|pending|' "$status_log" &&
+    ! grep -Fq "/compare/$base_sha...$head_sha" "$gh_log"; then
+    fail_case "$name" "gate did not bind its diff to event base/head SHAs" \
+      "$(cat "$gh_log")"
   fi
 
   if [ "$expect_label_query" = "true" ] &&
@@ -316,7 +432,7 @@ run_case "successful cleanup omits the stale-label recovery hint" \
   has_label=true edit_status=0 \
   exit=1 state=failure label_query=false decision=failure \
   gh_contains="--remove-label darwin-e2e-verified" \
-  output="then add the 'darwin-e2e-verified' label to verify this head"
+  output="then add the 'darwin-e2e-verified' label"
 
 run_case "reopened pull request fails current head" \
   action=reopened head_repo=contributor/fork path=entitlements.plist \
@@ -350,6 +466,18 @@ run_case "verified label publishes success to current head" \
   path=test/integration/debugger_e2e_darwin_arm64_test.go has_label=true \
   exit=0 state=success label_query=true decision=success \
   gh_missing="pr edit" output="verified locally"
+
+run_case "verified label cannot supersede an unevaluated head" \
+  action=labeled label=darwin-e2e-verified head_repo=contributor/fork \
+  path=entitlements.plist has_label=true prior_status='' \
+  exit=1 state=failure label_query=true decision=failure \
+  output="has not completed a trusted failing gate run"
+
+run_case "untrusted prior failure cannot authorize a verified label" \
+  action=labeled label=darwin-e2e-verified head_repo=contributor/fork \
+  path=entitlements.plist has_label=true prior_creator=octocat \
+  exit=1 state=failure label_query=true decision=failure \
+  output="has not completed a trusted failing gate run"
 
 run_case "verified label removal publishes failure" \
   action=unlabeled label=darwin-e2e-verified head_repo=contributor/fork \
@@ -410,52 +538,193 @@ needs-review' \
   exit=0 state=success label_query=true decision=success \
   output="verified locally"
 
+# --- pull request edits ------------------------------------------------------
+
+run_case "non-base pull request edit preserves the current status" \
+  action=edited base_changed=false head_repo=contributor/fork \
+  path=entitlements.plist \
+  exit=0 state=none decision=ignored gh_missing="statuses/" \
+  output="did not change the base"
+
+run_case "base retarget invalidates Darwin verification" \
+  action=edited base_changed=true head_repo=contributor/fork \
+  path=entitlements.plist has_label=true edit_status=1 \
+  exit=1 state=failure decision=failure label_query=false \
+  output="re-verification required"
+
 # --- path matching -----------------------------------------------------------
 
 run_case "non-Darwin synchronize publishes success" \
-  action=synchronize head_repo=contributor/fork path=internal/debugger/engine.go \
+  action=synchronize head_repo=contributor/fork path=internal/hub/hub.go \
   has_label=true edit_status=1 \
   exit=0 state=success label_query=false decision=success \
   output="No darwin-native code changed"
 
 run_case "near-match outside regex publishes success" \
-  action=opened head_repo=contributor/fork path=docs/backend_darwin_arm64.go \
+  action=opened head_repo=contributor/fork path=docs/backend-darwin-arm64.go \
   exit=0 state=success label_query=false decision=success \
   output="No darwin-native code changed"
+
+run_case "darwin GOOS suffix without arch still gates" \
+  action=opened head_repo=contributor/fork \
+  path=internal/debugger/backend_darwin.go \
+  exit=1 state=failure decision=failure output="verification required"
+
+run_case "darwin suffix in a new package still gates" \
+  action=opened head_repo=contributor/fork \
+  path=internal/hub/attach_darwin.go \
+  exit=1 state=failure decision=failure output="verification required"
+
+run_case "arm64 assembly in a new package still gates" \
+  action=opened head_repo=contributor/fork \
+  path=internal/hub/attach_arm64.s \
+  exit=1 state=failure decision=failure output="verification required"
+
+run_case "arm64 test suffix still gates" \
+  action=opened head_repo=contributor/fork \
+  path=internal/debugger/trap_arm64_test.go \
+  exit=1 state=failure decision=failure output="verification required"
+
+run_case "native source without platform suffix gates conservatively" \
+  action=opened head_repo=contributor/fork \
+  path=internal/debugger/machtrap.s \
+  exit=1 state=failure decision=failure output="verification required"
+
+darwin_constraint_blob=$(jq -n \
+  '{"0":"//go:build darwin && arm64 && bingonative\n\npackage debugger\n"}')
+run_case "darwin build constraint gates convention-free Go file" \
+  action=opened head_repo=contributor/fork \
+  path=internal/hub/machfix.go \
+  blob_contents_json="$darwin_constraint_blob" \
+  exit=1 state=failure decision=failure output="verification required"
+
+negated_constraint_blob=$(jq -n \
+  '{"0":"//go:build !linux && !windows\n\npackage debugger\n"}')
+run_case "negated platform constraint is evaluated as Darwin-only" \
+  action=opened head_repo=contributor/fork \
+  path=internal/hub/negated.go \
+  blob_contents_json="$negated_constraint_blob" \
+  exit=1 state=failure decision=failure output="verification required"
+
+legacy_constraint_blob=$(jq -n \
+  '{"0":"// +build darwin,arm64\n\npackage debugger\n"}')
+run_case "legacy Darwin build constraint still gates" \
+  action=opened head_repo=contributor/fork \
+  path=internal/hub/legacy.go \
+  blob_contents_json="$legacy_constraint_blob" \
+  exit=1 state=failure decision=failure output="verification required"
+
+cross_platform_constraint_blob=$(jq -n \
+  '{"0":"//go:build (linux && amd64) || (darwin && arm64)\n\npackage debugger\n"}')
+run_case "cross-platform build constraint gates conservatively" \
+  action=opened head_repo=contributor/fork \
+  path=internal/hub/crossplatform.go \
+  blob_contents_json="$cross_platform_constraint_blob" \
+  exit=1 state=failure decision=failure output="verification required"
+
+large_padding=$(awk 'BEGIN {
+  for (i = 0; i < 4000; i++) {
+    print "// padding padding padding padding padding"
+  }
+}')
+large_header=$(printf '//go:build darwin && arm64\n%s\npackage debugger\n' \
+  "$large_padding")
+large_constraint_blob=$(jq -n --arg content "$large_header" '{"0":$content}')
+run_case "large pre-package header cannot bypass build constraint detection" \
+  action=opened head_repo=contributor/fork \
+  path=internal/hub/largeheader.go \
+  blob_contents_json="$large_constraint_blob" \
+  exit=1 state=failure decision=failure output="verification required"
+
+decoy_constraint_blob=$(jq -n \
+  '{"0":"/*\n//go:build ignore\n*/\npackage debugger\n"}')
+run_case "constraint-like comment gates conservatively rather than false-green" \
+  action=opened head_repo=contributor/fork \
+  path=internal/hub/decoy.go \
+  blob_contents_json="$decoy_constraint_blob" \
+  exit=1 state=failure decision=failure output="verification required"
+
+run_case "existing Darwin probe constraint is gated" \
+  action=opened head_repo=contributor/fork \
+  path=internal/debugger/gcpreempt_probe_test.go \
+  blob_contents_json="$darwin_constraint_blob" \
+  exit=1 state=failure decision=failure output="verification required"
+
+run_case "ordinary Go change without Darwin constraint stays ungated" \
+  action=opened head_repo=contributor/fork \
+  path=internal/hub/hub.go \
+  exit=0 state=success decision=success output="No darwin-native code changed"
+
+run_case "runtime-dispatched debugger code always gates" \
+  action=opened head_repo=contributor/fork \
+  path=internal/debugger/dwarf.go \
+  exit=1 state=failure decision=failure output="verification required"
+
+run_case "integration suite entry point always gates" \
+  action=opened head_repo=contributor/fork \
+  path=test/integration/integration_suite_test.go \
+  exit=1 state=failure decision=failure output="verification required"
+
+run_case "Darwin verification recipe always gates" \
+  action=opened head_repo=contributor/fork path=justfile \
+  exit=1 state=failure decision=failure output="verification required"
+
+run_case "module graph changes always gate" \
+  action=opened head_repo=contributor/fork path=go.mod \
+  exit=1 state=failure decision=failure output="verification required"
 
 run_case "one Darwin file among many still gates" \
   action=opened head_repo=contributor/fork \
   paths_json='["README.md","internal/hub/hub.go","internal/debugger/backend_darwin_arm64.go","docs/x.md"]' \
   exit=1 state=failure decision=failure output="verification required"
 
-# --- PR files API integrity --------------------------------------------------
+# --- immutable tree diff integrity -------------------------------------------
 
-run_case "paginated file list is flattened and gated" \
+many_paths_json=$(jq -n \
+  '[range(0; 150) | "docs/generated-\(.).md"] + ["entitlements.plist"]')
+run_case "more than 100 changed files are evaluated immutably" \
   action=opened head_repo=contributor/fork \
-  paths_json='["a.md","b.md","c.md","entitlements.plist"]' pages=2 \
+  paths_json="$many_paths_json" \
   exit=1 state=failure decision=failure output="verification required"
 
-run_case "paginated non-Darwin file list publishes success" \
+run_case "multi-file non-Darwin tree diff publishes success" \
   action=opened head_repo=contributor/fork \
-  paths_json='["a.md","b.md","c.md","d.md","e.md","f.md"]' pages=3 \
+  paths_json='["a.md","b.md","c.md","d.md","e.md","f.md"]' \
   exit=0 state=success decision=success output="No darwin-native code changed"
 
-run_case "truncated PR files response fails closed" \
+run_case "truncated Git tree response fails closed" \
   action=opened head_repo=contributor/fork path=docs/readme.md \
-  declared_files=3001 \
+  tree_truncated=true \
   exit=1 state=failure decision=failure \
-  output="refusing an incomplete gate decision"
+  output="truncated or malformed tree"
 
-run_case "newline filename cannot hide truncated response" \
-  action=opened head_repo=contributor/fork path=$'000-padding\nextra-line' \
-  declared_files=2 \
-  exit=1 state=failure decision=failure output="returned 1 of 2 changed files"
-
-run_case "over-reported file list also fails closed" \
+run_case "truncated base tree cannot hide a Darwin deletion" \
   action=opened head_repo=contributor/fork \
-  paths_json='["a.md","b.md"]' declared_files=1 \
+  base_paths_json='["entitlements.plist","README.md"]' \
+  paths_json='["README.md"]' base_tree_truncated=true \
   exit=1 state=failure decision=failure \
-  output="refusing an incomplete gate decision"
+  output="truncated or malformed tree"
+
+run_case "control character filename fails closed" \
+  action=opened head_repo=contributor/fork \
+  path=$'000-padding\nentitlements.plist' \
+  exit=1 state=failure decision=failure output="verification required"
+
+run_case "empty immutable diff fails closed" \
+  action=opened head_repo=contributor/fork paths_json='[]' \
+  exit=1 state=failure decision=failure \
+  output="refusing an empty gate decision"
+
+run_case "deleting a Darwin file still requires verification" \
+  action=opened head_repo=contributor/fork \
+  base_paths_json='["entitlements.plist"]' paths_json='[]' \
+  exit=1 state=failure decision=failure output="verification required"
+
+run_case "deleting a convention-free Darwin constrained file is gated" \
+  action=opened head_repo=contributor/fork \
+  base_paths_json='["internal/hub/machfix.go"]' paths_json='[]' \
+  blob_contents_json="$darwin_constraint_blob" \
+  exit=1 state=failure decision=failure output="verification required"
 
 run_case "diff API failure replaces pending with failure" \
   action=opened head_repo=contributor/fork path=entitlements.plist \
@@ -490,9 +759,9 @@ run_case "unpublishable success degrades to failure" \
 # --- unsupported actions -----------------------------------------------------
 
 run_case "unsupported action refuses to decide" \
-  action=edited head_repo=contributor/fork path=entitlements.plist \
+  action=closed head_repo=contributor/fork path=entitlements.plist \
   exit=2 state=none decision=none gh_missing="statuses/" \
-  output="Unsupported pull_request_target action: edited"
+  output="Unsupported pull_request_target action: closed"
 
 run_status_persistence_sequence() {
   local name=$1
@@ -510,10 +779,18 @@ run_status_persistence_sequence() {
   local unrelated_event
   local first_status=0
   local second_status=0
+  local base_sha
+  local merge_base_sha
+  local base_tree_sha
+  local head_tree_sha
 
   case_count=$((case_count + 1))
   case_id=$case_count
   head_sha=$(printf '%040x' "$case_id")
+  base_sha=$(printf 'f%039x' "$case_id")
+  merge_base_sha=$(printf 'e%039x' "$case_id")
+  base_tree_sha=$(printf 'c%039x' "$case_id")
+  head_tree_sha=$(printf 'd%039x' "$case_id")
   gh_log="$tmpdir/sequence-gh-$case_id.log"
   status_log="$tmpdir/sequence-status-$case_id.log"
   first_event="$tmpdir/sequence-first-$case_id.json"
@@ -525,23 +802,27 @@ run_status_persistence_sequence() {
     --arg action "$first_action" \
     --arg event_label "$first_event_label" \
     --arg head_sha "$head_sha" \
+    --arg base_sha "$base_sha" \
     '{
       action: $action,
       label: {name: $event_label},
       pull_request: {
         number: 17,
         changed_files: 1,
+        base: {sha: $base_sha},
         head: {sha: $head_sha, repo: {full_name: "contributor/fork"}}
       }
     }' > "$first_event"
   jq -n \
     --arg head_sha "$head_sha" \
+    --arg base_sha "$base_sha" \
     '{
       action: "labeled",
       label: {name: "triage"},
       pull_request: {
         number: 17,
         changed_files: 1,
+        base: {sha: $base_sha},
         head: {sha: $head_sha, repo: {full_name: "contributor/fork"}}
       }
     }' > "$unrelated_event"
@@ -552,7 +833,17 @@ run_status_persistence_sequence() {
     MOCK_GH_LOG="$gh_log" \
     MOCK_STATUS_LOG="$status_log" \
     MOCK_CHANGED_PATHS_JSON='["entitlements.plist"]' \
-    MOCK_PAGES=1 \
+    MOCK_BASE_PATHS_JSON='[]' \
+    MOCK_BASE_TREE_TRUNCATED=false \
+    MOCK_TREE_TRUNCATED=false \
+    MOCK_MERGE_BASE_SHA="$merge_base_sha" \
+    MOCK_BASE_TREE_SHA="$base_tree_sha" \
+    MOCK_HEAD_TREE_SHA="$head_tree_sha" \
+    MOCK_HEAD_SHA="$head_sha" \
+    MOCK_BLOB_CONTENTS_JSON='{}' \
+    MOCK_PRIOR_STATUS_STATE=failure \
+    MOCK_PRIOR_STATUS_CREATOR='github-actions[bot]' \
+    MOCK_PRIOR_STATUS_TARGET='https://github.com/bingosuite/bingo/actions/runs/122' \
     MOCK_HAS_LABEL="$first_has_label" \
     MOCK_EDIT_STATUS="$first_edit_status" \
     MOCK_DIFF_STATUS=0 \
@@ -565,7 +856,17 @@ run_status_persistence_sequence() {
     MOCK_GH_LOG="$gh_log" \
     MOCK_STATUS_LOG="$status_log" \
     MOCK_CHANGED_PATHS_JSON='["entitlements.plist"]' \
-    MOCK_PAGES=1 \
+    MOCK_BASE_PATHS_JSON='[]' \
+    MOCK_BASE_TREE_TRUNCATED=false \
+    MOCK_TREE_TRUNCATED=false \
+    MOCK_MERGE_BASE_SHA="$merge_base_sha" \
+    MOCK_BASE_TREE_SHA="$base_tree_sha" \
+    MOCK_HEAD_TREE_SHA="$head_tree_sha" \
+    MOCK_HEAD_SHA="$head_sha" \
+    MOCK_BLOB_CONTENTS_JSON='{}' \
+    MOCK_PRIOR_STATUS_STATE=failure \
+    MOCK_PRIOR_STATUS_CREATOR='github-actions[bot]' \
+    MOCK_PRIOR_STATUS_TARGET='https://github.com/bingosuite/bingo/actions/runs/122' \
     MOCK_HAS_LABEL=true \
     MOCK_EDIT_STATUS=0 \
     MOCK_DIFF_STATUS=0 \
@@ -627,7 +928,7 @@ trusted_runs_base_policy_only() {
 }
 
 trusted_subscribes_to_gated_actions() {
-  grep -Fq 'types: [opened, synchronize, reopened, labeled, unlabeled]' \
+  grep -Fq 'types: [opened, synchronize, reopened, edited, labeled, unlabeled]' \
     "$trusted_workflow"
 }
 
@@ -640,7 +941,9 @@ trusted_never_cancels_in_progress() {
 
 unrelated_labels_are_isolated() {
   grep -Fq "format('unrelated-{0}', github.run_id)" "$trusted_workflow" &&
-    grep -Fq "github.event.label.name != 'darwin-e2e-verified'" "$trusted_workflow"
+    grep -Fq "github.event.label.name != 'darwin-e2e-verified'" "$trusted_workflow" &&
+    grep -Fq "github.event.action == 'edited' && github.event.changes.base == null" \
+      "$trusted_workflow"
 }
 
 # GitHub Actions '${{ }}' expressions are matched literally, not expanded.
@@ -701,6 +1004,13 @@ command_substitutions_disarm_the_err_trap() {
   fi
 }
 
+gate_uses_immutable_diff() {
+  grep -Fq 'compare/$base_sha...$head_sha' "$gate" &&
+    grep -Fq 'git/trees/$merge_base_tree_sha?recursive=1' "$gate" &&
+    grep -Fq 'git/trees/$head_tree_sha?recursive=1' "$gate" &&
+    ! grep -Fq '/pulls/$pr_number/files' "$gate"
+}
+
 gate_workflows_are_valid_yaml() {
   python3 -c 'import sys, yaml
 for path in sys.argv[1:]:
@@ -732,6 +1042,8 @@ assert_workflow "untrusted policy test cannot write pull requests" \
   head_tests_cannot_write_pull_requests
 assert_workflow "command substitutions cannot double-publish a status" \
   command_substitutions_disarm_the_err_trap
+assert_workflow "gate diff is bound to immutable event SHAs" \
+  gate_uses_immutable_diff
 
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' 2>/dev/null; then
   assert_workflow "gate workflows are valid YAML" gate_workflows_are_valid_yaml
