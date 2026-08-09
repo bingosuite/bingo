@@ -245,9 +245,6 @@ func declareStepOverlapSpec() {
 		AddReportEntry("overlap-goroutines", len(goroutines))
 		AddReportEntry("overlap-stepover-resolved-as-breakpoint", stepOverDeliveredForeign)
 		AddReportEntry("overlap-parked-stops", parked)
-		if stale, ok := debugger.LinuxStaleParkedStopCount(h.d); ok {
-			AddReportEntry("overlap-stale-parked-stops", stale)
-		}
 	})
 }
 
@@ -489,9 +486,6 @@ func declareStepOverlapStepIntoSpec() {
 				// stopped working. The two specs that gate on it are enough.
 				AddReportEntry("overlap-stepinto-parked-stops", parked)
 			}
-			if stale, ok := debugger.LinuxStaleParkedStopCount(p.h.d); ok {
-				AddReportEntry("overlap-stepinto-stale-parked-stops", stale)
-			}
 		})
 }
 
@@ -555,9 +549,6 @@ func declareStepOverlapSignalSpec() {
 			Expect(len(p.lateGoroutines)).To(BeNumerically(">=", 2),
 				"fewer than two goroutines still hitting breakpoints in the final quarter — a thread was stranded")
 
-			if stale, ok := debugger.LinuxStaleParkedStopCount(p.h.d); ok {
-				AddReportEntry("overlap-signal-stale-parked-stops", stale)
-			}
 			AddReportEntry("overlap-signal-iterations", iters)
 			AddReportEntry("overlap-signal-stops", p.signalOutputs)
 			AddReportEntry("overlap-signal-goroutines", len(p.goroutines))
@@ -708,9 +699,6 @@ func declareStepOverlapPauseSpec() {
 			AddReportEntry("overlap-pause-interrupts-held-mid-step", heldInterrupts)
 			if parked, ok := debugger.LinuxParkedStopCount(p.h.d); ok {
 				AddReportEntry("overlap-pause-parked-stops", parked)
-			}
-			if stale, ok := debugger.LinuxStaleParkedStopCount(p.h.d); ok {
-				AddReportEntry("overlap-pause-stale-parked-stops", stale)
 			}
 			if held, ok := debugger.LinuxParkedSignalCount(p.h.d); ok {
 				AddReportEntry("overlap-pause-parked-signal-stops", held)
