@@ -1742,8 +1742,7 @@ exact count approximate (or an approximate one exact). Each flag means only
 totals, and each is rendered independently (the VS Code view and `wsmon` append
 `+` per count). `PackGoroutines` takes only the goroutine flag — that shape
 carries no threads. A total below the delivered count is a contradiction, not a
-truncation report, and the consumer rejects it. Layer A owns the contract and the packers;
-producer wiring in `internal/debugger` is layer B and does not exist yet.
+truncation report, and the consumer rejects it.
 
 **Streaming cadence (the load-bearing invariant).** `EventGoroutineSnapshot` is
 auto-emitted on exactly the suspends that can change the concurrency picture —

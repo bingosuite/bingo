@@ -428,4 +428,57 @@ func TestGoroutinesUnwrapsPackedPayload(t *testing.T) {
 	if gs[0].ID != packed.Goroutines[0].ID {
 		t.Errorf("Goroutines[0].ID = %d; want %d", gs[0].ID, packed.Goroutines[0].ID)
 	}
+
+	// GoroutineList carries the honesty channel Goroutines cannot: without it a
+	// caller has no way to learn the list was bounded, and would report a
+	// truncated set as the whole runtime.
+	list, err := c.GoroutineList()
+	if err != nil {
+		t.Fatalf("GoroutineList: %v", err)
+	}
+	if len(list.Goroutines) != len(gs) {
+		t.Fatalf("GoroutineList returned %d entries; Goroutines returned %d",
+			len(list.Goroutines), len(gs))
+	}
+	if list.Totals == nil {
+		t.Fatal("GoroutineList dropped Totals for a truncated list")
+	}
+	if list.Totals.Goroutines != len(raw) {
+		t.Errorf("Totals.Goroutines = %d; want the original %d", list.Totals.Goroutines, len(raw))
+	}
+}
+
+// TestGoroutineListOmitsTotalsWhenComplete pins the other half of the contract:
+// Totals is absent exactly when nothing was left out, so its presence alone
+// means "this is not everything".
+func TestGoroutineListOmitsTotalsWhenComplete(t *testing.T) {
+	packed, report := protocol.PackGoroutines([]protocol.Goroutine{
+		{ID: 1, Status: "running", Current: true},
+		{ID: 2, Status: "waiting"},
+	}, false)
+	if report.Omitted() {
+		t.Fatalf("fixture must be complete, got %+v", report)
+	}
+
+	fs := newFakeServer(func(cmd protocol.Command) (protocol.Event, bool) {
+		if cmd.Kind == protocol.CmdGoroutines {
+			return replyEvent(protocol.EventGoroutines, packed), true
+		}
+		return protocol.Event{}, false
+	})
+	defer fs.close()
+
+	c := dialTestClient(t, fs)
+	defer func() { _ = c.Close() }()
+
+	list, err := c.GoroutineList()
+	if err != nil {
+		t.Fatalf("GoroutineList: %v", err)
+	}
+	if list.Totals != nil {
+		t.Errorf("Totals = %+v; want nil for a complete list", list.Totals)
+	}
+	if len(list.Goroutines) != 2 {
+		t.Errorf("Goroutines = %d; want 2", len(list.Goroutines))
+	}
 }

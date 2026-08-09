@@ -374,8 +374,9 @@ func printAuxEvent(evt protocol.Event) {
 				fmt.Print("bingo> ")
 				return
 			}
-			msg := fmt.Sprintf("\n  [goroutines] %d live, %d threads, current G%d",
-				len(p.Goroutines), len(p.Threads), p.Current)
+			msg := fmt.Sprintf("\n  [goroutines] %s, %s threads, current G%d",
+				countOf(len(p.Goroutines), p.Totals, totalGoroutines),
+				countOf(len(p.Threads), p.Totals, totalThreads), p.Current)
 			if len(p.Created) > 0 {
 				msg += fmt.Sprintf(", +%v", p.Created)
 			}
@@ -414,8 +415,9 @@ func printGoroutine(g protocol.Goroutine) {
 // printSnapshot renders a full concurrency snapshot: goroutines (with spawn
 // linkage), OS threads, and the created/exited lifecycle deltas.
 func printSnapshot(snap protocol.GoroutineSnapshotPayload) {
-	fmt.Printf("  goroutines: %d  threads: %d  current: G%d\n",
-		len(snap.Goroutines), len(snap.Threads), snap.Current)
+	fmt.Printf("  goroutines: %s  threads: %s  current: G%d\n",
+		countOf(len(snap.Goroutines), snap.Totals, totalGoroutines),
+		countOf(len(snap.Threads), snap.Totals, totalThreads), snap.Current)
 	for _, g := range snap.Goroutines {
 		printGoroutine(g)
 	}
@@ -436,6 +438,36 @@ func printSnapshot(snap protocol.GoroutineSnapshotPayload) {
 	if len(snap.Exited) > 0 {
 		fmt.Printf("  exited:  %v\n", snap.Exited)
 	}
+}
+
+// which collection countOf is describing; the two have independent scan
+// ceilings so they cannot share a lower-bound marker.
+type collection int
+
+const (
+	totalGoroutines collection = iota
+	totalThreads
+)
+
+// countOf renders a delivered count against what the debugger actually had.
+// Printing the delivered length alone would state a truncated event as the live
+// truth — the totals exist precisely so a client does not have to.
+func countOf(shown int, totals *protocol.SnapshotTotals, which collection) string {
+	if totals == nil {
+		return fmt.Sprintf("%d live", shown)
+	}
+	total, clipped := totals.Goroutines, totals.GoroutinesClipped
+	if which == totalThreads {
+		total, clipped = totals.Threads, totals.ThreadsClipped
+	}
+	bound := ""
+	if clipped {
+		bound = "+" // the scan stopped early, so the total is a floor
+	}
+	if shown >= total && bound == "" {
+		return fmt.Sprintf("%d live", shown)
+	}
+	return fmt.Sprintf("%d of %d%s", shown, total, bound)
 }
 
 func parseFileLine(s string) (string, int, bool) {
