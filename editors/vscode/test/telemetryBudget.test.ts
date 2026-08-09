@@ -1233,11 +1233,90 @@ describe("real WebSocket transport", () => {
     live.observer.dispose();
   });
 
+  // hugeFrame builds a legal, well-formed event of `kind` whose marshalled size
+  // is at least `bytes` — the shape a real oversized broadcast has, as opposed
+  // to unparseable filler.
+  function hugeFrame(kind: string, bytes: number): string {
+    return frame(1, kind, { variables: [{ value: "v".repeat(bytes) }] });
+  }
+
+  it("reconnects after a legal ignored event above the transport cap", async () => {
+    // The production scenario: a user expands a large variable, the hub
+    // broadcasts EventLocals to EVERY client, and it lands on the observer —
+    // which does not even read that kind. Locals/Frames/Evaluate are
+    // deliberately outside the goroutine byte contract, so this is not a
+    // contract violation and must not latch the view dead. Above the transport
+    // cap `ws` has already discarded the frame, so the kind is unknowable and
+    // the only safe classification is "transient".
+    let oversized = 0;
+    const live = await liveObserver((socket, connections) => {
+      socket.on("message", () => {
+        if (connections < 3) {
+          oversized += 1;
+          socket.send(hugeFrame("Locals", maximumTransportBytes + 1));
+          return;
+        }
+        socket.send(frame(1, "GoroutineSnapshot", { goroutines: [], threads: [] }));
+      });
+    });
+    live.observer.start();
+    await live.settled();
+
+    assert.ok(oversized >= 1, "the oversized Locals frame must actually have been sent");
+    assert.ok(
+      live.connections() >= 3,
+      `a legal ignored event must reconnect, not latch; got ${String(live.connections())}`,
+    );
+    assert.equal(live.observer.model.connection, "connected");
+    live.observer.dispose();
+  });
+
+  it("reconnects after a legal ignored event between the decoder and transport caps", async () => {
+    // Delivered (so the kind IS readable) but over the decoder budget. The
+    // prefix scan proves it is an unbounded kind, so it stays transient too.
+    let oversized = 0;
+    const live = await liveObserver((socket, connections) => {
+      socket.on("message", () => {
+        if (connections < 3) {
+          oversized += 1;
+          socket.send(hugeFrame("Locals", maximumEnvelopeBytes + 1));
+          return;
+        }
+        socket.send(frame(1, "GoroutineSnapshot", { goroutines: [], threads: [] }));
+      });
+    });
+    live.observer.start();
+    await live.settled();
+
+    assert.ok(oversized >= 1);
+    assert.ok(
+      live.connections() >= 3,
+      `an oversized unbounded kind must reconnect; got ${String(live.connections())}`,
+    );
+    assert.equal(live.observer.model.connection, "connected");
+    live.observer.dispose();
+  });
+
+  it("latches on a bounded kind one byte over the decoder cap", async () => {
+    // The other half of the matrix: the prefix scan proves this IS a goroutine
+    // event, so it is a contract violation the producer will reproduce exactly.
+    const live = await liveObserver((socket) => {
+      socket.on("message", () => {
+        socket.send(hugeFrame("GoroutineSnapshot", maximumEnvelopeBytes + 1));
+      });
+    });
+    live.observer.start();
+    await live.settled();
+
+    assert.equal(live.connections(), 1, "a proven violation must not be retried");
+    assert.equal(live.observer.model.connection, "error");
+    assert.match(live.observer.model.error, /byte contract/u);
+    live.observer.dispose();
+  });
+
   it("reconnects after a frame above the transport slack", async () => {
-    // Above the transport cap the frame is never delivered, so its kind is
-    // unknowable — and a legal, deliberately unbounded Locals/Frames/Evaluate
-    // broadcast can land here. Latching would kill the view over an event the
-    // observer never even reads, so this stays a transport failure.
+    // Unparseable filler above the transport cap: no kind can ever be read, so
+    // the safe classification is the same transient one.
     let oversized = 0;
     const live = await liveObserver((socket, connections) => {
       socket.on("message", () => {
