@@ -125,6 +125,12 @@ jobs:
         if: always()
         run: go test -tags e2e -race -count=1 -v -timeout 900s ./test/integration -ginkgo.v -ginkgo.label-filter=overlap
 
+      # Same spec WITHOUT the race detector: removes the "-race changed the
+      # scheduling" objection to the reproduction.
+      - name: E2E overlap run 4 (no -race)
+        if: always()
+        run: go test -tags e2e -count=1 -v -timeout 900s ./test/integration -ginkgo.v -ginkgo.label-filter=overlap
+
   darwin-arm64:
     name: Darwin arm64 (Mach exceptions)
     runs-on: macos-14
