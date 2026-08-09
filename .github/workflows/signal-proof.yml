@@ -1,0 +1,64 @@
+name: Signal Proof (U1)
+
+# PROOF-ONLY workflow on an isolated investigation branch. It runs the
+# Label("signalproof") specs in ./test/integration, which prove or disprove
+# hypothesis U1: the linux/amd64 engine swallows synchronous fatal signals
+# because handleStop's StopSignal branch resumes via ContinueProcess(), which
+# always issues PTRACE_CONT with signal 0.
+#
+# It changes nothing about the existing Debugger E2E workflow. It exists so the
+# claim is settled on a real GitHub-hosted linux/amd64 kernel rather than by
+# reading code. Each leg is run twice — with and without -race — because the
+# refault loop is a timing-sensitive tracer/tracee interaction and the race
+# detector materially changes engine-loop timing.
+#
+# Every spec is internally bounded (observation windows, a target watchdog,
+# PTRACE_O_EXITKILL, SIGKILL+reap cleanup); the job timeout is only a backstop.
+
+on:
+  push:
+    branches: ["xsachax-prove-linux-signal-suppression"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  signal-proof-linux-amd64:
+    name: Signal proof linux/amd64 (${{ matrix.mode }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: race
+            flags: "-race"
+          - mode: norace
+            flags: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Confirm native target
+        run: test "$(go env GOOS)/$(go env GOARCH)" = "linux/amd64"
+
+      - name: Show ptrace policy and kernel
+        run: |
+          uname -a
+          cat /proc/sys/kernel/yama/ptrace_scope || true
+
+      - name: Signal proof specs
+        run: >
+          go test -tags e2e ${{ matrix.flags }} -count=1 -v -timeout 600s
+          ./test/integration -ginkgo.label-filter=signalproof
+
+      - name: Confirm no orphaned tracees survived
+        if: always()
+        run: |
+          echo "--- remaining segv_target processes ---"
+          pgrep -a segv_target || echo "none"
