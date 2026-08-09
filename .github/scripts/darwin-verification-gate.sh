@@ -19,18 +19,33 @@ declared_changed_files=$(jq -er \
   "$GITHUB_EVENT_PATH")
 run_url="${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/${GITHUB_RUN_ID:-0}"
 final_status_posted=false
+decision_file=${DARWIN_GATE_DECISION_FILE:-}
+
+# The workflow treats an absent decision as "interrupted after posting pending"
+# and fails the head closed, so only terminal outcomes may be recorded here.
+record_decision() {
+  [ -n "$decision_file" ] || return 0
+  printf '%s\n' "$1" > "$decision_file"
+}
 
 post_status() {
   local state=$1
   local description=$2
 
-  gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head_sha" \
+  # A decision is only real once GitHub accepted it, and `fail_closed` runs with
+  # `set +e`, so the POST result must be checked explicitly rather than relying
+  # on `set -e` to abort here.
+  if ! gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head_sha" \
     -f state="$state" \
     -f context="$status_context" \
     -f description="$description" \
-    -f target_url="$run_url" >/dev/null
+    -f target_url="$run_url" >/dev/null; then
+    return 1
+  fi
+
   if [ "$state" != "pending" ]; then
     final_status_posted=true
+    record_decision "$state"
   fi
 }
 
@@ -57,6 +72,7 @@ esac
 if { [ "$event_action" = "labeled" ] || [ "$event_action" = "unlabeled" ]; } &&
   [ "$event_label" != "$verified_label" ]; then
   echo "Ignoring unrelated '$event_label' label event; the existing head-SHA status remains authoritative."
+  record_decision ignored
   exit 0
 fi
 

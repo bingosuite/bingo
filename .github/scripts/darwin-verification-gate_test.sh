@@ -42,6 +42,14 @@ case "$*" in
         context=*) context=${arg#context=} ;;
       esac
     done
+    # Only successfully published statuses are logged, so the log is an exact
+    # record of what GitHub would show on the head SHA.
+    for failing in ${MOCK_STATUS_FAIL_STATES:-}; do
+      if [ "$failing" = "$state" ]; then
+        echo "status API failed for state $state" >&2
+        exit 1
+      fi
+    done
     printf '%s|%s|%s\n' "$endpoint" "$state" "$context" >> "$MOCK_STATUS_LOG"
     ;;
   *"/pulls/"*"/files?"*)
@@ -49,7 +57,15 @@ case "$*" in
       echo "diff API failed" >&2
       exit "$MOCK_DIFF_STATUS"
     fi
-    jq -n --arg filename "$MOCK_CHANGED_PATH" '[[{filename: $filename}]]'
+    # `--slurp` yields one array per fetched page; the gate must flatten them.
+    jq -n \
+      --argjson filenames "$MOCK_CHANGED_PATHS_JSON" \
+      --argjson pages "$MOCK_PAGES" '
+        [$filenames[] | {filename: .}] as $files
+        | ((($files | length) + $pages - 1) / $pages | floor) as $size
+        | [range(0; $pages) | $files[(. * $size):((. + 1) * $size)]]
+        | map(select(length > 0))
+      '
     ;;
   *"/issues/"*"/labels?"*)
     if [ "$MOCK_LABEL_STATUS" -ne 0 ]; then
@@ -70,47 +86,88 @@ chmod +x "$tmpdir/bin/gh"
 
 case_count=0
 
+fail_case() {
+  printf 'not ok - %s\n' "$1" >&2
+  shift
+  if [ "$#" -gt 0 ]; then
+    printf '%s\n' "$@" >&2
+  fi
+  exit 1
+}
+
+# run_case NAME key=value...
+#
+# Keys: action, label, head_repo, path, paths_json, pages, has_label,
+# edit_status, diff_status, label_status, status_fail, declared_files,
+# exit, state, states, output, label_query, decision, gh_contains, gh_missing.
 run_case() {
   local name=$1
-  local action=$2
-  local event_label=$3
-  local head_repository=$4
-  local changed_path=$5
-  local has_label=$6
-  local edit_status=$7
-  local expected_exit=$8
-  local expected_state=$9
-  local expected_output=${10}
-  local expected_label_query=${11}
-  local diff_status=${12:-0}
-  local label_status=${13:-0}
-  local declared_changed_files=${14:-}
-  local case_id
-  local event_path
-  local gh_log
-  local status_log
+  shift
+
+  local action=opened label='' head_repo=contributor/fork
+  local path=entitlements.plist paths_json='' pages=1
+  local has_label=false edit_status=0 diff_status=0 label_status=0
+  local status_fail='' declared_files='' expect_exit=0 expect_state=none
+  local expect_states=''
+  local expect_output='' expect_label_query=any expect_decision=''
+  local gh_contains='' gh_missing=''
+  local kv key value
+
+  for kv in "$@"; do
+    key=${kv%%=*}
+    value=${kv#*=}
+    case "$key" in
+      action) action=$value ;;
+      label) label=$value ;;
+      head_repo) head_repo=$value ;;
+      path) path=$value ;;
+      paths_json) paths_json=$value ;;
+      pages) pages=$value ;;
+      has_label) has_label=$value ;;
+      edit_status) edit_status=$value ;;
+      diff_status) diff_status=$value ;;
+      label_status) label_status=$value ;;
+      status_fail) status_fail=$value ;;
+      declared_files) declared_files=$value ;;
+      exit) expect_exit=$value ;;
+      state) expect_state=$value ;;
+      states) expect_states=$value ;;
+      output) expect_output=$value ;;
+      label_query) expect_label_query=$value ;;
+      decision) expect_decision=$value ;;
+      gh_contains) gh_contains=$value ;;
+      gh_missing) gh_missing=$value ;;
+      *) fail_case "$name" "unknown run_case key: $key" ;;
+    esac
+  done
+
+  case_count=$((case_count + 1))
+  local case_id=$case_count
+  local event_path="$tmpdir/event-$case_id.json"
+  local gh_log="$tmpdir/gh-$case_id.log"
+  local status_log="$tmpdir/status-$case_id.log"
+  local decision_file="$tmpdir/decision-$case_id.txt"
   local head_sha
+  head_sha=$(printf '%040x' "$case_id")
   local output
   local status=0
 
-  case_count=$((case_count + 1))
-  case_id=$case_count
-  event_path="$tmpdir/event-$case_id.json"
-  gh_log="$tmpdir/gh-$case_id.log"
-  status_log="$tmpdir/status-$case_id.log"
-  head_sha=$(printf '%040x' "$case_id")
-  if [ -z "$declared_changed_files" ]; then
-    declared_changed_files=$(printf '%s\n' "$changed_path" | wc -l | tr -d ' ')
+  if [ -z "$paths_json" ]; then
+    paths_json=$(jq -n --arg path "$path" '[$path]')
+  fi
+  if [ -z "$declared_files" ]; then
+    declared_files=$(jq -n --argjson paths "$paths_json" '$paths | length')
   fi
   : > "$gh_log"
   : > "$status_log"
+  rm -f "$decision_file"
 
   jq -n \
     --arg action "$action" \
-    --arg event_label "$event_label" \
-    --arg head_repository "$head_repository" \
+    --arg event_label "$label" \
+    --arg head_repository "$head_repo" \
     --arg head_sha "$head_sha" \
-    --argjson changed_files "$declared_changed_files" \
+    --argjson changed_files "$declared_files" \
     '{
       action: $action,
       label: {name: $event_label},
@@ -127,13 +184,16 @@ run_case() {
       GITHUB_REPOSITORY=bingosuite/bingo \
       GITHUB_SERVER_URL=https://github.com \
       GITHUB_RUN_ID=123 \
+      DARWIN_GATE_DECISION_FILE="$decision_file" \
       MOCK_GH_LOG="$gh_log" \
       MOCK_STATUS_LOG="$status_log" \
-      MOCK_CHANGED_PATH="$changed_path" \
+      MOCK_CHANGED_PATHS_JSON="$paths_json" \
+      MOCK_PAGES="$pages" \
       MOCK_HAS_LABEL="$has_label" \
       MOCK_EDIT_STATUS="$edit_status" \
       MOCK_DIFF_STATUS="$diff_status" \
       MOCK_LABEL_STATUS="$label_status" \
+      MOCK_STATUS_FAIL_STATES="$status_fail" \
       DARWIN_NATIVE_REGEX='^never-match$' \
       VERIFIED_LABEL=attacker-controlled \
       EVENT_ACTION=opened \
@@ -147,47 +207,75 @@ run_case() {
       bash "$gate" 2>&1
   ) || status=$?
 
-  if [ "$status" -ne "$expected_exit" ]; then
-    printf 'not ok - %s (status %s, expected %s)\n%s\n' \
-      "$name" "$status" "$expected_exit" "$output" >&2
-    exit 1
+  if [ "$status" -ne "$expect_exit" ]; then
+    fail_case "$name" "status $status, expected $expect_exit" "$output"
   fi
 
-  if ! grep -Fq "$expected_output" <<< "$output"; then
-    printf 'not ok - %s (missing output: %s)\n%s\n' \
-      "$name" "$expected_output" "$output" >&2
-    exit 1
+  if [ -n "$expect_output" ] && ! grep -Fq -- "$expect_output" <<< "$output"; then
+    fail_case "$name" "missing output: $expect_output" "$output"
   fi
 
   if grep -Eq 'attacker-controlled|attacker/repository| 999 ' "$gh_log"; then
-    printf 'not ok - %s (hostile environment reached gh)\n' "$name" >&2
-    exit 1
+    fail_case "$name" "hostile environment reached gh" "$(cat "$gh_log")"
   fi
 
-  if [ "$expected_label_query" = "true" ] &&
+  if [ "$expect_label_query" = "true" ] &&
     ! grep -Fq "/issues/17/labels?" "$gh_log"; then
-    printf 'not ok - %s (expected live label query)\n' "$name" >&2
-    exit 1
+    fail_case "$name" "expected live label query" "$(cat "$gh_log")"
   fi
 
-  if [ "$expected_label_query" = "false" ] &&
+  if [ "$expect_label_query" = "false" ] &&
     grep -Fq "/issues/17/labels?" "$gh_log"; then
-    printf 'not ok - %s (unexpected live label query)\n' "$name" >&2
-    exit 1
+    fail_case "$name" "unexpected live label query" "$(cat "$gh_log")"
   fi
 
-  if [ "$expected_state" = "none" ]; then
+  if [ -n "$gh_contains" ] && ! grep -Fq -- "$gh_contains" "$gh_log"; then
+    fail_case "$name" "expected gh call: $gh_contains" "$(cat "$gh_log")"
+  fi
+
+  if [ -n "$gh_missing" ] && grep -Fq -- "$gh_missing" "$gh_log"; then
+    fail_case "$name" "unexpected gh call: $gh_missing" "$(cat "$gh_log")"
+  fi
+
+  if [ "$expect_state" = "none" ]; then
     if [ -s "$status_log" ]; then
-      printf 'not ok - %s (unexpected head status)\n' "$name" >&2
-      exit 1
+      fail_case "$name" "unexpected head status" "$(cat "$status_log")"
     fi
   else
-    expected_status="repos/bingosuite/bingo/statuses/$head_sha|$expected_state|Darwin E2E verified"
+    local expected_status="repos/bingosuite/bingo/statuses/$head_sha|$expect_state|Darwin E2E verified"
     if [ "$(tail -n 1 "$status_log")" != "$expected_status" ]; then
-      printf 'not ok - %s (missing head-SHA status: %s)\n' \
-        "$name" "$expected_status" >&2
-      cat "$status_log" >&2
-      exit 1
+      fail_case "$name" "missing head-SHA status: $expected_status" \
+        "$(cat "$status_log")"
+    fi
+  fi
+
+  # Assert the exact published sequence, not just the terminal status: the head
+  # must move `pending` -> decision, and nothing may follow a decision.
+  local want_states=$expect_states
+  if [ -z "$want_states" ]; then
+    if [ "$expect_state" = "none" ]; then
+      want_states=''
+    else
+      want_states="pending,$expect_state"
+    fi
+  fi
+  [ "$want_states" = "none" ] && want_states=''
+  local actual_states
+  actual_states=$(cut -d'|' -f2 "$status_log" | paste -sd, -)
+  if [ "$actual_states" != "$want_states" ]; then
+    fail_case "$name" "status sequence '$actual_states', expected '$want_states'" \
+      "$(cat "$status_log")"
+  fi
+
+  local decision=''
+  if [ -f "$decision_file" ]; then
+    decision=$(tr -d '\n' < "$decision_file")
+  fi
+  if [ -n "$expect_decision" ]; then
+    local want=$expect_decision
+    [ "$want" = "none" ] && want=''
+    if [ "$decision" != "$want" ]; then
+      fail_case "$name" "decision '$decision', expected '$want'"
     fi
   fi
 
@@ -200,63 +288,191 @@ printf '%s\n' 'jobs: {gate: {steps: [{run: "exit 0"}]}}' \
 printf '%s\n' '#!/usr/bin/env bash' 'exit 0' \
   > "$tmpdir/hostile-head/.github/scripts/darwin-verification-gate.sh"
 
-run_case \
-  "fork workflow exit 0 cannot bypass trusted synchronize" \
-  synchronize "" contributor/fork internal/debugger/backend_darwin_arm64.go \
-  true 1 1 failure "public-fork GITHUB_TOKEN could not remove" false
-run_case \
-  "same-repository synchronize fails current head" \
-  synchronize "" bingosuite/bingo entitlements.plist \
-  false 0 1 failure "re-verification required" false
-run_case \
-  "reopened pull request fails current head" \
-  reopened "" contributor/fork entitlements.plist \
-  true 1 1 failure "re-verification required" false
-run_case \
-  "verified label publishes success to current head" \
-  labeled darwin-e2e-verified contributor/fork \
-  test/integration/debugger_e2e_darwin_arm64_test.go \
-  true 0 0 success "verified locally" true
-run_case \
-  "verified label removal publishes failure" \
-  unlabeled darwin-e2e-verified contributor/fork internal/debugger/trap_arm64.go \
-  false 0 1 failure "not currently present" true
-run_case \
-  "re-added verified label survives delayed unlabel event" \
-  unlabeled darwin-e2e-verified contributor/fork internal/debugger/trap_arm64.go \
-  true 0 0 success "verified locally" true
-run_case \
-  "unrelated label leaves prior status untouched" \
-  labeled triage contributor/fork entitlements.plist \
-  true 0 0 none "existing head-SHA status remains authoritative" false
-run_case \
-  "unrelated unlabel leaves prior status untouched" \
-  unlabeled triage contributor/fork entitlements.plist \
-  true 0 0 none "existing head-SHA status remains authoritative" false
-run_case \
-  "non-Darwin synchronize publishes success" \
-  synchronize "" contributor/fork internal/debugger/engine.go \
-  true 1 0 success "No darwin-native code changed" false
-run_case \
-  "opened Darwin change publishes failure" \
-  opened "" contributor/fork entitlements.plist \
-  false 0 1 failure "verification required" false
-run_case \
-  "near-match outside regex publishes success" \
-  opened "" contributor/fork docs/backend_darwin_arm64.go \
-  false 0 0 success "No darwin-native code changed" false
-run_case \
-  "diff API failure replaces pending with failure" \
-  opened "" contributor/fork entitlements.plist \
-  false 0 1 failure "diff API failed" false 1
-run_case \
-  "truncated PR files response fails closed" \
-  opened "" contributor/fork docs/readme.md \
-  false 0 1 failure "refusing an incomplete gate decision" false 0 0 3001
-run_case \
-  "newline filename cannot hide truncated response" \
-  opened "" contributor/fork $'000-padding\nextra-line' \
-  false 0 1 failure "returned 1 of 2 changed files" false 0 0 2
+# --- synchronize / reopened: always unverify the new head --------------------
+
+run_case "fork workflow exit 0 cannot bypass trusted synchronize" \
+  action=synchronize head_repo=contributor/fork \
+  path=internal/debugger/backend_darwin_arm64.go has_label=true edit_status=1 \
+  exit=1 state=failure label_query=false decision=failure \
+  output="public-fork GITHUB_TOKEN could not remove"
+
+run_case "same-repository synchronize fails current head" \
+  action=synchronize head_repo=bingosuite/bingo path=entitlements.plist \
+  exit=1 state=failure label_query=false decision=failure \
+  gh_contains="pr edit 17" output="re-verification required"
+
+run_case "same-repository cleanup denial warns without fork wording" \
+  action=synchronize head_repo=bingosuite/bingo path=entitlements.plist \
+  has_label=true edit_status=1 \
+  exit=1 state=failure label_query=false decision=failure \
+  output="The API could not remove"
+
+run_case "successful cleanup omits the stale-label recovery hint" \
+  action=synchronize head_repo=contributor/fork path=entitlements.plist \
+  has_label=true edit_status=0 \
+  exit=1 state=failure label_query=false decision=failure \
+  gh_contains="--remove-label darwin-e2e-verified" \
+  output="then add the 'darwin-e2e-verified' label to verify this head"
+
+run_case "reopened pull request fails current head" \
+  action=reopened head_repo=contributor/fork path=entitlements.plist \
+  has_label=true edit_status=1 \
+  exit=1 state=failure label_query=false decision=failure \
+  output="re-verification required"
+
+run_case "synchronize with a live verified label still fails closed" \
+  action=synchronize head_repo=contributor/fork \
+  path=internal/debugger/trap_arm64.go has_label=true edit_status=0 \
+  exit=1 state=failure label_query=false decision=failure \
+  output="re-verification required"
+
+# --- opened ------------------------------------------------------------------
+
+run_case "opened Darwin change publishes failure" \
+  action=opened head_repo=contributor/fork path=entitlements.plist \
+  exit=1 state=failure label_query=false decision=failure \
+  gh_missing="pr edit" output="verification required"
+
+run_case "opened Darwin change ignores a pre-existing label" \
+  action=opened head_repo=contributor/fork path=entitlements.plist \
+  has_label=true \
+  exit=1 state=failure label_query=false decision=failure \
+  output="verification required"
+
+# --- verified label add / remove ---------------------------------------------
+
+run_case "verified label publishes success to current head" \
+  action=labeled label=darwin-e2e-verified head_repo=contributor/fork \
+  path=test/integration/debugger_e2e_darwin_arm64_test.go has_label=true \
+  exit=0 state=success label_query=true decision=success \
+  gh_missing="pr edit" output="verified locally"
+
+run_case "verified label removal publishes failure" \
+  action=unlabeled label=darwin-e2e-verified head_repo=contributor/fork \
+  path=internal/debugger/trap_arm64.go has_label=false \
+  exit=1 state=failure label_query=true decision=failure \
+  output="not currently present"
+
+run_case "re-added verified label survives delayed unlabel event" \
+  action=unlabeled label=darwin-e2e-verified head_repo=contributor/fork \
+  path=internal/debugger/trap_arm64.go has_label=true \
+  exit=0 state=success label_query=true decision=success \
+  output="verified locally"
+
+run_case "removed verified label defeats a delayed label event" \
+  action=labeled label=darwin-e2e-verified head_repo=contributor/fork \
+  path=internal/debugger/trap_arm64.go has_label=false \
+  exit=1 state=failure label_query=true decision=failure \
+  output="not currently present"
+
+run_case "live label API failure fails closed" \
+  action=labeled label=darwin-e2e-verified head_repo=contributor/fork \
+  path=entitlements.plist has_label=true label_status=1 \
+  exit=1 state=failure decision=failure output="label API failed"
+
+# --- unrelated labels --------------------------------------------------------
+
+run_case "unrelated label leaves prior status untouched" \
+  action=labeled label=triage head_repo=contributor/fork \
+  path=entitlements.plist has_label=true \
+  exit=0 state=none label_query=false decision=ignored \
+  gh_missing="statuses/" output="existing head-SHA status remains authoritative"
+
+run_case "unrelated unlabel leaves prior status untouched" \
+  action=unlabeled label=triage head_repo=contributor/fork \
+  path=entitlements.plist has_label=true \
+  exit=0 state=none label_query=false decision=ignored \
+  output="existing head-SHA status remains authoritative"
+
+run_case "verified-label prefix does not count as the verified label" \
+  action=labeled label=darwin-e2e-verified-2 head_repo=contributor/fork \
+  path=entitlements.plist has_label=true \
+  exit=0 state=none label_query=false decision=ignored \
+  output="existing head-SHA status remains authoritative"
+
+# --- path matching -----------------------------------------------------------
+
+run_case "non-Darwin synchronize publishes success" \
+  action=synchronize head_repo=contributor/fork path=internal/debugger/engine.go \
+  has_label=true edit_status=1 \
+  exit=0 state=success label_query=false decision=success \
+  output="No darwin-native code changed"
+
+run_case "near-match outside regex publishes success" \
+  action=opened head_repo=contributor/fork path=docs/backend_darwin_arm64.go \
+  exit=0 state=success label_query=false decision=success \
+  output="No darwin-native code changed"
+
+run_case "one Darwin file among many still gates" \
+  action=opened head_repo=contributor/fork \
+  paths_json='["README.md","internal/hub/hub.go","internal/debugger/backend_darwin_arm64.go","docs/x.md"]' \
+  exit=1 state=failure decision=failure output="verification required"
+
+# --- PR files API integrity --------------------------------------------------
+
+run_case "paginated file list is flattened and gated" \
+  action=opened head_repo=contributor/fork \
+  paths_json='["a.md","b.md","c.md","entitlements.plist"]' pages=2 \
+  exit=1 state=failure decision=failure output="verification required"
+
+run_case "paginated non-Darwin file list publishes success" \
+  action=opened head_repo=contributor/fork \
+  paths_json='["a.md","b.md","c.md","d.md","e.md","f.md"]' pages=3 \
+  exit=0 state=success decision=success output="No darwin-native code changed"
+
+run_case "truncated PR files response fails closed" \
+  action=opened head_repo=contributor/fork path=docs/readme.md \
+  declared_files=3001 \
+  exit=1 state=failure decision=failure \
+  output="refusing an incomplete gate decision"
+
+run_case "newline filename cannot hide truncated response" \
+  action=opened head_repo=contributor/fork path=$'000-padding\nextra-line' \
+  declared_files=2 \
+  exit=1 state=failure decision=failure output="returned 1 of 2 changed files"
+
+run_case "over-reported file list also fails closed" \
+  action=opened head_repo=contributor/fork \
+  paths_json='["a.md","b.md"]' declared_files=1 \
+  exit=1 state=failure decision=failure \
+  output="refusing an incomplete gate decision"
+
+run_case "diff API failure replaces pending with failure" \
+  action=opened head_repo=contributor/fork path=entitlements.plist \
+  diff_status=1 \
+  exit=1 state=failure decision=failure output="diff API failed"
+
+# --- status API failures -----------------------------------------------------
+
+# A pending POST that fails aborts before any evaluation; the ERR trap still
+# publishes an explicit failure to the head.
+run_case "pending status failure still fails the head closed" \
+  action=opened head_repo=contributor/fork path=entitlements.plist \
+  status_fail=pending \
+  exit=1 state=failure states=failure decision=failure \
+  output="status API failed for state pending"
+
+# When even the fail-closed POST cannot be delivered, no decision is recorded and
+# the workflow guard step takes over.
+run_case "unpublishable failure records no decision" \
+  action=opened head_repo=contributor/fork path=entitlements.plist \
+  status_fail=failure \
+  exit=1 state=pending states=pending decision=none \
+  output="status API failed for state failure"
+
+# A success POST that fails must degrade to failure, never to silence.
+run_case "unpublishable success degrades to failure" \
+  action=synchronize head_repo=contributor/fork path=internal/hub/hub.go \
+  status_fail=success \
+  exit=1 state=failure states=pending,failure decision=failure \
+  output="status API failed for state success"
+
+# --- unsupported actions -----------------------------------------------------
+
+run_case "unsupported action refuses to decide" \
+  action=edited head_repo=contributor/fork path=entitlements.plist \
+  exit=2 state=none decision=none gh_missing="statuses/" \
+  output="Unsupported pull_request_target action: edited"
 
 run_status_persistence_sequence() {
   local name=$1
@@ -315,7 +531,8 @@ run_status_persistence_sequence() {
     GITHUB_REPOSITORY=bingosuite/bingo \
     MOCK_GH_LOG="$gh_log" \
     MOCK_STATUS_LOG="$status_log" \
-    MOCK_CHANGED_PATH=entitlements.plist \
+    MOCK_CHANGED_PATHS_JSON='["entitlements.plist"]' \
+    MOCK_PAGES=1 \
     MOCK_HAS_LABEL="$first_has_label" \
     MOCK_EDIT_STATUS="$first_edit_status" \
     MOCK_DIFF_STATUS=0 \
@@ -327,7 +544,8 @@ run_status_persistence_sequence() {
     GITHUB_REPOSITORY=bingosuite/bingo \
     MOCK_GH_LOG="$gh_log" \
     MOCK_STATUS_LOG="$status_log" \
-    MOCK_CHANGED_PATH=entitlements.plist \
+    MOCK_CHANGED_PATHS_JSON='["entitlements.plist"]' \
+    MOCK_PAGES=1 \
     MOCK_HAS_LABEL=true \
     MOCK_EDIT_STATUS=0 \
     MOCK_DIFF_STATUS=0 \
@@ -336,19 +554,14 @@ run_status_persistence_sequence() {
 
   if [ "$first_status" -ne "$expected_first_exit" ] ||
     [ "$second_status" -ne 0 ]; then
-    printf 'not ok - %s (event statuses %s/%s)\n' \
-      "$name" "$first_status" "$second_status" >&2
-    exit 1
+    fail_case "$name" "event statuses $first_status/$second_status"
   fi
 
   expected_status="repos/bingosuite/bingo/statuses/$head_sha|$expected_state|Darwin E2E verified"
   if [ "$(wc -l < "$status_log" | tr -d ' ')" -ne 2 ] ||
     [ "$(tail -n 1 "$status_log")" != "$expected_status" ]; then
-    printf 'not ok - %s (unrelated label changed the SHA-bound status)\n' \
-      "$name" >&2
-    cat "$status_log" >&2
-    cat "$gh_log" >&2
-    exit 1
+    fail_case "$name" "unrelated label changed the SHA-bound status" \
+      "$(cat "$status_log")" "$(cat "$gh_log")"
   fi
 
   printf 'ok - %s\n' "$name"
@@ -361,43 +574,112 @@ run_status_persistence_sequence \
   "verified head plus unrelated label preserves success" \
   labeled darwin-e2e-verified true 0 success 0
 
-case_count=$((case_count + 1))
-if ! grep -Eq '^[[:space:]]+pull_request_target:' "$trusted_workflow" ||
-  grep -Eq '^[[:space:]]+pull_request:' "$trusted_workflow"; then
-  echo "not ok - trusted workflow is base-controlled pull_request_target only" >&2
-  exit 1
-fi
-echo "ok - trusted workflow is base-controlled pull_request_target only"
+# Workflow invariants are asserted through named predicates rather than an
+# `eval`'d string so the checks stay statically analysable.
+assert_workflow() {
+  local name=$1
+  shift
 
-case_count=$((case_count + 1))
-if ! grep -Fq 'ref: ${{ github.event.pull_request.base.sha }}' "$trusted_workflow" ||
-  grep -Fq 'github.event.pull_request.head.sha }}' "$trusted_workflow"; then
-  echo "not ok - trusted workflow checks out only the base policy" >&2
-  exit 1
-fi
-echo "ok - trusted workflow checks out only the base policy"
+  case_count=$((case_count + 1))
+  if ! "$@"; then
+    fail_case "$name" "workflow invariant not satisfied"
+  fi
+  printf 'ok - %s\n' "$name"
+}
 
-case_count=$((case_count + 1))
-if ! grep -Eq '^[[:space:]]+pull_request:' "$head_test_workflow" ||
-  ! grep -Fq 'bash .github/scripts/darwin-verification-gate_test.sh' "$head_test_workflow"; then
-  echo "not ok - unprivileged pull_request workflow tests proposed HEAD policy" >&2
-  exit 1
-fi
-echo "ok - unprivileged pull_request workflow tests proposed HEAD policy"
+trusted_is_base_controlled() {
+  grep -Eq '^[[:space:]]+pull_request_target:' "$trusted_workflow" &&
+    ! grep -Eq '^[[:space:]]+pull_request:' "$trusted_workflow"
+}
 
-case_count=$((case_count + 1))
-if grep -Fq 'Darwin E2E verified' "$head_test_workflow"; then
-  echo "not ok - untrusted policy test can collide with required status context" >&2
-  exit 1
-fi
-echo "ok - untrusted policy test has a distinct check name"
+# GitHub Actions '${{ }}' expressions are matched literally, not expanded.
+# shellcheck disable=SC2016
+trusted_checks_out_base_only() {
+  grep -Fq 'ref: ${{ github.event.pull_request.base.sha }}' "$trusted_workflow" &&
+    ! grep -Fq 'github.event.pull_request.head.sha }}' "$trusted_workflow"
+}
 
-case_count=$((case_count + 1))
-if ! grep -Fq 'statuses: write' "$trusted_workflow" ||
-  grep -Eq 'statuses:[[:space:]]*write' "$head_test_workflow"; then
-  echo "not ok - only the trusted workflow may publish commit statuses" >&2
-  exit 1
+trusted_subscribes_to_gated_actions() {
+  grep -Fq 'types: [opened, synchronize, reopened, labeled, unlabeled]' \
+    "$trusted_workflow"
+}
+
+# Cancelling a run between its pending and final status can strand the required
+# head status on pending, so superseding must only ever drop still-queued runs.
+trusted_never_cancels_in_progress() {
+  ! grep -Eq 'cancel-in-progress:[[:space:]]*true' "$trusted_workflow" &&
+    grep -Eq 'cancel-in-progress:[[:space:]]*false' "$trusted_workflow"
+}
+
+unrelated_labels_are_isolated() {
+  grep -Fq "format('unrelated-{0}', github.run_id)" "$trusted_workflow" &&
+    grep -Fq "github.event.label.name != 'darwin-e2e-verified'" "$trusted_workflow"
+}
+
+# GitHub Actions '${{ }}' expressions are matched literally, not expanded.
+# shellcheck disable=SC2016
+gating_events_share_one_group() {
+  grep -Fq 'darwin-verification-${{ github.event.pull_request.number }}' \
+    "$trusted_workflow"
+}
+
+trusted_fails_closed_without_decision() {
+  grep -Fq 'if: always()' "$trusted_workflow" &&
+    grep -Fq 'DARWIN_GATE_DECISION_FILE' "$trusted_workflow" &&
+    grep -Fq 'Darwin verification gate ended without a decision.' "$trusted_workflow"
+}
+
+head_tests_run_proposed_policy() {
+  grep -Eq '^[[:space:]]+pull_request:' "$head_test_workflow" &&
+    grep -Fq 'bash .github/scripts/darwin-verification-gate_test.sh' \
+      "$head_test_workflow"
+}
+
+head_tests_use_a_distinct_check_name() {
+  ! grep -Fq 'Darwin E2E verified' "$head_test_workflow"
+}
+
+only_trusted_publishes_statuses() {
+  grep -Fq 'statuses: write' "$trusted_workflow" &&
+    ! grep -Eq 'statuses:[[:space:]]*write' "$head_test_workflow"
+}
+
+head_tests_cannot_write_pull_requests() {
+  ! grep -Eq 'pull-requests:[[:space:]]*write' "$head_test_workflow"
+}
+
+gate_workflows_are_valid_yaml() {
+  python3 -c 'import sys, yaml
+for path in sys.argv[1:]:
+    with open(path) as handle:
+        yaml.safe_load(handle)' "$trusted_workflow" "$head_test_workflow"
+}
+
+assert_workflow "trusted workflow is base-controlled pull_request_target only" \
+  trusted_is_base_controlled
+assert_workflow "trusted workflow checks out only the base policy" \
+  trusted_checks_out_base_only
+assert_workflow "trusted workflow subscribes to every gated action" \
+  trusted_subscribes_to_gated_actions
+assert_workflow "trusted workflow never cancels a run in progress" \
+  trusted_never_cancels_in_progress
+assert_workflow "unrelated label events cannot supersede a gating run" \
+  unrelated_labels_are_isolated
+assert_workflow "gating events share one per-pull-request concurrency group" \
+  gating_events_share_one_group
+assert_workflow "trusted workflow fails closed without a published decision" \
+  trusted_fails_closed_without_decision
+assert_workflow "unprivileged pull_request workflow tests proposed HEAD policy" \
+  head_tests_run_proposed_policy
+assert_workflow "untrusted policy test has a distinct check name" \
+  head_tests_use_a_distinct_check_name
+assert_workflow "only the trusted workflow may publish commit statuses" \
+  only_trusted_publishes_statuses
+assert_workflow "untrusted policy test cannot write pull requests" \
+  head_tests_cannot_write_pull_requests
+
+if command -v python3 >/dev/null 2>&1 && python3 -c 'import yaml' 2>/dev/null; then
+  assert_workflow "gate workflows are valid YAML" gate_workflows_are_valid_yaml
 fi
-echo "ok - only the trusted workflow may publish commit statuses"
 
 printf '1..%s\n' "$case_count"

@@ -1427,7 +1427,15 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   `test/integration/*_darwin_*_test.go`, and `entitlements.plist`. The "Darwin
   E2E verified" **commit status is posted explicitly to the PR head SHA** and
   fails until the label is present; it is the status to require in branch
-  protection. The `pull_request_target` workflow and its own job run against the
+  protection. `pull_request_target` is a requirement here, not a preference: a
+  fork-triggered `pull_request` run gets a read-only `GITHUB_TOKEN` (it can
+  neither publish the head status nor clear a stale label) and it executes
+  workflow YAML taken from the PR head, so a fork could simply rewrite the gate
+  to pass. Only a base-controlled `pull_request_target` run has both a write
+  token and base-controlled policy. The usual argument against
+  `pull_request_target` — a privileged token combined with untrusted code — is
+  eliminated by never checking out or executing head content.
+  The `pull_request_target` workflow and its own job run against the
   base SHA, so that job is deliberately NOT the merge gate. The trusted workflow
   checks out only the exact base SHA policy script, never the PR head or merge
   tree, and reads PR files/labels through GitHub APIs. Do not add any step that
@@ -1453,10 +1461,35 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   or a stale-cleanup failure already bound to the same head SHA. Relevant runs
   post `pending` before evaluation, serialize per PR, and post failure on
   API/decision errors so an old success cannot survive a reopened/error window.
+  A status counts as published only when the API accepted it, so a failed POST
+  never records a decision.
   If the base policy is missing, the trusted workflow posts failure inline.
   Keep permissions limited to base checkout/API reads, PR-label cleanup, and
   head commit statuses; never expose secrets or execute untrusted code through
   `pull_request_target`.
+
+  **Never cancel a gate run.** Because every relevant run publishes `pending`
+  before it can decide, cancelling one mid-flight can strand the required head
+  status on `pending` forever — a killed runner is not a reliable place to
+  recover. So `cancel-in-progress` is **`false`**, which limits superseding to
+  runs that are still queued and have therefore published nothing. Do not
+  reintroduce `cancel-in-progress: true`.
+
+  **Concurrency grouping is part of the policy.** Only events that are
+  authoritative for the current head (`opened`, `synchronize`, `reopened`, and
+  `darwin-e2e-verified` label add/remove) share the serialized per-PR `policy`
+  group. Unrelated label events get a per-run group so they can neither queue
+  behind nor displace a queued gating run. That isolation is what makes queued
+  supersession safe: every event that can replace a queued `synchronize` either
+  performs the same stale-label cleanup itself (`synchronize`/`reopened`) or is
+  a deliberate human assertion about the current head (verified-label events).
+
+  **A run must publish a decision or fail closed.** The gate records its
+  terminal outcome (`success`, `failure`, or `ignored`) to
+  `DARWIN_GATE_DECISION_FILE`, and a final `if: always()` workflow step — which
+  also runs on cancellation — posts an explicit failure when that marker is
+  absent. This converts an interrupted run into a failing head status instead of
+  a permanently pending one.
 
 Build/test commands:
 
