@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"syscall"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -38,6 +39,7 @@ var _ = Describe("Linux amd64 debugger backend (ptrace) E2E", Label("linux"), fu
 	declareDAPExitSpec()
 	declareDAPMultiClientSpec()
 	declareDAPJoinSpec()
+	declareSignalForwardingSpec()
 	declareStepOverlapSpec()
 	declareStepOverlapStepIntoSpec()
 	declareStepOverlapSignalSpec()
@@ -45,6 +47,187 @@ var _ = Describe("Linux amd64 debugger backend (ptrace) E2E", Label("linux"), fu
 	declareStepOverlapPauseDeliverySpec()
 	declareStepOverlapKillSpec()
 })
+
+const signalTargetExitOK = 43
+
+const segvSignalTargetSrc = `package main
+
+import (
+	"os/signal"
+	"syscall"
+)
+
+var sinkByte byte
+
+func main() {
+	signal.Reset(syscall.SIGSEGV)
+	var p *byte
+	sinkByte = *p
+}
+`
+
+const abortSignalTargetSrc = `package main
+
+import (
+	"os"
+	"os/signal"
+	"runtime"
+	"syscall"
+)
+
+func main() {
+	signal.Reset(syscall.SIGABRT)
+	if err := syscall.Tgkill(os.Getpid(), syscall.Gettid(), syscall.SIGABRT); err != nil {
+		os.Exit(90)
+	}
+	for {
+		runtime.Gosched()
+	}
+}
+`
+
+// ordinarySignalTargetSrc directs one handled signal at a known locked thread
+// while a sibling thread keeps making progress. Exit 43 proves all three
+// outcomes: SIGUSR1 reached the tracee, the signalled thread was the one resumed,
+// and another thread was not stranded by the resume.
+const ordinarySignalTargetSrc = `package main
+
+import (
+	"os"
+	"os/signal"
+	"runtime"
+	"sync/atomic"
+	"syscall"
+	"time"
+)
+
+var (
+	signalledProgress int64
+	siblingProgress   int64
+)
+
+func runCounter(counter *int64, tid chan<- int) {
+	runtime.LockOSThread()
+	if tid != nil {
+		tid <- syscall.Gettid()
+	}
+	for {
+		atomic.AddInt64(counter, 1)
+		time.Sleep(100 * time.Microsecond)
+	}
+}
+
+func main() {
+	runtime.GOMAXPROCS(2)
+	received := make(chan os.Signal, 1)
+	signal.Notify(received, syscall.SIGUSR1)
+
+	tid := make(chan int, 1)
+	go runCounter(&signalledProgress, tid)
+	go runCounter(&siblingProgress, nil)
+	signalledTID := <-tid
+
+	for atomic.LoadInt64(&signalledProgress) == 0 || atomic.LoadInt64(&siblingProgress) == 0 {
+		runtime.Gosched()
+	}
+	signalledBefore := atomic.LoadInt64(&signalledProgress)
+	siblingBefore := atomic.LoadInt64(&siblingProgress)
+
+	if err := syscall.Tgkill(os.Getpid(), signalledTID, syscall.SIGUSR1); err != nil {
+		os.Exit(91)
+	}
+	select {
+	case <-received:
+	case <-time.After(5 * time.Second):
+		os.Exit(92)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt64(&signalledProgress) > signalledBefore &&
+			atomic.LoadInt64(&siblingProgress) > siblingBefore {
+			os.Exit(43)
+		}
+		runtime.Gosched()
+	}
+	os.Exit(93)
+}
+`
+
+// declareSignalForwardingSpec is the native regression for issue #206. A
+// signal-delivery stop must produce one Output event, then the signal must be
+// injected into the exact stopped TID so the target either dies from its fatal
+// signal or observes its handled signal and exits normally.
+func declareSignalForwardingSpec() {
+	It("forwards fatal signals once and reaches signal death", Label("signals"), func() {
+		cases := []struct {
+			name   string
+			src    string
+			signal syscall.Signal
+		}{
+			{name: "SIGSEGV", src: segvSignalTargetSrc, signal: syscall.SIGSEGV},
+			{name: "SIGABRT", src: abortSignalTargetSrc, signal: syscall.SIGABRT},
+		}
+
+		for _, tc := range cases {
+			By(tc.name)
+			bin := buildTarget("signal_"+strings.ToLower(tc.name)+"_target", tc.src)
+			h := newE2EHarness(bin)
+			h.waitFor(15*time.Second, protocol.EventStepped)
+
+			Expect(h.d.Continue()).To(Succeed(), "Continue into %s", tc.name)
+			awaitSignalExit(h.d.Events(), tc.signal, -1)
+		}
+	})
+
+	It("delivers an ordinary signal to its stopped thread without stranding its sibling",
+		Label("signals"), func() {
+			bin := buildTarget("signal_usr1_target", ordinarySignalTargetSrc)
+			h := newE2EHarness(bin)
+			h.waitFor(15*time.Second, protocol.EventStepped)
+
+			Expect(h.d.Continue()).To(Succeed(), "Continue into SIGUSR1 target")
+			awaitSignalExit(h.d.Events(), syscall.SIGUSR1, signalTargetExitOK)
+		})
+}
+
+func awaitSignalExit(events <-chan protocol.Event, signal syscall.Signal, wantExit int) {
+	GinkgoHelper()
+	wantOutput := fmt.Sprintf("signal %d", signal)
+	outputs := 0
+	deadline := time.After(20 * time.Second)
+
+	for {
+		select {
+		case evt, ok := <-events:
+			if !ok {
+				Fail(fmt.Sprintf("events closed before ProcessExited after %s", signal))
+			}
+			switch evt.Kind {
+			case protocol.EventOutput:
+				var out protocol.OutputPayload
+				Expect(json.Unmarshal(evt.Payload, &out)).To(Succeed(), "decode Output after %s", signal)
+				if strings.HasPrefix(out.Content, "signal ") {
+					Expect(out.Stream).To(Equal("stderr"), "signal output stream")
+					Expect(out.Content).To(Equal(wantOutput), "reported signal")
+					outputs++
+				}
+			case protocol.EventProcessExited:
+				var exited protocol.ProcessExitedPayload
+				Expect(json.Unmarshal(evt.Payload, &exited)).To(Succeed(), "decode ProcessExited after %s", signal)
+				Expect(outputs).To(Equal(1),
+					"%s must be reported exactly once before exit; a larger count is the refault loop", signal)
+				Expect(exited.ExitCode).To(Equal(wantExit), "ProcessExited after %s", signal)
+				return
+			case protocol.EventError:
+				Fail(fmt.Sprintf("debugger error after %s: %s", signal, evt.Payload))
+			}
+		case <-deadline:
+			Fail(fmt.Sprintf("TIMEOUT after %s: no ProcessExited after %s (possible suppressed-signal refault loop)",
+				20*time.Second, signal))
+		}
+	}
+}
 
 // overlapTargetSrc pounds two breakpoint-able lines from several
 // LockOSThread'd goroutines at once, so a sibling thread's SIGTRAP reliably
@@ -255,13 +438,13 @@ func declareStepOverlapSpec() {
 // where another spinner is single-stepping off a trap — the foreign StopSignal
 // case, as opposed to the foreign SIGTRAP the plain overlap target produces.
 //
-// SIGUSR1 is used because ptrace intercepts it before delivery and the engine
-// resumes with signal 0, so the tracee never observes it: the storm changes the
-// debugger's workload without changing the target's behaviour.
+// SIGUSR1 is handled explicitly so forwarding it changes only an atomic counter;
+// the storm can exercise delivery without terminating the target.
 const overlapSignalTargetSrc = `package main
 
 import (
 	"os"
+	"os/signal"
 	"runtime"
 	"sync/atomic"
 	"syscall"
@@ -295,6 +478,13 @@ func main() {
 	for i := int64(0); i < 6; i++ {
 		go spin(i)
 	}
+	signals := make(chan os.Signal, 64)
+	signal.Notify(signals, syscall.SIGUSR1)
+	go func() {
+		for range signals {
+			atomic.AddInt64(&sink, 1)
+		}
+	}()
 	pid := os.Getpid()
 	go func() {
 		for {
