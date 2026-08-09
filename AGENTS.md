@@ -1259,6 +1259,24 @@ stays alive for others to join. It buffers `break`s set before launch and flushe
 them on `initialized`. Any mix of `dapcli` and `cli` clients can drive/observe
 one session concurrently.
 
+`dapcli`'s connection death is explicit state, not an implied channel close.
+`markDisconnected` records the cause and closes a `done` channel once
+(`sync.Once`), all under the same `mu` that guards the pending-waiter map, so
+registering a waiter and observing the transport's death is one atomic step —
+a request issued after `readLoop` has already exited fails immediately instead
+of burning the full `replyTimeout`. Waiter channels are **never closed**: a
+receive from a closed channel yields a nil `godap.Message`, whose failed type
+assertion made `request` return `(nil, nil)` and let `restart` print
+"restarted", `initialize` enter the REPL on a dead socket, and
+`threads`/`bt`/`locals` print an empty result — a false success indistinguishable
+from a real one. Blocked waiters instead select on `done` and get a non-nil
+error carrying the underlying read error. That select does a **non-blocking
+re-check of the waiter channel** before reporting death, because a server that
+replies and then closes makes both cases ready at once and `select` picks at
+random; a delivered response must still win or correlation is lost. `close()`
+marks death through the same path, so quitting can't strand an in-flight
+request.
+
 **Option Y (rejected).** The alternative was teaching the hub about DAP directly
 (a second protocol path through `internal/hub`). Rejected: it would fork the most
 fragile fan-out/suspend-gate code for a second protocol. The `hub.WSConn`

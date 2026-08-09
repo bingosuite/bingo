@@ -54,10 +54,23 @@ type dapCLI struct {
 	conn   net.Conn
 	reader *bufio.Reader
 
-	// mu guards seq and pending (the response-waiter registry).
-	mu      sync.Mutex
-	seq     int
-	pending map[int]chan godap.Message
+	// mu guards seq, pending (the response-waiter registry), and the
+	// connection-death fields. Registering a waiter and observing the
+	// connection's death must be one atomic step, or a request racing the read
+	// loop's exit would register with nobody left to answer it and block for
+	// the whole replyTimeout.
+	mu           sync.Mutex
+	seq          int
+	pending      map[int]chan godap.Message
+	disconnected bool
+	connErr      error
+
+	// done is closed exactly once (closeOnce) when the transport dies, so
+	// waiters already blocked in request unblock. Waiter channels themselves
+	// are never closed: onResponse can be mid-send on one, and a receive from a
+	// closed channel yields a nil message that reads as a successful response.
+	done      chan struct{}
+	closeOnce sync.Once
 
 	// writeMu serialises WriteProtocolMessage across the REPL goroutine, the
 	// initialized-handler goroutine, and any command handler — concurrent writes
@@ -75,6 +88,20 @@ type dapCLI struct {
 	printMu sync.Mutex
 }
 
+// newDAPCLI builds a client over conn. Always construct through this so done is
+// non-nil: a nil channel blocks forever, which would silently defeat every
+// connection-death select.
+func newDAPCLI(conn net.Conn) *dapCLI {
+	return &dapCLI{
+		conn:      conn,
+		reader:    bufio.NewReader(conn),
+		pending:   make(map[int]chan godap.Message),
+		bpsByFile: make(map[string][]breakpoint),
+		curThread: 1,
+		done:      make(chan struct{}),
+	}
+}
+
 func main() {
 	addr := flag.String("addr", "localhost:4711", "DAP server address (host:port)")
 	sessionID := flag.String("session", "", "existing bingo session ID to join (omit to create on launch)")
@@ -86,13 +113,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	h := &dapCLI{
-		conn:      conn,
-		reader:    bufio.NewReader(conn),
-		pending:   make(map[int]chan godap.Message),
-		bpsByFile: make(map[string][]breakpoint),
-		curThread: 1,
-	}
+	h := newDAPCLI(conn)
 	go h.readLoop()
 
 	if *sessionID != "" {
@@ -283,7 +304,7 @@ func (h *dapCLI) readLoop() {
 	for {
 		msg, err := readDAPMessage(h.reader)
 		if err != nil {
-			h.failPending()
+			h.markDisconnected(err)
 			if !isClosed(err) {
 				h.printAsync("connection closed: " + err.Error())
 			} else {
@@ -324,43 +345,73 @@ func (h *dapCLI) onResponse(rm godap.ResponseMessage, msg godap.Message) {
 // ack we don't surface). Errors still surface via onResponse.
 func (h *dapCLI) fire(command string, m godap.RequestMessage) {
 	h.mu.Lock()
+	if h.disconnected {
+		cause := h.connErr
+		h.mu.Unlock()
+		h.printAsync("[error] " + connClosedError(command, cause).Error())
+		return
+	}
 	h.seq++
 	seq := h.seq
 	h.mu.Unlock()
-	h.write(command, seq, m)
+	if err := h.write(command, seq, m); err != nil {
+		h.printAsync(fmt.Sprintf("[error] write %s: %v", command, err))
+	}
 }
 
-// request sends a request and blocks for its response (or a timeout).
+// request sends a request and blocks for its response (or a timeout, or the
+// death of the connection).
 func (h *dapCLI) request(command string, m godap.RequestMessage) (godap.Message, error) {
 	h.mu.Lock()
+	if h.disconnected {
+		cause := h.connErr
+		h.mu.Unlock()
+		return nil, connClosedError(command, cause)
+	}
 	h.seq++
 	seq := h.seq
 	ch := make(chan godap.Message, 1)
 	h.pending[seq] = ch
 	h.mu.Unlock()
 
-	h.write(command, seq, m)
+	defer func() {
+		h.mu.Lock()
+		delete(h.pending, seq)
+		h.mu.Unlock()
+	}()
+
+	if err := h.write(command, seq, m); err != nil {
+		return nil, fmt.Errorf("write %s: %w", command, err)
+	}
 
 	select {
 	case msg := <-ch:
-		h.mu.Lock()
-		delete(h.pending, seq)
-		h.mu.Unlock()
-		if rm, ok := msg.(godap.ResponseMessage); ok {
-			if rs := rm.GetResponse(); !rs.Success {
-				return msg, fmt.Errorf("%s", rs.Message)
-			}
+		return decodeResponse(msg)
+	case <-h.done:
+		// The response and the transport's death can become ready together
+		// (a server that replies then closes), and select picks at random. A
+		// delivered response still wins so correlation is never lost.
+		select {
+		case msg := <-ch:
+			return decodeResponse(msg)
+		default:
 		}
-		return msg, nil
+		return nil, h.connClosed(command)
 	case <-time.After(replyTimeout):
-		h.mu.Lock()
-		delete(h.pending, seq)
-		h.mu.Unlock()
 		return nil, fmt.Errorf("timeout awaiting %s response", command)
 	}
 }
 
-func (h *dapCLI) write(command string, seq int, m godap.RequestMessage) {
+func decodeResponse(msg godap.Message) (godap.Message, error) {
+	if rm, ok := msg.(godap.ResponseMessage); ok {
+		if rs := rm.GetResponse(); !rs.Success {
+			return msg, fmt.Errorf("%s", rs.Message)
+		}
+	}
+	return msg, nil
+}
+
+func (h *dapCLI) write(command string, seq int, m godap.RequestMessage) error {
 	req := m.GetRequest()
 	req.Seq = seq
 	req.Type = "request"
@@ -368,22 +419,47 @@ func (h *dapCLI) write(command string, seq int, m godap.RequestMessage) {
 	h.writeMu.Lock()
 	err := godap.WriteProtocolMessage(h.conn, m)
 	h.writeMu.Unlock()
-	if err != nil {
-		h.printAsync(fmt.Sprintf("[error] write %s: %v", command, err))
-	}
+	return err
 }
 
-// failPending unblocks every outstanding waiter when the connection drops.
-func (h *dapCLI) failPending() {
+// markDisconnected records the transport failure once and releases every
+// waiter. Waiter channels are deliberately left unclosed — onResponse may be
+// mid-send on one, and a closed channel hands the waiter a nil message that is
+// indistinguishable from a successful empty response.
+func (h *dapCLI) markDisconnected(cause error) {
 	h.mu.Lock()
-	for seq, ch := range h.pending {
-		close(ch)
+	h.disconnected = true
+	if h.connErr == nil {
+		h.connErr = cause
+	}
+	for seq := range h.pending {
 		delete(h.pending, seq)
 	}
 	h.mu.Unlock()
+	h.closeOnce.Do(func() { close(h.done) })
 }
 
-func (h *dapCLI) close() { _ = h.conn.Close() }
+func (h *dapCLI) connClosed(command string) error {
+	h.mu.Lock()
+	cause := h.connErr
+	h.mu.Unlock()
+	return connClosedError(command, cause)
+}
+
+// connClosedError always prefixes the cause. A bare io.EOF from the read loop
+// reads as an ordinary end-of-stream success rather than a lost debug session,
+// so it must never reach the operator unqualified.
+func connClosedError(command string, cause error) error {
+	if cause == nil {
+		return fmt.Errorf("%s failed: connection to DAP server closed", command)
+	}
+	return fmt.Errorf("%s failed: connection to DAP server closed: %w", command, cause)
+}
+
+func (h *dapCLI) close() {
+	h.markDisconnected(nil)
+	_ = h.conn.Close()
+}
 
 // --- event handling ------------------------------------------------------------
 
