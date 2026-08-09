@@ -9,6 +9,23 @@ import (
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
+type ExportedGoRuntimeLayout struct {
+	Allgs uint64
+	Allm  uint64
+
+	GStack        uint64
+	GAtomicstatus uint64
+	GGoid         uint64
+	GParentGoid   uint64
+
+	StackLo uint64
+	StackHi uint64
+
+	MProcid  uint64
+	MCurg    uint64
+	MAlllink uint64
+}
+
 func ExportedTrapInstruction() []byte {
 	return archTrapInstruction()
 }
@@ -42,6 +59,57 @@ func ExportedPCForFileLine(d Debugger, file string, line int) (uint64, error) {
 		return lookupErr
 	})
 	return pc, err
+}
+
+func ExportedGoRuntimeLayoutFor(d Debugger) ExportedGoRuntimeLayout {
+	e := d.(*engine)
+	var out ExportedGoRuntimeLayout
+	if err := e.dispatch(func() error {
+		l, ok := e.getGoLayout()
+		if !ok {
+			return fmt.Errorf("no Go runtime layout")
+		}
+		allgs, ok := e.dw.runtimeVarAddr("runtime.allgs")
+		if !ok {
+			return fmt.Errorf("no runtime.allgs")
+		}
+		allm, ok := e.dw.runtimeVarAddr("runtime.allm")
+		if !ok {
+			return fmt.Errorf("no runtime.allm")
+		}
+		out = ExportedGoRuntimeLayout{
+			Allgs: allgs,
+			Allm:  allm,
+
+			GStack:        uint64(l.gStack),
+			GAtomicstatus: uint64(l.gAtomicstatus),
+			GGoid:         uint64(l.gGoid),
+			GParentGoid:   uint64(l.gParentGoid),
+
+			StackLo: uint64(l.stackLo),
+			StackHi: uint64(l.stackHi),
+
+			MProcid:  uint64(l.mProcid),
+			MCurg:    uint64(l.mCurg),
+			MAlllink: uint64(l.mAlllink),
+		}
+		return nil
+	}); err != nil {
+		panic("ExportedGoRuntimeLayoutFor: " + err.Error())
+	}
+	return out
+}
+
+func ExportedGoroutineSnapshot(d Debugger) protocol.GoroutineSnapshotPayload {
+	e := d.(*engine)
+	var snap protocol.GoroutineSnapshotPayload
+	if err := e.dispatch(func() error {
+		snap = e.goroutineSnapshot()
+		return nil
+	}); err != nil {
+		panic("ExportedGoroutineSnapshot: " + err.Error())
+	}
+	return snap
 }
 
 func ExportedFileMatches(candidate, target string) bool {
