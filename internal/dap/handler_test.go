@@ -1082,22 +1082,79 @@ func TestDisconnectTerminatesLaunchedDebuggee(t *testing.T) {
 	hh.cmds.waitForCommand(t, protocol.CmdKill)
 }
 
-// suspendAtBreakpoint runs the handshake and parks the handler at a breakpoint
-// on goroutine 7, leaving it suspended with a delivered stopped event.
+// --- rejected run-control helpers ----------------------------------------------
+//
+// Every rejected-resume scenario shares the same shape: park the adapter in a
+// known run state, issue a run-control request it answers optimistically, then
+// inject the hub's EventError and assert how the adapter resynchronizes. These
+// helpers own the shared mechanics; each test still spells out its own state,
+// command kind and expected recovery so a failure names the exact scenario.
+
+// suspendAtBreakpoint parks the handler at a breakpoint on goroutine 7 and
+// consumes the resulting stopped event.
 func suspendAtBreakpoint(t *testing.T, hh *harness) {
 	t.Helper()
 	hh.inject(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{Goroutine: protocol.Goroutine{ID: 7}})
 	_ = recvType[*godap.StoppedEvent](hh)
 }
 
-// requireResumeFailureStopped reads the console line and the resynchronizing
-// stopped event a rejected resume must produce, in that order.
-func requireResumeFailureStopped(t *testing.T, hh *harness, wantCommand, wantMessage string) {
+// newSuspendedHarness completes the handshake and leaves the adapter suspended
+// at a breakpoint — the starting state for every rejected-resume scenario.
+func newSuspendedHarness(t *testing.T) *harness {
 	t.Helper()
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	suspendAtBreakpoint(t, hh)
+	return hh
+}
+
+// driveContinue issues a DAP continue on goroutine 7, consumes its optimistic
+// success response, and waits for the bingo command to reach the hub.
+func driveContinue(t *testing.T, hh *harness) {
+	t.Helper()
+	before := hh.cmds.count(protocol.CmdContinue)
+	hh.sendReq("continue", &godap.ContinueRequest{Arguments: godap.ContinueArguments{ThreadId: 7}})
+	_ = recvType[*godap.ContinueResponse](hh)
+	hh.cmds.waitForCommands(t, protocol.CmdContinue, before+1)
+}
+
+// sendStepRequest issues one DAP step request on goroutine 7 and consumes its
+// bare acknowledgement. The three kinds are spelled out rather than derived:
+// they share a wire shape but decode to distinct response types, and an explicit
+// case keeps a failure pointing at the exact step that broke.
+func sendStepRequest(t *testing.T, hh *harness, request string) {
+	t.Helper()
+	switch request {
+	case "next":
+		hh.sendReq(request, &godap.NextRequest{Arguments: godap.NextArguments{ThreadId: 7}})
+		_ = recvType[*godap.NextResponse](hh)
+	case "stepIn":
+		hh.sendReq(request, &godap.StepInRequest{Arguments: godap.StepInArguments{ThreadId: 7}})
+		_ = recvType[*godap.StepInResponse](hh)
+	case "stepOut":
+		hh.sendReq(request, &godap.StepOutRequest{Arguments: godap.StepOutArguments{ThreadId: 7}})
+		_ = recvType[*godap.StepOutResponse](hh)
+	default:
+		t.Fatalf("unknown step request %q", request)
+	}
+}
+
+// rejectResume injects the hub's rejection of an in-flight resume and asserts
+// the console line, which must name the DAP request that failed rather than the
+// generic "error:" the pre-fix default branch emitted.
+func rejectResume(t *testing.T, hh *harness, kind protocol.CommandKind, request, msg string) {
+	t.Helper()
+	hh.inject(protocol.EventError, protocol.ErrorPayload{Command: kind, Message: msg})
 	out := recvType[*godap.OutputEvent](hh)
-	if want := wantCommand + " failed: " + wantMessage + "\n"; out.Body.Output != want {
+	if want := request + " failed: " + msg + "\n"; out.Body.Output != want {
 		t.Errorf("console output = %q, want %q", out.Body.Output, want)
 	}
+}
+
+// requireResyncStopped reads the stopped event a rejected Continue/Step must
+// send to walk the client back from the success response it already received.
+func requireResyncStopped(t *testing.T, hh *harness, wantMessage string) {
+	t.Helper()
 	stopped := recvType[*godap.StoppedEvent](hh)
 	if stopped.Body.Reason != "exception" {
 		t.Errorf("stopped reason = %q, want exception", stopped.Body.Reason)
@@ -1110,6 +1167,34 @@ func requireResumeFailureStopped(t *testing.T, hh *harness, wantCommand, wantMes
 	}
 	if stopped.Body.ThreadId != 7 {
 		t.Errorf("stopped threadId = %d, want the current thread 7", stopped.Body.ThreadId)
+	}
+}
+
+// rejectRestart sends a DAP restart, waits for the destructive command, injects
+// the hub's rejection, and asserts the delayed error response correlates back to
+// that request.
+func rejectRestart(t *testing.T, hh *harness, msg string) {
+	t.Helper()
+	before := hh.cmds.count(protocol.CmdRestart)
+	seq := hh.sendReq("restart", &godap.RestartRequest{})
+	hh.cmds.waitForCommands(t, protocol.CmdRestart, before+1)
+
+	hh.inject(protocol.EventError, protocol.ErrorPayload{Command: protocol.CmdRestart, Message: msg})
+	failed := recvType[*godap.ErrorResponse](hh)
+	if failed.RequestSeq != seq || failed.Success {
+		t.Fatalf("restart response = %+v, want an error for request %d", failed.Response, seq)
+	}
+}
+
+// requireSuspendedFlag asserts the handler's internal suspended view, which is
+// what gates whether inspection requests are forwarded to the hub.
+func requireSuspendedFlag(t *testing.T, hh *harness, want bool) {
+	t.Helper()
+	hh.handler.mu.Lock()
+	got := hh.handler.suspended
+	hh.handler.mu.Unlock()
+	if got != want {
+		t.Fatalf("handler suspended = %v, want %v", got, want)
 	}
 }
 
@@ -1141,6 +1226,20 @@ func requireInspectionReachesHub(t *testing.T, hh *harness) {
 	t.Fatal("timed out waiting for the hub-answered stackTrace response")
 }
 
+// requireInspectionAnsweredSynthetically is the not-suspended counterpart of
+// requireInspectionReachesHub: a stackTrace must be answered locally with an
+// empty stack and must NOT enqueue a Frames command at the hub.
+func requireInspectionAnsweredSynthetically(t *testing.T, hh *harness) {
+	t.Helper()
+	before := hh.cmds.count(protocol.CmdFrames)
+	hh.sendReq("stackTrace", &godap.StackTraceRequest{Arguments: godap.StackTraceArguments{ThreadId: 7}})
+	st := recvType[*godap.StackTraceResponse](hh)
+	if len(st.Body.StackFrames) != 0 {
+		t.Fatalf("stack frames = %+v, want an empty synthetic answer", st.Body.StackFrames)
+	}
+	hh.cmds.requireNoAdditionalCommands(t, protocol.CmdFrames, before)
+}
+
 // requireNoStoppedEvent fails if any stopped event arrives within the window.
 // It leaves the read deadline expired, so callers must not read afterwards.
 func requireNoStoppedEvent(t *testing.T, hh *harness, within time.Duration) {
@@ -1161,74 +1260,51 @@ func requireNoStoppedEvent(t *testing.T, hh *harness, within time.Duration) {
 	}
 }
 
+// quietWindow bounds the "nothing further arrives" assertions. Translation is
+// synchronous in inject, so an erroneous event is already on the wire long
+// before this elapses.
+const quietWindow = 150 * time.Millisecond
+
+// restartNoLaunchMsg is the hub's rejection for a session it cannot relaunch
+// (attach-created, or no prior Launch). It leaves the process untouched.
+const restartNoLaunchMsg = "no launched process to restart — use Launch first"
+
 // TestRejectedContinueRestoresSuspendedState covers the rejected Continue: the
 // adapter already answered the continue request successfully, so it must
 // resynchronize with the still-suspended engine and report a stop.
 func TestRejectedContinueRestoresSuspendedState(t *testing.T) {
-	hh := newHarness(t)
-	hh.doHandshake(t)
-	suspendAtBreakpoint(t, hh)
-
-	continues := hh.cmds.count(protocol.CmdContinue)
-	hh.sendReq("continue", &godap.ContinueRequest{Arguments: godap.ContinueArguments{ThreadId: 7}})
-	_ = recvType[*godap.ContinueResponse](hh)
-	hh.cmds.waitForCommands(t, protocol.CmdContinue, continues+1)
+	hh := newSuspendedHarness(t)
+	driveContinue(t, hh)
 
 	const msg = "Continue: reinstall breakpoint: write memory: permission denied"
-	hh.inject(protocol.EventError, protocol.ErrorPayload{Command: protocol.CmdContinue, Message: msg})
-	requireResumeFailureStopped(t, hh, "continue", msg)
+	rejectResume(t, hh, protocol.CmdContinue, "continue", msg)
+	requireResyncStopped(t, hh, msg)
 	requireInspectionReachesHub(t, hh)
 }
 
 // TestRejectedStepRestoresSuspendedState covers every step kind: all three DAP
 // step requests share onStep's optimistic resume, so all three must be handled
 // explicitly in onError rather than falling into the generic console default.
+// Each kind is its own named subtest, so a regression names the failing step.
 func TestRejectedStepRestoresSuspendedState(t *testing.T) {
-	cases := []struct {
+	steps := []struct {
 		request string
 		kind    protocol.CommandKind
-		send    func(hh *harness)
-		recv    func(hh *harness)
 	}{
-		{
-			request: "next",
-			kind:    protocol.CmdStepOver,
-			send: func(hh *harness) {
-				hh.sendReq("next", &godap.NextRequest{Arguments: godap.NextArguments{ThreadId: 7}})
-			},
-			recv: func(hh *harness) { _ = recvType[*godap.NextResponse](hh) },
-		},
-		{
-			request: "stepIn",
-			kind:    protocol.CmdStepInto,
-			send: func(hh *harness) {
-				hh.sendReq("stepIn", &godap.StepInRequest{Arguments: godap.StepInArguments{ThreadId: 7}})
-			},
-			recv: func(hh *harness) { _ = recvType[*godap.StepInResponse](hh) },
-		},
-		{
-			request: "stepOut",
-			kind:    protocol.CmdStepOut,
-			send: func(hh *harness) {
-				hh.sendReq("stepOut", &godap.StepOutRequest{Arguments: godap.StepOutArguments{ThreadId: 7}})
-			},
-			recv: func(hh *harness) { _ = recvType[*godap.StepOutResponse](hh) },
-		},
+		{"next", protocol.CmdStepOver},
+		{"stepIn", protocol.CmdStepInto},
+		{"stepOut", protocol.CmdStepOut},
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.request, func(t *testing.T) {
-			hh := newHarness(t)
-			hh.doHandshake(t)
-			suspendAtBreakpoint(t, hh)
+	for _, step := range steps {
+		t.Run(step.request, func(t *testing.T) {
+			hh := newSuspendedHarness(t)
+			sendStepRequest(t, hh, step.request)
+			hh.cmds.waitForCommand(t, step.kind)
 
-			tc.send(hh)
-			tc.recv(hh)
-			hh.cmds.waitForCommand(t, tc.kind)
-
-			msg := string(tc.kind) + " rejected by the engine"
-			hh.inject(protocol.EventError, protocol.ErrorPayload{Command: tc.kind, Message: msg})
-			requireResumeFailureStopped(t, hh, tc.request, msg)
+			msg := string(step.kind) + " rejected by the engine"
+			rejectResume(t, hh, step.kind, step.request, msg)
+			requireResyncStopped(t, hh, msg)
 			requireInspectionReachesHub(t, hh)
 		})
 	}
@@ -1238,17 +1314,13 @@ func TestRejectedStepRestoresSuspendedState(t *testing.T) {
 // trigger: StepOut at the outermost frame fails in the engine before resuming
 // and emits no stop of its own.
 func TestRejectedOutermostStepOutRestoresInspection(t *testing.T) {
-	hh := newHarness(t)
-	hh.doHandshake(t)
-	suspendAtBreakpoint(t, hh)
-
-	hh.sendReq("stepOut", &godap.StepOutRequest{Arguments: godap.StepOutArguments{ThreadId: 7}})
-	_ = recvType[*godap.StepOutResponse](hh)
+	hh := newSuspendedHarness(t)
+	sendStepRequest(t, hh, "stepOut")
 	hh.cmds.waitForCommand(t, protocol.CmdStepOut)
 
 	const msg = "StepOut: null frame pointer — at outermost frame?"
-	hh.inject(protocol.EventError, protocol.ErrorPayload{Command: protocol.CmdStepOut, Message: msg})
-	requireResumeFailureStopped(t, hh, "stepOut", msg)
+	rejectResume(t, hh, protocol.CmdStepOut, "stepOut", msg)
+	requireResyncStopped(t, hh, msg)
 	requireInspectionReachesHub(t, hh)
 }
 
@@ -1256,18 +1328,12 @@ func TestRejectedOutermostStepOutRestoresInspection(t *testing.T) {
 // of a rejected Continue is settled exactly once: the EventContinued it would
 // have produced never arrives, so the NEXT out-of-band continue must surface.
 func TestRejectedResumeSettlesContinueSuppression(t *testing.T) {
-	hh := newHarness(t)
-	hh.doHandshake(t)
-	suspendAtBreakpoint(t, hh)
-
-	continues := hh.cmds.count(protocol.CmdContinue)
-	hh.sendReq("continue", &godap.ContinueRequest{Arguments: godap.ContinueArguments{ThreadId: 7}})
-	_ = recvType[*godap.ContinueResponse](hh)
-	hh.cmds.waitForCommands(t, protocol.CmdContinue, continues+1)
+	hh := newSuspendedHarness(t)
+	driveContinue(t, hh)
 
 	const msg = "Continue: not suspended"
-	hh.inject(protocol.EventError, protocol.ErrorPayload{Command: protocol.CmdContinue, Message: msg})
-	requireResumeFailureStopped(t, hh, "continue", msg)
+	rejectResume(t, hh, protocol.CmdContinue, "continue", msg)
+	requireResyncStopped(t, hh, msg)
 
 	// Another client drives the resume: with the debt settled this must be
 	// surfaced rather than suppressed as our own.
@@ -1282,57 +1348,15 @@ func TestRejectedResumeSettlesContinueSuppression(t *testing.T) {
 // that loses the race with a real stop: the client's existing stopped already
 // describes this suspension, so a second one must not be fabricated.
 func TestRejectedResumeWhileSuspendedDoesNotDuplicateStopped(t *testing.T) {
-	hh := newHarness(t)
-	hh.doHandshake(t)
-	suspendAtBreakpoint(t, hh)
-
-	hh.sendReq("continue", &godap.ContinueRequest{Arguments: godap.ContinueArguments{ThreadId: 7}})
-	_ = recvType[*godap.ContinueResponse](hh)
-	hh.cmds.waitForCommand(t, protocol.CmdContinue)
+	hh := newSuspendedHarness(t)
+	driveContinue(t, hh)
 
 	// A genuine stop lands first, putting the client back in a stopped state.
-	hh.inject(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{Goroutine: protocol.Goroutine{ID: 7}})
-	_ = recvType[*godap.StoppedEvent](hh)
+	suspendAtBreakpoint(t, hh)
 
-	hh.inject(protocol.EventError, protocol.ErrorPayload{Command: protocol.CmdContinue, Message: "stale rejection"})
-	out := recvType[*godap.OutputEvent](hh)
-	if out.Body.Output != "continue failed: stale rejection\n" {
-		t.Errorf("console output = %q", out.Body.Output)
-	}
-	requireNoStoppedEvent(t, hh, 150*time.Millisecond)
-
-	hh.handler.mu.Lock()
-	suspended := hh.handler.suspended
-	hh.handler.mu.Unlock()
-	if !suspended {
-		t.Fatal("handler left the suspended state after a stale rejection")
-	}
-}
-
-// requireSuspendedFlag asserts the handler's internal suspended view, which is
-// what gates whether inspection requests are forwarded to the hub.
-func requireSuspendedFlag(t *testing.T, hh *harness, want bool) {
-	t.Helper()
-	hh.handler.mu.Lock()
-	got := hh.handler.suspended
-	hh.handler.mu.Unlock()
-	if got != want {
-		t.Fatalf("handler suspended = %v, want %v", got, want)
-	}
-}
-
-// requireInspectionAnsweredSynthetically is the not-suspended counterpart of
-// requireInspectionReachesHub: a stackTrace must be answered locally with an
-// empty stack and must NOT enqueue a Frames command at the hub.
-func requireInspectionAnsweredSynthetically(t *testing.T, hh *harness) {
-	t.Helper()
-	before := hh.cmds.count(protocol.CmdFrames)
-	hh.sendReq("stackTrace", &godap.StackTraceRequest{Arguments: godap.StackTraceArguments{ThreadId: 7}})
-	st := recvType[*godap.StackTraceResponse](hh)
-	if len(st.Body.StackFrames) != 0 {
-		t.Fatalf("stack frames = %+v, want an empty synthetic answer", st.Body.StackFrames)
-	}
-	hh.cmds.requireNoAdditionalCommands(t, protocol.CmdFrames, before)
+	rejectResume(t, hh, protocol.CmdContinue, "continue", "stale rejection")
+	requireNoStoppedEvent(t, hh, quietWindow)
+	requireSuspendedFlag(t, hh, true)
 }
 
 // TestRejectedRestartRestoresSuspendedWithoutStopped pins the restart variant
@@ -1341,27 +1365,12 @@ func requireInspectionAnsweredSynthetically(t *testing.T, hh *harness) {
 // may be sent — but the suspended view onRestart cleared optimistically must
 // still be restored.
 func TestRejectedRestartRestoresSuspendedWithoutStopped(t *testing.T) {
-	hh := newHarness(t)
-	hh.doHandshake(t)
-	suspendAtBreakpoint(t, hh)
-
-	restartSeq := hh.sendReq("restart", &godap.RestartRequest{})
-	hh.cmds.waitForCommand(t, protocol.CmdRestart)
-
-	// An attach-created session has no launch to relaunch, so the hub rejects
-	// the restart without touching the still-suspended process.
-	hh.inject(protocol.EventError, protocol.ErrorPayload{
-		Command: protocol.CmdRestart,
-		Message: "no launched process to restart — use Launch first",
-	})
-	failed := recvType[*godap.ErrorResponse](hh)
-	if failed.RequestSeq != restartSeq || failed.Success {
-		t.Fatalf("restart response = %+v, want an error for request %d", failed.Response, restartSeq)
-	}
+	hh := newSuspendedHarness(t)
+	rejectRestart(t, hh, restartNoLaunchMsg)
 
 	requireSuspendedFlag(t, hh, true)
 	requireInspectionReachesHub(t, hh)
-	requireNoStoppedEvent(t, hh, 150*time.Millisecond)
+	requireNoStoppedEvent(t, hh, quietWindow)
 }
 
 // TestRejectedRestartWhileRunningStaysRunning covers the inverse desync: DAP
@@ -1376,21 +1385,11 @@ func TestRejectedRestartWhileRunningStaysRunning(t *testing.T) {
 	hh.doHandshake(t)
 	requireSuspendedFlag(t, hh, false)
 
-	restartSeq := hh.sendReq("restart", &godap.RestartRequest{})
-	hh.cmds.waitForCommand(t, protocol.CmdRestart)
-
-	hh.inject(protocol.EventError, protocol.ErrorPayload{
-		Command: protocol.CmdRestart,
-		Message: "no launched process to restart — use Launch first",
-	})
-	failed := recvType[*godap.ErrorResponse](hh)
-	if failed.RequestSeq != restartSeq || failed.Success {
-		t.Fatalf("restart response = %+v, want an error for request %d", failed.Response, restartSeq)
-	}
+	rejectRestart(t, hh, restartNoLaunchMsg)
 
 	requireSuspendedFlag(t, hh, false)
 	requireInspectionAnsweredSynthetically(t, hh)
-	requireNoStoppedEvent(t, hh, 150*time.Millisecond)
+	requireNoStoppedEvent(t, hh, quietWindow)
 }
 
 // TestRejectedRestartAfterFailedRelaunchDropsSuspended covers the hub's
@@ -1399,39 +1398,26 @@ func TestRejectedRestartWhileRunningStaysRunning(t *testing.T) {
 // captured pre-request suspension must not be reasserted — and a retry restart
 // must still correlate to its own request.
 func TestRejectedRestartAfterFailedRelaunchDropsSuspended(t *testing.T) {
-	hh := newHarness(t)
-	hh.doHandshake(t)
-	suspendAtBreakpoint(t, hh)
+	hh := newSuspendedHarness(t)
+	rejectRestart(t, hh, "restart: relaunch failed: fork/exec /bin/x: no such file or directory")
 
-	firstSeq := hh.sendReq("restart", &godap.RestartRequest{})
-	hh.cmds.waitForCommand(t, protocol.CmdRestart)
-
-	hh.inject(protocol.EventError, protocol.ErrorPayload{
-		Command: protocol.CmdRestart,
-		Message: "restart: relaunch failed: fork/exec /bin/x: no such file or directory",
-	})
-	failed := recvType[*godap.ErrorResponse](hh)
-	if failed.RequestSeq != firstSeq || failed.Success {
-		t.Fatalf("restart response = %+v, want an error for request %d", failed.Response, firstSeq)
-	}
 	// The hub reports the teardown right after the error.
 	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{
 		SessionID: "sess-test", State: protocol.StateIdle, Clients: 1,
 	})
-
 	requireSuspendedFlag(t, hh, false)
 	requireInspectionAnsweredSynthetically(t, hh)
 
 	// Retry correlation survives: the gate was released, so a new restart is
 	// accepted and answered against its own request sequence.
-	secondSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	retrySeq := hh.sendReq("restart", &godap.RestartRequest{})
 	hh.cmds.waitForCommands(t, protocol.CmdRestart, 2)
 	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{})
 	restarted := recvType[*godap.RestartResponse](hh)
-	if restarted.RequestSeq != secondSeq || !restarted.Success {
-		t.Fatalf("retried restart response = %+v, want success for request %d", restarted.Response, secondSeq)
+	if restarted.RequestSeq != retrySeq || !restarted.Success {
+		t.Fatalf("retried restart response = %+v, want success for request %d", restarted.Response, retrySeq)
 	}
-	requireNoStoppedEvent(t, hh, 150*time.Millisecond)
+	requireNoStoppedEvent(t, hh, quietWindow)
 }
 
 // TestRejectedResumeAfterSessionEndedEmitsNoStopped pins the same lifecycle
@@ -1446,19 +1432,11 @@ func TestRejectedResumeAfterSessionEndedEmitsNoStopped(t *testing.T) {
 	_ = recvType[*godap.ExitedEvent](hh)
 	_ = recvType[*godap.TerminatedEvent](hh)
 
-	hh.sendReq("continue", &godap.ContinueRequest{Arguments: godap.ContinueArguments{ThreadId: 7}})
-	_ = recvType[*godap.ContinueResponse](hh)
-	hh.inject(protocol.EventError, protocol.ErrorPayload{
-		Command: protocol.CmdContinue,
-		Message: "no active debugger — send Launch or Attach first",
-	})
-	out := recvType[*godap.OutputEvent](hh)
-	if out.Body.Output != "continue failed: no active debugger — send Launch or Attach first\n" {
-		t.Errorf("console output = %q", out.Body.Output)
-	}
+	driveContinue(t, hh)
+	rejectResume(t, hh, protocol.CmdContinue, "continue", "no active debugger — send Launch or Attach first")
 
 	requireSuspendedFlag(t, hh, false)
-	requireNoStoppedEvent(t, hh, 150*time.Millisecond)
+	requireNoStoppedEvent(t, hh, quietWindow)
 }
 
 // TestRejectedResumeDuringJoinDefersToWelcome covers a joiner that receives
@@ -1475,15 +1453,8 @@ func TestRejectedResumeDuringJoinDefersToWelcome(t *testing.T) {
 	hh.sendReq("attach", &godap.AttachRequest{Arguments: json.RawMessage(`{"session":"sess-test"}`)})
 	_ = recvType[*godap.InitializedEvent](hh)
 
-	hh.inject(protocol.EventError, protocol.ErrorPayload{
-		Command: protocol.CmdContinue,
-		Message: "another client's continue failed",
-	})
-	out := recvType[*godap.OutputEvent](hh)
-	if out.Body.Output != "continue failed: another client's continue failed\n" {
-		t.Errorf("console output = %q", out.Body.Output)
-	}
-	requireNoStoppedEvent(t, hh, 150*time.Millisecond)
+	rejectResume(t, hh, protocol.CmdContinue, "continue", "another client's continue failed")
+	requireNoStoppedEvent(t, hh, quietWindow)
 
 	// The welcome still owns the initial state and reports the suspension.
 	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{
@@ -1517,8 +1488,8 @@ func TestRejectedAutoContinueRestoresSuspendedState(t *testing.T) {
 	hh.cmds.waitForCommand(t, protocol.CmdContinue)
 
 	const msg = "Continue: resume from breakpoint: single-step: no such process"
-	hh.inject(protocol.EventError, protocol.ErrorPayload{Command: protocol.CmdContinue, Message: msg})
-	requireResumeFailureStopped(t, hh, "continue", msg)
+	rejectResume(t, hh, protocol.CmdContinue, "continue", msg)
+	requireResyncStopped(t, hh, msg)
 	requireInspectionReachesHub(t, hh)
 }
 
