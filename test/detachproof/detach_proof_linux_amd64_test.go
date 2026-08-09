@@ -204,10 +204,10 @@ func TestAttachedRunningKillDetaches(t *testing.T) {
 				if dead, how := tg.terminated(2 * time.Second); dead {
 					deaths++
 					t.Errorf("U4 CONFIRMED (tracee destroyed): after a successful Kill the target DIED on reaching "+
-						"the former breakpoint instead of completing phase 2 — %s. The leftover INT3 raised a "+
-						"SIGTRAP that no debugger was left to absorb, so the Go runtime took it as a fatal trap. "+
-						"Killing an ATTACHED process is exactly what the attached branch of killProcess promises "+
-						"not to do.", how)
+						"the former breakpoint instead of completing phase 2 — %s.\n--- target stderr ---\n%s\n---------------------\n"+
+						"The leftover INT3 raised a SIGTRAP that no debugger was left to absorb, so the Go runtime "+
+						"took it as a fatal trap. Killing an ATTACHED process is exactly what the attached branch "+
+						"of killProcess promises not to do.", how, tg.stderr())
 				} else {
 					freezes++
 					t.Errorf("U4 CONFIRMED (tracee frozen): after a successful Kill the target never completed "+

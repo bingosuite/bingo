@@ -27,6 +27,7 @@
 package detachproof
 
 import (
+	"bytes"
 	"debug/elf"
 	"fmt"
 	"os"
@@ -35,6 +36,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -156,6 +158,21 @@ type target struct {
 	// blocked in Wait4(-1) won the race for the status first).
 	waited chan struct{}
 	state  atomic.Pointer[os.ProcessState]
+
+	// errMu guards errBuf. The target's stderr is captured because a Go
+	// process killed by an unabsorbed SIGTRAP prints a runtime fatal-error
+	// banner naming the signal — direct evidence of the leftover INT3 that
+	// does not depend on winning the wait-status race against the engine's
+	// leaked waitLoop.
+	errMu  sync.Mutex
+	errBuf bytes.Buffer
+}
+
+// stderr returns whatever the target has written to stderr so far.
+func (tg *target) stderr() string {
+	tg.errMu.Lock()
+	defer tg.errMu.Unlock()
+	return strings.TrimSpace(tg.errBuf.String())
 }
 
 // startTarget launches bin as an INDEPENDENT OS process (never under the
@@ -174,6 +191,7 @@ func startTarget(t *testing.T, bin string) *target {
 		waited: make(chan struct{}),
 	}
 	tg.cmd = exec.Command(bin, tg.gate, tg.ready, tg.done, tg.beat)
+	tg.cmd.Stderr = &lockedWriter{mu: &tg.errMu, w: &tg.errBuf}
 	if err := tg.cmd.Start(); err != nil {
 		t.Fatalf("start target: %v", err)
 	}
@@ -200,6 +218,19 @@ func startTarget(t *testing.T, bin string) *target {
 	// attach harness) so the attach stop is not racing process startup.
 	time.Sleep(200 * time.Millisecond)
 	return tg
+}
+
+// lockedWriter serialises writes from the exec copier goroutine against test
+// goroutines reading the buffer.
+type lockedWriter struct {
+	mu *sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 // terminated reports whether the target died within timeout and, if so, how.
