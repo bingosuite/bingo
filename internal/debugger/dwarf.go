@@ -429,9 +429,10 @@ func (r *dwarfReader) LocalsForFrame(b Backend, pc, frameBase uint64) ([]protoco
 
 // EvaluateName resolves a single variable name — no dotted paths, indexing, or
 // arithmetic (those belong to the later expression-evaluator PR). It first looks
-// for a local or parameter in the subprogram containing pc, then falls back to a
-// package-level global. The result is the same bounded typed tree LocalsForFrame
-// produces.
+// for a local or parameter in the subprogram containing pc. A bare global then
+// prefers the frame's package before falling back to the whole image; qualified
+// globals use the whole-image lookup directly. The result is the same bounded
+// typed tree LocalsForFrame produces.
 func (r *dwarfReader) EvaluateName(b Backend, pc, frameBase uint64, name string) (protocol.Variable, error) {
 	entries, err := r.subprogramVars(pc)
 	if err != nil {
@@ -442,7 +443,7 @@ func (r *dwarfReader) EvaluateName(b Backend, pc, frameBase uint64, name string)
 			return r.formatEntry(b, child, name, frameBase), nil
 		}
 	}
-	if addr, typ, ok := r.globalVar(name); ok {
+	if addr, typ, ok := r.globalVar(pc, name); ok {
 		return r.formatTyped(b, name, typ, addr), nil
 	}
 	return protocol.Variable{}, fmt.Errorf("no variable named %q in scope", name)
@@ -674,10 +675,84 @@ func (r *dwarfReader) varAddress(entry *dwarf.Entry, frameBase uint64) (uint64, 
 	}
 }
 
-// globalVar resolves a package-level variable to its address and type. It
-// matches either the exact DWARF name or a package-qualified "pkg.name" so a
-// caller can pass a bare "name". Mirrors resolveVarAddr but also returns type.
-func (r *dwarfReader) globalVar(name string) (uint64, dwarf.Type, bool) {
+// globalVar resolves a package-level variable to its address and type. Bare
+// names prefer globals from the frame's package; explicit qualified names and
+// degraded CU lookups retain the whole-binary exact-or-suffix behavior.
+func (r *dwarfReader) globalVar(pc uint64, name string) (uint64, dwarf.Type, bool) {
+	if !strings.Contains(name, ".") {
+		if packageName, ok := r.packageForPC(pc); ok {
+			if addr, typ, found := r.globalVarInPackage(packageName, name); found {
+				return addr, typ, true
+			}
+		}
+	}
+	return r.globalVarAnywhere(name)
+}
+
+// packageForPC uses DWARF's range-aware CU lookup rather than inferring package
+// ownership from a function name. Any lookup failure deliberately degrades to
+// the legacy whole-binary global search.
+func (r *dwarfReader) packageForPC(pc uint64) (string, bool) {
+	dwarfPC := uint64(int64(pc) - r.slide)
+	cu, err := r.data.Reader().SeekPC(dwarfPC)
+	if err != nil || cu == nil {
+		return "", false
+	}
+	name, ok := cu.Val(dwarf.AttrName).(string)
+	return name, ok && name != ""
+}
+
+// globalVarInPackage scans every CU with the same package identity. Go assembly
+// and Go source may contribute separate CUs for one package, while only the Go
+// CU carries its package variables.
+func (r *dwarfReader) globalVarInPackage(packageName, name string) (uint64, dwarf.Type, bool) {
+	rd := r.data.Reader()
+	for {
+		entry, err := rd.Next()
+		if err != nil || entry == nil {
+			return 0, nil, false
+		}
+		if entry.Tag != dwarf.TagCompileUnit {
+			continue
+		}
+		cuName, _ := entry.Val(dwarf.AttrName).(string)
+		if cuName != packageName {
+			rd.SkipChildren()
+			continue
+		}
+		if addr, typ, ok := r.directGlobalVar(rd, name); ok {
+			return addr, typ, true
+		}
+	}
+}
+
+// directGlobalVar reads only a CU's immediate children so local variables cannot
+// shadow package globals.
+func (r *dwarfReader) directGlobalVar(rd *dwarf.Reader, name string) (uint64, dwarf.Type, bool) {
+	for {
+		entry, err := rd.Next()
+		if err != nil || entry == nil || entry.Tag == 0 {
+			return 0, nil, false
+		}
+		if entry.Tag == dwarf.TagVariable {
+			n, _ := entry.Val(dwarf.AttrName).(string)
+			if n == name || strings.HasSuffix(n, "."+name) {
+				loc, ok := entry.Val(dwarf.AttrLocation).([]byte)
+				if ok && len(loc) >= 9 && loc[0] == 0x03 {
+					addr := uint64(int64(binary.LittleEndian.Uint64(loc[1:9])) + r.slide)
+					return addr, r.varType(entry), true
+				}
+			}
+		}
+		if entry.Children {
+			rd.SkipChildren()
+		}
+	}
+}
+
+// globalVarAnywhere preserves the original cross-package convenience lookup:
+// the first exact DWARF name or ".name" suffix match.
+func (r *dwarfReader) globalVarAnywhere(name string) (uint64, dwarf.Type, bool) {
 	rd := r.data.Reader()
 	for {
 		entry, err := rd.Next()
