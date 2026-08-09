@@ -45,11 +45,13 @@ type Client struct {
 	hub  *Hub
 	log  *slog.Logger
 
-	// send is closed exactly once — by the registry on shutdown, or by
-	// deliver() on buffer overflow. sendMu guards close-vs-send races.
-	send   chan []byte
-	sendMu sync.Mutex
-	closed bool
+	// send and disconnected are closed together exactly once — by registry
+	// teardown, explicit eviction, or deliver() on buffer overflow. sendMu
+	// guards close-vs-send races.
+	send         chan []byte
+	disconnected chan struct{}
+	sendMu       sync.Mutex
+	closed       bool
 
 	// writeMu serialises the normal write pump with a protocol close emitted by
 	// the read pump when an incompatible peer must be rejected immediately.
@@ -61,20 +63,26 @@ func newClient(conn WSConn, h *Hub, log *slog.Logger) *Client {
 		log = slog.Default()
 	}
 	return &Client{
-		conn: conn,
-		hub:  h,
-		send: make(chan []byte, 256),
-		log:  log,
+		conn:         conn,
+		hub:          h,
+		send:         make(chan []byte, 256),
+		disconnected: make(chan struct{}),
+		log:          log,
 	}
 }
 
 func (c *Client) closeSend() {
 	c.sendMu.Lock()
 	defer c.sendMu.Unlock()
+	c.closeSendLocked()
+}
+
+func (c *Client) closeSendLocked() {
 	if c.closed {
 		return
 	}
 	c.closed = true
+	close(c.disconnected)
 	close(c.send)
 }
 
@@ -84,6 +92,7 @@ func (c *Client) writePump() {
 	ticker := time.NewTicker(pingInterval)
 	defer func() {
 		ticker.Stop()
+		c.closeSend()
 		_ = c.conn.Close()
 	}()
 
@@ -171,7 +180,9 @@ func (c *Client) readPump() {
 			return
 		}
 
-		c.hub.injectCommand(c, cmd)
+		if !c.hub.injectCommand(c, cmd) {
+			return
+		}
 	}
 }
 
@@ -188,8 +199,7 @@ func (c *Client) deliver(msg []byte) bool {
 		return true
 	default:
 		c.log.Warn("send buffer full — evicting slow client")
-		c.closed = true
-		close(c.send)
+		c.closeSendLocked()
 		return false
 	}
 }
