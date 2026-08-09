@@ -450,6 +450,138 @@ func TestFailedClearStillAnswersSupersededSet(t *testing.T) {
 	}
 }
 
+// A restart re-identifies EVERY line it retains, including one with an
+// operation still in flight: the in-flight clear was marshalled with the
+// pre-restart id and will fail against the relaunched process, and retain-on-
+// failure would otherwise reissue that dead id forever while the real new
+// breakpoint stayed armed.
+func TestRestartReidentifiesLineUnderPendingClear(t *testing.T) {
+	hh := suspendedHarness(t)
+	hh.installBreakpoint(bpSource, []int{10}, []int{101})
+
+	removeSeq := hh.sendReq("setBreakpoints", setBreakpointsFor(bpSource))
+	if ids := hh.clearIDs(1); ids[0] != 101 {
+		t.Fatalf("clear id = %d, want 101", ids[0])
+	}
+
+	restartSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdRestart)
+	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{
+		Breakpoints: []protocol.Breakpoint{
+			{ID: 1, Location: protocol.Location{File: bpSource.Path, Line: 10}},
+		},
+	})
+	restarted := recvType[*godap.RestartResponse](hh)
+	if restarted.RequestSeq != restartSeq || !restarted.Success {
+		t.Fatalf("restart response = %+v, want success for %d", restarted.Response, restartSeq)
+	}
+
+	st, ok := hh.lineState(bpSource.Path, 10)
+	if !ok || st.installedID != 1 {
+		t.Fatalf("line state = %+v (present=%v), want the fresh debugger id 1", st, ok)
+	}
+	if st.dapID != 101 {
+		t.Fatalf("dapID = %d, want the stable client identity 101", st.dapID)
+	}
+	if st.pending == nil {
+		t.Fatal("restart cancelled the in-flight operation")
+	}
+	hh.handler.mu.Lock()
+	inFlight := len(hh.handler.clearQ)
+	hh.handler.mu.Unlock()
+	if inFlight != 1 {
+		t.Fatalf("clearQ length = %d, want the in-flight operation preserved", inFlight)
+	}
+
+	// The stale clear, carrying the pre-restart id, is rejected by the new
+	// engine — but the mapping has already self-healed.
+	hh.inject(protocol.EventError, protocol.ErrorPayload{
+		Command: protocol.CmdClearBreakpoint,
+		Message: "breakpoint 101 not found",
+	})
+	requireErrorResponse(t, recvType[*godap.ErrorResponse](hh), removeSeq, "breakpoint 101 not found")
+
+	hh.sendReq("setBreakpoints", setBreakpointsFor(bpSource))
+	ids := hh.clearIDs(2)
+	if ids[1] != 1 {
+		t.Fatalf("retry clear id = %d, want the fresh id 1 (not the dead %d)", ids[1], ids[0])
+	}
+	hh.inject(protocol.EventBreakpointCleared, protocol.BreakpointClearedPayload{ID: 1})
+	_ = recvType[*godap.SetBreakpointsResponse](hh)
+
+	if _, ok := hh.lineState(bpSource.Path, 10); ok {
+		t.Fatal("confirmed clear left the line in the cache")
+	}
+}
+
+// A line whose Set is still in flight owns no identity yet, so a restart
+// payload naming it describes another driver's breakpoint and must not be
+// adopted — neither as a retained id nor as a discard.
+func TestRestartIgnoresLineWithNoInstalledIdentity(t *testing.T) {
+	hh := suspendedHarness(t)
+
+	hh.sendReq("setBreakpoints", setBreakpointsFor(bpSource, 10))
+	hh.cmds.waitForCommands(t, protocol.CmdSetBreakpoint, 1)
+
+	restartSeq := hh.sendReq("restart", &godap.RestartRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdRestart)
+	hh.inject(protocol.EventRestarted, protocol.RestartedPayload{
+		Breakpoints: []protocol.Breakpoint{
+			{ID: 7, Location: protocol.Location{File: bpSource.Path, Line: 10}},
+		},
+		Discarded: []protocol.DiscardedBreakpoint{
+			{Location: protocol.Location{File: bpSource.Path, Line: 10}, Reason: "no such line"},
+		},
+	})
+	restarted := recvType[*godap.RestartResponse](hh)
+	if restarted.RequestSeq != restartSeq {
+		t.Fatalf("restart response seq = %d, want %d", restarted.RequestSeq, restartSeq)
+	}
+
+	st, ok := hh.lineState(bpSource.Path, 10)
+	if !ok || st.installedID != 0 || st.pending == nil || !st.desired {
+		t.Fatalf("line state = %+v (present=%v), want the in-flight set untouched", st, ok)
+	}
+
+	// Our own confirmation still lands on it and settles the request normally.
+	hh.confirmSet(bpSource, 10, 55)
+	resp := recvType[*godap.SetBreakpointsResponse](hh)
+	requireBreakpointIDs(t, resp, 55)
+}
+
+// The adapter must hand every breakpoint command to the hub, in the order their
+// FIFO slots were reserved, however large the burst — it blocks rather than
+// drops. This is one half of the delivery contract the transaction depends on:
+// a command that never reaches the debugger produces no confirmation, so its
+// line stays `pending` forever and its request is never answered. Hub-side
+// admission is the other half (#160 / #162).
+func TestLargeSetBreakpointsDeliversEveryCommandInOrder(t *testing.T) {
+	hh := suspendedHarness(t)
+
+	// Comfortably past the handler's own command buffer, so the staged outbox
+	// has to block on the hub read pump rather than discard.
+	count := 3 * cmdBufferSize
+	lines := make([]int, count)
+	for i := range lines {
+		lines[i] = 10 + i
+	}
+	hh.sendReq("setBreakpoints", setBreakpointsFor(bpSource, lines...))
+
+	cmds := hh.cmds.waitForCommands(t, protocol.CmdSetBreakpoint, count)
+	if len(cmds) != count {
+		t.Fatalf("SetBreakpoint commands = %d, want %d", len(cmds), count)
+	}
+	for i, cmd := range cmds {
+		var p protocol.SetBreakpointPayload
+		if err := protocol.DecodeCommandPayload(cmd, &p); err != nil {
+			t.Fatal(err)
+		}
+		if p.Line != lines[i] {
+			t.Fatalf("command %d = line %d, want %d (wire order must match reservation order)", i, p.Line, lines[i])
+		}
+	}
+}
+
 // Confirmations the adapter did not ask for must never produce a second
 // response for an already-answered request.
 func TestSetBreakpointsRespondsExactlyOnce(t *testing.T) {

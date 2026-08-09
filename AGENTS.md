@@ -1368,9 +1368,24 @@ no-breakpoint target, not a clear-then-continue.
 id (`installedID`). After `EventRestarted`, reconcile its exact source-path/line
 keys from `RestartedPayload` before replying: retained entries adopt the fresh
 debugger id, while discarded entries are removed and emit a `breakpoint` changed
-event with their prior DAP id and `verified:false`. A line with an op in flight
-is skipped — that op still owns the line and its confirmation is still queued.
-Do not reset `setQ`/`clearQ`; those FIFOs still own any in-flight confirmations.
+event with their prior DAP id and `verified:false`. A line with an operation in
+flight is re-identified **too** — correlation rides the queued `*bpOp`, not
+`installedID`, so adopting the fresh id cannot desynchronise the FIFOs, whereas
+keeping the pre-restart id would strand the line on an identifier the new engine
+never issued (the already-marshalled clear fails, retain-on-failure reissues that
+dead id forever, and the real new breakpoint becomes unremovable). Only a line
+with `installedID == 0` is skipped: it owns no identity yet, so a payload entry
+for it describes another driver's breakpoint. Do not reset `setQ`/`clearQ`; those
+FIFOs still own any in-flight confirmations.
+
+**This transaction depends on reliable ordinary-command delivery** (#160 / #162).
+There are deliberately no adapter-side timeouts — inventing one would mask
+command loss and could fire against a merely slow debugger. A silently dropped
+`SetBreakpoint`/`ClearBreakpoint` therefore produces no confirmation, which now
+latches that line's `pending` forever: no further operation can be issued for it
+and the owning request is never answered. The adapter side of the contract is
+covered here (it blocks rather than drops, and wire order matches slot-reservation
+order); the hub side is `injectCommand`'s admission.
 
 ### Server wiring + multi-client discovery
 
@@ -1513,8 +1528,9 @@ translator keeps DAP entirely outside the hub — a strictly additive package.
   breakpoint transaction: a rejected clear retains the id and fails its request,
   partial clear failure, a superseded pending set clears exactly once, an
   overlapping pending set issues one command, set→remove→re-add leaves one live
-  breakpoint, cross-source independence, restart around an in-flight op,
-  exactly-once responses). Run with the normal
+  breakpoint, cross-source independence, restart re-identification with an
+  in-flight operation, no-drop/in-order command delivery, exactly-once
+  responses). Run with the normal
   `go test -tags bingonative ./internal/dap/...`.
 - E2E: label `dap` in [test/integration](test/integration/) — a real go-dap
   client over TCP through the WHOLE stack (client → TCP →
