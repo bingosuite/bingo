@@ -214,18 +214,19 @@ func (h *Hub) clearBreakpoint(dbg debugger.Debugger, cmd protocol.Command) (disp
 	if err := protocol.DecodeCommandPayload(cmd, &p); err != nil {
 		return dispatchResult{}, err
 	}
-	m, ok := h.bps.lookup(p.ID)
+	logicalID := p.ID
+	m, ok := h.bps.lookup(logicalID)
 	if !ok {
-		return dispatchResult{}, fmt.Errorf("breakpoint %d not found", p.ID)
+		return dispatchResult{}, fmt.Errorf("breakpoint %d not found", logicalID)
 	}
 	if err := dbg.ClearBreakpoint(m.physicalID); err != nil {
 		// Retain the mapping: a failed clear leaves the trap armed (see
 		// breakpointTable.clear), so the client must keep being able to name it.
 		return dispatchResult{}, err
 	}
-	h.bps.untrack(p.ID)
+	h.bps.untrack(logicalID)
 	evt, err := protocol.NewEvent(protocol.EventBreakpointCleared, 0, protocol.BreakpointClearedPayload{
-		ID: p.ID,
+		ID: logicalID,
 	})
 	if err != nil {
 		return dispatchResult{}, err
