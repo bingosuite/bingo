@@ -19,6 +19,10 @@ type breakpointEntry struct {
 	enabled       bool
 }
 
+func (b *breakpointEntry) matchesID(id int) bool {
+	return b != nil && b.id == id
+}
+
 func (b *breakpointEntry) toProtocol() protocol.Breakpoint {
 	return protocol.Breakpoint{
 		ID:      b.id,
@@ -79,14 +83,23 @@ func (t *breakpointTable) set(b Backend, file string, line int, addr uint64) (*b
 func (t *breakpointTable) clear(b Backend, id int) error {
 	entry, ok := t.byID[id]
 	if !ok {
-		return fmt.Errorf("breakpoint %d not found", id)
+		return breakpointNotFound(id)
 	}
 	if err := b.WriteMemory(entry.addr, entry.originalBytes); err != nil {
 		return fmt.Errorf("breakpoint clear: restore bytes at 0x%x: %w", entry.addr, err)
 	}
+	entry.enabled = false
 	delete(t.byID, id)
 	delete(t.byAddr, entry.addr)
 	return nil
+}
+
+func breakpointNotFound(id int) error {
+	return fmt.Errorf("breakpoint %d not found", id)
+}
+
+func (t *breakpointTable) atID(id int) *breakpointEntry {
+	return t.byID[id]
 }
 
 func (t *breakpointTable) atAddr(addr uint64) *breakpointEntry {

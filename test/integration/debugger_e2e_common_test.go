@@ -212,10 +212,9 @@ func main() {
 `
 
 // twoBPTargetSrc has two distinct breakpoint-able lines in its hot loop (BP_A
-// then BP_B). The ClearBreakpoint spec sets both, then clears A while stopped at
-// B and asserts subsequent Continues only ever stop at B — proving the cleared
-// breakpoint really stops firing. Neither marked line contains a call, so the
-// spec exercises only Continue (never the darwin-fragile step-over path).
+// then BP_B). The ClearBreakpoint spec clears A while stopped on A and asserts
+// subsequent Continues only ever stop at B. Neither marked line contains a call,
+// so the acceptance isolates Continue's software-breakpoint step-off path.
 const twoBPTargetSrc = `package main
 
 import (
@@ -692,17 +691,12 @@ func declareTypedLocalsSpec() {
 	})
 }
 
-// declareClearBreakpointSpec asserts a cleared breakpoint stops firing. It sets
-// two breakpoints (A before B in the loop body), advances until it is stopped at
-// B, clears A (the non-current one — clearing the breakpoint the process is
-// currently parked on re-arms it through the step-off/reinstall path), then
-// Continues several times and asserts every subsequent stop is at B and never at
-// the cleared line A. Runs on both linux and darwin: after clearing A the process
-// is parked on B, so each subsequent Continue single-steps *off* B's armed trap
-// (the restore->single-step->reinstall dance), a path made reliable on darwin by
-// the Mach-exception model (see the scoping note above).
+// declareClearBreakpointSpec asserts that clearing the breakpoint the tracee is
+// currently parked on is final. The live PC was already rewound to A, so clearing
+// A restores executable bytes and the next Continue must run directly to B
+// without a stale step-off reinstall resurrecting A. Runs on both native backends.
 func declareClearBreakpointSpec() {
-	It("stops stopping at a cleared breakpoint", Label("breakpoints"), func() {
+	It("stops stopping at a breakpoint cleared while parked on it", Label("breakpoints"), func() {
 		lineA := markerLine(twoBPTargetSrc, "// BP_A")
 		lineB := markerLine(twoBPTargetSrc, "// BP_B")
 		bin := buildTarget("clearbp_target", twoBPTargetSrc)
@@ -715,23 +709,17 @@ func declareClearBreakpointSpec() {
 		_, err = h.d.SetBreakpoint("clearbp_target.go", lineB)
 		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint B")
 
-		// Advance to A, then to B, so we are parked on B (not A) when we clear A.
+		// Stop on A and clear the breakpoint the tracee is currently parked on.
 		Expect(h.d.Continue()).To(Succeed(), "Continue to A")
 		evt := h.waitFor(15*time.Second,
 			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
 		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit), "first stop")
 		Expect(bpLine(evt)).To(Equal(lineA), "first stop is at A")
 
-		Expect(h.d.Continue()).To(Succeed(), "Continue to B")
-		evt = h.waitFor(15*time.Second,
-			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
-		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit), "second stop")
-		Expect(bpLine(evt)).To(Equal(lineB), "second stop is at B")
-
 		Expect(h.d.ClearBreakpoint(bpA.ID)).To(Succeed(), "ClearBreakpoint A")
 
 		// With A cleared, every remaining stop in the loop must be B.
-		const rounds = 4
+		const rounds = 6
 		for i := 0; i < rounds; i++ {
 			Expect(h.d.Continue()).To(Succeed(), "Continue #%d after clear", i)
 			evt = h.waitFor(15*time.Second,
@@ -741,6 +729,8 @@ func declareClearBreakpointSpec() {
 			Expect(bpLine(evt)).To(Equal(lineB),
 				"post-clear stop #%d must be at B (%d), not the cleared A (%d)", i, lineB, lineA)
 		}
+		Expect(h.d.ClearBreakpoint(bpA.ID)).To(HaveOccurred(),
+			"the cleared ID must stay absent after repeated step-off completions")
 	})
 }
 

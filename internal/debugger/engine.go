@@ -236,7 +236,7 @@ func (e *engine) Kill() error {
 		// Release any threads held for an in-flight atomic step-over first, so
 		// a detach (attached-process Kill) never leaves them Mach-suspended.
 		e.endThreadStep()
-		e.bps.clearAll(e.backend)
+		e.clearAllBreakpoints()
 		if killErr := e.proc.kill(e.backend, running); killErr != nil {
 			return killErr
 		}
@@ -272,8 +272,48 @@ func (e *engine) SetBreakpoint(file string, line int) (protocol.Breakpoint, erro
 
 func (e *engine) ClearBreakpoint(id int) error {
 	return e.dispatch(func() error {
-		return e.bps.clear(e.backend, id)
+		return e.clearBreakpoint(id)
 	})
+}
+
+func (e *engine) clearBreakpoint(id int) error {
+	if e.steppingOverBP.matchesID(id) {
+		if !e.steppingOverBP.enabled {
+			return breakpointNotFound(id)
+		}
+		// The step-off path already restored the original instruction and
+		// transiently removed this entry from the table. Keep its metadata for
+		// the pending resume action, but make completion skip the reinstall.
+		e.steppingOverBP.enabled = false
+		return nil
+	}
+
+	entry := e.bps.atID(id)
+	if err := e.bps.clear(e.backend, id); err != nil {
+		return err
+	}
+	e.invalidateClearedBreakpoint(entry)
+	return nil
+}
+
+func (e *engine) invalidateClearedBreakpoint(entry *breakpointEntry) {
+	if e.lastBP != entry {
+		return
+	}
+	e.lastBP = nil
+	e.lastBPTID = 0
+}
+
+func (e *engine) clearAllBreakpoints() {
+	e.bps.clearAll(e.backend)
+	if e.lastBP != nil && !e.lastBP.enabled {
+		e.invalidateClearedBreakpoint(e.lastBP)
+	}
+	if e.steppingOverBP != nil {
+		// Its bytes were restored before the single-step began, so no backend
+		// write is needed to clear the transiently table-less entry.
+		e.steppingOverBP.enabled = false
+	}
 }
 
 func (e *engine) Continue() error {
@@ -639,11 +679,13 @@ func (e *engine) handleStop(stop StopEvent) {
 		var err error
 		stop, err = e.populateStopPC(stop, false)
 		if err != nil {
-			// Rearm the in-flight step-over BP and release held threads before
+			// Rearm a still-live in-flight BP and release held threads before
 			// surfacing the error, so the process is left in a clean state.
 			if sob := e.steppingOverBP; sob != nil {
 				e.steppingOverBP = nil
-				_ = e.bps.reinstall(e.backend, sob)
+				if sob.enabled {
+					_ = e.bps.reinstall(e.backend, sob)
+				}
 			}
 			e.endThreadStep()
 			e.setState(stateSuspended)
@@ -654,20 +696,22 @@ func (e *engine) handleStop(stop StopEvent) {
 			"steppingOverBP", e.steppingOverBP != nil)
 		if sob := e.steppingOverBP; sob != nil {
 			e.steppingOverBP = nil
-			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
-				// Reinstall failed. Suspend instead of resuming — running
-				// without the trap would let the process loose.
-				e.endThreadStep()
-				e.log.Error("breakpoint reinstall failed — suspending to prevent runaway process",
-					"addr", fmt.Sprintf("0x%x", sob.addr), "err", rerr)
-				e.setState(stateSuspended)
-				e.emitError(protocol.CmdNone, fmt.Errorf("reinstall breakpoint 0x%x: %w", sob.addr, rerr))
-				return
+			if sob.enabled {
+				if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
+					// Reinstall failed. Suspend instead of resuming — running
+					// without the trap would let the process loose.
+					e.endThreadStep()
+					e.log.Error("breakpoint reinstall failed — suspending to prevent runaway process",
+						"addr", fmt.Sprintf("0x%x", sob.addr), "err", rerr)
+					e.setState(stateSuspended)
+					e.emitError(protocol.CmdNone, fmt.Errorf("reinstall breakpoint 0x%x: %w", sob.addr, rerr))
+					return
+				}
+				e.log.Debug("breakpoint reinstalled", "addr", fmt.Sprintf("0x%x", sob.addr))
 			}
-			// The trap byte is back in place; only now is it safe to release
-			// the threads we held for the atomic step-over.
+			// The original instruction is executable now: either the live trap
+			// was reinstalled or a clear cancelled it while the step was in flight.
 			e.endThreadStep()
-			e.log.Debug("breakpoint reinstalled", "addr", fmt.Sprintf("0x%x", sob.addr))
 			switch e.bpResume {
 			case bpResumeContinue:
 				_ = e.backend.ContinueProcess()
@@ -727,14 +771,16 @@ func (e *engine) handleStop(stop StopEvent) {
 		e.emitStepped(stop)
 
 	case StopSignal:
-		// Reinstall any in-flight step-over BP before resuming or suspending.
+		// Reinstall any still-live in-flight BP before resuming or suspending.
 		if sob := e.steppingOverBP; sob != nil {
 			e.steppingOverBP = nil
-			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
-				e.endThreadStep()
-				e.setState(stateSuspended)
-				e.emitError(protocol.CmdNone, fmt.Errorf("reinstall breakpoint 0x%x after signal: %w", sob.addr, rerr))
-				return
+			if sob.enabled {
+				if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
+					e.endThreadStep()
+					e.setState(stateSuspended)
+					e.emitError(protocol.CmdNone, fmt.Errorf("reinstall breakpoint 0x%x after signal: %w", sob.addr, rerr))
+					return
+				}
 			}
 			e.endThreadStep()
 		}
@@ -1026,8 +1072,8 @@ func (e *engine) stepOut() error {
 }
 
 // resumeFromBreakpoint runs the step-over-software-BP sequence:
-// restore bytes → single-step → reinstall trap (in StopSingleStep handler)
-// → perform action.
+// restore bytes → single-step → conditionally reinstall the still-enabled trap
+// (in StopSingleStep handler) → perform action.
 func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) error {
 	bp := e.lastBP
 	e.lastBP = nil
