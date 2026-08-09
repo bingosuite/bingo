@@ -632,7 +632,13 @@ func (e *engine) handleStop(stop StopEvent) {
 		var err error
 		stop, err = e.populateBreakpointStop(stop)
 		if err != nil {
-			e.haltOnError(protocol.CmdNone, err, stop)
+			// Without a located stop the PC was never rewound off the trap.
+			// On amd64 RIP is left one byte past the INT3, so a plain resume
+			// would execute from mid-instruction; say so, because the client
+			// has no other way to know that continuing is the unsafe option.
+			e.haltOnError(protocol.CmdNone, fmt.Errorf(
+				"%w — the breakpoint PC was not rewound, so resuming may execute "+
+					"from mid-instruction; kill or restart to recover safely", err), stop)
 			return
 		}
 		bp := e.bps.atAddr(stop.PC)
@@ -839,7 +845,15 @@ func (e *engine) populateStopPC(stop StopEvent, rewind bool) (StopEvent, error) 
 	if stop.PC != 0 {
 		return stop, nil
 	}
-	if stop.TID == 0 {
+	// Keep the guessed thread local until it is confirmed by a successful
+	// register read. On darwin task_threads returns creation order, so
+	// threads[0] is frequently an idle runtime M rather than the thread that
+	// stopped; committing it to stop.TID on the error path would hand that
+	// wrong thread to curTID via the halt event, and curTID is what every
+	// later step primitive targets (see the curTID field comment). A real TID
+	// supplied by the backend is preserved untouched either way.
+	tid := stop.TID
+	if tid == 0 {
 		threads, err := e.backend.Threads()
 		if err != nil {
 			return stop, fmt.Errorf("get stop thread: %w", err)
@@ -847,12 +861,13 @@ func (e *engine) populateStopPC(stop StopEvent, rewind bool) (StopEvent, error) 
 		if len(threads) == 0 {
 			return stop, fmt.Errorf("get stop thread: no threads")
 		}
-		stop.TID = threads[0]
+		tid = threads[0]
 	}
-	regs, err := e.backend.GetRegisters(stop.TID)
+	regs, err := e.backend.GetRegisters(tid)
 	if err != nil {
-		return stop, fmt.Errorf("get stop PC for tid %d: %w", stop.TID, err)
+		return stop, fmt.Errorf("get stop PC for tid %d: %w", tid, err)
 	}
+	stop.TID = tid
 	if rewind {
 		stop.PC = archRewindPC(regs.PC)
 	} else {
@@ -1347,6 +1362,8 @@ func (e *engine) haltOnError(cmd protocol.CommandKind, cause error, stop StopEve
 // A synthetic goroutine and a pure-DWARF location are all the hub needs to gate
 // on and all DAP needs to map to `stopped` reason=pause; clients that want more
 // can request frames or a snapshot now that the session is responsive again.
+// Both go through locForPC so a PC of 0 short-circuits instead of scanning
+// every compilation unit, and so the location agrees with the goroutine's.
 func (e *engine) emitHaltedOnError(stop StopEvent) {
 	if stop.TID != 0 {
 		e.curTID = stop.TID
@@ -1354,13 +1371,9 @@ func (e *engine) emitHaltedOnError(stop StopEvent) {
 	// This is a suspend like any other self-stop, so it cancels a racing Pause
 	// whose interrupt is still queued in the tracee (see emitBreakpointHit).
 	e.manualStopPending = false
-	loc := protocol.Location{}
-	if e.dw != nil {
-		loc = e.dw.locationForPC(stop.PC)
-	}
 	e.emit(protocol.EventPaused, protocol.PausedPayload{
 		Goroutine: e.syntheticGoroutine(stop.PC),
-		Location:  loc,
+		Location:  e.locForPC(stop.PC),
 	})
 }
 
