@@ -72,9 +72,13 @@ case "$*" in
       echo "label API failed" >&2
       exit "$MOCK_LABEL_STATUS"
     fi
-    if [ "$MOCK_HAS_LABEL" = "true" ]; then
-      printf '%s\n' darwin-e2e-verified
-    fi
+    # Anything other than true/false is emitted verbatim as the live label set,
+    # so a case can pin that only an exact match counts as verification.
+    case "$MOCK_HAS_LABEL" in
+      true) printf '%s\n' darwin-e2e-verified ;;
+      false) ;;
+      *) printf '%s\n' "$MOCK_HAS_LABEL" ;;
+    esac
     ;;
   *)
     echo "Unexpected gh api call: $*" >&2
@@ -389,6 +393,22 @@ run_case "verified-label prefix does not count as the verified label" \
   path=entitlements.plist has_label=true \
   exit=0 state=none label_query=false decision=ignored \
   output="existing head-SHA status remains authoritative"
+
+# The live-label read is the only path that can publish a green status, so a
+# label that merely contains the verified name must not satisfy it.
+run_case "a live label that only contains the verified name is not a match" \
+  action=labeled label=darwin-e2e-verified head_repo=contributor/fork \
+  path=entitlements.plist has_label=darwin-e2e-verified-2 \
+  exit=1 state=failure label_query=true decision=failure \
+  output="not currently present"
+
+run_case "the verified label counts among several live labels" \
+  action=labeled label=darwin-e2e-verified head_repo=contributor/fork \
+  path=entitlements.plist has_label='triage
+darwin-e2e-verified
+needs-review' \
+  exit=0 state=success label_query=true decision=success \
+  output="verified locally"
 
 # --- path matching -----------------------------------------------------------
 
