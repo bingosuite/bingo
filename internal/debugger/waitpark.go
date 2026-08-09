@@ -1,5 +1,7 @@
 package debugger
 
+import "sync/atomic"
+
 // stopDisposition is the decision a backend's wait loop makes about a stop that
 // would otherwise be handed straight to the engine.
 type stopDisposition uint8
@@ -74,12 +76,26 @@ type stepQueue struct {
 	stepTID  int  // the exact thread SingleStep was issued against
 
 	parked []StopEvent // held foreign stops, in arrival order
+
+	// parkedTotal counts every stop ever held back. It exists solely so the
+	// native regression test can assert it actually exercised the parking path
+	// instead of passing vacuously on a run where the overlap never occurred.
+	// Atomic because that test reads it through a public hook from its own
+	// goroutine (see park_diag_linux_amd64.go).
+	parkedTotal atomic.Int64
 }
 
 // park holds a foreign stop until the in-flight step completes. It deliberately
 // does not touch the backend's current-stop bookkeeping: that must keep naming
 // the thread the backend will actually resume next, and this thread is not it.
-func (q *stepQueue) park(ev StopEvent) { q.parked = append(q.parked, ev) }
+func (q *stepQueue) park(ev StopEvent) {
+	q.parked = append(q.parked, ev)
+	q.parkedTotal.Add(1)
+}
+
+// parkedCount reports how many stops have been held back over the backend's
+// lifetime.
+func (q *stepQueue) parkedCount() int { return int(q.parkedTotal.Load()) }
 
 // releasable pops the oldest held stop if one may be surfaced now.
 //

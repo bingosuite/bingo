@@ -229,11 +229,22 @@ func declareStepOverlapSpec() {
 		Expect(len(goroutines)).To(BeNumerically(">=", 2),
 			"all hits came from one goroutine — no cross-thread overlap was exercised")
 
+		// The decisive one: assert the parking path actually ran. Everything
+		// above stays green if foreign stops are never held back at all, so
+		// without this the spec could pass on a run that never reproduced the
+		// overlap — or against a build with the rule removed.
+		parked, ok := debugger.LinuxParkedStopCount(h.d)
+		Expect(ok).To(BeTrue(), "parked-stop hook unavailable")
+		Expect(parked).To(BeNumerically(">", 0),
+			"no foreign stop was ever parked across %d cycles: this run never "+
+				"exercised the rule under test", iters)
+
 		AddReportEntry("overlap-iterations", iters)
 		AddReportEntry("overlap-hits-A", hits[bpA.ID])
 		AddReportEntry("overlap-hits-B", hits[bpB.ID])
 		AddReportEntry("overlap-goroutines", len(goroutines))
 		AddReportEntry("overlap-stepover-resolved-as-breakpoint", stepOverDeliveredForeign)
+		AddReportEntry("overlap-parked-stops", parked)
 	})
 }
 
@@ -445,6 +456,13 @@ func declareStepOverlapStepIntoSpec() {
 				"all hits came from one goroutine — no cross-thread overlap was exercised")
 			AddReportEntry("overlap-stepinto-iterations", iters)
 			AddReportEntry("overlap-stepinto-goroutines", len(p.goroutines))
+			if parked, ok := debugger.LinuxParkedStopCount(p.h.d); ok {
+				// Reported, not asserted: a plain machine step is a much
+				// narrower window than the step-over spec's, so a run with no
+				// park here is plausible rather than a signal that the rule
+				// stopped working. The two specs that gate on it are enough.
+				AddReportEntry("overlap-stepinto-parked-stops", parked)
+			}
 		})
 }
 
@@ -493,6 +511,15 @@ func declareStepOverlapSignalSpec() {
 			// otherwise this ran as a plain overlap spec.
 			Expect(p.signalOutputs).To(BeNumerically(">", 0),
 				"no signal stops were reported — the foreign-signal path was never exercised")
+			// And the parking rule itself must have run. Asserted here as well
+			// as in the step-over spec because this is the variant that carries
+			// foreign non-suspending signal stops through the queue, not just
+			// breakpoint stops.
+			parked, ok := debugger.LinuxParkedStopCount(p.h.d)
+			Expect(ok).To(BeTrue(), "parked-stop hook unavailable")
+			Expect(parked).To(BeNumerically(">", 0),
+				"no foreign stop was ever parked across %d cycles: this run never "+
+					"exercised the rule under test", iters)
 			// Liveness: threads are still making progress at the end of the
 			// run. A thread resumed while another was left stopped would drop
 			// out permanently, since every spinner is LockOSThread'd.
@@ -503,6 +530,7 @@ func declareStepOverlapSignalSpec() {
 			AddReportEntry("overlap-signal-stops", p.signalOutputs)
 			AddReportEntry("overlap-signal-goroutines", len(p.goroutines))
 			AddReportEntry("overlap-signal-late-goroutines", len(p.lateGoroutines))
+			AddReportEntry("overlap-signal-parked-stops", parked)
 		})
 }
 

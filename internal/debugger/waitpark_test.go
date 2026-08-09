@@ -208,3 +208,31 @@ func TestStepQueueEmptyIsInert(t *testing.T) {
 		t.Fatalf("releasable() = %+v, want nothing", ev)
 	}
 }
+
+// TestStepQueueCountsEveryPark pins the counter the native overlap regression
+// asserts on. If it stopped advancing, that spec would silently go vacuous
+// rather than fail, which is exactly the hole it exists to close.
+func TestStepQueueCountsEveryPark(t *testing.T) {
+	var q stepQueue
+	if got := q.parkedCount(); got != 0 {
+		t.Fatalf("fresh queue: parkedCount = %d, want 0", got)
+	}
+
+	q.beginStep(11)
+	q.park(StopEvent{Reason: StopBreakpoint, TID: 22})
+	q.park(StopEvent{Reason: StopSignal, TID: 33})
+	if got := q.parkedCount(); got != 2 {
+		t.Fatalf("after two parks: parkedCount = %d, want 2", got)
+	}
+
+	// The count is cumulative: draining and purging describe what is still
+	// held, not what was ever held, so neither may roll it back.
+	q.endStep()
+	if _, ok := q.releasable(); !ok {
+		t.Fatal("expected a released stop")
+	}
+	q.purge()
+	if got := q.parkedCount(); got != 2 {
+		t.Fatalf("after drain and purge: parkedCount = %d, want 2 (cumulative)", got)
+	}
+}
