@@ -24,10 +24,11 @@ func TestDebugger(t *testing.T) {
 // fakeBackend is an in-process Backend. Tests seed mem/regs, push StopEvents
 // to drive the state machine, and inspect recorded calls afterward.
 type fakeBackend struct {
-	memMu sync.RWMutex
-	mem   map[uint64]byte
-	regs  map[int]debugger.Registers
-	tids  []int
+	memMu        sync.RWMutex
+	mem          map[uint64]byte
+	readFailures map[uint64]int
+	regs         map[int]debugger.Registers
+	tids         []int
 
 	stopCh  chan debugger.StopEvent
 	waitErr chan error
@@ -67,16 +68,17 @@ type setRegistersCall struct {
 
 func newFakeBackend() *fakeBackend {
 	return &fakeBackend{
-		mem:        make(map[uint64]byte),
-		regs:       map[int]debugger.Registers{1: {}},
-		tids:       []int{1},
-		stopCh:     make(chan debugger.StopEvent, 8),
-		waitErr:    make(chan error, 1),
-		writtenAt:  make(map[uint64][]byte),
-		continueCh: make(chan struct{}, 16),
-		writeCount: make(map[uint64]int),
-		writeErrAt: make(map[uint64]error),
-		readErrAt:  make(map[uint64]error),
+		mem:          make(map[uint64]byte),
+		readFailures: make(map[uint64]int),
+		regs:         map[int]debugger.Registers{1: {}},
+		tids:         []int{1},
+		stopCh:       make(chan debugger.StopEvent, 8),
+		waitErr:      make(chan error, 1),
+		writtenAt:    make(map[uint64][]byte),
+		continueCh:   make(chan struct{}, 16),
+		writeCount:   make(map[uint64]int),
+		writeErrAt:   make(map[uint64]error),
+		readErrAt:    make(map[uint64]error),
 	}
 }
 
@@ -157,6 +159,12 @@ func (f *fakeBackend) seedRegs(r debugger.Registers) { f.regs[1] = r }
 
 func (f *fakeBackend) pushStop(evt debugger.StopEvent) { f.stopCh <- evt }
 
+func (f *fakeBackend) failNextReadAt(addr uint64) {
+	f.faultMu.Lock()
+	defer f.faultMu.Unlock()
+	f.readFailures[addr]++
+}
+
 // closeStop simulates process exit by closing stopCh, making Wait return
 // ErrProcessExited.
 func (f *fakeBackend) closeStop() {
@@ -221,6 +229,13 @@ func (f *fakeBackend) ReadMemory(addr uint64, dst []byte) error {
 	if err := f.faultFor("read", addr); err != nil {
 		return err
 	}
+	f.faultMu.Lock()
+	if f.readFailures[addr] > 0 {
+		f.readFailures[addr]--
+		f.faultMu.Unlock()
+		return errors.New("injected read failure")
+	}
+	f.faultMu.Unlock()
 	f.readCalls = append(f.readCalls, addr)
 	f.memMu.RLock()
 	defer f.memMu.RUnlock()

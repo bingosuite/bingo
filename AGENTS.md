@@ -1690,10 +1690,15 @@ made lifecycle-tracking or the automatic path non-tracking; the unit tests
 around `snapshotFrom` pin the seam's semantics but cannot catch a rewiring.
 
 **Graceful fallback.** Every read is best-effort. `resolveGoLayout` marks the
-layout invalid if any required `g`/`gobuf`/`stack`/`m` offset is missing, and any
-unreadable address degrades the whole snapshot to the legacy single synthetic
-goroutine (`ID:1, Status:"waiting"`, current PC) rather than erroring the stop.
-This preserves behavior for stripped binaries / attach-without-DWARF and keeps
+layout invalid if any required `g`/`gobuf`/`stack`/`m` offset is missing, and an
+unreadable `allgs` header/slot, required `g` status/goid, or `allm` head/link
+degrades the whole snapshot to the legacy single synthetic goroutine (`ID:1,
+Status:"waiting"`, current PC) rather than returning a partial live set or
+erroring the stop. Intentional nil/dead/freelist entries remain filters, and
+optional metadata remains best-effort. This distinction is load-bearing on
+Linux: ptrace stops only the reporting thread, so sibling runtime mutations can
+race the walk; only backends that stop the world make the reads race-free. This
+also preserves behavior for stripped binaries / attach-without-DWARF and keeps
 the `fakeBackend` engine unit tests green.
 
 **Current goroutine = SP-containment** (platform-independent): the stopped
