@@ -15,6 +15,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bingosuite/bingo/pkg/client"
 	"github.com/bingosuite/bingo/pkg/protocol"
@@ -521,13 +522,43 @@ func unvisitedIDs(nodes map[int]protocol.Goroutine, visited map[int]bool) []int 
 	return ids
 }
 
+// oneLine's budget counts complete code points, never bytes. It renders
+// arbitrary tracee output, panic text, and rejection messages, so a byte-sliced
+// cut can land inside a multi-byte rune and emit invalid UTF-8 that terminals
+// show as a replacement glyph (issue #209). Runes are the closest proxy to
+// on-screen length that needs no display-width dependency; a grapheme cluster
+// (a base plus its combining marks) can still be split, and an East Asian or
+// emoji run can still exceed the budget in columns, both of which would take a
+// segmentation/width table to avoid.
+const (
+	oneLineMaxRunes  = 120
+	oneLineKeepRunes = oneLineMaxRunes - len("...")
+)
+
 func oneLine(s string) string {
 	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", `\n`))
-	if len(s) > 120 {
-		return s[:117] + "..."
-	}
 	if s == "" {
 		return "-"
+	}
+	if utf8.RuneCountInString(s) > oneLineMaxRunes {
+		return truncateRunes(s, oneLineKeepRunes) + "..."
+	}
+	return s
+}
+
+// truncateRunes keeps the first n runes of s. Ranging over a string yields the
+// start offset of every rune, so the cut is always on a code-point boundary.
+// Bytes that are already invalid UTF-8 in s are each one rune here — matching
+// utf8.RuneCountInString and Go's own range semantics — and are passed through
+// untouched rather than rewritten, so truncation never introduces a broken
+// sequence that the input did not already contain.
+func truncateRunes(s string, n int) string {
+	count := 0
+	for i := range s {
+		if count == n {
+			return s[:i]
+		}
+		count++
 	}
 	return s
 }

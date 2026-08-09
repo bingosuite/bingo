@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
@@ -393,5 +394,158 @@ func TestUsageErrorUsesTheFlagSetUsage(t *testing.T) {
 	}
 	if strings.Contains(got, "Usage of ") {
 		t.Fatalf("output = %q, want no stock flag-package header", got)
+	}
+}
+
+// oneLine renders arbitrary tracee stdout/stderr, panic text, and rejection
+// messages, so its budget has to cut on code-point boundaries: a byte cut lands
+// inside a multi-byte rune and emits invalid UTF-8 that terminals show as a
+// replacement glyph (issue #209). The table pins the short/exact/over budget
+// boundaries across ASCII, Japanese, astral emoji, combining sequences, embedded
+// CR/LF, and input that is already invalid UTF-8.
+func TestOneLine(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "empty", in: "", want: "-"},
+		{name: "whitespace only", in: "   \t ", want: "-"},
+		{name: "short ascii", in: "hello", want: "hello"},
+		{name: "surrounding space trimmed", in: "  hello  ", want: "hello"},
+
+		// Newline normalization is unchanged by the UTF-8 fix: LF becomes the
+		// two-character escape, and a CR is left alone because collapsing it
+		// would be a separate rendering change.
+		{name: "embedded lf", in: "line one\nline two", want: `line one\nline two`},
+		{name: "embedded crlf", in: "line one\r\nline two", want: "line one\r" + `\n` + "line two"},
+		{name: "trailing lf", in: "hello\n", want: `hello\n`},
+
+		{name: "ascii at budget", in: strings.Repeat("a", 120), want: strings.Repeat("a", 120)},
+		{
+			name: "ascii one over budget",
+			in:   strings.Repeat("a", 121),
+			want: strings.Repeat("a", 117) + "...",
+		},
+
+		// The issue's exact repro: byte 117 falls inside the first Japanese
+		// rune, so s[:117] would end on its leading byte.
+		{
+			name: "cut lands inside a japanese rune",
+			in:   strings.Repeat("a", 116) + strings.Repeat("日", 10),
+			want: strings.Repeat("a", 116) + "日" + "...",
+		},
+		// 360 bytes but only 120 runes: a byte budget truncated this to 39
+		// characters, a rune budget leaves it whole.
+		{name: "japanese at budget", in: strings.Repeat("日", 120), want: strings.Repeat("日", 120)},
+		{
+			name: "japanese one over budget",
+			in:   strings.Repeat("日", 121),
+			want: strings.Repeat("日", 117) + "...",
+		},
+
+		// Astral planes are 4 bytes per rune, so 40 of them blow the old byte
+		// budget while sitting well inside the rune budget.
+		{name: "emoji under budget", in: strings.Repeat("🙂", 40), want: strings.Repeat("🙂", 40)},
+		{
+			name: "emoji one over budget",
+			in:   strings.Repeat("🙂", 121),
+			want: strings.Repeat("🙂", 117) + "...",
+		},
+		// A ZWJ sequence is several code points; cutting between them is
+		// allowed here — avoiding it needs grapheme segmentation.
+		{
+			name: "zwj sequence at the cut",
+			in:   strings.Repeat("a", 116) + "👨\u200d👩\u200d👧",
+			want: strings.Repeat("a", 116) + "👨" + "...",
+		},
+
+		// 61 base+mark pairs is 122 runes, so the cut separates the 59th base
+		// from its accent. Still valid UTF-8, still no split code point.
+		{
+			name: "combining mark separated from its base",
+			in:   strings.Repeat("e\u0301", 61),
+			want: strings.Repeat("e\u0301", 58) + "e" + "...",
+		},
+
+		// The LF escape is two ASCII runes, so the budget can land between
+		// them. Cosmetic, valid UTF-8, and unchanged from the byte version.
+		{
+			name: "cut inside the newline escape",
+			in:   strings.Repeat("a", 116) + "\n" + strings.Repeat("b", 10),
+			want: strings.Repeat("a", 116) + `\` + "...",
+		},
+
+		// Bytes that are already invalid pass through untouched rather than
+		// being rewritten to U+FFFD: oneLine truncates, it does not sanitize.
+		{name: "short invalid utf8", in: "bad \xff byte", want: "bad \xff byte"},
+		// Each invalid byte counts as one rune (utf8.RuneCountInString and
+		// range agree), so the cut sits after \xff and before the 17th 日.
+		{
+			name: "invalid byte before the cut",
+			in:   strings.Repeat("a", 100) + "\xff" + strings.Repeat("日", 30),
+			want: strings.Repeat("a", 100) + "\xff" + strings.Repeat("日", 16) + "...",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := oneLine(tc.in)
+			if got != tc.want {
+				t.Fatalf("oneLine(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+			if n := utf8.RuneCountInString(got); n > oneLineMaxRunes {
+				t.Fatalf("oneLine(%q) has %d runes, want at most %d", tc.in, n, oneLineMaxRunes)
+			}
+			if utf8.ValidString(tc.in) && !utf8.ValidString(got) {
+				t.Fatalf("oneLine(%q) = %q, which is not valid UTF-8", tc.in, got)
+			}
+		})
+	}
+}
+
+// A byte cut is unsafe only at some offsets, so sweep every prefix of a mixed
+// 1/2/3/4-byte string past the budget and assert the result is always valid
+// UTF-8 and within the budget. This is the property byte slicing cannot hold.
+func TestOneLineNeverSplitsACodePoint(t *testing.T) {
+	mixed := strings.Repeat("aé日🙂", 80)
+
+	for i := 0; i <= len(mixed); i++ {
+		in := mixed[:i]
+		if !utf8.ValidString(in) {
+			continue
+		}
+		got := oneLine(in)
+		if !utf8.ValidString(got) {
+			t.Fatalf("oneLine(prefix of %d bytes) = %q, want valid UTF-8", i, got)
+		}
+		if n := utf8.RuneCountInString(got); n > oneLineMaxRunes {
+			t.Fatalf("oneLine(prefix of %d bytes) has %d runes, want at most %d", i, n, oneLineMaxRunes)
+		}
+	}
+}
+
+// truncateRunes is the seam the fix turns on, so pin it directly: it keeps whole
+// code points and returns the input untouched when it is already short enough.
+func TestTruncateRunes(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		n    int
+		want string
+	}{
+		{name: "zero keeps nothing", in: "日本語", n: 0, want: ""},
+		{name: "shorter than n", in: "日本", n: 5, want: "日本"},
+		{name: "exactly n", in: "日本語", n: 3, want: "日本語"},
+		{name: "cuts on a rune boundary", in: "日本語", n: 2, want: "日本"},
+		{name: "invalid byte is one rune", in: "a\xffb", n: 2, want: "a\xff"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := truncateRunes(tc.in, tc.n); got != tc.want {
+				t.Fatalf("truncateRunes(%q, %d) = %q, want %q", tc.in, tc.n, got, tc.want)
+			}
+		})
 	}
 }
