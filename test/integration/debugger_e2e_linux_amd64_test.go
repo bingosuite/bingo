@@ -183,7 +183,15 @@ func declareStepOverlapSpec() {
 			goroutines[hit.Goroutine.ID] = true
 		}
 
-		iters := envInt("BINGO_E2E_OVERLAP_ITERS", 150)
+		// Sized against the target's own 180s watchdog, not against wall-clock
+		// preference: a cycle costs ~1.05s under -race on a fast hosted runner
+		// and ~1.26s on a slow one (runners vary by ~20%; see run 31330091994,
+		// where every spec was that much slower). 150 cycles fits the fast case
+		// at ~158s and blows the watchdog at ~190s on the slow one, which would
+		// surface as a spurious ProcessExited rather than a real regression. 90
+		// keeps ~37% headroom at the slow rate while still resolving dozens of
+		// step-overs as a parked sibling's breakpoint — the path under test.
+		iters := envInt("BINGO_E2E_OVERLAP_ITERS", 90)
 		for i := 0; i < iters; i++ {
 			Expect(h.d.Continue()).To(Succeed(), "Continue #%d", i)
 			evt := h.waitFor(30*time.Second,
