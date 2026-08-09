@@ -10,7 +10,8 @@ name: Debugger E2E
 # (correctness), `churn` (multi-thread robustness), `pause` (async interrupt /
 # manual stop), `stepping` (StepInto/StepOut), `inspect`
 # (StackFrames/Locals/Goroutines), `breakpoints` (ClearBreakpoint), `kill`
-# (kill-while-running), `exit` (process exit status), `overlap` (linux-only:
+# (kill-while-running), `exit` (process exit status), `signals` (linux signal
+# forwarding plus the shared Pause suppression control), `overlap` (linux-only:
 # a foreign thread's breakpoint stop arriving mid-single-step), `restart`,
 # `fullstack`
 # (operations driven through the whole client → WebSocket → hub → debugger stack),
@@ -102,6 +103,9 @@ jobs:
 
       - name: E2E exit (process exit status)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=exit
+
+      - name: E2E signals (fatal/ordinary forwarding + Pause suppression)
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=signals
 
       - name: E2E attach (attach to a running process)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=attach
