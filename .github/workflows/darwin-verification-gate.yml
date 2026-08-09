@@ -37,11 +37,6 @@ jobs:
     timeout-minutes: 5
     env:
       GH_TOKEN: ${{ github.token }}
-      VERIFIED_LABEL: darwin-e2e-verified
-      # Paths whose runtime behaviour only runs on real darwin/arm64 hardware and
-      # therefore can't be exercised by any CI job. Keep in sync with the darwin
-      # files under internal/debugger, the darwin E2E spec, and entitlements.
-      DARWIN_NATIVE_REGEX: '^(internal/debugger/.*_darwin_.*|internal/debugger/trap_arm64\.go|test/integration/.*_darwin_.*_test\.go|entitlements\.plist)$'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -54,63 +49,15 @@ jobs:
           if [ -r .github/scripts/darwin-verification-gate_test.sh ]; then
             bash .github/scripts/darwin-verification-gate_test.sh
           else
-            echo "Trusted base predates the gate script; the gate step will use its fail-closed bootstrap."
-          fi
-
-      - name: Remove stale verification label on new commits
-        id: stale-verification
-        if: github.event.action == 'synchronize'
-        env:
-          IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPOSITORY: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          if output=$(gh pr edit "$PR_NUMBER" --repo "$REPOSITORY" \
-            --remove-label "$VERIFIED_LABEL" 2>&1); then
-            echo "status=cleared" >> "$GITHUB_OUTPUT"
-            echo "Cleared '$VERIFIED_LABEL' if present — new commits require re-verification."
-          else
-            exit_code=$?
-            echo "status=failed" >> "$GITHUB_OUTPUT"
-            if [ "$IS_FORK" = "true" ]; then
-              echo "::warning title=Stale Darwin verification label not removed::The public-fork GITHUB_TOKEN is read-only, so '$VERIFIED_LABEL' could not be removed (exit $exit_code). The gate will fail closed; remove or toggle the stale label, then re-add it to verify this head."
-            else
-              echo "::warning title=Stale Darwin verification label not removed::The API failed to remove '$VERIFIED_LABEL' (exit $exit_code). The gate will fail closed; remove or toggle the stale label, then re-add it to verify this head."
-            fi
-            printf '%s\n' "$output" >&2
+            echo "Trusted base predates the gate script; the gate will fail closed."
           fi
 
       - name: Require local darwin E2E verification when darwin-native code changes
-        env:
-          EVENT_ACTION: ${{ github.event.action }}
-          LABEL_CLEANUP: ${{ steps.stale-verification.outputs.status }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh pr diff "$PR_NUMBER" --repo "$REPOSITORY" --name-only > changed.txt
-
           if [ ! -r .github/scripts/darwin-verification-gate.sh ]; then
-            echo "Changed files in this PR:"
-            sed 's/^/  /' changed.txt
-            echo
-            if grep -Eq "$DARWIN_NATIVE_REGEX" changed.txt; then
-              echo "::error title=Darwin E2E verification policy unavailable::The trusted base does not contain the gate script, so this Darwin-native change fails closed."
-              exit 1
-            fi
-            echo "No darwin-native code changed; gate not required."
-            exit 0
+            echo "::error title=Darwin E2E verification policy unavailable::The trusted base does not contain the gate script, so the gate cannot safely evaluate this pull request."
+            exit 1
           fi
 
-          has_label=
-          if [ "$EVENT_ACTION" != "synchronize" ]; then
-            has_label=$(gh pr view "$PR_NUMBER" --repo "$REPOSITORY" --json labels \
-              -q "[.labels[].name] | any(. == \"$VERIFIED_LABEL\")")
-          fi
-
-          EVENT_ACTION="$EVENT_ACTION" \
-            CHANGED_FILES=changed.txt \
-            HAS_VERIFIED_LABEL="$has_label" \
-            LABEL_CLEANUP="${LABEL_CLEANUP:-not-run}" \
-            bash .github/scripts/darwin-verification-gate.sh
+          bash .github/scripts/darwin-verification-gate.sh
