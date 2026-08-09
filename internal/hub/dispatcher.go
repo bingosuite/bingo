@@ -17,6 +17,12 @@ type dispatchResult struct {
 // dispatch translates cmd into a debugger call and returns the immediate
 // confirmation event (if any) plus any error.
 //
+// Breakpoint commands are deliberately absent: their ids cross the hub's
+// logical/physical translation boundary, so Hub.dispatchCommand handles them
+// (see breakpoints.go). Reaching them here would mean that routing was
+// bypassed, so the default case reports an error rather than handing a
+// client-supplied id straight to the engine.
+//
 //nolint:gocognit,gocyclo // Protocol command routing is intentionally centralized here.
 func dispatch(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, error) {
 	switch cmd.Kind {
@@ -37,37 +43,6 @@ func dispatch(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, erro
 
 	case protocol.CmdKill:
 		return dispatchResult{}, dbg.Kill()
-
-	case protocol.CmdSetBreakpoint:
-		var p protocol.SetBreakpointPayload
-		if err := protocol.DecodeCommandPayload(cmd, &p); err != nil {
-			return dispatchResult{}, err
-		}
-		bp, err := dbg.SetBreakpoint(p.File, p.Line)
-		if err != nil {
-			return dispatchResult{}, err
-		}
-		evt, err := protocol.NewEvent(protocol.EventBreakpointSet, 0, protocol.BreakpointSetPayload{
-			Breakpoint: bp,
-		})
-		if err != nil {
-			return dispatchResult{}, err
-		}
-		return dispatchResult{event: &evt}, nil
-
-	case protocol.CmdClearBreakpoint:
-		var p protocol.ClearBreakpointPayload
-		if err := protocol.DecodeCommandPayload(cmd, &p); err != nil {
-			return dispatchResult{}, err
-		}
-		if err := dbg.ClearBreakpoint(p.ID); err != nil {
-			return dispatchResult{}, err
-		}
-		evt, err := protocol.NewEvent(protocol.EventBreakpointCleared, 0, protocol.BreakpointClearedPayload(p))
-		if err != nil {
-			return dispatchResult{}, err
-		}
-		return dispatchResult{event: &evt}, nil
 
 	// Execution control: no immediate event. The debugger emits Stepped /
 	// Continued asynchronously.

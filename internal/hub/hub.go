@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -107,12 +106,13 @@ type Hub struct {
 	// sense for a process bingo itself started).
 	lastLaunch *protocol.LaunchPayload
 
-	// restartBreakpoints mirrors the breakpoints installed on the current
-	// debugger (id -> location), purely so Restart can reinstall them on the
-	// relaunched process. The engine's breakpointTable remains the sole
-	// source of truth for the live process; this is bookkeeping the hub
-	// needs across a Kill+relaunch, when the old breakpointTable is gone.
-	restartBreakpoints map[int]protocol.Location
+	// bps owns the session-stable logical breakpoint ids clients see and their
+	// mapping onto the active engine's physical ids, plus each breakpoint's
+	// location so Restart can reinstall it on the relaunched process. The
+	// engine's breakpointTable remains the sole source of truth for the live
+	// process; this is the identity layer above it (see breakpoints.go).
+	// Touched only on the Run goroutine.
+	bps *breakpointIDs
 }
 
 type clientCommand struct {
@@ -132,7 +132,7 @@ func newHub(log *slog.Logger) *Hub {
 		shutdownCh:              make(chan struct{}),
 		done:                    make(chan struct{}),
 		log:                     log,
-		restartBreakpoints:      make(map[int]protocol.Location),
+		bps:                     newBreakpointIDs(),
 	}
 }
 
@@ -300,6 +300,7 @@ func (h *Hub) removeClient(c *Client) {
 // also synthesises errors/confirmations.
 func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 	suspending := suspendingEvents[evt.Kind]
+	evt = h.localizeBreakpointIDs(evt)
 
 	// Discard any resuming command buffered while the process was still running
 	// BEFORE broadcasting the suspending event. Such a command is necessarily
@@ -356,6 +357,7 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 				}
 				return
 			}
+			nextEvt = h.localizeBreakpointIDs(nextEvt)
 			nextEvt.Seq = h.seq.Add(1)
 			h.broadcast(nextEvt)
 			if nextEvt.Kind == protocol.EventProcessExited {
@@ -505,7 +507,7 @@ func (h *Hub) executeCommand(cmd protocol.Command) {
 		return
 	}
 
-	result, err := dispatch(dbg, cmd)
+	result, err := h.dispatchCommand(dbg, cmd)
 	if callerOwned && !h.transferStartedDebugger(dbg, cmd, err) {
 		return
 	}
@@ -524,7 +526,7 @@ func (h *Hub) executeCommand(cmd protocol.Command) {
 			return
 		}
 		h.rememberLaunch(cmd)
-		h.restartBreakpoints = make(map[int]protocol.Location)
+		h.bps.reset()
 	case protocol.CmdAttach:
 		if !h.transitionState(protocol.StateRunning) {
 			return
@@ -532,20 +534,32 @@ func (h *Hub) executeCommand(cmd protocol.Command) {
 		// Restart only makes sense for a process bingo itself launched —
 		// mirrors Delve's canRestart check.
 		h.lastLaunch = nil
-		h.restartBreakpoints = make(map[int]protocol.Location)
+		h.bps.reset()
 	case protocol.CmdContinue, protocol.CmdStepOver, protocol.CmdStepInto, protocol.CmdStepOut:
 		if !h.transitionState(protocol.StateRunning) {
 			return
 		}
-	case protocol.CmdSetBreakpoint:
-		h.rememberBreakpoint(result)
-	case protocol.CmdClearBreakpoint:
-		h.forgetBreakpoint(cmd)
 	}
 
 	if result.event != nil {
 		result.event.Seq = h.seq.Add(1)
 		h.broadcast(*result.event)
+	}
+}
+
+// dispatchCommand routes cmd to the debugger. Breakpoint commands are handled
+// by the hub itself because they cross the logical/physical id boundary
+// (breakpoints.go) — everything else goes through the hub-agnostic dispatch
+// table. Both shapes return the same (dispatchResult, error) so error wrapping
+// and the single confirmation broadcast stay centralized in executeCommand.
+func (h *Hub) dispatchCommand(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, error) {
+	switch cmd.Kind {
+	case protocol.CmdSetBreakpoint:
+		return h.setBreakpoint(dbg, cmd)
+	case protocol.CmdClearBreakpoint:
+		return h.clearBreakpoint(dbg, cmd)
+	default:
+		return dispatch(dbg, cmd)
 	}
 }
 
@@ -561,42 +575,27 @@ func (h *Hub) rememberLaunch(cmd protocol.Command) {
 	h.lastLaunch = &p
 }
 
-// rememberBreakpoint records a successfully-set breakpoint's id -> location
-// so Restart can reinstall it later.
-func (h *Hub) rememberBreakpoint(result dispatchResult) {
-	if result.event == nil {
-		return
-	}
-	var p protocol.BreakpointSetPayload
-	if err := protocol.DecodeEventPayload(*result.event, &p); err != nil {
-		return
-	}
-	h.restartBreakpoints[p.Breakpoint.ID] = p.Breakpoint.Location
-}
-
-// forgetBreakpoint removes a cleared breakpoint from the Restart bookkeeping.
-func (h *Hub) forgetBreakpoint(cmd protocol.Command) {
-	var p protocol.ClearBreakpointPayload
-	if err := protocol.DecodeCommandPayload(cmd, &p); err != nil {
-		return
-	}
-	delete(h.restartBreakpoints, p.ID)
-}
-
-// sortedRestartLocations returns the tracked breakpoint locations in
-// ascending ID order, so Restart reinstalls them in a deterministic sequence
-// (and thus assigns deterministic new IDs) across runs.
-func (h *Hub) sortedRestartLocations() []protocol.Location {
-	ids := make([]int, 0, len(h.restartBreakpoints))
-	for id := range h.restartBreakpoints {
-		ids = append(ids, id)
-	}
-	sort.Ints(ids)
-	locs := make([]protocol.Location, 0, len(ids))
+// sortedRestartTargets returns the live logical breakpoints in ascending
+// logical-ID order, so Restart reinstalls them in a deterministic sequence
+// across runs.
+func (h *Hub) sortedRestartTargets() []restartTarget {
+	ids := h.bps.installedLogical()
+	targets := make([]restartTarget, 0, len(ids))
 	for _, id := range ids {
-		locs = append(locs, h.restartBreakpoints[id])
+		m, ok := h.bps.lookup(id)
+		if !ok {
+			continue
+		}
+		targets = append(targets, restartTarget{logicalID: id, loc: m.loc})
 	}
-	return locs
+	return targets
+}
+
+// restartTarget is one breakpoint Restart must re-establish on the relaunched
+// process, carrying the logical identity clients already hold.
+type restartTarget struct {
+	logicalID int
+	loc       protocol.Location
 }
 
 // handleRestart kills the current process (if any), relaunches the last
@@ -641,7 +640,7 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 		env = override.Env
 	}
 
-	saved := h.sortedRestartLocations()
+	saved := h.sortedRestartTargets()
 
 	oldDbg, open := h.detachDebugger()
 	if !open {
@@ -674,19 +673,25 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 		return
 	}
 
+	// Reinstalling re-homes each surviving logical id onto the replacement
+	// engine's own (compacted, reused) physical id. The identities clients hold
+	// are unchanged, so a clear generated before the restart still names the
+	// same breakpoint afterwards; one that cannot be reinstalled loses its
+	// mapping and any later clear for it is rejected rather than aliasing a
+	// different breakpoint — see breakpoints.go and AGENTS.md.
 	installed := make([]protocol.Breakpoint, 0, len(saved))
 	discarded := make([]protocol.DiscardedBreakpoint, 0)
-	newBreakpoints := make(map[int]protocol.Location, len(saved))
-	for _, loc := range saved {
-		bp, err := newDbg.SetBreakpoint(loc.File, loc.Line)
+	h.bps.reset()
+	for _, target := range saved {
+		bp, err := newDbg.SetBreakpoint(target.loc.File, target.loc.Line)
 		if err != nil {
-			discarded = append(discarded, protocol.DiscardedBreakpoint{Location: loc, Reason: err.Error()})
+			discarded = append(discarded, protocol.DiscardedBreakpoint{Location: target.loc, Reason: err.Error()})
 			continue
 		}
+		h.bps.bind(target.logicalID, bp.ID, bp.Location)
+		bp.ID = target.logicalID
 		installed = append(installed, bp)
-		newBreakpoints[bp.ID] = bp.Location
 	}
-	h.restartBreakpoints = newBreakpoints
 
 	evt, err := protocol.NewEvent(protocol.EventRestarted, h.seq.Add(1), protocol.RestartedPayload{
 		Program:     program,

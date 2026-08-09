@@ -826,13 +826,15 @@ gone once killed:
   Launch, or the session was started via `Attach` — mirrors Delve's
   `canRestart`: there's no "same binary" to relaunch for an attached process).
   Set on `CmdLaunch` success, cleared on `CmdAttach` success.
-- `h.restartBreakpoints map[int]protocol.Location` — id → location for every
-  breakpoint currently believed installed. Updated on `CmdSetBreakpoint` /
-  `CmdClearBreakpoint` success, reset on `CmdLaunch`/`CmdAttach`. Restart
-  reinstalls these (sorted by id for determinism) via `SetBreakpoint` on the
-  new `Debugger`, which re-resolves each `file:line` through DWARF against the
-  new process image — addresses aren't reused directly since a relaunch can
-  shift the load address.
+- `h.bps *breakpointIDs` — the logical-id table (see
+  [Breakpoint identity](#breakpoint-identity--hub-owned-logical-ids)). Restart
+  walks `sortedLogical()` for determinism, re-`SetBreakpoint`s each retained
+  location on the new `Debugger` (which re-resolves `file:line` through DWARF
+  against the new process image — addresses aren't reused directly since a
+  relaunch can shift the load address), `bind`s the logical id to the fresh
+  physical id, and reports the **same logical ids** in `RestartedPayload`.
+  Locations that no longer resolve lose their mapping and are reported in
+  `Discarded`.
 
 **Routing quirk**: `CmdRestart` intentionally does **not** go through
 `resumeCh` like `CmdContinue`/`CmdStep*`. `resumeCh` is only ever drained
@@ -860,6 +862,86 @@ see [Suspend/resume protocol](#suspendresume-protocol).
 suspending one — the new process's suspended state (if any, e.g. break-on-
 entry) is reported the normal way via `EventStepped`/`EventBreakpointHit` once
 the relaunched process actually reaches that point.
+
+## Breakpoint identity — hub-owned logical ids
+
+Source: [internal/hub/breakpoints.go](internal/hub/breakpoints.go).
+
+**Client-visible breakpoint ids are hub-owned logical ids, never raw engine
+ids.** `breakpointTable.nextID` (`internal/debugger/breakpoint.go`) restarts at
+1 in every engine, so a physical id only means anything to the engine that
+issued it — and Restart replaces that engine. A command can be *generated*
+against one engine and *injected* after it has been replaced: the DAP adapter
+marshals a `ClearBreakpoint` and its hub read pump is descheduled between
+`Handler.ReadMessage` and `injectCommand`
+([internal/hub/client.go](internal/hub/client.go)) while another client
+completes a Restart. The stale physical id then names a *different* breakpoint
+in the fresh process and disarms the wrong trap (issue #200).
+
+An epoch stamped at `injectCommand` is **provably insufficient** — provenance is
+bound when the Handler generates the bytes, but injection happens after the
+Restart and would read the new epoch. So the hub owns identity instead:
+
+- `breakpointIDs.next` is monotonic for the **whole hub lifetime**. `reset()`
+  (a fresh `Launch`/`Attach`) drops the mappings but deliberately does **not**
+  rewind the high-water mark; re-minting is exactly what would let a delayed
+  command from a previous target alias a breakpoint in the new one.
+- `byLogical` maps logical → `{physicalID, loc}`; `byPhysical` is the reverse
+  lookup engine-generated events need. `dropPhysical` only deletes a reverse
+  entry while it still points at the given logical id, so re-homing on Restart
+  cannot clobber another breakpoint's lookup.
+- `CmdSetBreakpoint` installs, then mints a logical id and broadcasts
+  `EventBreakpointSet` with it (`Hub.setBreakpoint`).
+- `CmdClearBreakpoint` (`Hub.clearBreakpoint`) rejects an unknown logical id
+  **without touching the debugger** — that is the load-bearing half of the fix —
+  translates a known one to the active physical id, and only `untrack`s after
+  the debugger confirms. **No optimistic deletion:** a rejected clear leaves the
+  trap armed (`breakpointTable.clear` keeps its entry when the memory write
+  fails), so the client must keep being able to name it.
+- `Hub.localizeBreakpointIDs` rewrites the physical id in an engine-generated
+  `EventBreakpointHit` to the logical id before broadcast. It runs on both
+  broadcast paths in `handleEvent` (the initial event and the suspended
+  wait-loop's `nextEvt`). The step-over/step-out sentinels (`<stepover-next>`,
+  `<stepout-return>`) report `EventStepped` and carry no breakpoint id, so they
+  are unaffected; the test-only `<direct-addr>` sentinel does emit
+  `EventBreakpointHit` and is translated like any other.
+- A hit can **race its own clear**. The engine emits into a buffered channel and
+  `engine.ClearBreakpoint` has no suspend guard, so `Run`'s `select` may execute
+  a queued clear before draining a hit that was generated first. `untrack`
+  therefore `retire`s the physical id, and `logicalFor` consults that record so
+  the late hit still reports the id the client held instead of a number it was
+  never told about. The record is per-engine (dropped by `reset()`) and bounded
+  by `retiredCap`; only a very recent retirement can still be in flight.
+- A physical id that is neither live nor retired is **adopted** rather than
+  passed through (`logicalFor`): passing it through could collide with a logical
+  id naming a different breakpoint. This keeps raw `hub.New` hubs (tests /
+  single-session, where a debugger may be driven directly) coherent. An adopted
+  mapping is **not** `installed`, so `installedLogical` excludes it from
+  `sortedRestartTargets` — the hub never armed it and must not arm it on the
+  replacement process.
+
+Every protocol surface carrying a breakpoint id is covered:
+`BreakpointSetPayload.Breakpoint.ID`, `BreakpointClearedPayload.ID`,
+`BreakpointHitPayload.Breakpoint.ID`, `RestartedPayload.Breakpoints[].ID`, and
+the inbound `ClearBreakpointPayload.ID`. Because breakpoint ids cross this
+translation boundary, `CmdSetBreakpoint`/`CmdClearBreakpoint` are **absent from
+the generic `dispatch`** in [dispatcher.go](internal/hub/dispatcher.go) —
+`Hub.dispatchCommand` routes them to the hub methods, and reaching `dispatch`
+with one means routing was bypassed, so it errors rather than handing a
+client-supplied id to the engine.
+
+The wire shape is unchanged (ids were already opaque ints); only ownership and
+lifetime changed, so `protocol.Version` stays at 1.2. On the DAP side this makes
+the positional `setQ`/`clearQ` FIFOs correlate confirmations that match the
+actual physical effect, and `reconcileRestartBreakpointsLocked` a self-consistent
+re-identification.
+
+Regression coverage:
+[internal/dap/hublogicalbp_test.go](internal/dap/hublogicalbp_test.go) drives a
+**real** `hub.Hub` + **real** `dap.Handler` with a gating `hub.WSConn`
+interposed at the `ReadMessage` → read-pump boundary; it holds a generated
+clear, restarts via a second client, releases it, and asserts the correct
+physical breakpoint was disarmed (plus an in-order negative control).
 
 ## Pause — async interrupt
 
@@ -2008,6 +2090,15 @@ through the justfile.
   unless they're truly required. Preserve the streaming-cadence invariant
   (snapshot on breakpoint/pause/entry, never per-step) and the degraded-snapshot
   rule (don't touch `prevGoids` on an unreadable read).
+- **Breakpoint ids**: client-visible ids are the hub's session-stable logical
+  ids (see
+  [Breakpoint identity](#breakpoint-identity--hub-owned-logical-ids)). A new
+  protocol surface carrying a breakpoint id must be translated in
+  [internal/hub/breakpoints.go](internal/hub/breakpoints.go) — outbound
+  physical→logical, inbound logical→physical — and an unknown inbound id must be
+  rejected without reaching the debugger. Never rewind
+  `breakpointIDs.next`, never delete a mapping before the debugger confirms the
+  removal, and never leak a raw engine id to clients.
 - **Suspend/resume sets**: update both `suspendingEvents` and
   `resumingCommands` in [hub.go](internal/hub/hub.go), and the matching
   hub_test cases.

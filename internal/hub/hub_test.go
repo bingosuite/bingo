@@ -976,17 +976,22 @@ var _ = Describe("Hub", func() {
 		It("broadcasts BreakpointCleared with the removed ID", func() {
 			conn := newFakeWSConn()
 			mustAddClient(h, conn)
+			fd.setBPResult = protocol.Breakpoint{
+				ID:       7,
+				Location: protocol.Location{File: "main.go", Line: 42},
+			}
+
+			conn.inject(mustCommand(protocol.CmdSetBreakpoint,
+				protocol.SetBreakpointPayload{File: "main.go", Line: 42}))
+			var set protocol.BreakpointSetPayload
+			waitForEventKind(conn, protocol.EventBreakpointSet, &set)
 
 			conn.inject(mustCommand(protocol.CmdClearBreakpoint,
-				protocol.ClearBreakpointPayload{ID: 5}))
+				protocol.ClearBreakpointPayload{ID: set.Breakpoint.ID}))
 
-			Eventually(func() protocol.EventKind {
-				e, ok := recvEvent(conn)
-				if !ok {
-					return ""
-				}
-				return e.Kind
-			}, "500ms", "10ms").Should(Equal(protocol.EventBreakpointCleared))
+			var cleared protocol.BreakpointClearedPayload
+			waitForEventKind(conn, protocol.EventBreakpointCleared, &cleared)
+			Expect(cleared.ID).To(Equal(set.Breakpoint.ID))
 		})
 	})
 
