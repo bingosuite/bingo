@@ -306,7 +306,9 @@ func (e *engine) readGoroutine(l *goLayout, gptr, liveSP, livePC uint64) gorouti
 		g.StartLoc = e.locForPC(startpc)
 	}
 	if gopc, ok := e.readU64(gptr + uint64(l.gGopc)); ok {
-		g.CreatedLoc = e.locForPC(gopc)
+		// gopc is captured by the runtime with sys.GetCallerPC(), so it is the
+		// return address of the `go` statement's call, not the statement itself.
+		g.CreatedLoc = e.locForPC(returnLookupPC(gopc))
 	}
 	if header.status == 4 { // waiting
 		if wr, ok := e.readU8(gptr + uint64(l.gWaitreason)); ok {
