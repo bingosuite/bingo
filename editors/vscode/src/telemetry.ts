@@ -111,13 +111,18 @@ export interface Thread {
 }
 
 // SnapshotTotals reports the server's ORIGINAL untrimmed counts. It is present
-// only when the server omitted elements or its runtime scan was clipped, so its
-// presence alone means "this is not everything". When clipped is true the
-// goroutine count is itself a lower bound, and the UI must say so.
+// only when the server omitted elements or one of its runtime scans was clipped,
+// so its presence alone means "this is not everything".
+//
+// The clipped flags are per collection because the debugger walks goroutines and
+// threads under independent ceilings. Each flag says only "this count is a lower
+// bound"; the counts themselves are always the original scanned totals. Sharing
+// one flag between them would mark an exact count as approximate.
 export interface SnapshotTotals {
   readonly goroutines: number;
   readonly threads: number;
-  readonly clipped: boolean;
+  readonly goroutinesClipped: boolean;
+  readonly threadsClipped: boolean;
 }
 
 export interface Snapshot {
@@ -417,11 +422,20 @@ function decodeTotals(value: unknown): SnapshotTotals | undefined {
     return undefined;
   }
   const item = record(value, "totals");
-  exactKeys(item, [], ["goroutines", "threads", "clipped"], "totals");
+  exactKeys(
+    item,
+    [],
+    ["goroutines", "threads", "goroutinesClipped", "threadsClipped"],
+    "totals",
+  );
   return {
     goroutines: optionalInteger(item.goroutines, "totals.goroutines"),
     threads: optionalInteger(item.threads, "totals.threads"),
-    clipped: optionalBoolean(item.clipped, "totals.clipped"),
+    goroutinesClipped: optionalBoolean(
+      item.goroutinesClipped,
+      "totals.goroutinesClipped",
+    ),
+    threadsClipped: optionalBoolean(item.threadsClipped, "totals.threadsClipped"),
   };
 }
 

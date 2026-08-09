@@ -335,7 +335,7 @@ var _ = Describe("Event", func() {
 				protocol.EventGoroutines,
 				protocol.GoroutinesPayload{
 					Goroutines: []protocol.Goroutine{sampleGoroutine},
-					Totals:     &protocol.SnapshotTotals{Goroutines: 9001, Clipped: true},
+					Totals:     &protocol.SnapshotTotals{Goroutines: 9001, GoroutinesClipped: true},
 				},
 				func(e protocol.Event) {
 					var p protocol.GoroutinesPayload
@@ -344,7 +344,8 @@ var _ = Describe("Event", func() {
 					Expect(p.Totals).NotTo(BeNil())
 					Expect(p.Totals.Goroutines).To(Equal(9001))
 					Expect(p.Totals.Threads).To(BeZero())
-					Expect(p.Totals.Clipped).To(BeTrue())
+					Expect(p.Totals.GoroutinesClipped).To(BeTrue())
+					Expect(p.Totals.ThreadsClipped).To(BeFalse())
 				},
 			),
 
@@ -386,7 +387,8 @@ var _ = Describe("Event", func() {
 					Expect(p.Totals).NotTo(BeNil())
 					Expect(p.Totals.Goroutines).To(Equal(41203))
 					Expect(p.Totals.Threads).To(Equal(64))
-					Expect(p.Totals.Clipped).To(BeFalse())
+					Expect(p.Totals.GoroutinesClipped).To(BeFalse())
+					Expect(p.Totals.ThreadsClipped).To(BeFalse())
 				},
 			),
 

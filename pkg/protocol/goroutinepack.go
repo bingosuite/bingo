@@ -44,8 +44,10 @@ func (r GoroutinePackReport) Omitted() bool {
 // PackSnapshot bounds a GoroutineSnapshotPayload to MaxGoroutineEventBytes and
 // the element-count caps, returning a wire-ready payload plus a report.
 //
-// scanClipped says the caller's runtime walk hit its own ceiling before this
-// call, which makes the reported goroutine total a lower bound.
+// goroutinesClipped and threadsClipped say whether each of the caller's runtime
+// walks hit its own ceiling before this call, which makes that count a lower
+// bound. They are separate because the ceilings are (maxGoroutineScan and
+// maxThreadScan), and a consumer must be able to tell which count to trust.
 //
 // Selection is deterministic so every client on one stop sees the same thing:
 // the current goroutine, then its ancestors nearest-first, then the rest by
@@ -53,11 +55,12 @@ func (r GoroutinePackReport) Omitted() bool {
 // current thread are REQUIRED — a result that cannot keep them degrades to empty
 // collections instead. Threads take an ordered floor before goroutines compete
 // for the budget, then reclaim whatever is left.
-func PackSnapshot(snap GoroutineSnapshotPayload, scanClipped bool) (GoroutineSnapshotPayload, GoroutinePackReport) {
+func PackSnapshot(snap GoroutineSnapshotPayload, goroutinesClipped, threadsClipped bool) (GoroutineSnapshotPayload, GoroutinePackReport) {
 	totals := SnapshotTotals{
-		Goroutines: len(snap.Goroutines),
-		Threads:    len(snap.Threads),
-		Clipped:    scanClipped,
+		Goroutines:        len(snap.Goroutines),
+		Threads:           len(snap.Threads),
+		GoroutinesClipped: goroutinesClipped,
+		ThreadsClipped:    threadsClipped,
 	}
 	// shape is the single source of the payload: pack measures through it and
 	// the caller assembles through it, so the measured bytes cannot drift from
@@ -89,9 +92,10 @@ func PackSnapshot(snap GoroutineSnapshotPayload, scanClipped bool) (GoroutineSna
 
 // PackGoroutines bounds the EventGoroutines list. It shares PackSnapshot's exact
 // accounting and ordering; only the payload schema differs. There are no threads
-// in this shape, so the whole budget goes to goroutines.
-func PackGoroutines(gs []Goroutine, scanClipped bool) (GoroutinesPayload, GoroutinePackReport) {
-	totals := SnapshotTotals{Goroutines: len(gs), Clipped: scanClipped}
+// in this shape, so the whole budget goes to goroutines and only the goroutine
+// scan flag is meaningful.
+func PackGoroutines(gs []Goroutine, goroutinesClipped bool) (GoroutinesPayload, GoroutinePackReport) {
+	totals := SnapshotTotals{Goroutines: len(gs), GoroutinesClipped: goroutinesClipped}
 	shape := func(gs []Goroutine, totals *SnapshotTotals) GoroutinesPayload {
 		return GoroutinesPayload{Goroutines: gs, Totals: totals}
 	}
@@ -108,10 +112,10 @@ func PackGoroutines(gs []Goroutine, scanClipped bool) (GoroutinesPayload, Gorout
 }
 
 // payloadTotals decides whether the payload carries Totals: only when the wire
-// omits elements or the producer's scan was clipped. A complete, unclipped
+// omits elements or one of the producer's scans was clipped. A complete,
 // unclipped result stays byte-identical to the pre-1.4 shape.
 func payloadTotals(totals SnapshotTotals, report GoroutinePackReport) *SnapshotTotals {
-	if !report.Omitted() && !totals.Clipped {
+	if !report.Omitted() && !totals.AnyClipped() {
 		return nil
 	}
 	copied := totals
@@ -152,7 +156,7 @@ func pack(
 	}
 
 	// Whether Totals ends up on the wire changes the reserve, and it is only
-	// known after packing — except when the scan was clipped, which forces it.
+	// known after packing — except when a scan was clipped, which forces it.
 	// So pack optimistically first; if that pass turns out to omit elements,
 	// Totals appears and the reserve was too small, so repack against the true
 	// one.
@@ -164,11 +168,11 @@ func pack(
 	// (Note the weaker claim "pass 2 omits at least as many" is false: with
 	// skip-and-continue a tighter budget can reject one big early element and
 	// admit several small later ones.)
-	gs, ts, report, ok := packOnce(orderedG, anchorG, orderedT, anchorT, totals, totals.Clipped, kind, build)
+	gs, ts, report, ok := packOnce(orderedG, anchorG, orderedT, anchorT, totals, totals.AnyClipped(), kind, build)
 	if !ok {
 		return degraded()
 	}
-	if !totals.Clipped && report.Omitted() {
+	if !totals.AnyClipped() && report.Omitted() {
 		gs, ts, report, ok = packOnce(orderedG, anchorG, orderedT, anchorT, totals, true, kind, build)
 		if !ok {
 			return degraded()

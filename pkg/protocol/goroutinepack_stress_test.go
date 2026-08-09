@@ -63,7 +63,7 @@ func TestPackExactSizeUnderAdversarialStrings(t *testing.T) {
 
 		snap, rep := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 			Goroutines: gs, Threads: ts, Current: 1, Created: created,
-		}, rng.Intn(2) == 0)
+		}, rng.Intn(2) == 0, rng.Intn(2) == 0)
 		actual := eventBytesPlain(t, protocol.EventGoroutineSnapshot, snap)
 		if actual > protocol.MaxGoroutineEventBytes {
 			t.Fatalf("round %d: snapshot %d bytes exceeds cap", round, actual)
@@ -144,7 +144,7 @@ func TestPackNeverExceedsCapAcrossTheBoundary(t *testing.T) {
 		target := protocol.MaxGoroutineEventBytes + offset
 		snap := sized(t, target)
 
-		out, rep := protocol.PackSnapshot(snap, false)
+		out, rep := protocol.PackSnapshot(snap, false, false)
 		actual := eventBytesPlain(t, protocol.EventGoroutineSnapshot, out)
 		if actual > protocol.MaxGoroutineEventBytes {
 			t.Fatalf("offset %d: returned %d bytes, over cap", offset, actual)
@@ -201,7 +201,7 @@ func TestPackTwoPassInvariantsUnderRandomInput(t *testing.T) {
 
 		out, rep := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
 			Goroutines: gs, Threads: ts, Current: cur, Created: created,
-		}, clipped)
+		}, clipped, clipped)
 
 		actual := eventBytesPlain(t, protocol.EventGoroutineSnapshot, out)
 		if !rep.Oversized && actual > protocol.MaxGoroutineEventBytes {

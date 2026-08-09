@@ -175,10 +175,11 @@ repaints with the new round's workers — the plumbing, end to end.
   so it is unaffected. Addressing a query to its requester needs wire-level
   correlation — out of scope for the current protocol.
 - Both observers report scale honestly. `wsmon`'s `counts:` line shows
-  `included/total` and names the two ways a picture can be incomplete —
+  `included/total` and names the ways a picture can be incomplete —
   `N omitted from this event` (the packer left elements off the wire) and
-  `scan hit its ceiling` with a trailing `+` (the debugger's own runtime walk
-  stopped early, so the total is itself a floor). A complete snapshot says so.
+  `goroutine scan hit its ceiling` / `thread scan hit its ceiling`, each with a
+  trailing `+` on its own count (that runtime walk stopped early, so that total
+  is itself a floor). A complete snapshot says so.
 - Snapshots stream on **breakpoint / pause / entry**, not per single-step (steps
   stay cheap). Use the driver's breakpoints/continue to advance between frames.
 - If the tracee is a stripped binary or stopped before runtime init, the snapshot
@@ -223,10 +224,12 @@ What a consumer sees:
   snapshots from any busy target. Even the worst case (both deltas full, widest
   ids) stays well under half the byte budget.
 - **`totals` is the honesty channel.** It appears *only* when elements were left
-  off the wire or the debugger's runtime scan was clipped, carrying the
+  off the wire or one of the debugger's runtime scans was clipped, carrying the
   **original** counts. Its presence alone means "this is not everything".
-  `totals.clipped` means the scan stopped early, so `totals.goroutines` is a
-  lower bound — render it as such (VS Code appends `+`).
+  `totals.goroutinesClipped` and `totals.threadsClipped` are separate, because
+  the two scans have independent ceilings: each says that *its* count is a lower
+  bound. Render them independently (VS Code and `wsmon` append `+` per count) —
+  borrowing one flag for both necessarily misreports one of them.
 
 A consumer should therefore treat the goroutine list as a bounded, ordered view
 and read `totals` for the truth about scale — not assume the list is complete.

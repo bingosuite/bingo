@@ -205,17 +205,21 @@ function summaryCards(
       "Goroutines",
       totals === undefined
         ? shownGoroutines
-        : formatServerCount(shownGoroutines, totals.goroutines, totals.clipped),
+        : formatServerCount(
+            shownGoroutines,
+            totals.goroutines,
+            totals.goroutinesClipped,
+          ),
     ],
     // The thread statistic reports the machine's real thread count from the
     // server totals when they are present; the list below shows only what was
-    // packed, so the two must not silently disagree. `clipped` describes the
-    // GOROUTINE scan, so the thread total is not marked as a lower bound.
+    // packed, so the two must not silently disagree. Each count is marked a
+    // lower bound only when its OWN scan clipped — the ceilings are independent.
     [
       "Threads",
       totals === undefined
         ? shownThreads
-        : formatServerCount(shownThreads, totals.threads, false),
+        : formatServerCount(shownThreads, totals.threads, totals.threadsClipped),
     ],
     ["Clients", session.clients],
     ["Current", session.snapshot?.current || "—"],
@@ -639,9 +643,14 @@ export function serverOmissionText(
       `${String(totals.goroutinesOmitted)} goroutines were not sent in this event (${String(totals.goroutines)} live)`,
     );
   }
-  if (totals.clipped) {
+  if (totals.goroutinesClipped) {
     notes.push(
-      `the debugger stopped scanning at ${String(totals.goroutines)} goroutines, so the total is a lower bound`,
+      `the debugger stopped scanning at ${String(totals.goroutines)} goroutines, so that total is a lower bound`,
+    );
+  }
+  if (totals.threadsClipped) {
+    notes.push(
+      `the debugger stopped scanning at ${String(totals.threads)} threads, so that total is a lower bound`,
     );
   }
   return notes.length === 0 ? undefined : notes.join(" · ");
