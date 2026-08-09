@@ -6,6 +6,7 @@
 os_name := if os() == "macos" { "darwin" } else { os() }
 arch_name := if arch() == "aarch64" { "arm64" } else if arch() == "x86_64" { "amd64" } else { arch() }
 vscode_target := if os_name + "/" + arch_name == "darwin/arm64" { "darwin-arm64" } else if os_name + "/" + arch_name == "linux/amd64" { "linux-x64" } else { "unsupported" }
+go_test := if os_name + "/" + arch_name == "darwin/arm64" { "env CGO_ENABLED=1 go test -tags bingonative" } else { "go test" }
 
 # Build the Target, build BinGo and run the Target
 default: build-target build run
@@ -117,11 +118,11 @@ vscode-install: vscode-package
 
 # Run unit tests on the PKG (defaults to ./...)
 test PKG="./...":
-	go test -v {{PKG}}
+	{{go_test}} -v {{PKG}}
 
 # Run coverage on the PKG (defaults to ./...)
 coverage PKG="./...":
-	go test -coverprofile=test/coverage.out {{PKG}}
+	{{go_test}} -coverprofile=test/coverage.out {{PKG}}
 	go tool cover -func=test/coverage.out
 
 # Run integration tests
