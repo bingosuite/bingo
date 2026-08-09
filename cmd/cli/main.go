@@ -10,11 +10,17 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/bingosuite/bingo/pkg/client"
 	"github.com/bingosuite/bingo/pkg/protocol"
 	"github.com/chzyer/readline"
 )
+
+// fullSnapshotNext renders the next EventGoroutineSnapshot in full rather than
+// as the usual one-line summary, so a user-typed `snapshot` gets the detailed
+// view. Shared between the REPL goroutine and the event printer.
+var fullSnapshotNext atomic.Bool
 
 //nolint:gocognit,gocyclo // The CLI keeps command routing in one switch while commands are still small.
 func main() {
@@ -242,12 +248,17 @@ func main() {
 			}
 
 		case "snapshot", "snap":
-			snap, err := c.GoroutineSnapshot()
-			if err != nil {
+			// Fire-and-forget: the snapshot answers on the event stream, where
+			// automatic stop snapshots also arrive. fullSnapshotNext only
+			// changes how the next one is *rendered* (full instead of the
+			// one-line summary) — every snapshot is printed either way, so
+			// nothing is correlated or discarded.
+			fullSnapshotNext.Store(true)
+			if err := c.RequestGoroutineSnapshot(); err != nil {
+				fullSnapshotNext.Store(false)
 				printErr(err)
 				continue
 			}
-			printSnapshot(snap)
 
 		case "help", "h", "?":
 			printHelp()
@@ -332,6 +343,11 @@ func printAuxEvent(evt protocol.Event) {
 	case protocol.EventError:
 		var p protocol.ErrorPayload
 		if protocol.DecodeEventPayload(evt, &p) == nil {
+			if p.Command == protocol.CmdGoroutineSnapshot {
+				// A rejected request has no snapshot to render in full; leaving
+				// the flag armed would expand the next automatic push instead.
+				fullSnapshotNext.Store(false)
+			}
 			fmt.Printf("\n  [error] %s: %s\nbingo> ", p.Command, p.Message)
 		}
 
@@ -345,6 +361,12 @@ func printAuxEvent(evt protocol.Event) {
 	case protocol.EventGoroutineSnapshot:
 		var p protocol.GoroutineSnapshotPayload
 		if protocol.DecodeEventPayload(evt, &p) == nil {
+			if fullSnapshotNext.CompareAndSwap(true, false) {
+				fmt.Println()
+				printSnapshot(p)
+				fmt.Print("bingo> ")
+				return
+			}
 			msg := fmt.Sprintf("\n  [goroutines] %d live, %d threads, current G%d",
 				len(p.Goroutines), len(p.Threads), p.Current)
 			if len(p.Created) > 0 {
@@ -447,7 +469,7 @@ func printHelp() {
   locals [frame]             show local variables (default frame 0)
   bt / backtrace             show call stack
   goroutines / grs           list goroutines (with parent/start)
-  snapshot / snap            full concurrency snapshot (goroutines + threads + deltas)
+  snapshot / snap            request a full concurrency snapshot (printed when it arrives)
 
   help / h / ?               show this help
   quit / q / exit            disconnect and exit`)

@@ -381,25 +381,30 @@ func TestUnresolvedReplyDebtMakesLaterRequestTimeout(t *testing.T) {
 	}
 }
 
-func TestTimedOutGoroutineSnapshotDoesNotConsumeAutoSnapshot(t *testing.T) {
+// The synchronous snapshot query this test was written against is gone; the
+// telemetry guarantee it protected is not. A snapshot request that is never
+// answered leaves no pending entry and no reply debt behind, so a later stop's
+// breakpoint event and its auto-pushed snapshot both reach Events() intact and
+// in order — there is nothing left that could absorb either of them.
+func TestUnansweredGoroutineSnapshotRequestDoesNotConsumeAutoSnapshot(t *testing.T) {
 	useSyncTimeout(t, 100*time.Millisecond)
 	h := newLoopbackClient(t)
 
-	result := make(chan error, 1)
-	go func() {
-		_, err := h.client.GoroutineSnapshot()
-		result <- err
-	}()
+	if err := h.client.RequestGoroutineSnapshot(); err != nil {
+		t.Fatalf("RequestGoroutineSnapshot: %v", err)
+	}
 	assertCommandKind(t, h.readCommand(t), protocol.CmdGoroutineSnapshot)
 
-	select {
-	case err := <-result:
-		if err == nil || !strings.Contains(err.Error(), "timeout") {
-			t.Fatalf("GoroutineSnapshot error = %v, want timeout", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("GoroutineSnapshot did not return")
+	h.client.pendingMu.Lock()
+	pending := len(h.client.pending)
+	h.client.pendingMu.Unlock()
+	if pending != 0 {
+		t.Fatalf("pending entries after snapshot request = %d, want 0", pending)
 	}
+
+	// Well past the old synchronous deadline, so a debt-based implementation
+	// would have had its retired entry armed by now.
+	time.Sleep(2 * syncTimeout)
 
 	h.writeEvent(t, protocol.MustEvent(
 		protocol.EventBreakpointHit,
