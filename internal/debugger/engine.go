@@ -762,12 +762,15 @@ func (e *engine) handleStop(stop StopEvent) {
 			case bpResumeStepOut:
 				_, setErr := e.bps.set(e.backend, stepOutReturnFile, 0, e.bpRetAddr)
 				if setErr != nil && !errors.Is(setErr, errBreakpointExists) {
-					// The tracee is halted here — the trap was reinstalled and
-					// the held threads released, but ContinueProcess is never
-					// reached. resumeFromBreakpoint left the engine running, so
-					// unlike the other failure paths this one must correct the
-					// state itself or every later command is rejected with
-					// ErrNotSuspended against a process that cannot move.
+					// The tracee is halted here — the step-over trap was
+					// reinstalled and the stepping bookkeeping ended (which
+					// disarms the hardware single-step but deliberately does
+					// NOT resume the world; only ContinueProcess does, and it
+					// is never reached on this path). resumeFromBreakpoint left
+					// the engine running, so unlike the other failure paths
+					// this one must correct the state itself or every later
+					// command is rejected with ErrNotSuspended against a
+					// process that cannot move.
 					e.setState(stateSuspended)
 					e.haltOnError(protocol.CmdStepOut,
 						fmt.Errorf("StepOut: set return breakpoint: %w", setErr), stop)
