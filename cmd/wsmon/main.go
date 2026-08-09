@@ -208,7 +208,7 @@ func rejectionContext(msg string) string {
 	if msg == "" {
 		return ""
 	}
-	return fmt.Sprintf(" (a snapshot request was rejected meanwhile: %s)", msg)
+	return fmt.Sprintf(" (a snapshot request was rejected meanwhile: %s)", oneLine(msg))
 }
 
 func (m *monitor) applyEvent(evt protocol.Event) (bool, bool) {
@@ -535,8 +535,10 @@ const (
 	oneLineKeepRunes = oneLineMaxRunes - len("...")
 )
 
+var oneLineEscaper = strings.NewReplacer("\r", `\r`, "\n", `\n`)
+
 func oneLine(s string) string {
-	s = strings.TrimSpace(strings.ReplaceAll(s, "\n", `\n`))
+	s = strings.TrimSpace(oneLineEscaper.Replace(s))
 	if s == "" {
 		return "-"
 	}

@@ -135,6 +135,26 @@ func TestRunOnceDeadlineReportsObservedRejection(t *testing.T) {
 	}
 }
 
+func TestRunOnceEscapesRejectionContext(t *testing.T) {
+	events := make(chan protocol.Event, 1)
+	events <- protocol.MustEvent(protocol.EventError, 2, protocol.ErrorPayload{
+		Command: protocol.CmdGoroutineSnapshot,
+		Message: "before\rafter\nlast",
+	})
+	close(events)
+
+	m := &monitor{clients: -1}
+	err := m.run(events, true, time.Minute, func() {})
+	if err == nil {
+		t.Fatal("run(-once) returned nil despite never receiving a snapshot")
+	}
+	if got := err.Error(); !strings.Contains(got, `before\rafter\nlast`) {
+		t.Fatalf("run error = %q, want escaped rejection context", got)
+	} else if strings.ContainsAny(got, "\r\n") {
+		t.Fatalf("run error = %q, want no raw line controls", got)
+	}
+}
+
 // The deadline also bounds a silent server, with no rejection to report.
 func TestRunOnceDeadlineWithoutRejection(t *testing.T) {
 	events := make(chan protocol.Event)
@@ -398,11 +418,10 @@ func TestUsageErrorUsesTheFlagSetUsage(t *testing.T) {
 }
 
 // oneLine renders arbitrary tracee stdout/stderr, panic text, and rejection
-// messages, so its budget has to cut on code-point boundaries: a byte cut lands
-// inside a multi-byte rune and emits invalid UTF-8 that terminals show as a
-// replacement glyph (issue #209). The table pins the short/exact/over budget
-// boundaries across ASCII, Japanese, astral emoji, combining sequences, embedded
-// CR/LF, and input that is already invalid UTF-8.
+// messages. Raw line controls must not reach the terminal, and its budget has to
+// cut on code-point boundaries: a byte cut lands inside a multi-byte rune and
+// emits invalid UTF-8 that terminals show as a replacement glyph (issue #209).
+// The table pins normalization and the short/exact/over budget boundaries.
 func TestOneLine(t *testing.T) {
 	cases := []struct {
 		name string
@@ -414,11 +433,13 @@ func TestOneLine(t *testing.T) {
 		{name: "short ascii", in: "hello", want: "hello"},
 		{name: "surrounding space trimmed", in: "  hello  ", want: "hello"},
 
-		// Newline normalization is unchanged by the UTF-8 fix: LF becomes the
-		// two-character escape, and a CR is left alone because collapsing it
-		// would be a separate rendering change.
+		{name: "embedded cr", in: "line one\rline two", want: `line one\rline two`},
 		{name: "embedded lf", in: "line one\nline two", want: `line one\nline two`},
-		{name: "embedded crlf", in: "line one\r\nline two", want: "line one\r" + `\n` + "line two"},
+		{name: "embedded crlf", in: "line one\r\nline two", want: `line one\r\nline two`},
+		{name: "embedded lfcr", in: "line one\n\rline two", want: `line one\n\rline two`},
+		{name: "repeated controls", in: "\r\r\n\n\r", want: `\r\r\n\n\r`},
+		{name: "surrounding controls stay visible", in: " \t\r\n \t", want: `\r\n`},
+		{name: "trailing cr", in: "hello\r", want: `hello\r`},
 		{name: "trailing lf", in: "hello\n", want: `hello\n`},
 
 		{name: "ascii at budget", in: strings.Repeat("a", 120), want: strings.Repeat("a", 120)},
@@ -475,6 +496,17 @@ func TestOneLine(t *testing.T) {
 			in:   strings.Repeat("a", 116) + "\n" + strings.Repeat("b", 10),
 			want: strings.Repeat("a", 116) + `\` + "...",
 		},
+		{
+			name: "cut inside the carriage return escape",
+			in:   strings.Repeat("a", 116) + "\r" + strings.Repeat("b", 10),
+			want: strings.Repeat("a", 116) + `\` + "...",
+		},
+		{name: "normalized controls at budget", in: strings.Repeat("\r", 60), want: strings.Repeat(`\r`, 60)},
+		{
+			name: "normalized controls over budget",
+			in:   strings.Repeat("\r", 61),
+			want: strings.Repeat(`\r`, 58) + `\` + "...",
+		},
 
 		// Bytes that are already invalid pass through untouched rather than
 		// being rewritten to U+FFFD: oneLine truncates, it does not sanitize.
@@ -500,6 +532,9 @@ func TestOneLine(t *testing.T) {
 			if utf8.ValidString(tc.in) && !utf8.ValidString(got) {
 				t.Fatalf("oneLine(%q) = %q, which is not valid UTF-8", tc.in, got)
 			}
+			if strings.ContainsAny(got, "\r\n") {
+				t.Fatalf("oneLine(%q) = %q, which contains a raw line control", tc.in, got)
+			}
 		})
 	}
 }
@@ -508,7 +543,7 @@ func TestOneLine(t *testing.T) {
 // 1/2/3/4-byte string past the budget and assert the result is always valid
 // UTF-8 and within the budget. This is the property byte slicing cannot hold.
 func TestOneLineNeverSplitsACodePoint(t *testing.T) {
-	mixed := strings.Repeat("aé日🙂", 80)
+	mixed := strings.Repeat("aé日🙂\r\n", 80)
 
 	for i := 0; i <= len(mixed); i++ {
 		in := mixed[:i]
@@ -521,6 +556,9 @@ func TestOneLineNeverSplitsACodePoint(t *testing.T) {
 		}
 		if n := utf8.RuneCountInString(got); n > oneLineMaxRunes {
 			t.Fatalf("oneLine(prefix of %d bytes) has %d runes, want at most %d", i, n, oneLineMaxRunes)
+		}
+		if strings.ContainsAny(got, "\r\n") {
+			t.Fatalf("oneLine(prefix of %d bytes) = %q, which contains a raw line control", i, got)
 		}
 	}
 }
