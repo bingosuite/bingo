@@ -26,6 +26,12 @@ name: PROOF U2 (linux tracee reaping)
 # summary at the end states the verdict.
 
 on:
+  # Branch-scoped push trigger: this workflow file does not exist on the default
+  # branch, and GitHub only accepts workflow_dispatch for workflows present
+  # there. Scoping the push trigger to this single proof branch keeps it from
+  # ever running anywhere else.
+  push:
+    branches: ["xsachax-prove-linux-reaping"]
   workflow_dispatch:
     inputs:
       settle_ms:
@@ -46,7 +52,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      BINGO_PROOF_SETTLE_MS: ${{ github.event.inputs.settle_ms || '5000' }}
+      BINGO_PROOF_SETTLE_MS: ${{ github.event.inputs.settle_ms || '8000' }}
       BINGO_PROOF_CYCLES: ${{ github.event.inputs.cycles || '25' }}
     steps:
       - uses: actions/checkout@v4
