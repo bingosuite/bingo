@@ -695,11 +695,21 @@ of issue #32). Constructors accept a nil logger and fall back to
 
 ## Hub seq stream — why one counter
 
-The hub re-stamps every outbound event with its own atomic `seq` counter. The
-engine has its own seq, and the hub also synthesises events (errors,
-confirmations like `BreakpointSet`). If clients saw both streams interleaved,
-they'd see two overlapping monotonic sequences and couldn't detect drops.
-**Always go through `h.seq.Add(1)` before broadcasting.**
+The hub re-stamps every outbound event with its own `seq` counter. The engine
+has its own seq, and the hub also synthesises events (errors, confirmations like
+`BreakpointSet`). If clients saw both streams interleaved, they'd see two
+overlapping monotonic sequences and couldn't detect drops.
+
+**`broadcast` is the only sequence-allocation path.** Its `outboundMu` covers
+sequence assignment, marshal, and nonblocking `deliver` to the registry
+snapshot, so every connected client sees the same frames in the same order.
+Managed `AddClient` takes that same lock across registry admission and a
+**broadcast** `EventSessionState`; existing clients therefore learn the new
+client count without a phantom gap, and the join state is the new client's
+first frame. Do not unicast an allocated sequence, reuse `seq` without
+incrementing it, or route join state through `Run` (which may be blocked in the
+suspended wait). `shutdown` also takes `outboundMu` before registry teardown so
+admission plus its initial state enqueue cannot interleave with closure.
 
 ## Restart — hub-level, not engine-level
 
