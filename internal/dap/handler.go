@@ -92,6 +92,23 @@ type Handler struct {
 	restartReqSeq int
 	curThreadID   int
 
+	// restartWasSuspended is the suspended view this connection held when it
+	// issued the in-flight restart, captured before onRestart clears it
+	// optimistically. DAP permits restart while the tracee is RUNNING, and the
+	// hub rejects some restarts (an attach-created session, no prior Launch)
+	// without touching the process at all — so a rejected restart must restore
+	// exactly the prior view rather than unconditionally claiming a suspension
+	// that never existed.
+	restartWasSuspended bool
+
+	// sessionState is the last lifecycle state a managed hub broadcast. It stays
+	// empty for a raw hub (hub.New), which broadcasts none. idle/exited mean no
+	// live process, which is the one case a resume rejection must NOT be
+	// resynchronized into a suspension (see failResume/failRestart): the hub
+	// reports a failed relaunch as an error followed by idle, and answers every
+	// later command with "no active debugger".
+	sessionState protocol.SessionState
+
 	// pendingContinues counts Continue commands THIS adapter issued whose
 	// resulting EventContinued must be suppressed (a DAP adapter must not emit
 	// `continued` for a resume it initiated). Out-of-band continues from other
@@ -395,4 +412,11 @@ func (h *Handler) resetVarsLocked() {
 		h.varCache = make(map[int][]godap.Variable)
 	}
 	h.nextVarRef = 0
+}
+
+// sessionEndedLocked reports whether the hub has told us there is no live
+// process: a failed relaunch leaves a managed session idle, and a terminated one
+// exited. Caller MUST hold h.mu.
+func (h *Handler) sessionEndedLocked() bool {
+	return h.sessionState == protocol.StateIdle || h.sessionState == protocol.StateExited
 }
