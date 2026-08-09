@@ -416,6 +416,19 @@ func (hh *harness) inject(kind protocol.EventKind, payload any) {
 	}
 }
 
+// expectNoResponse asserts the handler is not answering anything right now — a
+// setBreakpoints request must stay open while an operation it owns is in flight.
+func (hh *harness) expectNoResponse() {
+	hh.t.Helper()
+	_ = hh.client.SetReadDeadline(time.Now().Add(80 * time.Millisecond))
+	defer func() { _ = hh.client.SetReadDeadline(time.Time{}) }()
+	if _, err := hh.reader.Peek(1); err == nil {
+		hh.t.Fatal("handler responded while an owned breakpoint operation was still pending")
+	} else if nerr, ok := err.(net.Error); !ok || !nerr.Timeout() {
+		hh.t.Fatalf("peek while pending: %v", err)
+	}
+}
+
 func initArgs() *godap.InitializeRequest {
 	return &godap.InitializeRequest{Arguments: godap.InitializeRequestArguments{AdapterID: "bingo"}}
 }
@@ -718,13 +731,16 @@ func TestSetBreakpointsDiffAndFIFO(t *testing.T) {
 		Breakpoints: []godap.SourceBreakpoint{{Line: 20}},
 	}}
 	hh.sendReq("setBreakpoints", sb2)
-	// Line 20 unchanged → resolves immediately without a new SetBreakpoint.
+	// A ClearBreakpoint for the removed line 10 must have been enqueued, and the
+	// response must wait for it: the request owns that removal.
+	hh.cmds.waitForCommand(t, protocol.CmdClearBreakpoint)
+	hh.expectNoResponse()
+	hh.inject(protocol.EventBreakpointCleared, protocol.BreakpointClearedPayload{ID: 101})
+
 	resp2 := recvType[*godap.SetBreakpointsResponse](hh)
 	if len(resp2.Body.Breakpoints) != 1 || resp2.Body.Breakpoints[0].Line != 20 {
 		t.Fatalf("diff response = %+v", resp2.Body.Breakpoints)
 	}
-	// A ClearBreakpoint for the removed line 10 must have been enqueued.
-	hh.cmds.waitForCommand(t, protocol.CmdClearBreakpoint)
 }
 
 func seedRestartBreakpointCache(t *testing.T, hh *harness, source godap.Source) {
@@ -794,8 +810,8 @@ func requireRestartBreakpointCache(t *testing.T, hh *harness, source godap.Sourc
 	retained := hh.handler.bpByFile[source.Path][10]
 	_, droppedStillCached := hh.handler.bpByFile[source.Path][20]
 	hh.handler.mu.Unlock()
-	if retained.debuggerID != 101 || retained.dapID != 41 {
-		t.Fatalf("retained breakpoint state = %+v, want debuggerID=101 dapID=41", retained)
+	if retained == nil || retained.installedID != 101 || retained.dapID != 41 {
+		t.Fatalf("retained breakpoint state = %+v, want installedID=101 dapID=41", retained)
 	}
 	if droppedStillCached {
 		t.Fatal("discarded breakpoint remained in cache")
@@ -837,6 +853,7 @@ func clearReidentifiedBreakpoint(t *testing.T, hh *harness, source godap.Source)
 	if clear.ID != 101 {
 		t.Fatalf("clear breakpoint id = %d, want fresh debugger id 101", clear.ID)
 	}
+	hh.inject(protocol.EventBreakpointCleared, protocol.BreakpointClearedPayload{ID: 101})
 	_ = recvType[*godap.SetBreakpointsResponse](hh)
 }
 
@@ -955,17 +972,18 @@ func TestRestartErrorAllowsRetry(t *testing.T) {
 
 func TestRestartPreservesBreakpointCorrelationQueues(t *testing.T) {
 	h := NewHandler(nil, nil, nil)
-	setSlot := &bpSlot{}
-	h.setQ = []*bpSlot{setSlot}
-	h.clearQ = []int{73}
+	setOp := &bpOp{file: "/x/main.go", line: 10}
+	clearOp := &bpOp{file: "/x/main.go", line: 20}
+	h.setQ = []*bpOp{setOp}
+	h.clearQ = []*bpOp{clearOp}
 
 	h.onRestarted(protocol.MustEvent(protocol.EventRestarted, 1, protocol.RestartedPayload{}))
 
-	if len(h.setQ) != 1 || h.setQ[0] != setSlot {
+	if len(h.setQ) != 1 || h.setQ[0] != setOp {
 		t.Fatalf("setQ changed across restart: %+v", h.setQ)
 	}
-	if len(h.clearQ) != 1 || h.clearQ[0] != 73 {
-		t.Fatalf("clearQ changed across restart: %v", h.clearQ)
+	if len(h.clearQ) != 1 || h.clearQ[0] != clearOp {
+		t.Fatalf("clearQ changed across restart: %+v", h.clearQ)
 	}
 }
 
