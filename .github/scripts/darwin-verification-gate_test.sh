@@ -670,6 +670,15 @@ command_substitutions_disarm_the_err_trap() {
     printf 'unguarded command substitution:\n%s\n' "$offenders" >&2
     return 1
   fi
+
+  # Backticks, process substitution and explicit subshells inherit the ERR trap
+  # exactly like '$( )' does, but carry no '$(' for the scan above to catch.
+  # Ban them outright so the guarded form stays the only way to spawn a subshell.
+  offenders=$(printf '%s\n' "$body" | grep -E '`|<\(|>\(' || true)
+  if [ -n "$offenders" ]; then
+    printf 'subshell form that cannot be guarded:\n%s\n' "$offenders" >&2
+    return 1
+  fi
 }
 
 gate_workflows_are_valid_yaml() {
