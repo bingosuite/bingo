@@ -16,8 +16,11 @@ export type OwnedProcessOutcome =
 export interface OwnedProcess {
   readonly pid: number | undefined;
   readonly outcome: Promise<OwnedProcessOutcome>;
+  hasProcessGroup(): boolean;
   isFinished(): boolean;
   ref(): void;
+  signalGroup(signal: NodeJS.Signals): boolean;
+  signalLeader(signal: NodeJS.Signals): boolean;
 }
 
 export interface OwnedProcessCleanupOptions {
@@ -25,10 +28,12 @@ export interface OwnedProcessCleanupOptions {
   readonly exitTimeoutMs?: number;
   readonly groupTimeoutMs?: number;
   readonly pollIntervalMs?: number;
-  readonly signalProcess?: ProcessSignal;
 }
 
-export function observeOwnedProcess(child: ChildProcess): OwnedProcess;
+export function observeOwnedProcess(
+  child: ChildProcess,
+  signalProcess?: ProcessSignal,
+): OwnedProcess;
 
 export function waitForOwnedProcessExit(
   ownedProcess: OwnedProcess,

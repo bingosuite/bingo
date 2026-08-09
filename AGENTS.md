@@ -938,11 +938,14 @@ requires local/self-hosted Apple Silicon, where the same E2E covers all five
 examples. Both tests observe server-owned idle exit on success. On failure the
 test harness tracks the detached child's terminal outcome before signaling,
 requests graceful shutdown with SIGTERM to the exact captured server PID, and
-escalates to SIGKILL on only its captured process group when the tracked server
-remains live past a bounded grace. It then waits for the server outcome and
-confirms the owned group is absent before deleting scratch artifacts; incomplete
-cleanup is reported and preserves those artifacts. Cleanup is test-only and
-must never enter extension production code.
+escalates to SIGKILL on only its captured process group when that owned group
+remains nonempty past a bounded grace, even if the server leader exited first.
+The tracker permanently releases group ownership when an existence probe reports
+it absent, so cleanup never signals a later group that reused the numeric PGID.
+It then waits for the server outcome and confirms the owned group is absent
+before deleting scratch artifacts; incomplete cleanup is reported and preserves
+those artifacts. Cleanup is test-only and must never enter extension production
+code.
 Apple's external linker can vary `LC_UUID` even for identical cgo inputs, but
 current dyld rejects binaries with `-no_uuid`; `normalize-mach-o-uuid.mjs`
 therefore derives a stable UUID from the unsigned Mach-O with its UUID and

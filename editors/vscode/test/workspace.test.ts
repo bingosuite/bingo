@@ -47,7 +47,7 @@ describe("repository VS Code integration", () => {
     assert.doesNotMatch(productionProcessSources, /SIGKILL|process\.kill/);
     assert.match(
       readText("editors/vscode/scripts/owned-process.mjs"),
-      /sendSignal\(signalProcess, -pid, "SIGKILL"\)/,
+      /ownedProcess\.signalGroup\("SIGKILL"\)/,
     );
     const smoke = readText("editors/vscode/scripts/smoke-server.mjs");
     assert.match(smoke, /ownedServer = observeOwnedProcess\(child\)/);

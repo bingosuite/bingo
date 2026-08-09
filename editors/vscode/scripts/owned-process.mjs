@@ -6,9 +6,11 @@ const defaultExitTimeoutMs = 3000;
 const defaultGroupTimeoutMs = 2000;
 const defaultPollIntervalMs = 20;
 
-export function observeOwnedProcess(child) {
+export function observeOwnedProcess(child, signalProcess = process.kill) {
   const pid = child.pid;
   let finished = false;
+  let groupReleased = pid === undefined;
+  let groupProbeError;
   let resolveOutcome;
   const outcome = new Promise((resolve) => {
     resolveOutcome = resolve;
@@ -17,8 +19,50 @@ export function observeOwnedProcess(child) {
     if (finished) {
       return;
     }
+    try {
+      hasProcessGroup();
+    } catch {
+      // Cleanup reports the saved probe failure without throwing from an event callback.
+    }
     finished = true;
     resolveOutcome(value);
+  };
+  const hasProcessGroup = () => {
+    if (groupReleased) {
+      return false;
+    }
+    if (groupProbeError !== undefined) {
+      throw groupProbeError;
+    }
+    try {
+      signalProcess(-pid, 0);
+      return true;
+    } catch (error) {
+      if (error?.code === "ESRCH") {
+        groupReleased = true;
+        return false;
+      }
+      if (error?.code === "EPERM") {
+        return true;
+      }
+      groupProbeError = error;
+      throw error;
+    }
+  };
+  const signalGroup = (signal) => {
+    if (!hasProcessGroup()) {
+      return false;
+    }
+    try {
+      signalProcess(-pid, signal);
+      return true;
+    } catch (error) {
+      if (error?.code === "ESRCH") {
+        groupReleased = true;
+        return false;
+      }
+      throw error;
+    }
   };
 
   child.once("error", (error) => {
@@ -34,8 +78,16 @@ export function observeOwnedProcess(child) {
     isFinished() {
       return finished;
     },
+    hasProcessGroup,
     ref() {
       child.ref();
+    },
+    signalGroup,
+    signalLeader(signal) {
+      if (finished || pid === undefined) {
+        return false;
+      }
+      return sendSignal(signalProcess, pid, signal);
     },
   };
 }
@@ -57,17 +109,6 @@ export async function terminateOwnedProcessGroup(
   ownedProcess,
   options = {},
 ) {
-  if (ownedProcess.isFinished()) {
-    throw new Error(
-      "test-owned server finished before cleanup; refusing to signal a potentially reused PID or process group",
-    );
-  }
-  const pid = ownedProcess.pid;
-  if (pid === undefined) {
-    throw new Error("test-owned server has no process ID");
-  }
-
-  const signalProcess = options.signalProcess ?? process.kill;
   const gracefulTimeoutMs =
     options.gracefulTimeoutMs ?? defaultGracefulTimeoutMs;
   const exitTimeoutMs = options.exitTimeoutMs ?? defaultExitTimeoutMs;
@@ -76,37 +117,33 @@ export async function terminateOwnedProcessGroup(
     options.pollIntervalMs ?? defaultPollIntervalMs;
 
   ownedProcess.ref();
-  const gracefulSignalDelivered = sendSignal(
-    signalProcess,
-    pid,
-    "SIGTERM",
-  );
-  const gracefulOutcome = await outcomeWithin(
-    ownedProcess.outcome,
+  if (!ownedProcess.isFinished()) {
+    ownedProcess.signalLeader("SIGTERM");
+  }
+  const groupExited = await waitForProcessGroupExit(
+    ownedProcess,
     gracefulTimeoutMs,
+    pollIntervalMs,
   );
-  if (
-    gracefulOutcome === undefined &&
-    !ownedProcess.isFinished() &&
-    gracefulSignalDelivered &&
-    processExists(signalProcess, pid)
-  ) {
-    sendSignal(signalProcess, -pid, "SIGKILL");
+  if (!groupExited) {
+    ownedProcess.signalGroup("SIGKILL");
   }
 
-  const outcome =
-    gracefulOutcome ??
-    (await waitForOwnedProcessExit(
-      ownedProcess,
-      exitTimeoutMs,
-      "test-owned packaged server did not exit after cleanup",
-    ));
-  await waitForProcessGroupExit(
-    pid,
+  const outcome = await waitForOwnedProcessExit(
+    ownedProcess,
+    exitTimeoutMs,
+    "test-owned packaged server did not exit after cleanup",
+  );
+  const groupGone = await waitForProcessGroupExit(
+    ownedProcess,
     groupTimeoutMs,
     pollIntervalMs,
-    signalProcess,
   );
+  if (!groupGone) {
+    throw new Error(
+      "test-owned packaged server process group remained alive after cleanup",
+    );
+  }
   return outcome;
 }
 
@@ -122,37 +159,20 @@ function sendSignal(signalProcess, pid, signal) {
   }
 }
 
-function processExists(signalProcess, pid) {
-  try {
-    signalProcess(pid, 0);
-    return true;
-  } catch (error) {
-    if (error?.code === "ESRCH") {
-      return false;
-    }
-    if (error?.code === "EPERM") {
-      return true;
-    }
-    throw error;
-  }
-}
-
 async function waitForProcessGroupExit(
-  pid,
+  ownedProcess,
   timeoutMs,
   pollIntervalMs,
-  signalProcess,
 ) {
   const deadline = Date.now() + timeoutMs;
-  while (processExists(signalProcess, -pid)) {
+  while (ownedProcess.hasProcessGroup()) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      throw new Error(
-        "test-owned packaged server process group remained alive after cleanup",
-      );
+      return false;
     }
     await delay(Math.min(pollIntervalMs, remaining));
   }
+  return true;
 }
 
 function outcomeWithin(outcome, timeoutMs) {
