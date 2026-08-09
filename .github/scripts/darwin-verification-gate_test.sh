@@ -133,7 +133,7 @@ case "$*" in
     done
     sha=${path##*/}
     content=$(jq -r --arg sha "$sha" '.[$sha] // "package bingo\n"' \
-      <<< "$MOCK_BLOB_CONTENTS_JSON")
+      "$MOCK_BLOB_CONTENTS_FILE")
     printf '%s' "$content" | base64
     ;;
   *"/issues/"*"/labels?"*)
@@ -232,6 +232,7 @@ run_case() {
   local gh_log="$tmpdir/gh-$case_id.log"
   local status_log="$tmpdir/status-$case_id.log"
   local decision_file="$tmpdir/decision-$case_id.txt"
+  local blob_contents_file="$tmpdir/blobs-$case_id.json"
   local head_sha
   head_sha=$(printf '%040x' "$case_id")
   local base_sha
@@ -250,6 +251,7 @@ run_case() {
   fi
   : > "$gh_log"
   : > "$status_log"
+  printf '%s\n' "$blob_contents_json" > "$blob_contents_file"
   rm -f "$decision_file"
 
   jq -n \
@@ -294,7 +296,7 @@ run_case() {
       MOCK_BASE_TREE_SHA="$base_tree_sha" \
       MOCK_HEAD_TREE_SHA="$head_tree_sha" \
       MOCK_HEAD_SHA="$head_sha" \
-      MOCK_BLOB_CONTENTS_JSON="$blob_contents_json" \
+      MOCK_BLOB_CONTENTS_FILE="$blob_contents_file" \
       MOCK_PRIOR_STATUS_STATE="$prior_status" \
       MOCK_PRIOR_STATUS_CREATOR="$prior_creator" \
       MOCK_PRIOR_STATUS_TARGET="$prior_target" \
@@ -629,7 +631,10 @@ large_padding=$(awk 'BEGIN {
 }')
 large_header=$(printf '//go:build darwin && arm64\n%s\npackage debugger\n' \
   "$large_padding")
-large_constraint_blob=$(jq -n --arg content "$large_header" '{"0":$content}')
+large_header_file="$tmpdir/large-header.go"
+printf '%s' "$large_header" > "$large_header_file"
+large_constraint_blob=$(jq -n --rawfile content "$large_header_file" \
+  '{"0":$content}')
 run_case "large pre-package header cannot bypass build constraint detection" \
   action=opened head_repo=contributor/fork \
   path=internal/hub/largeheader.go \
@@ -797,6 +802,7 @@ run_status_persistence_sequence() {
   unrelated_event="$tmpdir/sequence-unrelated-$case_id.json"
   : > "$gh_log"
   : > "$status_log"
+  printf '%s\n' '{}' > "$tmpdir/blobs-sequence-$case_id.json"
 
   jq -n \
     --arg action "$first_action" \
@@ -840,7 +846,7 @@ run_status_persistence_sequence() {
     MOCK_BASE_TREE_SHA="$base_tree_sha" \
     MOCK_HEAD_TREE_SHA="$head_tree_sha" \
     MOCK_HEAD_SHA="$head_sha" \
-    MOCK_BLOB_CONTENTS_JSON='{}' \
+    MOCK_BLOB_CONTENTS_FILE="$tmpdir/blobs-sequence-$case_id.json" \
     MOCK_PRIOR_STATUS_STATE=failure \
     MOCK_PRIOR_STATUS_CREATOR='github-actions[bot]' \
     MOCK_PRIOR_STATUS_TARGET='https://github.com/bingosuite/bingo/actions/runs/122' \
@@ -863,7 +869,7 @@ run_status_persistence_sequence() {
     MOCK_BASE_TREE_SHA="$base_tree_sha" \
     MOCK_HEAD_TREE_SHA="$head_tree_sha" \
     MOCK_HEAD_SHA="$head_sha" \
-    MOCK_BLOB_CONTENTS_JSON='{}' \
+    MOCK_BLOB_CONTENTS_FILE="$tmpdir/blobs-sequence-$case_id.json" \
     MOCK_PRIOR_STATUS_STATE=failure \
     MOCK_PRIOR_STATUS_CREATOR='github-actions[bot]' \
     MOCK_PRIOR_STATUS_TARGET='https://github.com/bingosuite/bingo/actions/runs/122' \
