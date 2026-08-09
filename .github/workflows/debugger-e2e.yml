@@ -87,6 +87,44 @@ jobs:
       - name: E2E concurrency (goroutine/thread snapshot foundation)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=concurrency
 
+  # TEMPORARY PROOF JOB — do not merge. workflow_dispatch only, so PR/push
+  # semantics of every other job are untouched. Drives the `overlap` label: a
+  # sibling thread's software-breakpoint stop delivered by Wait4(-1, WALL) while
+  # the engine is mid-step-over of another thread's breakpoint.
+  overlap-proof-linux-amd64:
+    name: PROOF overlap (sibling BP during step-over, ptrace)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Confirm native target
+        run: test "$(go env GOOS)/$(go env GOARCH)" = "linux/amd64"
+
+      - name: Environment
+        run: |
+          uname -a
+          nproc
+          cat /proc/sys/kernel/yama/ptrace_scope || true
+          go version
+
+      - name: E2E overlap run 1
+        run: go test -tags e2e -race -count=1 -v -timeout 900s ./test/integration -ginkgo.v -ginkgo.label-filter=overlap
+
+      - name: E2E overlap run 2
+        if: always()
+        run: go test -tags e2e -race -count=1 -v -timeout 900s ./test/integration -ginkgo.v -ginkgo.label-filter=overlap
+
+      - name: E2E overlap run 3
+        if: always()
+        run: go test -tags e2e -race -count=1 -v -timeout 900s ./test/integration -ginkgo.v -ginkgo.label-filter=overlap
+
   darwin-arm64:
     name: Darwin arm64 (Mach exceptions)
     runs-on: macos-14
