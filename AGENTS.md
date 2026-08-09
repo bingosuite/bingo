@@ -1570,9 +1570,16 @@ are detected by a `mach_msg` receive loop.
   child-DIE read errors propagate instead of becoming a truncated success.
 - `EvaluateName` resolves a **single variable name only** (no dotted paths /
   indexing / arithmetic): a local or parameter in the subprogram containing the
-  frame PC first, then a package-level global via `globalVar` (matches the exact
-  DWARF name or a package-qualified `pkg.name` suffix, `DW_OP_addr` only). Backs
-  the WebSocket `CmdEvaluate`/`EventEvaluate` and the DAP `evaluate` request.
+  frame PC first. A bare global then prefers the frame package identified by
+  `debug/dwarf.Reader.SeekPC` on the unslid PC and scans direct globals across
+  every CU with that same `DW_AT_name` (Go and assembly can emit separate CUs
+  for one package); if CU lookup or that scoped search fails, it falls back to
+  the whole-image exact/package-suffix scan for cross-package convenience.
+  Qualified names skip package preference. Generic shape code is emitted in the
+  instantiating CU, so its bare globals follow that CU rather than the generic's
+  defining package; use explicit qualification instead of function-name
+  heuristics. Global locations remain `DW_OP_addr` only. Backs the WebSocket
+  `CmdEvaluate`/`EventEvaluate` and the DAP `evaluate` request.
 - **`DW_OP_fbreg` locals resolve against the CFA, not a fixed FP offset** — this
   is why [frame.go](internal/debugger/frame.go) exists. Go compiles every
   function's `DW_AT_frame_base` to `DW_OP_call_frame_cfa`, so a local at

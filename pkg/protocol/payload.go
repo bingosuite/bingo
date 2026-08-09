@@ -240,8 +240,12 @@ type LocalsPayloadCmd struct {
 // EvaluatePayloadCmd asks the debugger to resolve a single variable NAME in a
 // stack frame (FrameIndex 0 is innermost). This is name-only: no dotted paths,
 // indexing, or arithmetic — those belong to a later expression-evaluator PR.
-// A local or parameter of the frame is resolved first; failing that, a
-// package-level global of the same name. Answered with EventEvaluate.
+// A local or parameter is resolved first. A bare global then prefers the
+// frame's DWARF compilation-unit package before falling back to the whole
+// image; a qualified global uses the whole-image lookup directly. Generic shape
+// code is scoped to the instantiating CU, so explicit qualification may be
+// needed to inspect a global from the package that defined the generic.
+// Answered with EventEvaluate.
 type EvaluatePayloadCmd struct {
 	FrameIndex int    `json:"frameIndex"`
 	Name       string `json:"name"`

@@ -475,9 +475,10 @@ func (e *engine) Locals(frameIndex int) ([]protocol.Variable, error) {
 }
 
 // Evaluate resolves a single variable NAME in the given frame (local/parameter
-// first, then a package global) and returns its bounded typed tree. It is
-// non-suspending and non-resuming — like Locals, it only reads a suspended
-// tracee. Expression parsing (dotted paths, indexing, arithmetic) is a later PR.
+// first, then a frame-package global, then a whole-image fallback) and returns
+// its bounded typed tree. It is non-suspending and non-resuming — like Locals,
+// it only reads a suspended tracee. Expression parsing (dotted paths, indexing,
+// arithmetic) is a later PR.
 func (e *engine) Evaluate(frameIndex int, name string) (protocol.Variable, error) {
 	var result protocol.Variable
 	err := e.dispatch(func() error {
