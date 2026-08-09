@@ -45,10 +45,13 @@ jobs:
   proof:
     name: Linux amd64 wait4 isolation proof
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     env:
       BINGO_PROOF_U3_ITERS: ${{ inputs.iterations || '10' }}
       BINGO_PROOF_U3_KILL_WAIT: ${{ inputs.kill_wait_seconds || '20' }}
+      # Last-resort child self-termination budget; must exceed every in-scenario
+      # deadline so a hang is reported as a verdict instead of a parent SIGKILL.
+      BINGO_PROOF_U3_CHILD_BUDGET: "90"
     steps:
       - uses: actions/checkout@v4
 
@@ -79,5 +82,5 @@ jobs:
       - name: Proofs (green == defect reproduced)
         if: always()
         run: |
-          go test -tags proofu3 -count=1 -v -timeout 2400s \
+          go test -tags proofu3 -count=1 -v -timeout 3600s \
             ./test/proofu3 -run 'TestProof_'

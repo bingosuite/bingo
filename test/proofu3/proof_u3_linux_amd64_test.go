@@ -64,14 +64,18 @@ import (
 )
 
 const (
-	envScenario = "BINGO_PROOF_U3_SCENARIO"
-	envLongBin  = "BINGO_PROOF_U3_LONG_BIN"
-	envQuickBin = "BINGO_PROOF_U3_QUICK_BIN"
+	envScenario    = "BINGO_PROOF_U3_SCENARIO"
+	envLongBin     = "BINGO_PROOF_U3_LONG_BIN"
+	envQuickBin    = "BINGO_PROOF_U3_QUICK_BIN"
+	envChildBudget = "BINGO_PROOF_U3_CHILD_BUDGET"
 
 	exitOK     = 0
 	exitSetup  = 1
 	exitWedged = 20
 	exitStolen = 30
+	// exitWatchdog means the scenario blocked past its whole budget in a wait
+	// that nothing in-process can cancel. It is a hang, not a harness timeout.
+	exitWatchdog = 40
 )
 
 // longTargetSrc stays alive far longer than any scenario. Used both as a
@@ -123,6 +127,7 @@ func TestMain(m *testing.M) {
 	if s := os.Getenv(envScenario); s != "" {
 		longBin = os.Getenv(envLongBin)
 		quickBin = os.Getenv(envQuickBin)
+		startChildWatchdog()
 		os.Exit(runScenario(s))
 	}
 
@@ -257,6 +262,8 @@ func codeName(c int) string {
 		return "wedge/deadlock observed"
 	case exitStolen:
 		return "theft observed"
+	case exitWatchdog:
+		return "child watchdog: blocked in an uncancellable wait"
 	default:
 		return "unknown"
 	}
@@ -356,19 +363,57 @@ func TestProof_SuspendedKillWedgedByLivePeerSession(t *testing.T) {
 // forever. This is an inherent race, so it is repeated and reported as a rate.
 func TestProof_PeerWaitLoopStealsProcessExit(t *testing.T) {
 	iters := envInt("BINGO_PROOF_U3_ITERS", 15)
-	stolen := 0
+	stolen, wedged := 0, 0
 	for i := 0; i < iters; i++ {
-		r := runChild(t, "proof-peer-waitloop-steals-exit", 90*time.Second)
-		if r.code == exitSetup {
+		r := runChild(t, "proof-peer-waitloop-steals-exit", 120*time.Second)
+		switch r.code {
+		case exitSetup:
 			t.Fatalf("iteration %d: setup failure", i)
-		}
-		if r.code == exitStolen {
+		case exitStolen:
 			stolen++
+		case exitWedged, exitWatchdog:
+			wedged++
 		}
 	}
-	t.Logf("PROOF cross-session exit theft: %d/%d iterations lost B's EventProcessExited", stolen, iters)
-	if stolen == 0 {
+	t.Logf("PROOF cross-session exit theft: %d/%d iterations lost B's EventProcessExited "+
+		"(+%d iterations hung outright)", stolen, iters, wedged)
+	if stolen+wedged == 0 {
 		t.Errorf("no theft reproduced in %d iterations — this is a wait4 wake race; "+
+			"re-run or raise BINGO_PROOF_U3_ITERS before concluding the path is safe", iters)
+	}
+}
+
+// --- U3-c: cross-session launch-stop theft ----------------------------------
+
+// TestControl_SingleSession_Launch is the control for launch theft: one session,
+// no peer waitLoop, so Launch must always complete.
+func TestControl_SingleSession_Launch(t *testing.T) {
+	iters := envInt("BINGO_PROOF_U3_ITERS", 15)
+	for i := 0; i < iters; i++ {
+		r := runChild(t, "control-single-launch", 60*time.Second)
+		requireCode(t, r, "control-single-launch", exitOK)
+	}
+}
+
+// TestProof_PeerWaitLoopStealsLaunchStop shows the defect can wedge a session
+// before it executes anything: a peer's armed waitLoop consumes the new tracee's
+// post-execve SIGTRAP, so startTracedProcess's pid-specific Wait4 — and with it
+// Launch itself — never returns.
+func TestProof_PeerWaitLoopStealsLaunchStop(t *testing.T) {
+	iters := envInt("BINGO_PROOF_U3_ITERS", 15)
+	wedged := 0
+	for i := 0; i < iters; i++ {
+		r := runChild(t, "proof-peer-waitloop-steals-launch", 120*time.Second)
+		switch r.code {
+		case exitSetup:
+			t.Fatalf("iteration %d: setup failure", i)
+		case exitWedged, exitWatchdog:
+			wedged++
+		}
+	}
+	t.Logf("PROOF cross-session launch-stop theft: %d/%d launches never returned", wedged, iters)
+	if wedged == 0 {
+		t.Errorf("no launch wedge reproduced in %d iterations — this is a wait4 wake race; "+
 			"re-run or raise BINGO_PROOF_U3_ITERS before concluding the path is safe", iters)
 	}
 }
@@ -386,7 +431,7 @@ func TestProof_ReapAfterKillVersusPeerDeath(t *testing.T) {
 		switch r.code {
 		case exitSetup:
 			t.Fatalf("iteration %d: setup failure", i)
-		case exitWedged:
+		case exitWedged, exitWatchdog:
 			wedged++
 		case exitStolen:
 			stolen++
@@ -421,6 +466,10 @@ func runScenario(name string) int {
 		return scenarioPeerWaitLoopStealsExit()
 	case "proof-reapafterkill-vs-peer-death":
 		return scenarioReapAfterKillVsPeerDeath()
+	case "proof-peer-waitloop-steals-launch":
+		return scenarioPeerWaitLoopStealsLaunch()
+	case "control-single-launch":
+		return scenarioSingleLaunch()
 	default:
 		tracef("unknown scenario %q", name)
 		return exitSetup
@@ -454,6 +503,48 @@ func launchSuspended(bin string, args ...string) (debugger.Debugger, int, error)
 		return nil, 0, errors.New("could not identify the launched tracee PID")
 	}
 	return d, pid, nil
+}
+
+// launchResult carries a bounded launch outcome. Bounding matters because a
+// peer session's waitLoop can consume the new tracee's execve SIGTRAP, leaving
+// startTracedProcess's pid-specific Wait4 blocked forever — Launch itself hangs.
+type launchResult struct {
+	dbg debugger.Debugger
+	pid int
+	err error
+}
+
+// launchSuspendedTimed bounds launchSuspended so a stolen execve stop is
+// reported as a verdict rather than hanging the scenario. The launch goroutine
+// is deliberately abandoned on timeout: it is blocked in a kernel wait that
+// nothing in-process can cancel, which is precisely the defect being measured.
+func launchSuspendedTimed(bin string, d time.Duration, args ...string) (launchResult, bool) {
+	ch := make(chan launchResult, 1)
+	go func() {
+		dbg, pid, err := launchSuspended(bin, args...)
+		ch <- launchResult{dbg: dbg, pid: pid, err: err}
+	}()
+	select {
+	case r := <-ch:
+		return r, true
+	case <-time.After(d):
+		return launchResult{}, false
+	}
+}
+
+// startChildWatchdog guarantees the child self-terminates. Every scenario is
+// individually deadline-bounded, but the defect under test can block a call in
+// an uncancellable kernel wait, so this is the last-resort backstop that turns
+// "parent had to SIGKILL me" into a reportable verdict with a goroutine dump.
+func startChildWatchdog() {
+	budget := time.Duration(envInt(envChildBudget, 75)) * time.Second
+	go func() {
+		time.Sleep(budget)
+		tracef("child watchdog fired after %s — the scenario blocked in an "+
+			"uncancellable wait", budget)
+		dumpBlockedGoroutines()
+		os.Exit(exitWatchdog)
+	}()
 }
 
 // childPIDs returns every process whose real parent is this process — i.e. every
@@ -722,6 +813,73 @@ func scenarioWait4Scope() int {
 }
 
 // scenarioSuspendedKillLivePeer — U3-a headline proof.
+// scenarioSingleLaunch is the control for launch theft: with one session in the
+// process there is no peer waitLoop, so Launch must always complete promptly.
+func scenarioSingleLaunch() int {
+	r, ok := launchSuspendedTimed(longBin, 20*time.Second)
+	result("launch_completed", ok)
+	if !ok {
+		tracef("single-session Launch did not complete within 20s")
+		return exitWedged
+	}
+	if r.err != nil {
+		tracef("launch: %v", r.err)
+		return exitSetup
+	}
+	tracef("single-session Launch completed, tracee pid=%d", r.pid)
+	_ = syscall.Kill(r.pid, syscall.SIGKILL)
+	return exitOK
+}
+
+// scenarioPeerWaitLoopStealsLaunch — U3-c: a peer's waitLoop consumes a NEW
+// session's execve stop, so Launch itself never returns.
+//
+// A is launched and continued, so its waitLoop is parked in Wait4(-1, WALL)
+// with nothing of its own to receive. B is then launched: the kernel delivers
+// B's post-execve SIGTRAP to whichever waiter it wakes, and A's process-wide
+// wait is eligible. When A wins, startTracedProcess's pid-specific Wait4 for B
+// blocks forever and B.Launch never returns — a brand new session is wedged by
+// an unrelated one before it ever runs a line of user code.
+func scenarioPeerWaitLoopStealsLaunch() int {
+	a, aPID, err := launchSuspended(longBin)
+	if err != nil {
+		tracef("launch A: %v", err)
+		return exitSetup
+	}
+	aExit := make(chan struct{}, 1)
+	drain(a, aExit)
+	if err := a.Continue(); err != nil {
+		tracef("A.Continue: %v", err)
+		return exitSetup
+	}
+	// Let A's runtime finish spawning threads so its own clone traffic is over
+	// and the only contested event is B's execve stop.
+	time.Sleep(700 * time.Millisecond)
+	tracef("peer A running, tracee pid=%d threads=%d", aPID, threadCount(aPID))
+	result("a_pid", aPID)
+
+	t0 := time.Now()
+	r, ok := launchSuspendedTimed(longBin, killWait())
+	result("launch_completed", ok)
+	if !ok {
+		tracef("B.Launch DID NOT return within %s while peer A's waitLoop is armed",
+			killWait())
+		result("a_saw_a_stop", len(aExit) > 0)
+		dumpBlockedGoroutines()
+		return exitWedged
+	}
+	if r.err != nil {
+		tracef("B.Launch failed: %v", r.err)
+		return exitSetup
+	}
+	tracef("B.Launch completed in %s, tracee pid=%d — no theft this iteration",
+		time.Since(t0), r.pid)
+	result("b_pid", r.pid)
+	_ = syscall.Kill(r.pid, syscall.SIGKILL)
+	_ = syscall.Kill(aPID, syscall.SIGKILL)
+	return exitOK
+}
+
 func scenarioSuspendedKillLivePeer() int {
 	// Peer session B: launched, never resumed. Its tracee is a live child of
 	// this process, parked at its entry stop, with its execve SIGTRAP already
@@ -796,7 +954,15 @@ func scenarioPeerWaitLoopStealsExit() int {
 	result("a_pid", aPID)
 
 	bExit := make(chan struct{}, 1)
-	b, bPID, err := launchSuspended(quickBin, "600")
+	bRes, bOK := launchSuspendedTimed(quickBin, killWait(), "600")
+	if !bOK {
+		// B's execve stop was consumed by A's waitLoop; Launch never returns.
+		tracef("B.Launch wedged by peer A's waitLoop (launch-stop theft)")
+		result("launch_wedged", true)
+		dumpBlockedGoroutines()
+		return exitWedged
+	}
+	b, bPID, err := bRes.dbg, bRes.pid, bRes.err
 	if err != nil {
 		tracef("launch B: %v", err)
 		return exitSetup
@@ -842,11 +1008,22 @@ func scenarioReapAfterKillVsPeerDeath() int {
 	tracef("peer B running, tracee pid=%d, will exit in ~2.5s", bPID)
 	result("b_pid", bPID)
 
-	a, aPID, err := launchSuspended(longBin)
-	if err != nil {
-		tracef("launch A: %v", err)
+	a, aRes := (debugger.Debugger)(nil), launchResult{}
+	{
+		r, ok := launchSuspendedTimed(longBin, killWait())
+		if !ok {
+			tracef("A.Launch wedged by peer B's waitLoop (launch-stop theft)")
+			result("launch_wedged", true)
+			dumpBlockedGoroutines()
+			return exitWedged
+		}
+		aRes = r
+	}
+	if aRes.err != nil {
+		tracef("launch A: %v", aRes.err)
 		return exitSetup
 	}
+	a, aPID := aRes.dbg, aRes.pid
 	tracef("session A launched suspended, tracee pid=%d", aPID)
 	result("a_pid", aPID)
 
