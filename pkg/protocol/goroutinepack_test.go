@@ -1297,3 +1297,49 @@ func withCurrent(gs []protocol.Goroutine, id int) []protocol.Goroutine {
 	}
 	return out
 }
+
+// The bounded-event work is additive and DORMANT: the packers exist but nothing
+// calls them, so the bytes on the wire must be indistinguishable from the
+// release before them. These specs are the merge-safety gate — if any of them
+// fails, this change is no longer safe to land ahead of the producer.
+var _ = Describe("dormant until the producer packs", func() {
+	It("keeps the wire version at 1.2", func() {
+		Expect(protocol.Version).To(Equal("1.2"))
+	})
+
+	It("emits no new keys on an unpacked snapshot", func() {
+		raw, err := json.Marshal(protocol.GoroutineSnapshotPayload{
+			Goroutines: []protocol.Goroutine{sampleGoroutine},
+			Threads:    []protocol.Thread{sampleThread},
+			Current:    1,
+			Created:    []int{7},
+			Exited:     []int{3},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(raw)).NotTo(ContainSubstring("totals"),
+			"an untouched payload must serialise exactly as it did at 1.2")
+	})
+
+	It("emits no new keys on an unpacked goroutine list", func() {
+		raw, err := json.Marshal(protocol.GoroutinesPayload{
+			Goroutines: []protocol.Goroutine{sampleGoroutine},
+		})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(string(raw)).NotTo(ContainSubstring("totals"))
+	})
+
+	It("still decodes a payload written without the new field", func() {
+		// Forward compatibility in the other direction: a 1.2 peer's bytes must
+		// keep decoding into the extended struct with Totals absent.
+		var snap protocol.GoroutineSnapshotPayload
+		Expect(json.Unmarshal([]byte(
+			`{"goroutines":[],"threads":[],"current":1,"created":[7],"exited":[3]}`,
+		), &snap)).To(Succeed())
+		Expect(snap.Totals).To(BeNil())
+		Expect(snap.Current).To(Equal(1))
+
+		var list protocol.GoroutinesPayload
+		Expect(json.Unmarshal([]byte(`{"goroutines":[]}`), &list)).To(Succeed())
+		Expect(list.Totals).To(BeNil())
+	})
+})

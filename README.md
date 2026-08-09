@@ -61,7 +61,7 @@ Frontends can identify and reuse a compatible bingo process through
 {
   "service": "bingo",
   "managementApiVersion": 1,
-  "wireProtocolVersion": "1.3",
+  "wireProtocolVersion": "1.2",
   "instanceId": "4dd4dfdd-7f55-41a5-bd95-c086ce6f3c2a",
   "dap": {
     "enabled": true,
@@ -117,7 +117,7 @@ Build and install the repository's companion extension:
 just vscode-install
 ```
 
-The capability-safe graphical concurrency runtime requires extension version **0.4.0 or
+The capability-safe graphical concurrency runtime requires extension version **0.3.1 or
 newer**. After installing or updating the VSIX, run **Developer: Reload Window**
 once so the current extension host activates the new bundle.
 
@@ -160,7 +160,7 @@ from a terminal with
 `code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"`.
 Compatible manually-started servers remain supported and are reused.
 
-The **Bingo Concurrency** Activity Bar view was introduced in 0.3.0; use 0.4.0
+The **Bingo Concurrency** Activity Bar view was introduced in 0.3.0; use 0.3.1
 or newer so managed-server reuse requires the session-discovery capability.
 Press F5, choose one of the five progressive examples, and the view
 automatically follows the exact DAP-created session over WebSocket—no session

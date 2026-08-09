@@ -78,7 +78,7 @@ try {
   if (
     health.service !== "bingo" ||
     health.managementApiVersion !== 1 ||
-    health.wireProtocolVersion !== "1.3" ||
+    health.wireProtocolVersion !== "1.2" ||
     health.dap?.enabled !== true ||
     health.dap.sessionEventVersion !== 1 ||
     health.dap.address !== `127.0.0.1:${String(dapPort)}` ||

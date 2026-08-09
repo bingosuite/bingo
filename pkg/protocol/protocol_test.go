@@ -809,7 +809,6 @@ var _ = Describe("Version", func() {
 		},
 		Entry("newer", "999.0"),
 		Entry("older", "1.1"),
-		Entry("the previous release", "1.2"),
 		Entry("omitted", ""),
 	)
 	It("is stamped on every event", func() {
@@ -819,8 +818,12 @@ var _ = Describe("Version", func() {
 		decoded, _ := protocol.UnmarshalEvent(wire)
 		Expect(decoded.Version).To(Equal(protocol.Version))
 	})
-	It("is 1.3 — the goroutine event budget and totals reshape", func() {
-		Expect(protocol.Version).To(Equal("1.3"))
+	It("stays 1.2 until the goroutine event contract is enforced end to end", func() {
+		// The bounded-event types and packers below are additive and dormant:
+		// no producer packs yet, so Totals is never populated and the wire is
+		// byte-identical to 1.2. Bumping the version here would tell clients to
+		// enforce a contract the server still violates.
+		Expect(protocol.Version).To(Equal("1.2"))
 	})
 })
 

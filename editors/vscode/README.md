@@ -20,10 +20,8 @@ just vscode-install
 ```
 
 This builds, verifies, and installs `dist/bingo-<platform>.vsix`. The graphical
-concurrency view debuted in 0.3.0 and 0.3.1 added capability-safe managed-server
-reuse; **0.4.0** speaks wire protocol **1.3**, whose bounded goroutine event
-contract is what keeps the concurrency view alive on highly concurrent targets.
-0.4.0 is the minimum supported version. Rerun the command to update, then run
+concurrency view debuted in 0.3.0; **0.3.1** adds capability-safe managed-server
+reuse and is the minimum supported version. Rerun the command to update, then run
 **Developer: Reload Window** once so the active extension host loads the new
 bundle. Package without installing with `just vscode-package`. Uninstall with:
 
@@ -100,34 +98,6 @@ nonce CSP, local bundles only, DOM `textContent` for tracee strings, VS Code
 theme/high-contrast colors, labelled controls, and keyboard selection.
 Treeitems expose hierarchy level, parent context, sibling position, selection,
 and synchronized keyboard focus to assistive technology.
-
-### Large targets and the 1.3 telemetry contract
-
-A highly concurrent target can hold far more goroutines than fit in one
-telemetry frame. Wire protocol 1.3 makes that a bounded, honest contract rather
-than a failure:
-
-- The debugger packs `GoroutineSnapshot` and `Goroutines` to a **2 MiB** budget
-  scoped to those two events only, keeping the current goroutine, its ancestors,
-  and the current thread first so the tree you are looking at stays intact.
-- When anything is left out, the payload carries the server's **original**
-  totals. The view then shows `shown of total` rather than presenting a
-  truncated set as the whole picture, and notes server-side omissions separately
-  from the view's own filter and 500-node render cap.
-- If the debugger's runtime scan itself hit its ceiling, the totals are a lower
-  bound and are marked with a trailing `+`.
-- The WebSocket transport limit sits deliberately **above** the decoder limit, so
-  a frame that breaks the contract is reported as a protocol error instead of
-  looking like a dropped connection. Protocol errors are terminal: the observer
-  stops instead of reconnecting into the identical failure. Ordinary connection
-  drops still reconnect as before, and an oversized event that the contract does
-  not cover — a very large `Locals`/`Frames`/`Evaluate` broadcast, for
-  instance — stays recoverable rather than ending the view. If the view does stop
-  on a protocol error, **Refresh** clears it and reconnects.
-- Events the view does not consume (`Output`, `Locals`, `Frames`, `Goroutines`,
-  `Evaluate`, breakpoint confirmations, `Restarted`) have their envelope
-  validated but their body skipped, so another client's large data request can
-  never take the view down.
 
 ## Configurations
 

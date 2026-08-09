@@ -104,7 +104,7 @@ describe("telemetry observer", () => {
     socket.open();
     assert.equal(socket.sent.length, 1);
     assert.deepEqual(JSON.parse(socket.sent[0]!), {
-      v: "1.3",
+      v: "1.2",
       kind: "GoroutineSnapshot",
       payload: {},
     });

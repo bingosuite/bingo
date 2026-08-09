@@ -330,7 +330,7 @@ class FakeTelemetryServer {
           readonly payload?: unknown;
         };
         assert.deepEqual(command, {
-          v: "1.3",
+          v: "1.2",
           kind: "GoroutineSnapshot",
           payload: {},
         });
@@ -377,7 +377,7 @@ class FakeTelemetryServer {
     this.#sequence += 1;
     socket.send(
       JSON.stringify({
-        v: "1.3",
+        v: "1.2",
         kind,
         seq: this.#sequence,
         payload,
