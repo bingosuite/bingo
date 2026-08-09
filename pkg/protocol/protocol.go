@@ -51,10 +51,19 @@ const (
 	EventPanic         EventKind = "Panic"
 	EventStepped       EventKind = "Stepped"
 
-	// EventPaused reports that a Pause request forcibly halted the running
-	// tracee. Like BreakpointHit it is a suspending event — the process is
-	// stopped and the hub waits for a resuming command — but it is delivered
-	// asynchronously in response to CmdPause rather than a self-stop.
+	// EventPaused reports that the tracee was forcibly halted rather than
+	// reaching a self-stop. Like BreakpointHit it is a suspending event — the
+	// process is stopped and the hub waits for a resuming command — but it is
+	// delivered asynchronously, at whatever instruction execution reached.
+	//
+	// Two things produce it: a client's CmdPause, and an INTERNAL halt where
+	// the engine aborts an in-flight resume it can no longer complete safely
+	// (e.g. a software breakpoint that cannot be reinstalled after the
+	// step-over single-step). The internal case is always preceded by an
+	// EventError carrying the cause; this event exists so the halt is still
+	// reported as a suspend, because EventError is not suspending and on its
+	// own would leave the hub believing the tracee is running — permanently
+	// stranding every later resume. See AGENTS.md → step-over flow.
 	EventPaused EventKind = "Paused"
 )
 
