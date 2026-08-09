@@ -342,12 +342,24 @@ that can never fire.
 
 What a halt promises is **control**, not a pristine tracee: the operator regains
 the ability to inspect, retry, or kill. It does not guarantee the tracee's byte
-state is consistent — a write that failed partway can leave an untracked trap,
-and at the `populateBreakpointStop` site the PC was never rewound — so a
-subsequent resume is best-effort and the error text says the breakpoint may no
-longer be armed or tracked. Reconciling tracee state after a partially-applied
-breakpoint write is a separate problem; do not add disabled-breakpoint
+state is consistent, and at the `populateBreakpointStop` site it specifically is
+not — with no located stop the PC was never rewound off the trap, so on amd64
+RIP sits one byte past the `INT3` and a plain `Continue` would execute from
+mid-instruction. **`Kill`/`Restart` is the safe recovery there, not `Continue`**;
+that site's `EventError` says so explicitly. Elsewhere a failed or partially
+applied breakpoint write can leave an untracked trap behind. Reconciling tracee
+state after such a write is a separate problem — do not add disabled-breakpoint
 protocol/state here.
+
+Note also that this rule covers the *reporting* of halts, not every internal
+resume: five `handleStop` paths still ignore `ContinueProcess`'s error (the
+spurious-trap advance, `bpResumeContinue`, the successful `StepOut`
+continuation, the leftover-pause-signal suppression, and the ordinary-signal
+auto-resume). If one of those ever fails, the engine records `stateRunning` for
+a tracee that never resumed and no event is emitted at all — the same class of
+liveness loss from the other direction. None has a confirmed backend
+reachability, so none is fixed or filed yet; **do not treat this class as
+globally closed.**
 
 The sites are `populateBreakpointStop` failure (`StopBreakpoint`),
 `populateStopPC` failure and `bps.reinstall` failure (`StopSingleStep`), the
