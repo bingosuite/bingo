@@ -244,3 +244,34 @@ jobs:
           echo "SKIPPED: task_for_pid is blocked on GitHub-hosted macOS runners (Apple Sonoma restriction)."
           echo "The darwin backend + E2E binary compiled and codesigned successfully above."
           echo "Run the full-stack darwin E2E locally on real hardware: just e2e-darwin"
+
+  minrepro-198:
+    name: MINREPRO 198 (linux amd64 ptrace)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+      - name: Environment
+        run: uname -a; nproc; cat /proc/sys/kernel/yama/ptrace_scope || true
+      - name: minrepro attempt 1 (-race)
+        if: always()
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.v -ginkgo.label-filter=overlapmin
+      - name: minrepro attempt 2 (-race)
+        if: always()
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.v -ginkgo.label-filter=overlapmin
+      - name: minrepro attempt 3 (-race)
+        if: always()
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.v -ginkgo.label-filter=overlapmin
+      - name: minrepro attempt 4 (-race)
+        if: always()
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.v -ginkgo.label-filter=overlapmin
+      - name: minrepro attempt 5 (no -race)
+        if: always()
+        run: go test -tags e2e -count=1 -v -timeout 300s ./test/integration -ginkgo.v -ginkgo.label-filter=overlapmin
+      - name: minrepro attempt 6 (no -race)
+        if: always()
+        run: go test -tags e2e -count=1 -v -timeout 300s ./test/integration -ginkgo.v -ginkgo.label-filter=overlapmin
