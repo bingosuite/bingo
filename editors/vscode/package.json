@@ -2,7 +2,7 @@
   "name": "bingo",
   "displayName": "bingo Debugger",
   "description": "Debug Go concurrency with bingo's DAP adapter and live goroutine visualization.",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "publisher": "bingosuite",
   "license": "MIT",
   "private": true,
