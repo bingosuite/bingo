@@ -468,8 +468,16 @@ are detected by a `mach_msg` receive loop.
   the true `ExitCode`, or `StopKilled` on signal death. Returning a hardcoded 0
   here dropped every tracee's exit code (#94).
 - ptrace stops are per-thread. The backend records the last stopped TID and
-  targets `ContinueProcess` / memory writes at that TID, not
-  blindly at the process PID. Non-main thread exits are absorbed inside `Wait`.
+  targets `ContinueProcess` / memory writes at that TID, not blindly at the
+  process PID. `lastStopTID` is `atomic.Int64`: `Wait` records stops from the
+  one-shot `waitLoop` goroutine, while running engine commands can concurrently
+  read it through `traceTID` (`Kill` → breakpoint cleanup, or WebSocket
+  Set/ClearBreakpoint). The atomic is only a defined TID snapshot, not a
+  stop-state guarantee; the ptrace call still returns its normal error if that
+  TID is not stopped. Ordinary suspended operations remain ordered by the
+  `waitLoop` → `stopCh` → engine-loop handoff. Regression coverage is
+  `TestLinuxBackend*StopTID*`, run under `-race` in the unit-test workflow.
+  Non-main thread exits are absorbed inside `Wait`.
 - `ReadMemory` uses **`process_vm_readv(2)`** as the fast path, falling back to
   `PTRACE_PEEKDATA` only when it is unavailable or short-reads. `process_vm_readv`
   bulk-copies the whole buffer in one syscall and — unlike ptrace ops — is NOT

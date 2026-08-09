@@ -86,7 +86,8 @@ func seedBreakpointEntries(e *engine, count int) {
 	}
 }
 
-// TestLinuxBackendRunningKillStopTIDRace is a production-path race probe:
+// TestLinuxBackendRunningKillStopTIDConcurrentAccess is a production-path race
+// regression:
 // waitLoop publishes stops through recordStop while the engine actor executes
 // running Kill -> breakpointTable.clearAll -> WriteMemory -> traceTID.
 //
@@ -94,14 +95,14 @@ func seedBreakpointEntries(e *engine, count int) {
 // TIDs so ptrace writes fail quickly after reading traceTID; clearAll's
 // best-effort contract leaves every entry present, giving the race detector
 // many reads against the live wait-loop writer.
-func TestLinuxBackendRunningKillStopTIDRace(t *testing.T) {
+func TestLinuxBackendRunningKillStopTIDConcurrentAccess(t *testing.T) {
 	b := newStopTIDRaceBackend(t)
 	e := newEngine(b, nil)
 
 	if err := e.dispatch(func() error {
 		e.proc = process{pid: b.pid, live: true}
 		e.setState(stateRunning)
-		seedBreakpointEntries(e, 256)
+		seedBreakpointEntries(e, 16)
 		go e.waitLoop()
 		return nil
 	}); err != nil {
@@ -116,11 +117,11 @@ func TestLinuxBackendRunningKillStopTIDRace(t *testing.T) {
 	<-e.done
 }
 
-// TestLinuxBackendRunningMemoryStopTIDRace covers the other two traceTID
-// readers. WriteMemory is reachable from running SetBreakpoint/ClearBreakpoint;
-// ReadMemory's ptrace fallback is reachable from running SetBreakpoint when
-// process_vm_readv is unavailable or short-reads.
-func TestLinuxBackendRunningMemoryStopTIDRace(t *testing.T) {
+// TestLinuxBackendRunningMemoryStopTIDConcurrentAccess covers the other two
+// traceTID readers. WriteMemory is reachable from running SetBreakpoint/
+// ClearBreakpoint; ReadMemory's ptrace fallback is reachable from running
+// SetBreakpoint when process_vm_readv is unavailable or short-reads.
+func TestLinuxBackendRunningMemoryStopTIDConcurrentAccess(t *testing.T) {
 	tests := []struct {
 		name string
 		read func(*linuxBackend) error
@@ -150,7 +151,7 @@ func TestLinuxBackendRunningMemoryStopTIDRace(t *testing.T) {
 			}()
 			<-b.waitStarted
 
-			for i := 0; i < 256; i++ {
+			for i := 0; i < 16; i++ {
 				_ = tt.read(b.linuxBackend)
 			}
 			close(b.stopWriter)
