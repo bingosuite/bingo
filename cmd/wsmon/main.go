@@ -354,20 +354,24 @@ func (m *monitor) render() {
 // ways the picture can be incomplete are reported separately: elements the
 // packer left off the wire, and a runtime scan that stopped early (which makes
 // the totals themselves a floor, not a count).
+func bound(clipped bool) string {
+	if clipped {
+		return "+"
+	}
+	return ""
+}
+
 func countsLine(snap protocol.GoroutineSnapshotPayload) string {
 	shownG, shownT := len(snap.Goroutines), len(snap.Threads)
 	if snap.Totals == nil {
 		return fmt.Sprintf("counts: goroutines=%d threads=%d (complete)", shownG, shownT)
 	}
-	// Clipped describes the GOROUTINE scan ceiling, so only that total is marked
-	// as a floor; claiming the thread total is also uncertain would overstate
-	// what the debugger actually reported.
-	bound := ""
-	if snap.Totals.Clipped {
-		bound = "+"
-	}
-	line := fmt.Sprintf("counts: goroutines=%d/%d%s threads=%d/%d",
-		shownG, snap.Totals.Goroutines, bound, shownT, snap.Totals.Threads)
+	// The two scans have independent ceilings, so each count carries its own
+	// lower-bound marker. Marking both from one flag would call an exact count
+	// approximate (or worse, an approximate one exact).
+	line := fmt.Sprintf("counts: goroutines=%d/%d%s threads=%d/%d%s",
+		shownG, snap.Totals.Goroutines, bound(snap.Totals.GoroutinesClipped),
+		shownT, snap.Totals.Threads, bound(snap.Totals.ThreadsClipped))
 
 	var notes []string
 	if omitted := snap.Totals.Goroutines - shownG; omitted > 0 {
@@ -376,8 +380,11 @@ func countsLine(snap protocol.GoroutineSnapshotPayload) string {
 	if omitted := snap.Totals.Threads - shownT; omitted > 0 {
 		notes = append(notes, fmt.Sprintf("%d threads omitted from this event", omitted))
 	}
-	if snap.Totals.Clipped {
-		notes = append(notes, "debugger scan hit its ceiling, so totals are a lower bound")
+	if snap.Totals.GoroutinesClipped {
+		notes = append(notes, "goroutine scan hit its ceiling, so that total is a lower bound")
+	}
+	if snap.Totals.ThreadsClipped {
+		notes = append(notes, "thread scan hit its ceiling, so that total is a lower bound")
 	}
 	if len(notes) > 0 {
 		line += "\n  ! " + strings.Join(notes, "\n  ! ")

@@ -2128,7 +2128,7 @@ func TestThreadsFromPackedGoroutines(t *testing.T) {
 	if len(packed.Goroutines) >= len(raw) {
 		t.Fatalf("packed %d of %d; the input must actually be too big", len(packed.Goroutines), len(raw))
 	}
-	if packed.Totals == nil || packed.Totals.Goroutines != len(raw) || !packed.Totals.Clipped {
+	if packed.Totals == nil || packed.Totals.Goroutines != len(raw) || !packed.Totals.GoroutinesClipped {
 		t.Fatalf("totals = %+v; want the original count and the clipped flag", packed.Totals)
 	}
 

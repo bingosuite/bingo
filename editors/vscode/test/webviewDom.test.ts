@@ -251,3 +251,82 @@ describe("concurrency webview DOM", () => {
     assert.match(document.body.textContent, /<img src=x/);
   });
 });
+
+describe("server-omission rendering", () => {
+  // Goes through the real render path, not the formatter, so a card that reads
+  // the wrong flag is caught. The debugger's goroutine and thread scans have
+  // independent ceilings, so each count must be marked a lower bound only when
+  // its OWN scan clipped.
+  function cards(
+    goroutinesClipped: boolean,
+    threadsClipped: boolean,
+  ): { readonly goroutines: string; readonly threads: string; readonly notes: string } {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    mountConcurrencyView(document, { postMessage() {} })(
+      model({
+        snapshot: {
+          ...snapshot(
+            [goroutine(1, 0, { current: true, threadId: 10 })],
+            [thread(10, 1)],
+          ),
+          totals: {
+            goroutines: 8192,
+            threads: 2048,
+            goroutinesClipped,
+            threadsClipped,
+          },
+        },
+      }),
+    );
+    const values = [...document.querySelectorAll(".card")].map((card) => ({
+      label: card.querySelector("span")?.textContent ?? "",
+      value: card.querySelector("strong")?.textContent ?? "",
+    }));
+    return {
+      goroutines: values.find((v) => v.label === "Goroutines")?.value ?? "",
+      threads: values.find((v) => v.label === "Threads")?.value ?? "",
+      notes: [...document.querySelectorAll(".server-omitted")]
+        .map((n) => n.textContent ?? "")
+        .join(" | "),
+    };
+  }
+
+  it("marks neither count when neither scan clipped", () => {
+    const rendered = cards(false, false);
+    assert.equal(rendered.goroutines.endsWith("+"), false);
+    assert.equal(rendered.threads.endsWith("+"), false);
+    assert.doesNotMatch(rendered.notes, /lower bound/u);
+  });
+
+  it("marks only goroutines when only the goroutine scan clipped", () => {
+    const rendered = cards(true, false);
+    assert.equal(rendered.goroutines.endsWith("+"), true);
+    assert.equal(
+      rendered.threads.endsWith("+"),
+      false,
+      "an exact thread count must not be shown as approximate",
+    );
+    assert.match(rendered.notes, /8192 goroutines, so that total is a lower bound/u);
+    assert.doesNotMatch(rendered.notes, /threads, so that total is a lower bound/u);
+  });
+
+  it("marks only threads when only the thread scan clipped", () => {
+    const rendered = cards(false, true);
+    assert.equal(
+      rendered.goroutines.endsWith("+"),
+      false,
+      "an exact goroutine count must not be shown as approximate",
+    );
+    assert.equal(rendered.threads.endsWith("+"), true);
+    assert.match(rendered.notes, /2048 threads, so that total is a lower bound/u);
+    assert.doesNotMatch(rendered.notes, /goroutines, so that total is a lower bound/u);
+  });
+
+  it("marks both counts when both scans clipped", () => {
+    const rendered = cards(true, true);
+    assert.equal(rendered.goroutines.endsWith("+"), true);
+    assert.equal(rendered.threads.endsWith("+"), true);
+    assert.match(rendered.notes, /8192 goroutines, so that total is a lower bound/u);
+    assert.match(rendered.notes, /2048 threads, so that total is a lower bound/u);
+  });
+});
