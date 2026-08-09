@@ -419,6 +419,48 @@ func (h *Hub) handleDebuggerClosed() {
 	h.log.Info("debugger closed — session idle, ready for re-launch")
 }
 
+func (h *Hub) prepareCommandDebugger(cmd protocol.Command) (dbg debugger.Debugger, callerOwned, proceed bool) {
+	dbg = h.currentDebugger()
+	if h.sessionID == "" || (cmd.Kind != protocol.CmdLaunch && cmd.Kind != protocol.CmdAttach) {
+		return dbg, false, true
+	}
+	if dbg != nil {
+		h.broadcastError(cmd.Kind, fmt.Errorf("debugger already active (state: %s)", h.State()))
+		return nil, false, false
+	}
+	if h.newDebugger == nil {
+		h.broadcastError(cmd.Kind, fmt.Errorf("no debugger factory configured"))
+		return nil, false, false
+	}
+
+	dbg = h.newDebugger()
+	if h.isClosing() {
+		discardDebugger(dbg)
+		return nil, false, false
+	}
+	// Keep the candidate caller-owned through startup. Installing it first
+	// would let shutdown Kill an idle debugger before Launch/Attach creates
+	// a process, leaving that later process outside either owner's teardown.
+	return dbg, true, true
+}
+
+func (h *Hub) transferStartedDebugger(dbg debugger.Debugger, cmd protocol.Command, startErr error) bool {
+	if startErr != nil {
+		discardDebugger(dbg)
+		if h.isClosing() {
+			return false
+		}
+		h.log.Warn("command failed", "kind", cmd.Kind, "err", startErr)
+		h.broadcastError(cmd.Kind, startErr)
+		return false
+	}
+	if !h.installDebugger(dbg) {
+		discardDebugger(dbg)
+		return false
+	}
+	return true
+}
+
 func (h *Hub) executeCommand(cmd protocol.Command) {
 	// Restart doesn't fit the generic dispatch(dbg, cmd) shape below: it
 	// tears down h.dbg and replaces it with a brand new instance, which only
@@ -428,26 +470,9 @@ func (h *Hub) executeCommand(cmd protocol.Command) {
 		return
 	}
 
-	dbg := h.currentDebugger()
-	candidate := false
-	if h.sessionID != "" && (cmd.Kind == protocol.CmdLaunch || cmd.Kind == protocol.CmdAttach) {
-		if dbg != nil {
-			h.broadcastError(cmd.Kind, fmt.Errorf("debugger already active (state: %s)", h.State()))
-			return
-		}
-		if h.newDebugger == nil {
-			h.broadcastError(cmd.Kind, fmt.Errorf("no debugger factory configured"))
-			return
-		}
-		dbg = h.newDebugger()
-		if h.isClosing() {
-			discardDebugger(dbg)
-			return
-		}
-		// Keep the candidate caller-owned through startup. Installing it first
-		// would let shutdown Kill an idle debugger before Launch/Attach creates
-		// a process, leaving that later process outside either owner's teardown.
-		candidate = true
+	dbg, callerOwned, proceed := h.prepareCommandDebugger(cmd)
+	if !proceed {
+		return
 	}
 
 	if dbg == nil {
@@ -463,20 +488,8 @@ func (h *Hub) executeCommand(cmd protocol.Command) {
 	}
 
 	result, err := dispatch(dbg, cmd)
-	if candidate {
-		if err != nil {
-			discardDebugger(dbg)
-			if h.isClosing() {
-				return
-			}
-			h.log.Warn("command failed", "kind", cmd.Kind, "err", err)
-			h.broadcastError(cmd.Kind, err)
-			return
-		}
-		if !h.installDebugger(dbg) {
-			discardDebugger(dbg)
-			return
-		}
+	if callerOwned && !h.transferStartedDebugger(dbg, cmd, err) {
+		return
 	}
 	if h.isClosing() {
 		return
