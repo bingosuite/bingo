@@ -363,6 +363,16 @@ function decodeSnapshot(payload: Record<string, unknown>): Snapshot {
   const threads = rawThreads.map((value, index) =>
     decodeThread(value, `threads[${String(index)}]`),
   );
+  const current = optionalInteger(payload.current, "current");
+  if (current !== 0 && !ids.has(current)) {
+    // The current goroutine is a required anchor, so a non-degraded snapshot
+    // always carries it; a degraded one reports current 0. A current that names
+    // a goroutine we did not receive is a dangling reference — the view would
+    // either select something that does not exist or silently substitute.
+    throw new TelemetryProtocolError(
+      `current goroutine ${String(current)} is not among the delivered goroutines`,
+    );
+  }
   if (totals !== undefined) {
     // Totals are the server's ORIGINAL counts, so they can never be below what
     // actually arrived. A total that is smaller is not a truncation report, it
@@ -374,7 +384,7 @@ function decodeSnapshot(payload: Record<string, unknown>): Snapshot {
   return {
     goroutines,
     threads,
-    current: optionalInteger(payload.current, "current"),
+    current,
     created: decodeIDs(payload.created, "created"),
     exited: decodeIDs(payload.exited, "exited"),
     ...(totals === undefined ? {} : { totals }),

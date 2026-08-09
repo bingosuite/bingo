@@ -191,6 +191,9 @@ What a consumer sees:
   whole — never truncated — because a consumer that enforces the same limit would
   otherwise be forced to reject the event. Count UTF-16 code units, not bytes or
   runes: an astral character costs two.
+- **`current` is either zero or one of the delivered goroutines.** A degraded
+  event reports zero rather than pointing at a goroutine it did not send, so a
+  consumer never has to resolve a dangling selection.
 - **Deltas are not packed elements.** Because they are never trimmed,
   `created`/`exited` can legitimately exceed the element caps. Their bound is
   `MaxLifecycleDeltaIDs` (8192), which restates the debugger's own goroutine scan
