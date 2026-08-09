@@ -1570,16 +1570,29 @@ are detected by a `mach_msg` receive loop.
   child-DIE read errors propagate instead of becoming a truncated success.
 - `EvaluateName` resolves a **single variable name only** (no dotted paths /
   indexing / arithmetic): a local or parameter in the subprogram containing the
-  frame PC first. A bare global then prefers the frame package identified by
-  `debug/dwarf.Reader.SeekPC` on the unslid PC and scans direct globals across
-  every CU with that same `DW_AT_name` (Go and assembly can emit separate CUs
-  for one package); if CU lookup or that scoped search fails, it falls back to
-  the whole-image exact/package-suffix scan for cross-package convenience.
-  Qualified names skip package preference. Generic shape code is emitted in the
-  instantiating CU, so its bare globals follow that CU rather than the generic's
-  defining package; use explicit qualification instead of function-name
-  heuristics. Global locations remain `DW_OP_addr` only. Backs the WebSocket
-  `CmdEvaluate`/`EventEvaluate` and the DAP `evaluate` request.
+  frame PC first. A bare global then prefers the **logical code package at that
+  PC**, not merely the physical CU returned by `debug/dwarf.Reader.SeekPC`:
+  inside inlined code it uses the deepest containing
+  `DW_TAG_inlined_subroutine`'s `DW_AT_abstract_origin`; otherwise it uses the
+  same qualified subprogram name reported as `Frame.Function`. The function's
+  package is matched against exact known CU `DW_AT_name` identities (never split
+  heuristically), then direct globals are scanned across every CU with that
+  package name because Go and assembly can emit separate CUs. This also handles
+  generic shape code emitted in an instantiating package's physical CU while
+  retaining the defining package in its qualified subprogram name.
+  `SeekPC` always receives the unslid PC. If the inline origin is missing,
+  malformed, or ambiguous, the logical function cannot be matched to a known
+  package, or the scoped global is absent, lookup conservatively falls back to
+  the whole-image exact/package-suffix scan for cross-package convenience
+  rather than confidently choosing the physical CU. Qualified names skip
+  package preference. Global locations remain `DW_OP_addr` only.
+  Bingo does not synthesize inline stack frames: at an inline-body PC,
+  `Frame.Function` can still name the physical caller while `Frame.Location`
+  points into the inlined source; bare globals follow that deepest inline
+  lexical scope. Locals remain those of the physical subprogram because inline
+  frames/locals are not synthesized, so local and bare-global scope can differ
+  at such a PC. Backs the WebSocket `CmdEvaluate`/`EventEvaluate` and the DAP
+  `evaluate` request.
 - **`DW_OP_fbreg` locals resolve against the CFA, not a fixed FP offset** — this
   is why [frame.go](internal/debugger/frame.go) exists. Go compiles every
   function's `DW_AT_frame_base` to `DW_OP_call_frame_cfa`, so a local at

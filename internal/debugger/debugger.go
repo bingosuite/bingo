@@ -71,9 +71,9 @@ type Debugger interface {
 	Locals(frameIndex int) ([]protocol.Variable, error)
 
 	// Evaluate resolves a single variable NAME in the given frame (local or
-	// parameter, then a frame-package global, then a whole-image fallback) to
-	// its bounded typed tree. Name-only: no dotted paths, indexing, or
-	// arithmetic. Non-suspending, non-resuming.
+	// parameter, then a global from the logical code package at the frame PC,
+	// then a whole-image fallback) to its bounded typed tree. Name-only: no
+	// dotted paths, indexing, or arithmetic. Non-suspending, non-resuming.
 	Evaluate(frameIndex int, name string) (protocol.Variable, error)
 
 	StackFrames() ([]protocol.Frame, error)

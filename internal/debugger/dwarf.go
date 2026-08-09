@@ -42,6 +42,12 @@ type dwarfReader struct {
 	funcIndexOnce sync.Once
 	funcIndex     []funcRange
 
+	// packageNames is the de-duplicated set of DW_AT_name values from compile
+	// units, longest first. Matching a qualified function name against known CU
+	// identities avoids guessing where an import path ends.
+	packageNamesOnce sync.Once
+	packageNames     []string
+
 	// cacheMu guards the lazily-populated runtime-introspection caches below.
 	// Struct layouts and variable addresses never change for a loaded image, so
 	// each is resolved from DWARF at most once. Inspection already runs on the
@@ -430,9 +436,9 @@ func (r *dwarfReader) LocalsForFrame(b Backend, pc, frameBase uint64) ([]protoco
 // EvaluateName resolves a single variable name — no dotted paths, indexing, or
 // arithmetic (those belong to the later expression-evaluator PR). It first looks
 // for a local or parameter in the subprogram containing pc. A bare global then
-// prefers the frame's package before falling back to the whole image; qualified
-// globals use the whole-image lookup directly. The result is the same bounded
-// typed tree LocalsForFrame produces.
+// prefers the logical code package at pc before falling back to the whole image;
+// qualified globals use the whole-image lookup directly. The result is the same
+// bounded typed tree LocalsForFrame produces.
 func (r *dwarfReader) EvaluateName(b Backend, pc, frameBase uint64, name string) (protocol.Variable, error) {
 	entries, err := r.subprogramVars(pc)
 	if err != nil {
@@ -676,8 +682,9 @@ func (r *dwarfReader) varAddress(entry *dwarf.Entry, frameBase uint64) (uint64, 
 }
 
 // globalVar resolves a package-level variable to its address and type. Bare
-// names prefer globals from the frame's package; explicit qualified names and
-// degraded CU lookups retain the whole-binary exact-or-suffix behavior.
+// names prefer globals from the logical code package at pc; explicit qualified
+// names and degraded scope lookups retain the whole-binary exact-or-suffix
+// behavior.
 func (r *dwarfReader) globalVar(pc uint64, name string) (uint64, dwarf.Type, bool) {
 	if !strings.Contains(name, ".") {
 		if packageName, ok := r.packageForPC(pc); ok {
@@ -689,17 +696,176 @@ func (r *dwarfReader) globalVar(pc uint64, name string) (uint64, dwarf.Type, boo
 	return r.globalVarAnywhere(name)
 }
 
-// packageForPC uses DWARF's range-aware CU lookup rather than inferring package
-// ownership from a function name. Any lookup failure deliberately degrades to
-// the legacy whole-binary global search.
+// packageForPC identifies the package whose code is executing at pc. The
+// physical CU alone is insufficient: an inline body keeps its abstract
+// origin's lexical package, and generic shape functions can be emitted in the
+// instantiating package's CU. Any ambiguous or malformed scope degrades to the
+// legacy whole-binary global search.
 func (r *dwarfReader) packageForPC(pc uint64) (string, bool) {
 	dwarfPC := uint64(int64(pc) - r.slide)
-	cu, err := r.data.Reader().SeekPC(dwarfPC)
-	if err != nil || cu == nil {
+	rd := r.data.Reader()
+	if _, err := rd.SeekPC(dwarfPC); err != nil {
 		return "", false
 	}
-	name, ok := cu.Val(dwarf.AttrName).(string)
-	return name, ok && name != ""
+
+	function, hasInline, ok := r.inlinedFunctionAt(rd, dwarfPC)
+	if !ok {
+		return "", false
+	}
+	if !hasInline {
+		function = r.functionAt(pc)
+	}
+	if function == "" {
+		return "", false
+	}
+	return r.packageForFunction(function)
+}
+
+// inlinedFunctionAt returns the deepest inline abstract-origin function that
+// contains dwarfPC. hasInline distinguishes an ordinary physical frame from an
+// inline scope whose origin could not be resolved safely.
+func (r *dwarfReader) inlinedFunctionAt(rd *dwarf.Reader, dwarfPC uint64) (name string, hasInline, ok bool) {
+	for {
+		entry, err := rd.Next()
+		if err != nil || entry == nil {
+			return "", false, false
+		}
+		if entry.Tag == 0 {
+			return "", false, true
+		}
+		if entry.Tag != dwarf.TagSubprogram {
+			if entry.Children {
+				rd.SkipChildren()
+			}
+			continue
+		}
+		ranges, err := r.data.Ranges(entry)
+		if err != nil {
+			return "", false, false
+		}
+		if !rangesContainPC(ranges, dwarfPC) {
+			rd.SkipChildren()
+			continue
+		}
+		if !entry.Children {
+			return "", false, true
+		}
+		return r.inlinedFunctionInSubprogram(rd, dwarfPC)
+	}
+}
+
+func (r *dwarfReader) inlinedFunctionInSubprogram(rd *dwarf.Reader, dwarfPC uint64) (name string, hasInline, ok bool) {
+	depth := 0
+	bestDepth := -1
+	for {
+		entry, err := rd.Next()
+		if err != nil || entry == nil {
+			return "", hasInline, false
+		}
+		if entry.Tag == 0 {
+			if depth == 0 {
+				break
+			}
+			depth--
+			continue
+		}
+
+		entryDepth := depth
+		if entry.Tag == dwarf.TagInlinedSubroutine {
+			ranges, err := r.data.Ranges(entry)
+			if err != nil {
+				return "", true, false
+			}
+			if rangesContainPC(ranges, dwarfPC) {
+				hasInline = true
+				originName, resolved := r.abstractOriginName(entry)
+				switch {
+				case entryDepth > bestDepth:
+					bestDepth = entryDepth
+					name = originName
+					ok = resolved
+				case entryDepth == bestDepth && (!resolved || !ok || originName != name):
+					ok = false
+				}
+			}
+		}
+		if entry.Children {
+			depth++
+		}
+	}
+	if !hasInline {
+		return "", false, true
+	}
+	return name, true, ok && name != ""
+}
+
+func rangesContainPC(ranges [][2]uint64, pc uint64) bool {
+	for _, pcs := range ranges {
+		if pcs[0] <= pc && pc < pcs[1] {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *dwarfReader) abstractOriginName(entry *dwarf.Entry) (string, bool) {
+	offset, ok := entry.Val(dwarf.AttrAbstractOrigin).(dwarf.Offset)
+	for range 8 {
+		if !ok {
+			return "", false
+		}
+		rd := r.data.Reader()
+		rd.Seek(offset)
+		origin, err := rd.Next()
+		if err != nil || origin == nil {
+			return "", false
+		}
+		if name, _ := origin.Val(dwarf.AttrName).(string); name != "" {
+			return name, true
+		}
+		offset, ok = origin.Val(dwarf.AttrAbstractOrigin).(dwarf.Offset)
+		if !ok {
+			offset, ok = origin.Val(dwarf.AttrSpecification).(dwarf.Offset)
+		}
+	}
+	return "", false
+}
+
+func (r *dwarfReader) packageForFunction(function string) (string, bool) {
+	r.packageNamesOnce.Do(r.buildPackageNames)
+	for _, packageName := range r.packageNames {
+		if strings.HasPrefix(function, packageName+".") {
+			return packageName, true
+		}
+	}
+	return "", false
+}
+
+func (r *dwarfReader) buildPackageNames() {
+	seen := make(map[string]struct{})
+	rd := r.data.Reader()
+	for {
+		entry, err := rd.Next()
+		if err != nil || entry == nil {
+			break
+		}
+		if entry.Tag != dwarf.TagCompileUnit {
+			continue
+		}
+		if name, _ := entry.Val(dwarf.AttrName).(string); name != "" {
+			if _, ok := seen[name]; !ok {
+				seen[name] = struct{}{}
+				r.packageNames = append(r.packageNames, name)
+			}
+		}
+		rd.SkipChildren()
+	}
+	sort.Slice(r.packageNames, func(i, j int) bool {
+		if len(r.packageNames[i]) != len(r.packageNames[j]) {
+			return len(r.packageNames[i]) > len(r.packageNames[j])
+		}
+		return r.packageNames[i] < r.packageNames[j]
+	})
 }
 
 // globalVarInPackage scans every CU with the same package identity. Go assembly
