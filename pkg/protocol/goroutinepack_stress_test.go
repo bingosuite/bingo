@@ -168,80 +168,173 @@ func TestPackNeverExceedsCapAcrossTheBoundary(t *testing.T) {
 	}
 }
 
-// TestPackTwoPassInvariantsUnderRandomInput mixes deep ancestor chains, threads,
-// lifecycle deltas, scan clipping, and near-cap element sizes. It pins the three
-// invariants that cannot be verified by inspection: the result never exceeds the
-// cap, the reported size is the real one, Totals is present exactly when the
-// result is incomplete, and every anchor survives a non-degraded pack.
+// packStressCase is one randomized input plus the facts an assertion needs to
+// judge the result. Keeping generation, packing and checking in separate units
+// is what keeps each readable — the invariants are subtle enough that burying
+// them inside a generator loop hides which one actually failed.
+type packStressCase struct {
+	round   int
+	input   protocol.GoroutineSnapshotPayload
+	current int
+	clipped bool
+}
+
+// randomPackStressCase mixes the shapes that interact badly: deep ancestor
+// chains, threads, large lifecycle deltas, scan clipping, and element sizes that
+// straddle the budget.
+func randomPackStressCase(rng *rand.Rand, round int) packStressCase {
+	n := 1 + rng.Intn(60)
+	// Half the rounds stay comfortably inside every limit. Without them the
+	// generator would omit something almost every time — a 70 KB wait reason
+	// exceeds the per-string cap on its own — and "complete but clipped", the
+	// case where the clipped flag ALONE must force Totals onto the wire, would
+	// never be exercised.
+	roomy := rng.Intn(2) == 0
+	gs := make([]protocol.Goroutine, 0, n)
+	for i := 1; i <= n; i++ {
+		reason := rng.Intn(70000)
+		if roomy {
+			reason = rng.Intn(80)
+		}
+		g := protocol.Goroutine{
+			ID: i, Status: "waiting",
+			WaitReason: strings.Repeat("w", reason),
+		}
+		if i > 1 && rng.Intn(3) > 0 {
+			g.ParentID = i - 1 // deep chain
+		}
+		gs = append(gs, g)
+	}
+
+	ts := make([]protocol.Thread, 0, 8)
+	for i := 0; i < rng.Intn(8); i++ {
+		ts = append(ts, protocol.Thread{ID: i, MID: rng.Intn(50), Current: i == 0})
+	}
+
+	deltas := rng.Intn(200)
+	if roomy {
+		deltas = rng.Intn(5)
+	}
+	created := make([]int, deltas)
+	for i := range created {
+		created[i] = math.MaxInt64 - i
+	}
+
+	current := 1 + rng.Intn(n)
+	return packStressCase{
+		round: round,
+		input: protocol.GoroutineSnapshotPayload{
+			Goroutines: gs, Threads: ts, Current: current, Created: created,
+		},
+		current: current,
+		clipped: rng.Intn(2) == 0,
+	}
+}
+
+// assertSizeIsReportedAndBounded pins the contract itself: the payload fits the
+// budget unless the packer explicitly says it could not, and the reported size is
+// the real one rather than an estimate.
+func assertSizeIsReportedAndBounded(
+	t *testing.T,
+	c packStressCase,
+	out protocol.GoroutineSnapshotPayload,
+	rep protocol.GoroutinePackReport,
+) {
+	t.Helper()
+	actual := eventBytesPlain(t, protocol.EventGoroutineSnapshot, out)
+	if !rep.Oversized && actual > protocol.MaxGoroutineEventBytes {
+		t.Fatalf("round %d: %d bytes over cap (degraded=%v)", c.round, actual, rep.Degraded)
+	}
+	if rep.Bytes != actual {
+		t.Fatalf("round %d: report %d actual %d", c.round, rep.Bytes, actual)
+	}
+}
+
+// assertTotalsPresence pins the honesty rule: Totals appears exactly when the
+// result is incomplete, so its presence alone means "this is not everything".
+func assertTotalsPresence(
+	t *testing.T,
+	c packStressCase,
+	out protocol.GoroutineSnapshotPayload,
+	rep protocol.GoroutinePackReport,
+) {
+	t.Helper()
+	want := rep.Omitted() || c.clipped
+	if want != (out.Totals != nil) {
+		t.Fatalf("round %d: totals presence %v want %v (omitted=%v clipped=%v)",
+			c.round, out.Totals != nil, want, rep.Omitted(), c.clipped)
+	}
+}
+
+// assertAnchorsRetained walks the spawn chain the packer promised to keep. A
+// non-degraded result must carry the current goroutine, every ancestor of it,
+// and the current thread; and Current must name a goroutine actually delivered.
+func assertAnchorsRetained(
+	t *testing.T,
+	c packStressCase,
+	out protocol.GoroutineSnapshotPayload,
+	rep protocol.GoroutinePackReport,
+) {
+	t.Helper()
+	if rep.Degraded {
+		return
+	}
+
+	delivered := make(map[int]bool, len(out.Goroutines))
+	for _, g := range out.Goroutines {
+		delivered[g.ID] = true
+	}
+	if out.Current != 0 && !delivered[out.Current] {
+		t.Fatalf("round %d: current g%d is not among the delivered goroutines", c.round, out.Current)
+	}
+
+	for id := range ancestorChain(c.input.Goroutines, c.current) {
+		if !delivered[id] {
+			t.Fatalf("round %d: anchor g%d missing from non-degraded result", c.round, id)
+		}
+	}
+	if len(c.input.Threads) > 0 && len(out.Threads) == 0 {
+		t.Fatalf("round %d: current thread dropped", c.round)
+	}
+}
+
+// ancestorChain yields the current goroutine and each ancestor above it, stopping
+// at an unknown parent or a cycle so a malformed input cannot hang the test.
+func ancestorChain(gs []protocol.Goroutine, current int) map[int]struct{} {
+	byID := make(map[int]protocol.Goroutine, len(gs))
+	for _, g := range gs {
+		if _, dup := byID[g.ID]; !dup {
+			byID[g.ID] = g
+		}
+	}
+
+	chain := make(map[int]struct{})
+	for id := current; id != 0; {
+		if _, seen := chain[id]; seen {
+			break
+		}
+		g, ok := byID[id]
+		if !ok {
+			break
+		}
+		chain[id] = struct{}{}
+		id = g.ParentID
+	}
+	return chain
+}
+
+// TestPackTwoPassInvariantsUnderRandomInput pins the invariants that cannot be
+// verified by inspection: the result never exceeds the cap, the reported size is
+// the real one, Totals is present exactly when the result is incomplete, and
+// every anchor survives a non-degraded pack.
 func TestPackTwoPassInvariantsUnderRandomInput(t *testing.T) {
 	rng := rand.New(rand.NewSource(99))
 	for round := 0; round < 600; round++ {
-		n := 1 + rng.Intn(60)
-		gs := make([]protocol.Goroutine, 0, n)
-		for i := 1; i <= n; i++ {
-			g := protocol.Goroutine{
-				ID: i, Status: "waiting",
-				WaitReason: strings.Repeat("w", rng.Intn(70000)),
-			}
-			if i > 1 && rng.Intn(3) > 0 {
-				g.ParentID = i - 1 // deep chain
-			}
-			gs = append(gs, g)
-		}
-		cur := 1 + rng.Intn(n)
-		ts := make([]protocol.Thread, 0, 8)
-		for i := 0; i < rng.Intn(8); i++ {
-			ts = append(ts, protocol.Thread{ID: i, MID: rng.Intn(50), Current: i == 0})
-		}
-		created := make([]int, rng.Intn(200))
-		for i := range created {
-			created[i] = math.MaxInt64 - i
-		}
-		clipped := rng.Intn(2) == 0
+		c := randomPackStressCase(rng, round)
+		out, rep := protocol.PackSnapshot(c.input, c.clipped, c.clipped)
 
-		out, rep := protocol.PackSnapshot(protocol.GoroutineSnapshotPayload{
-			Goroutines: gs, Threads: ts, Current: cur, Created: created,
-		}, clipped, clipped)
-
-		actual := eventBytesPlain(t, protocol.EventGoroutineSnapshot, out)
-		if !rep.Oversized && actual > protocol.MaxGoroutineEventBytes {
-			t.Fatalf("round %d: %d bytes over cap (degraded=%v)", round, actual, rep.Degraded)
-		}
-		if rep.Bytes != actual {
-			t.Fatalf("round %d: report %d actual %d", round, rep.Bytes, actual)
-		}
-		// Totals presence must agree with reality.
-		wantTotals := rep.Omitted() || clipped
-		if wantTotals != (out.Totals != nil) {
-			t.Fatalf("round %d: totals presence %v want %v (omitted=%v clipped=%v)",
-				round, out.Totals != nil, wantTotals, rep.Omitted(), clipped)
-		}
-		// Anchors must be present in every non-degraded result.
-		if !rep.Degraded {
-			have := map[int]bool{}
-			for _, g := range out.Goroutines {
-				have[g.ID] = true
-			}
-			byID := map[int]protocol.Goroutine{}
-			for _, g := range gs {
-				if _, dup := byID[g.ID]; !dup {
-					byID[g.ID] = g
-				}
-			}
-			seen := map[int]bool{}
-			for id := cur; id != 0 && !seen[id]; {
-				seen[id] = true
-				if _, ok := byID[id]; !ok {
-					break
-				}
-				if !have[id] {
-					t.Fatalf("round %d: anchor g%d missing from non-degraded result", round, id)
-				}
-				id = byID[id].ParentID
-			}
-			if len(ts) > 0 && len(out.Threads) == 0 {
-				t.Fatalf("round %d: current thread dropped", round)
-			}
-		}
+		assertSizeIsReportedAndBounded(t, c, out, rep)
+		assertTotalsPresence(t, c, out, rep)
+		assertAnchorsRetained(t, c, out, rep)
 	}
 }
