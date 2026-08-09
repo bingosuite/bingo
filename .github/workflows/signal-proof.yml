@@ -52,10 +52,27 @@ jobs:
           uname -a
           cat /proc/sys/kernel/yama/ptrace_scope || true
 
-      - name: Signal proof specs
+      - name: Diagnostic proof specs (document observed behaviour)
         run: >
           go test -tags e2e ${{ matrix.flags }} -count=1 -v -timeout 600s
           ./test/integration -ginkgo.label-filter=signalproof
+
+      # Expected to FAIL on linux today — that failure IS the reproduction.
+      # continue-on-error keeps the diagnostic evidence above attributable while
+      # still surfacing the outcome in the step conclusion.
+      - name: Regression spec (correct behaviour — expected to fail on linux)
+        id: regression
+        continue-on-error: true
+        run: >
+          go test -tags e2e ${{ matrix.flags }} -count=1 -v -timeout 600s
+          ./test/integration -ginkgo.label-filter=signalregression
+
+      - name: Report regression spec outcome
+        run: |
+          echo "signalregression outcome: ${{ steps.regression.outcome }}"
+          test "${{ steps.regression.outcome }}" = "failure" \
+            && echo "U1 REPRODUCED: a fatal fault under the debugger did not terminate the tracee." \
+            || echo "U1 NOT reproduced on this runner."
 
       - name: Confirm no orphaned tracees survived
         if: always()
