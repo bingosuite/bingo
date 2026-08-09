@@ -1,0 +1,136 @@
+name: PROOF U2 (linux tracee reaping)
+
+# PROOF-ONLY, TEST-ONLY workflow. It does not gate anything, is never triggered
+# automatically, and touches no production code. It exists to answer hypothesis
+# U2 on a real GitHub-hosted linux/amd64 kernel:
+#
+#   "The main thread's PTRACE_EVENT_EXIT reports the logical exit and the engine
+#    closes down before the later final wait status is reaped, leaving zombie
+#    tracees behind in a long-lived server process."
+#
+# The Ginkgo specs live in test/integration/reapproof_linux_amd64_test.go under
+# label `reapproof`. Three specs run in this order:
+#
+#   1. controls      negative (a Wait()ed child vanishes) + positive (a
+#                    never-Wait()ed child stays Z). If EITHER fails the
+#                    experiment is invalid and this job fails hard — no
+#                    conclusion may be drawn from the subject.
+#   2. subject       one debugger launch→exit; asserts the tracee is NOT a
+#                    persistent zombie after EventProcessExited (and that the
+#                    reported exit code is still 42).
+#   3. accumulation  N launch→exit cycles; asserts zombies do not pile up.
+#
+# Specs 2 and 3 are expected to FAIL if the hypothesis is true, so they are run
+# with their exit status captured rather than failing the job — the point is to
+# collect the evidence for both -race and no-race, not to gate a merge. The job
+# summary at the end states the verdict.
+
+on:
+  workflow_dispatch:
+    inputs:
+      settle_ms:
+        description: "Observation window per subject, in milliseconds"
+        required: false
+        default: "5000"
+      cycles:
+        description: "launch→exit cycles in the accumulation spec"
+        required: false
+        default: "25"
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    name: PROOF U2 linux/amd64 tracee reaping
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      BINGO_PROOF_SETTLE_MS: ${{ github.event.inputs.settle_ms || '5000' }}
+      BINGO_PROOF_CYCLES: ${{ github.event.inputs.cycles || '25' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Confirm native target
+        run: |
+          test "$(go env GOOS)/$(go env GOARCH)" = "linux/amd64"
+          uname -a
+          go version
+          cat /proc/sys/kernel/yama/ptrace_scope || true
+
+      # Must pass. A failure here means the /proc detector or the observation
+      # window is wrong and nothing below can be interpreted.
+      - name: Controls (detector validity)
+        run: |
+          go test -tags e2e -count=1 -v -timeout 300s ./test/integration \
+            -ginkgo.label-filter=reapproof \
+            -ginkgo.focus='establishes that the /proc detector'
+
+      - name: Subject — single cycle (no -race)
+        id: subject_norace
+        run: |
+          set +e
+          go test -tags e2e -count=1 -v -timeout 300s ./test/integration \
+            -ginkgo.label-filter=reapproof \
+            -ginkgo.focus='does not leave the tracee as a persistent zombie'
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Subject — single cycle (-race)
+        id: subject_race
+        run: |
+          set +e
+          go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration \
+            -ginkgo.label-filter=reapproof \
+            -ginkgo.focus='does not leave the tracee as a persistent zombie'
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Accumulation — N cycles (no -race)
+        id: accum_norace
+        run: |
+          set +e
+          go test -tags e2e -count=1 -v -timeout 600s ./test/integration \
+            -ginkgo.label-filter=reapproof \
+            -ginkgo.focus='does not accumulate zombie tracees'
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Accumulation — N cycles (-race)
+        id: accum_race
+        run: |
+          set +e
+          go test -tags e2e -race -count=1 -v -timeout 600s ./test/integration \
+            -ginkgo.label-filter=reapproof \
+            -ginkgo.focus='does not accumulate zombie tracees'
+          echo "status=$?" >> "$GITHUB_OUTPUT"
+
+      - name: Verdict
+        run: |
+          {
+            echo "## PROOF U2 — linux/amd64 tracee reaping after PTRACE_EVENT_EXIT"
+            echo
+            echo "Controls passed (detector distinguishes reaped from unreaped children)."
+            echo
+            echo "| experiment | go test exit status | reading |"
+            echo "| --- | --- | --- |"
+            for pair in \
+              "subject/no-race:${{ steps.subject_norace.outputs.status }}" \
+              "subject/race:${{ steps.subject_race.outputs.status }}" \
+              "accumulation/no-race:${{ steps.accum_norace.outputs.status }}" \
+              "accumulation/race:${{ steps.accum_race.outputs.status }}"; do
+              name="${pair%%:*}"; st="${pair##*:}"
+              if [ "$st" = "0" ]; then
+                echo "| $name | 0 | no persistent zombie — hypothesis NOT reproduced |"
+              else
+                echo "| $name | $st | persistent zombie observed — **hypothesis U2 CONFIRMED** |"
+              fi
+            done
+            echo
+            echo "Settle window: ${BINGO_PROOF_SETTLE_MS}ms · cycles: ${BINGO_PROOF_CYCLES}"
+            echo
+            echo "See the step logs for the per-sample /proc timelines"
+            echo "(\`subject(debugger-launched)\`, \`positive-control\`, \`negative-control\`, \`cycles\`)."
+          } >> "$GITHUB_STEP_SUMMARY"
