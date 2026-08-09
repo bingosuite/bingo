@@ -536,6 +536,26 @@ those specs. The counter is cumulative and `atomic` because the test reads it
 from its own goroutine; draining and purging describe what is still held, not
 what was ever held, so neither rolls it back.
 
+`LinuxParkedSignalCount` splits out the held **signal** stops, and the `Pause`
+overlap spec's non-vacuity rests on it. The wait loop absorbs SIGURG, SIGCONT
+and a new thread's initial SIGSTOP before `classifyUserStop`, so a signal stop
+that reaches the queue can only be an externally-directed interrupt — in that
+target, the SIGSTOP `Pause` sends at the main thread. Since the main thread
+never traps there, it is never the stepped thread, so a held signal is direct
+evidence that the interrupt arrived *while a single-step was outstanding*. That
+spec asserts three independent things: a `Pause` was accepted (the engine was
+running, so a step really was in flight), an interrupt was held mid-step, and at
+least one `EventPaused` actually surfaced.
+
+**A held interrupt is usually surfaced, not suppressed — but only usually.** It
+surfaces when it drains while `manualStopPending` is still set, which is the
+common case for a source-level step-over: the queue is released as soon as the
+machine step finishes, and the engine then runs on to the next-line breakpoint,
+so the interrupt is delivered well before the `EventStepped` that would clear
+the flag. It is suppressed when a self-stop completes the step first — the
+documented pending-interrupt race. Both are legitimate, so `EventPaused` is
+asserted across a whole run and never per cycle.
+
 **Sizing rule for these specs — they race their own target's watchdog.** Every
 E2E target self-terminates with `go func() { time.Sleep(180 * time.Second);
 os.Exit(0) }()`. A `-race` cycle costs ~0.8–1.05s and hosted runners vary by
