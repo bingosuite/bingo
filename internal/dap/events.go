@@ -138,6 +138,13 @@ func (h *Handler) onStop(evt protocol.Event) {
 
 	// The first Stepped after a Restart is the new process's entry stop.
 	if restarting && evt.Kind == protocol.EventStepped {
+		if h.restartReqSeq != 0 {
+			// EventRestarted precedes its process's entry in the hub/client FIFO.
+			// A pending newer response makes this the superseded process's entry;
+			// preserve the latch for the replacement process.
+			h.mu.Unlock()
+			return
+		}
 		h.restarting = false
 		if stopOnEntry {
 			h.suspended = true
