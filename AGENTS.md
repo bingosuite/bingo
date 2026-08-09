@@ -546,6 +546,20 @@ that their stops are *reported later*, after the trap is back:
   cannot stop again until it is resumed (G7) — so no cap is needed.
 - Out of scope: a user `ClearBreakpoint` of an address a parked stop refers to
   still surfaces that stop as a spurious trap when it is finally delivered.
+- **A stepped thread that dies with stops still held releases them, and that
+  delivery deliberately precedes an already-queued main-thread exit.** Because
+  the drain runs at the top of the `Wait` loop, before blocking in `wait4`, a
+  stop held behind an abandoned step is delivered on the next `Wait` even if the
+  process is on its way out. This is accepted, not overlooked: the parked thread
+  is still ptrace-stopped at delivery, so it is a real stop; the alternative —
+  peeking at the wait queue before draining — would invert the drain-before-block
+  rule that makes a same-address sibling resolve only after the reinstall, i.e.
+  it would defeat the fix. If such a delivery does race a dying process, the
+  engine's ptrace reads fail and degrade through `haltOnError` (`EventError` plus
+  a suspending `EventPaused`) rather than hanging, and the exit surfaces on the
+  following `Wait`. Once the main exit *is* observed, `purge` wins and nothing is
+  delivered afterwards, so the engine never acts on a dead thread. Pinned by
+  `TestLinuxBackendSteppedThreadDeathDeliversHeldStopBeforeExit`.
 
 **No lock, and none is needed.** `parked` is touched only inside `Wait`.
 Successive `Wait` calls run on different one-shot `waitLoop` goroutines that the
