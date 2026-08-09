@@ -470,6 +470,26 @@ note below):
    deliberately **no engine-callable purge**: the queue is not part of the
    engine's state model.
 
+7. **A held breakpoint stop whose trap vanished is dropped, not delivered.**
+   Holding a stop opens a window the engine never had: it can clear the very trap
+   the held stop refers to. The `<stepover-next>` sentinel is cleared by
+   whichever thread reaches it *first*, so a sibling parked at that address wakes
+   holding a stop for a trap that no longer exists. Delivering it takes the
+   engine's spurious-SIGTRAP path, which resumes the thread at the trap-return PC
+   — and with the original bytes restored that address is **mid-instruction** on
+   amd64, so the thread faults on every retry (the engine's ordinary-signal path
+   re-continues with signal 0) and the tracee silently stops making progress.
+   `drainParked` therefore checks, per held *breakpoint* stop, whether the trap
+   bytes are still at the rewound PC (`parkedTrapMissing`); if they are gone the
+   thread's PC is rewound to the instruction and it is `PTRACE_CONT`ed, the stop
+   is dropped, and the next held stop is considered. **`recordStop` must not run
+   for a dropped stop** — the engine never sees that thread, so pointing the
+   TID-less ptrace ops at it would be the original corruption again. Every
+   failure (registers unreadable/unwritable, memory unreadable) falls back to
+   delivering the stop, i.e. to the behaviour this backend had before stops could
+   be held at all. The check is a no-op on an architecture whose rewind is
+   identity (arm64 stops *at* the trap, so re-executing is correct either way).
+
 **Explicit limits — this is NOT an atomic stop-the-world step-over.** Sibling
 threads keep running and keep trapping during a step; the fix only guarantees
 that their stops are *reported later*, after the trap is back:
@@ -484,7 +504,16 @@ that their stops are *reported later*, after the trap is back:
 - Queue depth is bounded by the live thread count — a ptrace-stopped thread
   cannot stop again until it is resumed (G7) — so no cap is needed.
 - Out of scope: a user `ClearBreakpoint` of an address a parked stop refers to
-  still surfaces that stop as a spurious trap when it is finally delivered.
+  still surfaces that stop as a spurious trap when it is finally delivered. Rule
+  7 covers only the engine's own sentinel auto-clear, which is intrinsic to
+  stepping and which the queue makes near-certain on every step-over cycle.
+- The engine's spurious-SIGTRAP path (`engine.go`, `StopBreakpoint` with
+  `bp == nil`) advances the PC past a trap instruction that may no longer be
+  there, which is wrong for **any** delayed trap, parked or not — a
+  kernel-queued sibling `SIGTRAP` arriving after a `bps.clear` hits it on the
+  base branch too. That is pre-existing and deliberately untouched here (the
+  engine layer is byte-identical to the base commit); rule 7 removes the one
+  variant this change would otherwise have made routine.
 - **A stepped thread that dies with stops still held releases them, and that
   delivery deliberately precedes an already-queued main-thread exit.** Because
   the drain runs at the top of the `Wait` loop, before blocking in `wait4`, a
@@ -511,11 +540,12 @@ but `Wait`.
 
 Regression gates: the classifier table **and** the queue-mechanics tests in
 [waitpark_test.go](internal/debugger/waitpark_test.go) — both host-agnostic, so
-they run and can be mutation-checked on macOS — plus the three backend-specific
+they run and can be mutation-checked on macOS — plus the backend-specific
 tests in
 [backend_linux_amd64_test.go](internal/debugger/backend_linux_amd64_test.go)
 that pin *when `lastStopTID` moves* (not on park, only on delivery, and `Wait`
-drains before blocking), plus the linux-only `overlap` E2E label in
+drains before blocking) and that the drain consults the stale-trap rule with
+this backend's real trap encoding and PC rewind, plus the linux-only `overlap` E2E label in
 [debugger_e2e_linux_amd64_test.go](test/integration/debugger_e2e_linux_amd64_test.go):
 step-over overlap, machine-step (`StepInto`) overlap, a foreign ordinary-signal
 storm, `Pause` racing an in-flight step, and kill with stops held. Those assert
@@ -535,6 +565,12 @@ gate a build with the parking rule deleted still passes every other assertion in
 those specs. The counter is cumulative and `atomic` because the test reads it
 from its own goroutine; draining and purging describe what is still held, not
 what was ever held, so neither rolls it back.
+
+`LinuxStaleParkedStopCount` exposes the rule-7 drop counter the same way. It is
+reported by the overlap specs rather than asserted: the drop depends on which
+thread reaches the sentinel first, so a run with none is plausible rather than a
+signal that the rule broke. Its unit coverage is the gate; the report exists to
+show natively that the recovery really does fire.
 
 `LinuxParkedSignalCount` splits out the held **signal** stops, and the `Pause`
 overlap spec's non-vacuity rests on it. The wait loop absorbs SIGURG, SIGCONT
