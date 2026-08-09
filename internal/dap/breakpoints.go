@@ -35,21 +35,21 @@ func (h *Handler) onSetBreakpoints(req *godap.SetBreakpointsRequest) {
 	h.mu.Lock()
 	current := h.bpByFile[file]
 	if current == nil {
-		current = make(map[int]int)
+		current = make(map[int]breakpointState)
 		h.bpByFile[file] = current
 	}
 
 	// Clear breakpoints no longer requested.
-	for line, id := range current {
+	for line, state := range current {
 		if desired[line] {
 			continue
 		}
 		delete(current, line)
-		if id == 0 {
+		if state.debuggerID == 0 {
 			continue // never confirmed; nothing to clear on the debugger
 		}
-		h.clearQ = append(h.clearQ, id)
-		if cmd, err := marshalCommand(protocol.CmdClearBreakpoint, protocol.ClearBreakpointPayload{ID: id}); err == nil {
+		h.clearQ = append(h.clearQ, state.debuggerID)
+		if cmd, err := marshalCommand(protocol.CmdClearBreakpoint, protocol.ClearBreakpointPayload{ID: state.debuggerID}); err == nil {
 			clears = append(clears, cmd)
 		}
 	}
@@ -59,13 +59,13 @@ func (h *Handler) onSetBreakpoints(req *godap.SetBreakpointsRequest) {
 		slot := &bpSlot{req: reqObj, file: file, line: b.Line}
 		reqObj.slots = append(reqObj.slots, slot)
 
-		if id, ok := current[b.Line]; ok && id != 0 {
+		if state, ok := current[b.Line]; ok && state.debuggerID != 0 {
 			slot.resolved = true
-			slot.bp = godap.Breakpoint{Id: id, Verified: true, Line: b.Line, Source: &src}
+			slot.bp = godap.Breakpoint{Id: state.dapID, Verified: true, Line: b.Line, Source: &src}
 			continue
 		}
 
-		current[b.Line] = 0 // pending sentinel, replaced on confirmation
+		current[b.Line] = breakpointState{} // pending sentinel, replaced on confirmation
 		h.setQ = append(h.setQ, slot)
 		if cmd, err := marshalCommand(protocol.CmdSetBreakpoint, protocol.SetBreakpointPayload{File: file, Line: b.Line}); err == nil {
 			sets = append(sets, cmd)

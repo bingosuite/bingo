@@ -99,11 +99,13 @@ type Handler struct {
 	// Suspend/resume (EventContinued).
 	pendingContinues int
 
-	// Breakpoint bookkeeping. bpByFile maps file -> requested line -> bingo
-	// breakpoint id (0 = set enqueued, awaiting confirmation). setQ/clearQ are
-	// FIFOs of in-flight confirmations, correlated to the hub's ordered
-	// event stream (valid while the DAP client is the sole breakpoint driver).
-	bpByFile map[string]map[int]int
+	// Breakpoint bookkeeping. bpByFile maps file -> requested line -> DAP and
+	// debugger identities. The two diverge after Restart: DAP identity remains
+	// stable while the fresh debugger assigns a new internal id.
+	// setQ/clearQ are FIFOs of in-flight confirmations, correlated to the hub's
+	// ordered event stream (valid while the DAP client is the sole breakpoint
+	// driver).
+	bpByFile map[string]map[int]breakpointState
 	setQ     []*bpSlot
 	clearQ   []int
 
@@ -139,6 +141,11 @@ type bpSlot struct {
 	line     int
 	resolved bool
 	bp       godap.Breakpoint
+}
+
+type breakpointState struct {
+	dapID      int
+	debuggerID int
 }
 
 // bpRequest collects the slots of a single setBreakpoints request; its response
@@ -194,7 +201,7 @@ func NewHandler(conn net.Conn, provider Provider, log *slog.Logger) *Handler {
 		log:      log,
 		cmdOut:   make(chan []byte, cmdBufferSize),
 		done:     make(chan struct{}),
-		bpByFile: make(map[string]map[int]int),
+		bpByFile: make(map[string]map[int]breakpointState),
 		varCache: make(map[int][]godap.Variable),
 	}
 }
