@@ -382,14 +382,24 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 
 		case cc := <-h.cmdCh:
 			// Non-resuming command (SetBreakpoint, Locals, …) while suspended.
-			// Execute immediately — process is paused — and keep waiting.
-			// Restart and Kill are the exceptions: Restart tears down and
-			// replaces the suspended process, and Kill terminates it, so in
-			// both cases the process we were waiting to resume no longer
-			// exists — return and let Run's outer loop pick up the new or
-			// closed debugger's events channel.
+			// Execute immediately — the process is paused — and decide whether
+			// to keep waiting from the OBSERVED state, never from the command
+			// kind. Restart and Kill only dissolve the suspend when they
+			// actually take effect: a Restart rejected before it touches the
+			// debugger (raw hub, no prior Launch, malformed payload) or a
+			// failed Kill broadcasts an EventError and leaves the original
+			// process suspended. Returning on kind alone stranded those cases —
+			// a later resume lands in resumeCh, which only this wait loop
+			// drains (Run's outer loop never selects on it), wedging the
+			// session forever. Same guard as the resumeCh branch above.
+			//
+			// A SUCCESSFUL Kill also leaves the state suspended (Kill has no
+			// state transition of its own), so the loop stays parked until the
+			// debugger reports its own teardown — ProcessExited or a closed
+			// Events channel — which the eventsCh branch above already handles.
+			// That is strictly more accurate than inferring death from a kind.
 			h.executeCommand(cc.cmd)
-			if cc.cmd.Kind == protocol.CmdRestart || cc.cmd.Kind == protocol.CmdKill {
+			if h.State() != protocol.StateSuspended {
 				return
 			}
 
