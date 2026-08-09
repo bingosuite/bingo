@@ -3,6 +3,7 @@ package debugger_test
 import (
 	"encoding/binary"
 	"errors"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -36,6 +37,17 @@ type fakeBackend struct {
 	continueCh       chan struct{}
 	writeErr         error
 	getRegistersErr  error
+
+	// Fault injection for the asynchronous stop-handling error paths. A test
+	// arms a fault and only then pushes the stop event that reaches the
+	// faulting code, so the arming is already ordered before the engine's
+	// read; faultMu makes that explicit rather than leaning on the channel's
+	// happens-before edge, and keeps -race quiet if a waitLoop is in flight.
+	faultMu    sync.Mutex
+	threadsErr error
+	regsErr    error
+	writeErrAt map[uint64]error
+	readErrAt  map[uint64]error
 }
 
 func newFakeBackend() *fakeBackend {
@@ -46,7 +58,60 @@ func newFakeBackend() *fakeBackend {
 		stopCh:     make(chan debugger.StopEvent, 8),
 		writtenAt:  make(map[uint64][]byte),
 		continueCh: make(chan struct{}, 16),
+		writeErrAt: make(map[uint64]error),
+		readErrAt:  make(map[uint64]error),
 	}
+}
+
+var errInjected = errors.New("injected backend fault")
+
+func (f *fakeBackend) failThreads(err error) {
+	f.faultMu.Lock()
+	defer f.faultMu.Unlock()
+	f.threadsErr = err
+}
+
+func (f *fakeBackend) failRegisters(err error) {
+	f.faultMu.Lock()
+	defer f.faultMu.Unlock()
+	f.regsErr = err
+}
+
+func (f *fakeBackend) failWriteAt(addr uint64, err error) {
+	f.faultMu.Lock()
+	defer f.faultMu.Unlock()
+	f.writeErrAt[addr] = err
+}
+
+func (f *fakeBackend) failReadAt(addr uint64, err error) {
+	f.faultMu.Lock()
+	defer f.faultMu.Unlock()
+	f.readErrAt[addr] = err
+}
+
+func (f *fakeBackend) clearFaults() {
+	f.faultMu.Lock()
+	defer f.faultMu.Unlock()
+	f.threadsErr = nil
+	f.regsErr = nil
+	f.writeErrAt = make(map[uint64]error)
+	f.readErrAt = make(map[uint64]error)
+}
+
+func (f *fakeBackend) faultFor(kind string, addr uint64) error {
+	f.faultMu.Lock()
+	defer f.faultMu.Unlock()
+	switch kind {
+	case "threads":
+		return f.threadsErr
+	case "regs":
+		return f.regsErr
+	case "write":
+		return f.writeErrAt[addr]
+	case "read":
+		return f.readErrAt[addr]
+	}
+	return nil
 }
 
 func (f *fakeBackend) seedMem(addr uint64, data []byte) {
@@ -77,7 +142,9 @@ func (f *fakeBackend) peekMem(addr uint64, n int) []byte {
 }
 
 func (f *fakeBackend) ContinueProcess() error {
+	f.faultMu.Lock()
 	f.continueCalls++
+	f.faultMu.Unlock()
 	select {
 	case f.continueCh <- struct{}{}:
 	default:
@@ -85,9 +152,24 @@ func (f *fakeBackend) ContinueProcess() error {
 	return nil
 }
 
-func (f *fakeBackend) StopProcess() error      { f.stopProcessCalls++; return nil }
-func (f *fakeBackend) PauseSignal() int        { return int(syscall.SIGSTOP) }
-func (f *fakeBackend) Threads() ([]int, error) { return f.tids, nil }
+// continueCount reads the resume counter under the lock. Assertions that poll
+// (Eventually) must use it: unlike the synchronously-dispatched cases, a
+// polling read genuinely races the engine loop's ContinueProcess.
+func (f *fakeBackend) continueCount() int {
+	f.faultMu.Lock()
+	defer f.faultMu.Unlock()
+	return f.continueCalls
+}
+
+func (f *fakeBackend) StopProcess() error { f.stopProcessCalls++; return nil }
+func (f *fakeBackend) PauseSignal() int   { return int(syscall.SIGSTOP) }
+
+func (f *fakeBackend) Threads() ([]int, error) {
+	if err := f.faultFor("threads", 0); err != nil {
+		return nil, err
+	}
+	return f.tids, nil
+}
 
 func (f *fakeBackend) SingleStep(tid int) error {
 	f.singleStepCalls = append(f.singleStepCalls, tid)
@@ -95,6 +177,9 @@ func (f *fakeBackend) SingleStep(tid int) error {
 }
 
 func (f *fakeBackend) ReadMemory(addr uint64, dst []byte) error {
+	if err := f.faultFor("read", addr); err != nil {
+		return err
+	}
 	for i := range dst {
 		dst[i] = f.mem[addr+uint64(i)]
 	}
@@ -105,6 +190,9 @@ func (f *fakeBackend) WriteMemory(addr uint64, src []byte) error {
 	if f.writeErr != nil {
 		err := f.writeErr
 		f.writeErr = nil
+		return err
+	}
+	if err := f.faultFor("write", addr); err != nil {
 		return err
 	}
 	cp := make([]byte, len(src))
@@ -120,6 +208,9 @@ func (f *fakeBackend) GetRegisters(tid int) (debugger.Registers, error) {
 	if f.getRegistersErr != nil {
 		err := f.getRegistersErr
 		f.getRegistersErr = nil
+		return debugger.Registers{}, err
+	}
+	if err := f.faultFor("regs", 0); err != nil {
 		return debugger.Registers{}, err
 	}
 	return f.regs[tid], nil
@@ -597,9 +688,9 @@ var _ = Describe("Engine", func() {
 		})
 
 		It("calls ContinueProcess on the backend", func() {
-			before := fb.continueCalls
+			before := fb.continueCount()
 			Expect(d.Continue()).To(Succeed())
-			Expect(fb.continueCalls).To(Equal(before + 1))
+			Expect(fb.continueCount()).To(Equal(before + 1))
 		})
 
 		It("rejects a second Continue without an intervening stop", func() {

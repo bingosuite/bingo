@@ -167,6 +167,8 @@ var _ = Describe("Breakpoint clear state transitions", func() {
 
 		evt := mustNextEvent(d)
 		Expect(evt.Kind).To(Equal(protocol.EventError))
+		Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventPaused),
+			"an asynchronous stop-handling failure must re-enter the suspended state")
 		expectOriginalInstruction()
 		Expect(d.ClearBreakpoint(id)).To(MatchError(ContainSubstring("not found")))
 
