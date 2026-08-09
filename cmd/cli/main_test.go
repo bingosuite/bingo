@@ -1,38 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
+	"github.com/chzyer/readline"
 )
-
-// captureStdout runs fn with os.Stdout redirected and returns what it printed.
-func captureStdout(t *testing.T, fn func()) string {
-	t.Helper()
-
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("pipe: %v", err)
-	}
-	original := os.Stdout
-	os.Stdout = w
-	defer func() { os.Stdout = original }()
-
-	fn()
-
-	if err := w.Close(); err != nil {
-		t.Fatalf("close pipe writer: %v", err)
-	}
-	out, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatalf("read pipe: %v", err)
-	}
-	return string(out)
-}
 
 func testSnapshotEvent(t *testing.T, seq uint64) protocol.Event {
 	t.Helper()
@@ -55,7 +37,9 @@ func TestFullSnapshotNextRendersOnceThenSummarises(t *testing.T) {
 	t.Cleanup(func() { fullSnapshotNext.Store(false) })
 
 	fullSnapshotNext.Store(true)
-	full := captureStdout(t, func() { printEvent(testSnapshotEvent(t, 2)) })
+	var out bytes.Buffer
+	printEvent(&out, testSnapshotEvent(t, 2))
+	full := out.String()
 	if !strings.Contains(full, "goroutines: 2 live  threads: 1 live  current: G1") {
 		t.Fatalf("requested snapshot render = %q, want the full view", full)
 	}
@@ -66,7 +50,9 @@ func TestFullSnapshotNextRendersOnceThenSummarises(t *testing.T) {
 		t.Fatal("fullSnapshotNext still armed after one snapshot")
 	}
 
-	summary := captureStdout(t, func() { printEvent(testSnapshotEvent(t, 3)) })
+	out.Reset()
+	printEvent(&out, testSnapshotEvent(t, 3))
+	summary := out.String()
 	if !strings.Contains(summary, "[goroutines] 2 live, 1 live threads, current G1") {
 		t.Fatalf("automatic snapshot render = %q, want the summary line", summary)
 	}
@@ -85,14 +71,18 @@ func TestSnapshotErrorDisarmsFullRender(t *testing.T) {
 		Command: protocol.CmdGoroutineSnapshot,
 		Message: "process not suspended",
 	})
-	if out := captureStdout(t, func() { printEvent(rejected) }); !strings.Contains(out, "process not suspended") {
-		t.Fatalf("error render = %q, want the server message", out)
+	var out bytes.Buffer
+	printEvent(&out, rejected)
+	if got := out.String(); !strings.Contains(got, "process not suspended") {
+		t.Fatalf("error render = %q, want the server message", got)
 	}
 	if fullSnapshotNext.Load() {
 		t.Fatal("fullSnapshotNext still armed after a rejected request")
 	}
 
-	summary := captureStdout(t, func() { printEvent(testSnapshotEvent(t, 3)) })
+	out.Reset()
+	printEvent(&out, testSnapshotEvent(t, 3))
+	summary := out.String()
 	if !strings.Contains(summary, "[goroutines] 2 live") {
 		t.Fatalf("automatic snapshot render = %q, want the summary line", summary)
 	}
@@ -168,6 +158,154 @@ func TestCountOf(t *testing.T) {
 	}
 }
 
+type testEditor struct {
+	lines  chan *readline.Result
+	closed chan struct{}
+	once   sync.Once
+	closes atomic.Int32
+	out    bytes.Buffer
+}
+
+func newTestEditor() *testEditor {
+	return &testEditor{
+		lines:  make(chan *readline.Result),
+		closed: make(chan struct{}),
+	}
+}
+
+func (e *testEditor) Line() *readline.Result {
+	select {
+	case line := <-e.lines:
+		return line
+	case <-e.closed:
+		return &readline.Result{Error: io.EOF}
+	}
+}
+
+func (e *testEditor) Stdout() io.Writer { return &e.out }
+
+func (e *testEditor) Close() error {
+	e.once.Do(func() {
+		e.closes.Add(1)
+		close(e.closed)
+	})
+	return nil
+}
+
+func TestRunInteractiveStopsOnEventStreamClosure(t *testing.T) {
+	editor := newTestEditor()
+	events := make(chan protocol.Event)
+	var transportCloses atomic.Int32
+	done := make(chan struct{})
+	go func() {
+		runInteractive(context.Background(), editor, events, func() error {
+			transportCloses.Add(1)
+			return nil
+		}, func(context.Context, []string) bool {
+			t.Error("dispatch called after disconnect")
+			return false
+		})
+		close(done)
+	}()
+
+	close(events)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("interactive session stayed blocked after event stream closure")
+	}
+	if got := editor.closes.Load(); got != 1 {
+		t.Fatalf("editor close calls = %d, want 1", got)
+	}
+	if got := transportCloses.Load(); got != 1 {
+		t.Fatalf("transport close calls = %d, want 1", got)
+	}
+	if got := editor.out.String(); got != "  disconnected\n" {
+		t.Fatalf("output = %q, want one disconnect notice", got)
+	}
+}
+
+func TestRunInteractiveCancellationIsSilentAndClosesResources(t *testing.T) {
+	editor := newTestEditor()
+	events := make(chan protocol.Event)
+	var transportCloses atomic.Int32
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		runInteractive(ctx, editor, events, func() error {
+			transportCloses.Add(1)
+			return nil
+		}, func(context.Context, []string) bool {
+			t.Error("dispatch called after cancellation")
+			return false
+		})
+		close(done)
+	}()
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("interactive session stayed blocked after cancellation")
+	}
+	if got := editor.closes.Load(); got != 1 {
+		t.Fatalf("editor close calls = %d, want 1", got)
+	}
+	if got := transportCloses.Load(); got != 1 {
+		t.Fatalf("transport close calls = %d, want 1", got)
+	}
+	if got := editor.out.String(); got != "" {
+		t.Fatalf("output = %q, want no disconnect or goodbye on cancellation", got)
+	}
+}
+
+func TestPrintEventSurfacesOutputWithoutHandwrittenPrompt(t *testing.T) {
+	event, err := protocol.NewEvent(protocol.EventOutput, 1, protocol.OutputPayload{
+		Stream:  "stderr",
+		Content: "debuggee output\n",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+
+	printEvent(&out, event)
+
+	if got := out.String(); got != "  [stderr] debuggee output\n" {
+		t.Fatalf("output = %q", got)
+	}
+	if strings.Contains(out.String(), "bingo>") {
+		t.Fatal("async output wrote a prompt instead of relying on readline redraw")
+	}
+}
+
+type recordingLocalsClient struct {
+	frames []int
+}
+
+func (c *recordingLocalsClient) Locals(frameIndex int) ([]protocol.Variable, error) {
+	c.frames = append(c.frames, frameIndex)
+	return nil, nil
+}
+
+func TestShowLocalsRejectsInvalidFramesBeforeDispatch(t *testing.T) {
+	for _, frame := range []string{"abc", "-1"} {
+		t.Run(frame, func(t *testing.T) {
+			client := &recordingLocalsClient{}
+			var out bytes.Buffer
+
+			showLocals(context.Background(), client, []string{frame}, &out)
+
+			if len(client.frames) != 0 {
+				t.Fatalf("Locals called with %v", client.frames)
+			}
+			if !strings.Contains(out.String(), "invalid frame index") {
+				t.Fatalf("output = %q", out.String())
+			}
+		})
+	}
+}
+
 // TestFormatGoroutineListStatesWhatItOmits pins the listing's honesty. The
 // goroutine list is bounded by the wire contract, so a caller that prints only
 // the delivered entries presents a packed subset — or a scan that stopped early
@@ -218,5 +356,54 @@ func TestFormatGoroutineListStatesWhatItOmits(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+type blockingLocalsClient struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (c *blockingLocalsClient) Locals(int) ([]protocol.Variable, error) {
+	close(c.started)
+	<-c.release
+	return nil, errors.New("client closed")
+}
+
+func TestShowLocalsSuppressesCancellationError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &blockingLocalsClient{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	var out bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		showLocals(ctx, client, nil, &out)
+		close(done)
+	}()
+
+	<-client.started
+	cancel()
+	close(client.release)
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("showLocals did not return after cancellation")
+	}
+	if got := out.String(); got != "" {
+		t.Fatalf("output = %q, want silent cancellation", got)
+	}
+}
+
+func TestCommandErrorSuppressionOnlyMatchesShutdown(t *testing.T) {
+	if !commandErrorSuppressed(context.Background(), errors.New("client closed")) {
+		t.Fatal("client closure was not suppressed")
+	}
+	if !commandErrorSuppressed(context.Background(), io.ErrUnexpectedEOF) {
+		t.Fatal("transport EOF was not suppressed")
+	}
+	if commandErrorSuppressed(context.Background(), errors.New("server: no active debugger")) {
+		t.Fatal("server command error was incorrectly suppressed")
 	}
 }
