@@ -2,6 +2,8 @@ package debugger
 
 import (
 	"debug/dwarf"
+	"encoding/binary"
+	"errors"
 	"testing"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
@@ -23,6 +25,47 @@ func (readableBackend) SetRegisters(int, Registers) error     { return nil }
 func (readableBackend) Threads() ([]int, error)               { return []int{1}, nil }
 func (readableBackend) Wait() (StopEvent, error)              { return StopEvent{}, nil }
 
+type valueMemoryBackend struct {
+	readableBackend
+	mem map[uint64]byte
+}
+
+func newValueMemoryBackend() *valueMemoryBackend {
+	return &valueMemoryBackend{mem: make(map[uint64]byte)}
+}
+
+func (b *valueMemoryBackend) ReadMemory(addr uint64, dst []byte) error {
+	for i := range dst {
+		value, ok := b.mem[addr+uint64(i)]
+		if !ok {
+			return errors.New("unreadable memory")
+		}
+		dst[i] = value
+	}
+	return nil
+}
+
+func (b *valueMemoryBackend) seedUint64(addr, value uint64) {
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, value)
+	for i := range buf {
+		b.mem[addr+uint64(i)] = buf[i]
+	}
+}
+
+func testIntType() *dwarf.IntType {
+	return &dwarf.IntType{BasicType: dwarf.BasicType{
+		CommonType: dwarf.CommonType{ByteSize: 8, Name: "int"},
+	}}
+}
+
+func testPointerType(name string, target dwarf.Type) *dwarf.PtrType {
+	return &dwarf.PtrType{
+		CommonType: dwarf.CommonType{ByteSize: 8, Name: name},
+		Type:       target,
+	}
+}
+
 func countNodes(v protocol.Variable) int {
 	n := 1
 	for i := range v.Children {
@@ -43,12 +86,137 @@ func hasTruncationNode(v protocol.Variable) bool {
 	return false
 }
 
+func TestFormatTypedExpandsSiblingPointerAliases(t *testing.T) {
+	intType := testIntType()
+	ptrType := testPointerType("*int", intType)
+	pairType := &dwarf.StructType{
+		CommonType: dwarf.CommonType{ByteSize: 16, Name: "pair"},
+		StructName: "pair",
+		Kind:       "struct",
+		Field: []*dwarf.StructField{
+			{Name: "Left", Type: ptrType, ByteOffset: 0},
+			{Name: "Right", Type: ptrType, ByteOffset: 8},
+		},
+	}
+	backend := newValueMemoryBackend()
+	backend.seedUint64(0x1000, 0x2000)
+	backend.seedUint64(0x1008, 0x2000)
+	backend.seedUint64(0x2000, 42)
+
+	root := (&dwarfReader{}).formatTyped(backend, "pair", pairType, 0x1000)
+
+	if len(root.Children) != 2 {
+		t.Fatalf("pair children = %d, want 2", len(root.Children))
+	}
+	for _, pointer := range root.Children {
+		if len(pointer.Children) != 1 {
+			t.Errorf("%s children = %d, want 1", pointer.Name, len(pointer.Children))
+			continue
+		}
+		if got := pointer.Children[0].Value; got != "42" {
+			t.Errorf("%s pointee = %q, want 42", pointer.Name, got)
+		}
+	}
+}
+
+func TestFormatCtxPointerPathOwnership(t *testing.T) {
+	ctx := &formatCtx{activePointers: make(map[uint64]bool)}
+
+	leaveAncestor, ok := ctx.enterPointer(0x2000)
+	if !ok {
+		t.Fatal("first pointer entry was rejected")
+	}
+	if leaveCycle, ok := ctx.enterPointer(0x2000); ok || leaveCycle != nil {
+		t.Fatal("cycle entry must not own ancestor cleanup")
+	}
+	if !ctx.activePointers[0x2000] {
+		t.Fatal("rejected cycle entry removed its ancestor")
+	}
+
+	leaveAncestor()
+	leaveAlias, ok := ctx.enterPointer(0x2000)
+	if !ok {
+		t.Fatal("sibling alias was rejected after ancestor unwound")
+	}
+	leaveAlias()
+}
+
+func TestFormatTypedPointerCyclesRemainBounded(t *testing.T) {
+	t.Run("self cycle", func(t *testing.T) {
+		nodeType := &dwarf.StructType{
+			CommonType: dwarf.CommonType{ByteSize: 8, Name: "node"},
+			StructName: "node",
+			Kind:       "struct",
+		}
+		nodePtr := testPointerType("*node", nodeType)
+		nodeType.Field = []*dwarf.StructField{
+			{Name: "Next", Type: nodePtr, ByteOffset: 0},
+		}
+		backend := newValueMemoryBackend()
+		backend.seedUint64(0x1000, 0x2000)
+		backend.seedUint64(0x2000, 0x2000)
+
+		root := (&dwarfReader{}).formatTyped(backend, "head", nodePtr, 0x1000)
+
+		if total := countNodes(root); total > 4 {
+			t.Fatalf("self-cycle node count = %d, want <= 4", total)
+		}
+	})
+
+	t.Run("mutual cycle", func(t *testing.T) {
+		leftType := &dwarf.StructType{
+			CommonType: dwarf.CommonType{ByteSize: 8, Name: "leftNode"},
+			StructName: "leftNode",
+			Kind:       "struct",
+		}
+		rightType := &dwarf.StructType{
+			CommonType: dwarf.CommonType{ByteSize: 8, Name: "rightNode"},
+			StructName: "rightNode",
+			Kind:       "struct",
+		}
+		leftType.Field = []*dwarf.StructField{
+			{Name: "Right", Type: testPointerType("*rightNode", rightType), ByteOffset: 0},
+		}
+		rightType.Field = []*dwarf.StructField{
+			{Name: "Left", Type: testPointerType("*leftNode", leftType), ByteOffset: 0},
+		}
+		backend := newValueMemoryBackend()
+		backend.seedUint64(0x2000, 0x3000)
+		backend.seedUint64(0x3000, 0x2000)
+
+		root := (&dwarfReader{}).formatTyped(backend, "left", leftType, 0x2000)
+
+		if total := countNodes(root); total > 5 {
+			t.Fatalf("mutual-cycle node count = %d, want <= 5", total)
+		}
+	})
+}
+
+func TestFormatTypedUnreadablePointerTarget(t *testing.T) {
+	backend := newValueMemoryBackend()
+	backend.seedUint64(0x1000, 0x2000)
+
+	root := (&dwarfReader{}).formatTyped(
+		backend,
+		"value",
+		testPointerType("*int", testIntType()),
+		0x1000,
+	)
+
+	if len(root.Children) != 1 {
+		t.Fatalf("pointer children = %d, want 1", len(root.Children))
+	}
+	if got, want := root.Children[0].Value, "<unreadable: unreadable memory>"; got != want {
+		t.Errorf("unreadable pointee = %q, want %q", got, want)
+	}
+}
+
 // TestFormatTypedBudget guards the shared per-inspection node/byte ceiling: a
 // pathologically wide, deep aggregate ([100][100][100][100]int, ~10^8 potential
 // nodes) must be truncated to O(maxTotalNodes) with a truncation node present,
 // so one Locals/Evaluate request can never wedge the single-threaded engine loop.
 func TestFormatTypedBudget(t *testing.T) {
-	intT := &dwarf.IntType{BasicType: dwarf.BasicType{CommonType: dwarf.CommonType{ByteSize: 8, Name: "int"}}}
+	intT := testIntType()
 	arr := func(elem dwarf.Type, count int64) *dwarf.ArrayType {
 		return &dwarf.ArrayType{Type: elem, Count: count}
 	}
