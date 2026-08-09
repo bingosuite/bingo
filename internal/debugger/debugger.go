@@ -76,7 +76,7 @@ type Debugger interface {
 	Evaluate(frameIndex int, name string) (protocol.Variable, error)
 
 	StackFrames() ([]protocol.Frame, error)
-	Goroutines() ([]protocol.Goroutine, error)
+	Goroutines() (protocol.GoroutinesPayload, error)
 
 	// GoroutineSnapshot returns the full concurrency picture on demand — every
 	// goroutine (with parent linkage), every OS thread, and the current

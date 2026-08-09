@@ -103,8 +103,10 @@ func (d *raceDebugger) Locals(int) ([]protocol.Variable, error) { return nil, ni
 func (d *raceDebugger) Evaluate(int, string) (protocol.Variable, error) {
 	return protocol.Variable{}, nil
 }
-func (d *raceDebugger) StackFrames() ([]protocol.Frame, error)    { return nil, nil }
-func (d *raceDebugger) Goroutines() ([]protocol.Goroutine, error) { return nil, nil }
+func (d *raceDebugger) StackFrames() ([]protocol.Frame, error) { return nil, nil }
+func (d *raceDebugger) Goroutines() (protocol.GoroutinesPayload, error) {
+	return protocol.GoroutinesPayload{}, nil
+}
 func (d *raceDebugger) GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error) {
 	return protocol.GoroutineSnapshotPayload{}, nil
 }

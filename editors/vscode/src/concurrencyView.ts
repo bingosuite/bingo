@@ -246,6 +246,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, .graph-viewport
 .node-id { font-size: 14px; font-weight: 700; }
 .node-status, .node-thread { font-size: 10px; fill: var(--vscode-descriptionForeground) !important; }
 .omitted { position: absolute; bottom: 2px; left: 8px; color: var(--vscode-descriptionForeground); font-size: 10px; }
+.server-omitted { position: absolute; bottom: 14px; left: 8px; color: var(--vscode-editorWarning-foreground); font-size: 10px; }
+.threads .server-omitted { position: static; margin: 4px 0 0; }
 .inspector, .threads, .timeline { padding: 11px; }
 h2 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; color: var(--vscode-descriptionForeground); }
 .inspector-title { display: block; margin-bottom: 10px; font-size: 15px; }

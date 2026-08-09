@@ -7,20 +7,13 @@ import (
 	"fmt"
 )
 
-const Version = "1.3"
+const Version = "1.4"
 
 // Size limits for the goroutine event family — EventGoroutineSnapshot and
 // EventGoroutines. They are deliberately NOT generic envelope limits: every
 // other event keeps its existing unbounded behaviour, and neither the hub, the
 // Go client, nor Location strings are capped. Only these two events carry an
 // unbounded runtime collection, so only they are bounded here (see issue #194).
-//
-// NOTHING PRODUCES THESE YET. This file defines the contract and the pure
-// packers that implement it; wiring the debugger to pack, and teaching clients
-// to enforce, is a follow-up. Until both land together Totals is never
-// populated and no peer may assume a goroutine event is bounded, so a consumer
-// must not enforce the budget ahead of the producer — it would reject
-// perfectly valid output.
 const (
 	// MaxGoroutineEventBytes is the exact marshalled Event ceiling for the
 	// goroutine event family, matched to the binding consumer's decoder budget
