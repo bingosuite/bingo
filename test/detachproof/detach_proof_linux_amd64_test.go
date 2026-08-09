@@ -62,7 +62,7 @@ func boundedKill(d debugger.Debugger, timeout time.Duration) (error, bool) {
 //
 // When setBP is false the breakpoint step is skipped (used by the no-breakpoint
 // control, which isolates the detach failure from the trap-restoration failure).
-func attachAndArm(t *testing.T, setBP bool) (*target, debugger.Debugger, uint64, []byte) {
+func attachAndArm(t *testing.T, setBP bool) (*target, debugger.Debugger, uint64, []byte, int) {
 	t.Helper()
 	bin, srcName := buildProofTarget(t, "detach_proof_target", proofTargetSrc)
 	bpLine := markerLine(t, proofTargetSrc, "// BP")
@@ -96,6 +96,7 @@ func attachAndArm(t *testing.T, setBP bool) (*target, debugger.Debugger, uint64,
 		t.Fatalf("after Attach: TracerPid=%d does not belong to this test process (%d)", tp, os.Getpid())
 	}
 
+	bpOff := -1
 	if setBP {
 		bp, err := d.SetBreakpoint(srcName, bpLine)
 		if err != nil {
@@ -114,10 +115,11 @@ func attachAndArm(t *testing.T, setBP bool) (*target, debugger.Debugger, uint64,
 		if len(idx) != 1 || got[idx[0]] != int3 {
 			t.Fatalf("expected exactly one INT3 patched into main.gated, got diffs %v", idx)
 		}
+		bpOff = idx[0]
 		t.Logf("armed: INT3 installed at main.gated+0x%x (runtime 0x%x)", idx[0], vaddr+uint64(idx[0]))
 	}
 
-	return tg, d, vaddr, disk
+	return tg, d, vaddr, disk, bpOff
 }
 
 // resumeAndConfirmRunning continues the tracee and proves it is genuinely
@@ -159,7 +161,7 @@ func TestAttachedRunningKillDetaches(t *testing.T) {
 	})
 	for i := 0; i < iters; i++ {
 		t.Run(fmt.Sprintf("iter%d", i), func(t *testing.T) {
-			tg, d, vaddr, disk := attachAndArm(t, true)
+			tg, d, vaddr, disk, bpOff := attachAndArm(t, true)
 			resumeAndConfirmRunning(t, tg, d)
 
 			killErr, returned := boundedKill(d, 10*time.Second)
@@ -191,6 +193,11 @@ func TestAttachedRunningKillDetaches(t *testing.T) {
 			}
 			if idx := diffBytes(disk, got, 8); len(idx) != 0 {
 				trapLeaks++
+				if len(idx) != 1 || idx[0] != bpOff || got[idx[0]] != int3 {
+					t.Errorf("unexpected post-Kill divergence: diffs %v (armed offset was 0x%x); "+
+						"this is NOT the clean leftover-INT3 signature and must be investigated "+
+						"before the result is trusted", idx, bpOff)
+				}
 				t.Errorf("U4 CONFIRMED (trap leak): after a successful Kill, main.gated still differs from the ELF "+
 					"at offsets %v (first byte in memory = 0x%02x, want 0x%02x). bps.clearAll writes via "+
 					"PTRACE_POKEDATA, which needs a ptrace-stop; on a running tracee it fails with ESRCH and "+
@@ -233,7 +240,7 @@ func TestAttachedRunningKillDetaches(t *testing.T) {
 // legal, so this must pass on origin/main. If it fails, the harness — not the
 // production path — is at fault, and the main proof means nothing.
 func TestControlSuspendedDetach(t *testing.T) {
-	tg, d, vaddr, disk := attachAndArm(t, true)
+	tg, d, vaddr, disk, _ := attachAndArm(t, true)
 
 	// No Continue: stay parked at the attach stop.
 	if st := procState(tg.pid); st != "t" && st != "T" {
@@ -281,7 +288,7 @@ func TestControlSuspendedDetach(t *testing.T) {
 // So a target that stays traced yet still completes phase 2 pins the freeze in
 // the main proof on the leftover INT3 rather than on tracing per se.
 func TestControlRunningNoBreakpoint(t *testing.T) {
-	tg, d, vaddr, disk := attachAndArm(t, false)
+	tg, d, vaddr, disk, _ := attachAndArm(t, false)
 	resumeAndConfirmRunning(t, tg, d)
 
 	killErr, returned := boundedKill(d, 10*time.Second)

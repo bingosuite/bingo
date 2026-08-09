@@ -77,7 +77,7 @@ func main() {
 	runtime.LockOSThread()
 	gate, ready, done, beat := os.Args[1], os.Args[2], os.Args[3], os.Args[4]
 
-	if err := os.WriteFile(ready, []byte(fmt.Sprint(os.Getpid())), 0o600); err != nil {
+	if err := os.WriteFile(ready, []byte(fmt.Sprint(syscall.Gettid())), 0o600); err != nil {
 		os.Exit(3)
 	}
 
@@ -213,6 +213,22 @@ func startTarget(t *testing.T, bin string) *target {
 
 	if !waitForFile(tg.ready, 15*time.Second) {
 		t.Fatalf("target pid %d never wrote its readiness marker", tg.pid)
+	}
+	// PTRACE_ATTACH traces one THREAD, and the linux backend attaches to the
+	// pid. Unless the target's locked main thread is the group leader
+	// (tid == pid), the heartbeat would come from an untraced M and would not
+	// prove the traced thread resumed.
+	b, err := os.ReadFile(tg.ready)
+	if err != nil {
+		t.Fatalf("read readiness marker: %v", err)
+	}
+	tid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		t.Fatalf("parse readiness marker %q: %v", b, err)
+	}
+	if tid != tg.pid {
+		t.Fatalf("target's locked main thread is tid %d but the process is pid %d; "+
+			"PTRACE_ATTACH would trace a different thread than the one heartbeating", tid, tg.pid)
 	}
 	// Let the Go runtime reach steady state before attaching (mirrors the e2e
 	// attach harness) so the attach stop is not racing process startup.
