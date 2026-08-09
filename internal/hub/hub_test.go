@@ -735,60 +735,32 @@ var _ = Describe("Hub", func() {
 		It("stays resumable after a raw hub rejects Restart", func() {
 			conn := newFakeWSConn()
 			mustAddClient(h, conn)
-
-			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
-				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
-			waitForEventKind(conn, protocol.EventBreakpointHit, nil)
+			suspendAtBreakpoint(conn, fd)
 
 			// hub.New has no session ID and no debugger factory, so Restart is
 			// refused without touching h.dbg or the state.
-			conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
-			waitForEventKind(conn, protocol.EventError, nil)
-			Expect(h.State()).To(Equal(protocol.StateSuspended))
-
-			conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
-			Eventually(fd.recordedCalls, "500ms", "10ms").
-				Should(ContainElement("Continue"))
+			expectRejectedWhileSuspended(h, conn,
+				mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+			expectResumable(conn, fd)
 		})
 
 		It("stays resumable after a failed Kill", func() {
 			conn := newFakeWSConn()
 			mustAddClient(h, conn)
-			fd.killErr = errors.New("kill failed")
+			refuseKillWhileSuspended(h, conn, fd)
 
-			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
-				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
-			waitForEventKind(conn, protocol.EventBreakpointHit, nil)
-
-			conn.inject(mustCommand(protocol.CmdKill, struct{}{}))
-			waitForEventKind(conn, protocol.EventError, nil)
-			Expect(h.State()).To(Equal(protocol.StateSuspended))
-
-			conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
-			Eventually(fd.recordedCalls, "500ms", "10ms").
-				Should(ContainElement("Continue"))
+			expectResumable(conn, fd)
 		})
 
 		It("lets a retry Kill reach the debugger after the first fails", func() {
 			conn := newFakeWSConn()
 			mustAddClient(h, conn)
-			fd.killErr = errors.New("kill failed")
-
-			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
-				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
-			waitForEventKind(conn, protocol.EventBreakpointHit, nil)
-
-			conn.inject(mustCommand(protocol.CmdKill, struct{}{}))
-			// The rejection surfaces as an EventError, which also serves as a
-			// happens-before barrier before the transient failure is cleared.
-			waitForEventKind(conn, protocol.EventError, nil)
-			Expect(countCalls(fd.recordedCalls(), "Kill")).To(Equal(1))
+			refuseKillWhileSuspended(h, conn, fd)
+			expectCallCount(fd, "Kill", 1, "the rejected Kill ran exactly once")
 
 			fd.killErr = nil
 			conn.inject(mustCommand(protocol.CmdKill, struct{}{}))
-			Eventually(func() int {
-				return countCalls(fd.recordedCalls(), "Kill")
-			}, "500ms", "10ms").Should(Equal(2),
+			expectCallCount(fd, "Kill", 2,
 				"retry Kill must reach the debugger after a failed Kill")
 		})
 	})
@@ -894,23 +866,15 @@ var _ = Describe("Hub", func() {
 			conn := newFakeWSConn()
 			mustAddClient(h, conn)
 			fd.continueErr = errors.New("reinstall failed")
+			suspendAtBreakpoint(conn, fd)
 
-			fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
-				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
-			waitForEventKind(conn, protocol.EventBreakpointHit, nil)
-
-			conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
 			// The rejected resume surfaces as an EventError; it also serves as a
 			// happens-before barrier before we clear the transient error below.
-			waitForEventKind(conn, protocol.EventError, nil)
-			Expect(countCalls(fd.recordedCalls(), "Continue")).To(Equal(1))
+			expectRejectedWhileSuspended(h, conn, mustCommand(protocol.CmdContinue, struct{}{}))
+			expectCallCount(fd, "Continue", 1, "the rejected resume ran exactly once")
 
 			fd.continueErr = nil
-			conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
-			Eventually(func() int {
-				return countCalls(fd.recordedCalls(), "Continue")
-			}, "500ms", "10ms").Should(Equal(2),
-				"retry resume must reach the debugger after a failed resume")
+			expectResumable(conn, fd)
 		})
 
 		It("still resumes via Continue after a failed StepOver", func() {
@@ -1168,6 +1132,15 @@ func launchManaged(conn *fakeWSConn, fd *fakeDebugger, program string) {
 	_, _ = recvEvent(conn) // state -> running
 }
 
+// attachManaged is launchManaged's counterpart for an Attach-based session.
+// Attach clears lastLaunch, so the session has no binary Restart could
+// relaunch — the setup for every "Restart is refused" scenario.
+func attachManaged(conn *fakeWSConn, fd *fakeDebugger, pid int) {
+	conn.inject(mustCommand(protocol.CmdAttach, protocol.AttachPayload{PID: pid}))
+	EventuallyWithOffset(1, fd.recordedCalls, "500ms", "10ms").Should(ContainElement("Attach"))
+	_, _ = recvEvent(conn) // state -> running
+}
+
 // waitForEventKind polls conn until an event of the given kind arrives,
 // decoding it into out (if non-nil) before returning.
 func waitForEventKind(conn *fakeWSConn, kind protocol.EventKind, out any) {
@@ -1300,6 +1273,55 @@ var _ = Describe("Suspend safety timeout", func() {
 	})
 })
 
+// expectCallCount waits until name has been dispatched to fd exactly want
+// times, then holds — catching both a missing dispatch and a duplicate one.
+func expectCallCount(fd *fakeDebugger, name string, want int, msg string) {
+	EventuallyWithOffset(1, func() int {
+		return countCalls(fd.recordedCalls(), name)
+	}, "500ms", "10ms").Should(Equal(want), msg)
+}
+
+// suspendAtBreakpoint pushes a BreakpointHit from fd and waits for conn to
+// observe it, leaving the hub parked in the suspend-wait loop. The pushed seq
+// is cosmetic — the hub re-stamps every outbound event with its own counter.
+func suspendAtBreakpoint(conn *fakeWSConn, fd *fakeDebugger) {
+	fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+		protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+	waitForEventKind(conn, protocol.EventBreakpointHit, nil)
+}
+
+// expectRejectedWhileSuspended injects cmd and waits for the resulting
+// EventError, then asserts the session is untouched — still suspended, with
+// the original process alive. The error also serves as a happens-before
+// barrier for anything the caller mutates afterwards.
+func expectRejectedWhileSuspended(h *hub.Hub, conn *fakeWSConn, cmd protocol.Command) {
+	conn.inject(cmd)
+	waitForEventKind(conn, protocol.EventError, nil)
+	ExpectWithOffset(1, h.State()).To(Equal(protocol.StateSuspended))
+}
+
+// expectResumable proves the hub is still parked in the suspend-wait loop by
+// driving one more Continue through to the debugger. That loop is the only
+// drainer of resumeCh (Run's outer select never reads it), so a Continue that
+// lands is proof the suspend was not abandoned.
+func expectResumable(conn *fakeWSConn, fd *fakeDebugger) {
+	want := countCalls(fd.recordedCalls(), "Continue") + 1
+	conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
+	EventuallyWithOffset(1, func() int {
+		return countCalls(fd.recordedCalls(), "Continue")
+	}, "500ms", "10ms").Should(Equal(want),
+		"resume must still reach the debugger while suspended")
+}
+
+// refuseKillWhileSuspended parks the hub at a breakpoint behind a debugger
+// that refuses Kill, then drives that rejected Kill — the shared starting
+// state for every "a failed Kill must not dissolve the suspend" scenario.
+func refuseKillWhileSuspended(h *hub.Hub, conn *fakeWSConn, fd *fakeDebugger) {
+	fd.killErr = errors.New("kill failed")
+	suspendAtBreakpoint(conn, fd)
+	expectRejectedWhileSuspended(h, conn, mustCommand(protocol.CmdKill, struct{}{}))
+}
+
 var _ = Describe("Restart", func() {
 	var fd *fakeDebugger
 
@@ -1331,8 +1353,7 @@ var _ = Describe("Restart", func() {
 		_, conn, cancel := newManagedRestartHub(fd)
 		defer cancel()
 
-		conn.inject(mustCommand(protocol.CmdAttach, protocol.AttachPayload{PID: 123}))
-		Eventually(fd.recordedCalls, "500ms", "10ms").Should(ContainElement("Attach"))
+		attachManaged(conn, fd, 123)
 
 		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
 		waitForEventKind(conn, protocol.EventError, nil)
@@ -1386,10 +1407,7 @@ var _ = Describe("Restart", func() {
 		managed, conn, cancel := newManagedRestartHub(fd)
 		defer cancel()
 		launchManaged(conn, fd, "myapp")
-
-		fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
-			protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
-		waitForEventKind(conn, protocol.EventBreakpointHit, nil)
+		suspendAtBreakpoint(conn, fd)
 
 		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
 		waitForEventKind(conn, protocol.EventRestarted, nil)
@@ -1397,13 +1415,8 @@ var _ = Describe("Restart", func() {
 
 		// Run's outer loop owns the relaunched debugger's events again: a
 		// fresh stop suspends the hub and a Continue resumes it.
-		fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 2,
-			protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
-		waitForEventKind(conn, protocol.EventBreakpointHit, nil)
-
-		conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
-		Eventually(fd.recordedCalls, "500ms", "10ms").
-			Should(ContainElement("Continue"))
+		suspendAtBreakpoint(conn, fd)
+		expectResumable(conn, fd)
 	})
 
 	// Restart is refused before it touches the debugger or the session state
@@ -1413,32 +1426,19 @@ var _ = Describe("Restart", func() {
 	It("stays resumable when Restart is rejected while suspended", func() {
 		managed, conn, cancel := newManagedRestartHub(fd)
 		defer cancel()
+		attachManaged(conn, fd, 123)
+		suspendAtBreakpoint(conn, fd)
 
-		// Attach leaves lastLaunch nil, so Restart has no binary to relaunch.
-		conn.inject(mustCommand(protocol.CmdAttach, protocol.AttachPayload{PID: 123}))
-		Eventually(fd.recordedCalls, "500ms", "10ms").Should(ContainElement("Attach"))
-
-		fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
-			protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
-		waitForEventKind(conn, protocol.EventBreakpointHit, nil)
-
-		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
-		waitForEventKind(conn, protocol.EventError, nil)
-		Expect(managed.State()).To(Equal(protocol.StateSuspended))
-
-		conn.inject(mustCommand(protocol.CmdContinue, struct{}{}))
-		Eventually(fd.recordedCalls, "500ms", "10ms").
-			Should(ContainElement("Continue"))
+		expectRejectedWhileSuspended(managed, conn,
+			mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
+		expectResumable(conn, fd)
 	})
 
 	It("goes idle and leaves the suspend loop when the relaunch fails", func() {
 		managed, conn, cancel := newManagedRestartHub(fd)
 		defer cancel()
 		launchManaged(conn, fd, "myapp")
-
-		fd.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
-			protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
-		waitForEventKind(conn, protocol.EventBreakpointHit, nil)
+		suspendAtBreakpoint(conn, fd)
 
 		fd.launchErr = errors.New("relaunch failed")
 		conn.inject(mustCommand(protocol.CmdRestart, protocol.RestartPayload{}))
