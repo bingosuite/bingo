@@ -434,20 +434,33 @@ func TestProof_OwnershipPlainChildren(t *testing.T) {
 // the victim is a REAL peer debugger session's tracee, with every owned tid
 // recorded. Session B is suspended at entry so it has no waitLoop; session A is
 // therefore the only waiter, and B's death is provably delivered to A.
-func TestProof_OwnershipForeignTracee(t *testing.T) {
-	r := runChild(t, "proof-ownership-foreign-tracee", 120*time.Second)
-	requireCode(t, r, "proof-ownership-foreign-tracee", exitStolen)
+// TestProof_PeerPtraceStopMakesWedgeUnrecoverable proves the wedge has no
+// external escape hatch. A peer session's tracee parked in ptrace-stop cannot
+// be killed by anyone but its own tracer, so it remains a live child forever
+// and the process-wide ECHILD that reapAfterKill waits for can never arrive.
+//
+// This also demonstrates facet 4 of U3: whoever wins the wait is not
+// necessarily able to act on what it wins.
+func TestProof_PeerPtraceStopMakesWedgeUnrecoverable(t *testing.T) {
+	r := runChild(t, "proof-peer-ptrace-stop-unrecoverable", 120*time.Second)
+	requireCode(t, r, "proof-peer-ptrace-stop-unrecoverable", exitWedged)
+	mustResult(t, r, "b_waitloop_armed=false",
+		"the peer session must have no waitLoop, so session A is the sole waiter")
+	mustResult(t, r, "a_tracee_reaped=true",
+		"session A's own tracee must already be gone before we attribute the wait")
 	mustResult(t, r, "kill_blocked_while_peer_session_tracee_lives=true",
 		"Kill must block while another SESSION's tracee is alive")
-	mustResult(t, r, "kill_returned_on_peer_session_tracee_death=true",
-		"Kill must be released by the death of a tracee it does not own")
-	mustResult(t, r, "b_tracee_status_consumed_by_session_a=true",
-		"session A must have consumed the exit status of session B's tracee")
-	mustResult(t, r, "b_session_saw_its_own_process_exit=false",
-		"session B must never learn its own tracee died")
-	if strings.Contains(r.output, "reaped by the HARNESS just now") {
-		t.Errorf("attribution broken: the harness reaped B's tracee itself:\n%s", r.output)
-	}
+	mustResult(t, r, "b_tracee_state_after_external_sigkill=t",
+		"the peer tracee must survive an external SIGKILL, frozen in ptrace-stop")
+	mustResult(t, r, "b_tracee_sigkill_pending_undelivered=true",
+		"SIGKILL must be queued-but-unacted-on, which is why the tracee cannot die")
+	mustResult(t, r, "b_tracee_still_child=true",
+		"the peer tracee must remain a child, keeping process-wide ECHILD unreachable")
+	mustResult(t, r, "kill_returned_after_external_sigkill=false",
+		"the wedge must be unrecoverable by any action outside the owning session")
+	mustResult(t, r, "harness_consumed_a_status=false",
+		"the harness must not have consumed a status itself")
+	requireWedgeStack(t, r)
 }
 
 // mustResult asserts an exact RESULT line, so a proof cannot pass on a value it
@@ -592,8 +605,8 @@ func runScenario(name string) int {
 		return scenarioSuspendedKillPlainChild()
 	case "proof-ownership-plain-children":
 		return scenarioOwnershipPlainChildren()
-	case "proof-ownership-foreign-tracee":
-		return scenarioOwnershipForeignTracee()
+	case "proof-peer-ptrace-stop-unrecoverable":
+		return scenarioPeerPtraceStopMakesWedgeUnrecoverable()
 	case "proof-peer-waitloop-steals-exit":
 		return scenarioPeerWaitLoopStealsExit()
 	case "proof-reapafterkill-vs-peer-death":
@@ -811,6 +824,51 @@ func reapedBySomeoneElse(pid int) (string, bool) {
 }
 
 func isNoChild(err error) bool { return errors.Is(err, syscall.ECHILD) }
+
+// sigkillPending reports whether SIGKILL is queued-but-undelivered for pid.
+// A task sitting in ptrace-stop accepts the signal into its pending mask but
+// does not act on it until its TRACER restarts it, which is what makes such a
+// tracee unkillable from outside its owning session.
+func sigkillPending(pid int) bool {
+	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if !strings.HasPrefix(line, "ShdPnd:") && !strings.HasPrefix(line, "SigPnd:") {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		mask, err := strconv.ParseUint(f[1], 16, 64)
+		if err != nil {
+			continue
+		}
+		if mask&(1<<(uint(syscall.SIGKILL)-1)) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// hasPendingStatus reports whether pid still has an unconsumed wait status.
+// Used to tell "another waiter already took it" from "there was never one".
+func hasPendingStatus(pid int) (string, bool) {
+	var ws syscall.WaitStatus
+	wpid, err := syscall.Wait4(pid, &ws, syscall.WNOHANG|syscall.WALL|syscall.WUNTRACED, nil)
+	switch {
+	case isNoChild(err):
+		return "ECHILD (not a child any more)", false
+	case err != nil:
+		return "wait4 error: " + err.Error(), false
+	case wpid == 0:
+		return "live child, no wait status available", false
+	default:
+		return fmt.Sprintf("status available and consumed by the HARNESS (pid=%d)", wpid), true
+	}
+}
 
 // startUntracedChild spawns a plain child this process never waits on, so its
 // only possible reaper is whatever else calls wait4 in this process.
@@ -1181,15 +1239,22 @@ func scenarioOwnershipPlainChildren() int {
 	return exitStolen
 }
 
-// scenarioOwnershipForeignTracee is the same deterministic attribution applied
-// to a REAL peer debugger session's tracee, naming every tid.
+// scenarioPeerPtraceStopMakesWedgeUnrecoverable is the strongest liveness
+// result in this harness, and it involves NO race at all.
 //
-// Session B is launched and left suspended at its entry stop, so B has NO
-// waitLoop armed (engine.Launch consumed the execve stop with a pid-specific
-// wait). Session A is then suspended-killed, parking reapAfterKill in
-// Wait4(-1, WALL) as the process's only waiter. Killing B's tracee therefore
-// delivers B's tids to A — provably, not probably.
-func scenarioOwnershipForeignTracee() int {
+// Session B is launched and left suspended at its entry stop. Its tracee is
+// therefore parked in ptrace-stop, and B's entry status was already consumed by
+// Launch's pid-specific wait — so the tracee has no pending wait status and can
+// generate no new one. Session A is then suspended-killed, parking reapAfterKill
+// in Wait4(-1, WALL) as the process's only waiter.
+//
+// The operator's natural rescue — SIGKILL the offending peer tracee from
+// outside — provably CANNOT work: a task in ptrace-stop takes SIGKILL into its
+// pending mask but does not act on it until its own TRACER restarts it, and its
+// tracer is session B, which is not going to. So B's tracee stays a live child
+// forever, process-wide ECHILD is unreachable forever, and A's Kill (running on
+// A's engine loop goroutine) is permanently unrecoverable.
+func scenarioPeerPtraceStopMakesWedgeUnrecoverable() int {
 	bExit := make(chan struct{}, 1)
 	b, bPID, err := launchSuspended(longBin)
 	if err != nil {
@@ -1197,10 +1262,10 @@ func scenarioOwnershipForeignTracee() int {
 		return exitSetup
 	}
 	drain(b, bExit, nil)
-	bTIDs := threadTIDs(bPID)
 	result("b_session_tracee_pid", bPID)
-	result("b_session_owned_tids", fmt.Sprint(bTIDs))
+	result("b_session_owned_tids", fmt.Sprint(threadTIDs(bPID)))
 	result("b_waitloop_armed", false) // suspended at entry: no waitLoop exists
+	result("b_tracee_state_initial", procState(bPID))
 
 	a, aPID, err := launchSuspended(longBin)
 	if err != nil {
@@ -1208,7 +1273,6 @@ func scenarioOwnershipForeignTracee() int {
 		return exitSetup
 	}
 	result("a_session_tracee_pid", aPID)
-	result("a_session_owned_tids", fmt.Sprint(threadTIDs(aPID)))
 
 	killed := killAsync(a)
 	if !awaitReaped(aPID, 15*time.Second) {
@@ -1220,39 +1284,39 @@ func scenarioOwnershipForeignTracee() int {
 	select {
 	case err := <-killed:
 		tracef("A.Kill returned early (err=%v) — no wedge this run", err)
-		result("kill_returned_before_peer_died", true)
+		result("kill_returned_before_rescue_attempt", true)
 		_ = syscall.Kill(bPID, syscall.SIGKILL)
 		return exitOK
 	case <-time.After(3 * time.Second):
 		result("kill_blocked_while_peer_session_tracee_lives", true)
 	}
 
-	// The single contested event: the death of a tracee owned by session B.
-	tracef("killing session B's tracee (pid=%d, tids=%v) while only A waits", bPID, bTIDs)
+	// The rescue attempt: kill the obstacle from outside its owning session.
+	tracef("attempting external rescue: SIGKILL peer session B's tracee pid=%d (state=%s)",
+		bPID, procState(bPID))
 	_ = syscall.Kill(bPID, syscall.SIGKILL)
+	time.Sleep(2 * time.Second)
+
+	result("b_tracee_state_after_external_sigkill", procState(bPID))
+	result("b_tracee_sigkill_pending_undelivered", sigkillPending(bPID))
+	result("b_tracee_still_child", ppidOf(bPID) == os.Getpid())
+	why, harnessTook := hasPendingStatus(bPID)
+	result("b_tracee_wait_status", why)
+	result("harness_consumed_a_status", harnessTook)
 
 	select {
 	case err := <-killed:
-		tracef("A.Kill returned immediately after B's tracee died (err=%v)", err)
-		result("kill_returned_on_peer_session_tracee_death", true)
+		tracef("A.Kill returned after the external SIGKILL (err=%v) — recoverable", err)
+		result("kill_returned_after_external_sigkill", true)
+		return exitOK
 	case <-time.After(10 * time.Second):
-		tracef("A.Kill still blocked after B's tracee died")
-		result("kill_returned_on_peer_session_tracee_death", false)
+		tracef("A.Kill STILL blocked: peer tracee is frozen in ptrace-stop with SIGKILL " +
+			"pending, so process-wide ECHILD is unreachable by any external action")
+		result("kill_returned_after_external_sigkill", false)
+		result("b_session_saw_its_own_process_exit", len(bExit) > 0)
 		dumpBlockedGoroutines()
 		return exitWedged
 	}
-
-	why, ok := reapedBySomeoneElse(bPID)
-	result("b_tracee_status_after_a_kill_returned", why)
-	result("b_tracee_status_consumed_by_session_a", ok)
-	result("b_session_saw_its_own_process_exit", len(bExit) > 0)
-	result("tids_owned_by_b_but_consumed_by_a", fmt.Sprint(bTIDs))
-	tracef("session A's reapAfterKill consumed the exit status of session B's "+
-		"tracee pid=%d (tids %v); B itself was never told", bPID, bTIDs)
-	if !ok {
-		return exitSetup
-	}
-	return exitStolen
 }
 
 // scenarioSuspendedKillPlainChild shows the wedge is not specific to a second
