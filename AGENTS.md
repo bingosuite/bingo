@@ -1558,23 +1558,39 @@ are detected by a `mach_msg` receive loop.
   cycle guard** for pointer targets. Pointer addresses are removed as each
   subtree unwinds, so self-referential structures terminate without suppressing
   later sibling aliases to the same non-cyclic target.
-  Those are *per-path* caps; on top of them a **shared global ceiling**
-  (`maxTotalNodes=10000`, `maxTotalBytes=256 KiB`) is threaded through `formatCtx`
-  and debited once per `formatNode` and by every read. Without it a
+  Those are *per-path* caps; on top of them a **shared per-REQUEST ceiling**
+  (`maxTotalNodes=10000`, `maxTotalBytes=256 KiB`) is threaded through **one**
+  `formatCtx` and debited once per `formatNode` and by every read. Without it a
   collection-of-collections stays bounded only by the *product* of the width caps
   (`[][][][]int` ≈ `maxChildren⁴` ≈ 10⁸ nodes, each its own `ReadMemory`), which
   would wedge the single-threaded engine loop for a single `Locals`/`Evaluate`/
   `variables` request. When either budget is exhausted the walk stops expanding
   and appends **one** truncation node (`Value: "<truncated: inspection budget
   exhausted>"`) — a per-path degradation, never an error on the stop.
+  **The ceiling is per request, NOT per root variable.** `LocalsForFrame` builds
+  exactly one `formatCtx` (`newFormatCtx`) and renders every root through the
+  shared `formatRequestRoots` loop; `formatTyped` is the single-root entry point
+  that starts its own budget (`EvaluateName`, tests). Giving each root its own
+  context multiplied the ceiling by the root count — 40 huge locals measured at
+  ~400k nodes / ~396k `ReadMemory` calls and an 11s stall of the engine loop
+  (issue #186). The root loop also checks the budget **between** roots and
+  collapses every remaining root into exactly **one** trailing truncation node,
+  since a marker per elided root is itself unbounded on a frame with thousands of
+  locals. Cycle state stays strictly **path-local** across this sharing: every
+  `enterPointer` claim is balanced by its `defer leave()`, so `activePointers` is
+  empty again between roots and a later root aliasing an earlier root's address
+  still expands.
   Reads go through the backend's bulk `ReadMemory` (linux `process_vm_readv`,
   darwin `mach_vm_read`) sized per type — never per-byte. Any unreadable address
   degrades that one node to `<unreadable: …>`; an unknown/absent type degrades to
   an 8-byte hex or `<optimized out>` — the surrounding tree and the stop are
   unaffected. The pure leaf-formatters (`formatInt/Uint/Float/Bool/Complex`) take
-  raw bytes and are unit-tested without DWARF or a backend; the global ceiling is
-  pinned by `TestFormatTypedBudget` (a pathological nested aggregate truncates to
-  ~`maxTotalNodes`).
+  raw bytes and are unit-tested without DWARF or a backend; the single-root
+  ceiling is pinned by `TestFormatTypedBudget` (a pathological nested aggregate
+  truncates to ~`maxTotalNodes`) and the request-wide one by
+  [values_budget_test.go](internal/debugger/values_budget_test.go) (shared budget
+  across roots, carried-forward remainder, one root-level truncation marker, the
+  byte ceiling, cross-root aliases, bounded cycles, and `Evaluate` independence).
 - `subprogramVars` is a depth-aware walk of the full containing subprogram,
   not a flat scan to the first null DIE. Both `DW_TAG_lexical_block` and
   `DW_TAG_inlined_subroutine` define variable scope. The containing subprogram

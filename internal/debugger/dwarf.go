@@ -420,17 +420,23 @@ func frameLookupPC(pc uint64, frameIndex int) uint64 {
 // Children; see values.go. Only DW_OP_addr (0x03) and DW_OP_fbreg (0x91)
 // locations are evaluated — register-allocated variables come back as
 // "<optimized out>".
+//
+// Every root shares ONE formatCtx, so the node/byte ceiling bounds the whole
+// request rather than each root independently: a frame with many large
+// aggregates otherwise multiplied the ceiling by its root count and stalled the
+// single-threaded engine loop (issue #186). Once the budget is spent the loop
+// stops formatting and appends exactly one truncation node covering all
+// remaining roots — never one marker per elided root.
 func (r *dwarfReader) LocalsForFrame(b Backend, pc, frameBase uint64) ([]protocol.Variable, error) {
 	entries, err := r.subprogramVars(pc)
 	if err != nil {
 		return nil, err
 	}
-	var vars []protocol.Variable
-	for _, child := range entries {
-		name, _ := child.Val(dwarf.AttrName).(string)
-		vars = append(vars, r.formatEntry(b, child, name, frameBase))
-	}
-	return vars, nil
+	ctx := newFormatCtx(b)
+	return formatRequestRoots(ctx, len(entries), func(i int) protocol.Variable {
+		name, _ := entries[i].Val(dwarf.AttrName).(string)
+		return r.formatEntry(ctx, entries[i], name, frameBase)
+	}), nil
 }
 
 // EvaluateName resolves a single variable name — no dotted paths, indexing, or
@@ -438,7 +444,8 @@ func (r *dwarfReader) LocalsForFrame(b Backend, pc, frameBase uint64) ([]protoco
 // for a local or parameter in the subprogram containing pc. A bare global then
 // prefers the logical code package at pc before falling back to the whole image;
 // qualified globals use the whole-image lookup directly. The result is the same
-// bounded typed tree LocalsForFrame produces.
+// bounded typed tree LocalsForFrame produces, against a budget of its own (one
+// root per request).
 func (r *dwarfReader) EvaluateName(b Backend, pc, frameBase uint64, name string) (protocol.Variable, error) {
 	entries, err := r.subprogramVars(pc)
 	if err != nil {
@@ -446,7 +453,7 @@ func (r *dwarfReader) EvaluateName(b Backend, pc, frameBase uint64, name string)
 	}
 	for _, child := range entries {
 		if n, _ := child.Val(dwarf.AttrName).(string); n == name {
-			return r.formatEntry(b, child, name, frameBase), nil
+			return r.formatEntry(newFormatCtx(b), child, name, frameBase), nil
 		}
 	}
 	if addr, typ, ok := r.globalVar(pc, name); ok {
@@ -455,16 +462,17 @@ func (r *dwarfReader) EvaluateName(b Backend, pc, frameBase uint64, name string)
 	return protocol.Variable{}, fmt.Errorf("no variable named %q in scope", name)
 }
 
-// formatEntry renders one variable/parameter DIE. When its location can't be
-// evaluated (register-allocated, or an unsupported expr) it degrades to
-// "<optimized out>" while still reporting the type name.
-func (r *dwarfReader) formatEntry(b Backend, entry *dwarf.Entry, name string, frameBase uint64) protocol.Variable {
+// formatEntry renders one variable/parameter DIE against the caller's request
+// budget. When its location can't be evaluated (register-allocated, or an
+// unsupported expr) it degrades to "<optimized out>" while still reporting the
+// type name.
+func (r *dwarfReader) formatEntry(ctx *formatCtx, entry *dwarf.Entry, name string, frameBase uint64) protocol.Variable {
 	typ := r.varType(entry)
 	addr, ok := r.varAddress(entry, frameBase)
 	if !ok {
 		return protocol.Variable{Name: name, Type: typeDisplayName(typ), Value: optimizedOut}
 	}
-	return r.formatTyped(b, name, typ, addr)
+	return r.formatRoot(ctx, name, typ, addr)
 }
 
 // subprogramVars collects the variable and formal-parameter DIEs of the

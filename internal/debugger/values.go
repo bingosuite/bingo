@@ -25,11 +25,11 @@ import (
 // path from running away, but a collection-of-collections is still bounded only
 // by their product (e.g. [][][][]int ≈ maxChildren⁴ nodes, each doing its own
 // ReadMemory). maxTotalNodes/maxTotalBytes add a SHARED ceiling across the whole
-// walk — threaded through formatCtx and debited once per node and by each read —
-// so one Locals/Evaluate/variables request can never wedge the single-threaded
-// engine loop no matter how deep or wide the target's data is. Exhausting either
-// budget degrades the subtree to a single truncation node; it never errors the
-// stop.
+// REQUEST — threaded through one formatCtx and debited once per node and by each
+// read — so one Locals/Evaluate/variables request can never wedge the
+// single-threaded engine loop no matter how deep or wide the target's data is,
+// nor how many root variables the frame has. Exhausting either budget degrades
+// the subtree to a single truncation node; it never errors the stop.
 const (
 	maxValueDepth  = 4    // aggregate nesting levels expanded
 	maxChildren    = 100  // fields/elements per aggregate before a "… N more" node
@@ -37,12 +37,12 @@ const (
 	maxStringBytes = 256  // bytes read from a string/[]byte before truncation
 	maxScalarBytes = 4096 // defensive cap on any single ReadMemory
 
-	maxTotalNodes = 10000      // nodes across ONE inspection before truncation
-	maxTotalBytes = 256 * 1024 // bytes read across ONE inspection before truncation
+	maxTotalNodes = 10000      // nodes across ONE request before truncation
+	maxTotalBytes = 256 * 1024 // bytes read across ONE request before truncation
 )
 
 // truncatedValue marks a node the eager walk refused to expand because the
-// shared per-inspection node/byte budget (formatCtx) was exhausted.
+// shared per-request node/byte budget (formatCtx) was exhausted.
 const truncatedValue = "<truncated: inspection budget exhausted>"
 
 // Variable.Kind classifier strings.
@@ -63,18 +63,38 @@ const (
 	kindInterface = "interface"
 )
 
-// formatCtx carries the per-inspection state shared across the whole recursive
-// walk. activePointers contains only the current recursion path; entries are
-// removed while unwinding so sibling aliases expand independently. depth and
-// ptrDepth are passed by value so a sibling's recursion budget is independent.
-// nodesLeft and bytesLeft are the shared GLOBAL ceiling (see the bounds block):
-// decremented once per formatNode and by each read, so a
-// collection-of-collections can't fan out unboundedly.
+// formatCtx carries the per-REQUEST state shared across every root variable's
+// recursive walk. One context serves a whole Locals request; Evaluate has a
+// single root and gets its own.
+//
+// activePointers contains only the current recursion path; entries are removed
+// while unwinding (the enterPointer/leave pairing) so sibling aliases — within a
+// root AND across roots — expand independently. Because every claim is balanced
+// by its defer, the map is empty again between roots: sharing the context must
+// never make a later root's alias look cyclic.
+//
+// depth and ptrDepth are passed by value so a sibling's recursion budget is
+// independent. nodesLeft and bytesLeft are the shared GLOBAL ceiling (see the
+// bounds block): decremented once per formatNode and by each read, and NOT reset
+// per root, so neither a collection-of-collections nor a frame full of large
+// locals can fan out unboundedly.
 type formatCtx struct {
 	b              Backend
 	activePointers map[uint64]bool
-	nodesLeft      int // remaining nodes for this inspection (shared)
-	bytesLeft      int // remaining bytes to read for this inspection (shared)
+	nodesLeft      int // remaining nodes for this request (shared across roots)
+	bytesLeft      int // remaining bytes to read for this request (shared across roots)
+}
+
+// newFormatCtx starts a fresh inspection budget. Callers that render several
+// root variables for one request (LocalsForFrame) must create exactly one and
+// reuse it; a per-root context would multiply the ceiling by the root count.
+func newFormatCtx(b Backend) *formatCtx {
+	return &formatCtx{
+		b:              b,
+		activePointers: map[uint64]bool{},
+		nodesLeft:      maxTotalNodes,
+		bytesLeft:      maxTotalBytes,
+	}
 }
 
 // read fetches n bytes at addr like readMem, additionally debiting the shared
@@ -86,7 +106,7 @@ func (ctx *formatCtx) read(addr uint64, n int) ([]byte, error) {
 }
 
 // budgetExhausted reports whether the shared node or byte ceiling for one
-// inspection has been reached. Once true the walk emits a single truncation node
+// request has been reached. Once true the walk emits a single truncation node
 // instead of recursing or reading further — degrading the subtree, never
 // erroring the stop.
 func (ctx *formatCtx) budgetExhausted() bool {
@@ -104,15 +124,36 @@ func (ctx *formatCtx) enterPointer(addr uint64) (leave func(), ok bool) {
 }
 
 // formatTyped renders the value of type typ stored at addr into a bounded
-// protocol.Variable tree rooted at name.
+// protocol.Variable tree rooted at name, using a budget of its own. It is the
+// single-root entry point (Evaluate, tests); multi-root callers must share one
+// context via formatRoot instead.
 func (r *dwarfReader) formatTyped(b Backend, name string, typ dwarf.Type, addr uint64) protocol.Variable {
-	ctx := &formatCtx{
-		b:              b,
-		activePointers: map[uint64]bool{},
-		nodesLeft:      maxTotalNodes,
-		bytesLeft:      maxTotalBytes,
-	}
+	return r.formatRoot(newFormatCtx(b), name, typ, addr)
+}
+
+// formatRoot renders one root variable against an existing request budget.
+func (r *dwarfReader) formatRoot(ctx *formatCtx, name string, typ dwarf.Type, addr uint64) protocol.Variable {
 	return r.formatNode(name, typ, addr, 0, 0, ctx)
+}
+
+// formatRequestRoots renders the roots of ONE inspection request against the
+// single shared budget in ctx, calling render for root i.
+//
+// The budget is checked between roots, not just inside a tree, so a frame full
+// of large aggregates stops at the global ceiling instead of spending a fresh
+// one per root. Elided roots collapse into exactly ONE trailing truncation node
+// — a marker per remaining root would itself be unbounded on a frame with
+// thousands of locals.
+func formatRequestRoots(ctx *formatCtx, roots int, render func(i int) protocol.Variable) []protocol.Variable {
+	var out []protocol.Variable
+	for i := 0; i < roots; i++ {
+		if ctx.budgetExhausted() {
+			out = append(out, truncatedNode())
+			break
+		}
+		out = append(out, render(i))
+	}
+	return out
 }
 
 func (r *dwarfReader) formatNode(name string, typ dwarf.Type, addr uint64, depth, ptrDepth int, ctx *formatCtx) protocol.Variable {
@@ -509,8 +550,9 @@ func moreNode(n int) protocol.Variable {
 	return protocol.Variable{Name: "…", Value: fmt.Sprintf("%d more", n)}
 }
 
-// truncatedNode is the single leaf a loop appends when the shared per-inspection
-// budget (formatCtx) is exhausted, standing in for every elided remaining child.
+// truncatedNode is the single leaf a loop appends when the shared per-request
+// budget (formatCtx) is exhausted, standing in for every elided remaining child
+// — or, at the root level, for every remaining root variable.
 func truncatedNode() protocol.Variable {
 	return protocol.Variable{Name: "…", Value: truncatedValue}
 }
