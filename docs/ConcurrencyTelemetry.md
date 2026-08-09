@@ -236,7 +236,10 @@ Two limits that are easy to get wrong:
 - **Latch only on a proven violation.** A frame above your *transport* cap was
   never delivered, so you cannot know its kind — treat that as a transient
   failure. Reserve terminal handling for a decoded frame that broke a rule you
-  can name, and give the user an explicit way to retry.
+  can name, and give the user an explicit way to retry. A violation should end
+  that connection *without* spending a reconnect attempt; only genuine transport
+  failures belong in the ladder. Skipping the body of an unused-but-valid kind is
+  not a violation.
 - **Scope the fatal treatment to these two kinds.** Every other event is
   deliberately unbounded — `EventLocals`/`EventFrames`/`EventEvaluate` are
   broadcast to all clients and are limited only by the debugger's inspection
