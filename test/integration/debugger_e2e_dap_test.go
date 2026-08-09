@@ -207,9 +207,8 @@ func declareDAPEvaluateSpec() {
 // declareDAPExitSpec proves the exited/terminated mapping end to end: a DAP
 // client launches a target with NO breakpoints and lets it run to a clean exit,
 // asserting the adapter emits `exited` (with the code) followed by `terminated`.
-// Kept separate from declareDAPSpec because reaching exit from a breakpoint the
-// process is parked on would re-arm it through the step-off path (see the clearbp
-// spec) — a plain continue from the entry stop is the deterministic exit path.
+// Kept separate from declareDAPSpec so the exit assertion is not coupled to
+// breakpoint cleanup or another loop iteration.
 func declareDAPExitSpec() {
 	It("maps a clean process exit to DAP exited+terminated", Label("dap"), func() {
 		bin := buildTarget("dap_exit_target", dapTargetSrc)

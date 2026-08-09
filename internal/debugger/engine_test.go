@@ -33,15 +33,19 @@ type fakeBackend struct {
 	singleStepCalls  []int
 	stopProcessCalls int
 	writtenAt        map[uint64][]byte
+	continueCh       chan struct{}
+	writeErr         error
+	getRegistersErr  error
 }
 
 func newFakeBackend() *fakeBackend {
 	return &fakeBackend{
-		mem:       make(map[uint64]byte),
-		regs:      map[int]debugger.Registers{1: {}},
-		tids:      []int{1},
-		stopCh:    make(chan debugger.StopEvent, 8),
-		writtenAt: make(map[uint64][]byte),
+		mem:        make(map[uint64]byte),
+		regs:       map[int]debugger.Registers{1: {}},
+		tids:       []int{1},
+		stopCh:     make(chan debugger.StopEvent, 8),
+		writtenAt:  make(map[uint64][]byte),
+		continueCh: make(chan struct{}, 16),
 	}
 }
 
@@ -72,7 +76,15 @@ func (f *fakeBackend) peekMem(addr uint64, n int) []byte {
 	return out
 }
 
-func (f *fakeBackend) ContinueProcess() error  { f.continueCalls++; return nil }
+func (f *fakeBackend) ContinueProcess() error {
+	f.continueCalls++
+	select {
+	case f.continueCh <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
 func (f *fakeBackend) StopProcess() error      { f.stopProcessCalls++; return nil }
 func (f *fakeBackend) PauseSignal() int        { return int(syscall.SIGSTOP) }
 func (f *fakeBackend) Threads() ([]int, error) { return f.tids, nil }
@@ -90,6 +102,11 @@ func (f *fakeBackend) ReadMemory(addr uint64, dst []byte) error {
 }
 
 func (f *fakeBackend) WriteMemory(addr uint64, src []byte) error {
+	if f.writeErr != nil {
+		err := f.writeErr
+		f.writeErr = nil
+		return err
+	}
 	cp := make([]byte, len(src))
 	copy(cp, src)
 	f.writtenAt[addr] = cp
@@ -100,6 +117,11 @@ func (f *fakeBackend) WriteMemory(addr uint64, src []byte) error {
 }
 
 func (f *fakeBackend) GetRegisters(tid int) (debugger.Registers, error) {
+	if f.getRegistersErr != nil {
+		err := f.getRegistersErr
+		f.getRegistersErr = nil
+		return debugger.Registers{}, err
+	}
 	return f.regs[tid], nil
 }
 
