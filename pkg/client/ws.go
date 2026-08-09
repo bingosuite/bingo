@@ -252,7 +252,13 @@ func (c *wsClient) sendAndWait(cmd protocol.Command, wantKind protocol.EventKind
 		}
 		return evt, nil
 	case <-time.After(syncTimeout):
-		c.retirePending(req)
+		if cmd.Kind == protocol.CmdGoroutineSnapshot && wantKind == protocol.EventGoroutineSnapshot {
+			// Snapshot events are also unsolicited telemetry; debt would consume
+			// the next auto-pushed snapshot instead of delivering it to Events.
+			c.discardPending(req)
+		} else {
+			c.retirePending(req)
+		}
 		return protocol.Event{}, fmt.Errorf("timeout waiting for %s response", wantKind)
 	case <-c.done:
 		c.discardPending(req)
