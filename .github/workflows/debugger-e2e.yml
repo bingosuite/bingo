@@ -6,21 +6,18 @@ name: Debugger E2E
 # exercises only the in-process fakeBackend), these launch a real process and
 # step it through the actual OS backend, so they need a real kernel and run on
 # native GitHub-hosted runners. Gated behind the `e2e` build tag; the Ginkgo
-# suite lives in ./test/integration and is split via Ginkgo labels into `basic`
-# (correctness), `churn` (multi-thread robustness), `pause` (async interrupt /
-# manual stop), `stepping` (StepInto/StepOut), `inspect`
-# (StackFrames/Locals/Goroutines), `breakpoints` (ClearBreakpoint), `kill`
-# (kill-while-running), `exit` (process exit status), `restart`, `fullstack`
-# (operations driven through the whole client → WebSocket → hub → debugger stack),
-# and `dap` (a real Debug Adapter Protocol client driving a session over TCP,
-# with WebSocket observers sharing it).
+# suite lives in ./test/integration. See AGENTS.md → Test layering for the
+# canonical, currently accurate Ginkgo label inventory (including the
+# darwin-only `hygiene` check) — don't duplicate that list here.
 #
-# Both linux and darwin run the full set. The step-off-an-armed-trap specs
-# (basic, stepping, breakpoints, churn) and kill (kill-while-running) used to be
-# LINUX-ONLY because they were unreliable under the old darwin wait4/ptrace model;
-# the Mach-exception rearchitecture (#92) — per-thread exception delivery plus a
-# target-side I-cache flush on breakpoint writes plus a wait4-free kill — closed
-# those gaps, so they now run on darwin as well. See AGENTS.md → Test layering.
+# Both linux and darwin run the shared label set. The step-off-an-armed-trap
+# specs (basic, stepping, breakpoints, churn) and kill (kill-while-running)
+# used to be LINUX-ONLY because they were unreliable under the old darwin
+# wait4/ptrace model; the Mach-exception rearchitecture (#92) — per-thread
+# exception delivery plus a target-side I-cache flush on breakpoint writes
+# plus a wait4-free kill — closed those gaps, so they now run on darwin as
+# well. Darwin additionally runs `hygiene`, which is meaningless on the ptrace
+# backend and so has no linux counterpart.
 #
 # The linux jobs run fully on hosted runners. The darwin jobs compile and
 # codesign the E2E binary on hosted macOS runners (the only CI coverage that the
