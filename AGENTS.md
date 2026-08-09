@@ -275,13 +275,33 @@ created via `hub.New(dbg, log)` (tests / single-session) do not.
 In [pkg/client](pkg/client/), the `Client` interface splits methods by what
 they wait for:
 
-- **Synchronous** (`SetBreakpoint`, `ClearBreakpoint`, `Locals`, `StackFrames`,
-  `Goroutines`): block until the matching confirmation event (or `EventError`
-  for the same command kind) arrives. Implemented via `sendAndWait` in
-  [pkg/client/ws.go](pkg/client/ws.go).
-- **Fire-and-forget** (`Launch`, `Attach`, `Kill`, `Continue`, `Step*`):
+- **Synchronous** (`Restart`, `SetBreakpoint`, `ClearBreakpoint`, `Locals`,
+  `Evaluate`, `StackFrames`, `Goroutines`, `GoroutineSnapshot`): block until
+  the matching confirmation event (or `EventError` for the same command kind)
+  arrives. Implemented via `sendAndWait` in [pkg/client/ws.go](pkg/client/ws.go).
+- **Fire-and-forget** (`Launch`, `Attach`, `Kill`, `Continue`, `Step*`, `Pause`):
   return as soon as the command is on the wire. Results arrive asynchronously
   on the `Events()` channel.
+
+`syncMu` serializes synchronous commands, but a timeout does **not** cancel the
+command already sent to the server. The pending queue therefore retains a
+timed-out request as retired reply debt until its matching confirmation or
+matching `EventError` arrives. `routeToPending` always claims and removes the
+oldest matching entry under `pendingMu` before notifying a live waiter; retired
+matches are consumed without notification. This prevents a late response from
+one of this client's timed-out commands from satisfying a newer same-kind call,
+and prevents back-to-back matching frames from blocking the read pump on a
+waiter's one-element channel. If a debt never resolves, a newer same-kind call
+must time out rather than accept an ambiguous reply; subsequent same-kind calls
+continue timing out while that reply stream remains one response short. Keep the
+WebSocket open: disconnecting the last client tears down the hub/debuggee, while
+unrelated async events remain valid.
+
+This is deliberately bounded by the id-less broadcast protocol. The queue
+preserves this client's ordered command stream; it cannot distinguish an
+unsolicited same-kind event or confirmation caused by another driving client.
+The single-driver caveat still applies until the wire protocol gains correlation
+IDs.
 
 ## Engine concurrency model — non-obvious invariants
 
