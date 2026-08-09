@@ -516,7 +516,13 @@ note below):
    spurious-trap path.
 4. **`recordStop` runs on delivery only.** Never at park time — moving the resume
    target to a thread the engine is not working on is precisely the corruption
-   being fixed.
+   being fixed. The same rule covers the stop's **signal**, which is why the
+   queue holds whole `StopEvent`s: the signal is a field of the parked event,
+   not backend state, so it cannot be observed against a thread other than its
+   own and there is no separate signal record to keep in step with `recordStop`
+   (the ordering hazard issue #204 raises for pending signals). Do not hoist the
+   signal — or any other per-stop datum — into `linuxBackend`; that would
+   reintroduce exactly that ordering obligation.
 5. **A dead stepped thread lifts the gate.** `clearStepIfStepped` clears
    `stepping`/`stepTID` when the stepped TID exits or dies by signal, otherwise
    its completion never arrives and the queue is stranded.
