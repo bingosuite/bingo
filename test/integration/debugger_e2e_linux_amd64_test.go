@@ -37,6 +37,7 @@ var _ = Describe("Linux amd64 debugger backend (ptrace) E2E", Label("linux"), fu
 	declareExitCodeSpec()
 	declareAttachSpec()
 	declareConcurrencySpec()
+	declareBaselineOwnershipSpec()
 	declareFullStackSpec()
 	declareRestartSpec()
 	declareDAPSpec()

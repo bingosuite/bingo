@@ -19,7 +19,9 @@ import (
 
 // fullSnapshotNext renders the next EventGoroutineSnapshot in full rather than
 // as the usual one-line summary, so a user-typed `snapshot` gets the detailed
-// view. Shared between the REPL goroutine and the event printer.
+// view. It is a display preference, not correlation: the arm is consumed by
+// whichever snapshot arrives first and is cleared by any broadcast snapshot
+// error. Shared between the REPL goroutine and the event printer.
 var fullSnapshotNext atomic.Bool
 
 //nolint:gocognit,gocyclo // The CLI keeps command routing in one switch while commands are still small.
@@ -249,10 +251,14 @@ func main() {
 
 		case "snapshot", "snap":
 			// Fire-and-forget: the snapshot answers on the event stream, where
-			// automatic stop snapshots also arrive. fullSnapshotNext only
-			// changes how the next one is *rendered* (full instead of the
-			// one-line summary) — every snapshot is printed either way, so
-			// nothing is correlated or discarded.
+			// automatic stop snapshots also arrive. fullSnapshotNext is a
+			// display arm only — it selects the renderer for the NEXT snapshot,
+			// whichever that turns out to be. An automatic push (or another
+			// client's requested one) can consume the arm, and any broadcast
+			// snapshot error can disarm it, so the detailed view may land on a
+			// different snapshot than the one this command asked for. No
+			// snapshot data is lost either way: every one is printed, in order,
+			// in one form or the other.
 			fullSnapshotNext.Store(true)
 			if err := c.RequestGoroutineSnapshot(); err != nil {
 				fullSnapshotNext.Store(false)
@@ -344,8 +350,9 @@ func printAuxEvent(evt protocol.Event) {
 		var p protocol.ErrorPayload
 		if protocol.DecodeEventPayload(evt, &p) == nil {
 			if p.Command == protocol.CmdGoroutineSnapshot {
-				// A rejected request has no snapshot to render in full; leaving
-				// the flag armed would expand the next automatic push instead.
+				// Disarm on any broadcast snapshot rejection, including one
+				// caused by another client: EventError carries no requester, so
+				// leaving the arm set would expand an unrelated automatic push.
 				fullSnapshotNext.Store(false)
 			}
 			fmt.Printf("\n  [error] %s: %s\nbingo> ", p.Command, p.Message)

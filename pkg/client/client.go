@@ -65,6 +65,13 @@ type Client interface {
 	// correlated to a request by kind. Every snapshot, requested or automatic,
 	// is delivered on Events(). Requested snapshots carry no created/exited
 	// deltas; only the automatic ones do.
+	//
+	// Delivery is best-effort: like every event it goes through the shared
+	// Events() buffer, which drops when a caller stops draining, and a rejected
+	// request answers with EventError (Command == CmdGoroutineSnapshot) rather
+	// than a snapshot. A caller that blocks waiting for one must handle both.
+	// The answer is also broadcast to every client on the session, so other
+	// observers see this refresh — with empty deltas — as an ordinary snapshot.
 	RequestGoroutineSnapshot() error
 
 	Close() error

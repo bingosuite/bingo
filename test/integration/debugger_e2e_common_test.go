@@ -317,6 +317,112 @@ func main() {
 }
 `
 
+// snapshotBaselineTargetSrc isolates the ONE window in which an on-demand
+// snapshot can differ from the last automatic one: a suspend that carries no
+// automatic snapshot. Steps are exactly that (emitStepped never scans allgs), so
+// stepping over a `go` statement creates a goroutine the automatic baseline has
+// never seen.
+//
+//	go parked() <- BP_SPAWN, stop #1: automatic snapshot adopts a baseline
+//	               WITHOUT parked, then one StepOver executes the statement
+//	tick()      <- BP_SNAPTICK, stop #2: parked MUST appear in the Created delta
+//
+// parked blocks forever on an unclosed channel so it is unambiguously alive at
+// both the on-demand query and the next automatic snapshot.
+const snapshotBaselineTargetSrc = `package main
+
+import "time"
+
+var hold = make(chan struct{})
+
+func parked() {
+	<-hold
+}
+
+func tick() {
+	time.Sleep(time.Millisecond) // BP_SNAPTICK
+}
+
+func main() {
+	go parked() // BP_SPAWN
+	for i := 0; i < 100000; i++ {
+		tick() // keep the process alive for teardown
+	}
+}
+`
+
+// declareBaselineOwnershipSpec is the mutation gate for "automatic snapshots
+// alone own the lifecycle baseline" (issue #187). Asserting it needs a query
+// whose live set DIFFERS from the last automatic snapshot's, which only happens
+// at a suspend that carried no automatic snapshot — i.e. after a step. So the
+// sequence is: automatic baseline at a breakpoint on the `go` statement, one
+// StepOver to execute it (creating a goroutine off the automatic stream), an
+// on-demand query, then continue to the next automatic snapshot.
+//
+// It fails on either ablation of the split:
+//   - engine.GoroutineSnapshot reverted to the tracking path: the query returns
+//     the new goid in Created AND adopts it, so the next automatic snapshot no
+//     longer reports it.
+//   - the automatic path made non-tracking: no baseline is ever adopted, so the
+//     automatic snapshot's Created is empty.
+func declareBaselineOwnershipSpec() {
+	It("keeps lifecycle deltas with automatic snapshots across an on-demand query", Label("concurrency"), func() {
+		src := snapshotBaselineTargetSrc
+		bin := buildTarget("snapshot_baseline_target", src)
+
+		h := newE2EHarness(bin)
+		h.waitFor(15*time.Second, protocol.EventStepped) // initial launch stop
+
+		_, err := h.d.SetBreakpoint("snapshot_baseline_target.go", markerLine(src, "// BP_SPAWN"))
+		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint on the spawn line")
+
+		Expect(h.d.Continue()).To(Succeed(), "Continue to the spawn line")
+		hit := h.waitFor(15*time.Second,
+			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+		Expect(hit.Kind).To(Equal(protocol.EventBreakpointHit), "spawn-line breakpoint hit")
+
+		baselineEvt := h.waitFor(15*time.Second, protocol.EventGoroutineSnapshot)
+		var baseline protocol.GoroutineSnapshotPayload
+		Expect(json.Unmarshal(baselineEvt.Payload, &baseline)).To(Succeed(), "decode baseline snapshot")
+		Expect(findByStart(baseline.Goroutines, "main.parked")).To(BeNil(),
+			"parked must not exist yet at the baseline stop")
+
+		// The `go` statement runs during a StepOver, which emits Stepped with no
+		// snapshot — so parked is born entirely off the automatic stream. This
+		// is the only state an automatic baseline can be missing.
+		Expect(h.d.StepOver()).To(Succeed(), "StepOver the spawn statement")
+		stepped := h.waitFor(15*time.Second,
+			protocol.EventStepped, protocol.EventProcessExited, protocol.EventError)
+		Expect(stepped.Kind).To(Equal(protocol.EventStepped), "the spawn statement executed via a step")
+
+		onDemand, err := h.d.GoroutineSnapshot()
+		Expect(err).NotTo(HaveOccurred(), "GoroutineSnapshot on demand")
+		parked := findByStart(onDemand.Goroutines, "main.parked")
+		Expect(parked).NotTo(BeNil(),
+			"the on-demand query must observe the goroutine created since the baseline")
+		Expect(onDemand.Created).To(BeEmpty(),
+			"a query reports no created delta (it does not own the baseline)")
+		Expect(onDemand.Exited).To(BeEmpty(), "a query reports no exited delta")
+		parkedID := parked.ID
+
+		_, err = h.d.SetBreakpoint("snapshot_baseline_target.go", markerLine(src, "// BP_SNAPTICK"))
+		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint on the tick line")
+
+		Expect(h.d.Continue()).To(Succeed(), "Continue to the next automatic stop")
+		hit = h.waitFor(15*time.Second,
+			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+		Expect(hit.Kind).To(Equal(protocol.EventBreakpointHit), "tick breakpoint hit")
+
+		nextEvt := h.waitFor(15*time.Second, protocol.EventGoroutineSnapshot)
+		var next protocol.GoroutineSnapshotPayload
+		Expect(json.Unmarshal(nextEvt.Payload, &next)).To(Succeed(), "decode next automatic snapshot")
+		Expect(findByStart(next.Goroutines, "main.parked")).NotTo(BeNil(),
+			"parked is still alive at the next stop")
+		Expect(next.Created).To(ContainElement(parkedID),
+			"the automatic snapshot still owns the delta the query observed but must not consume")
+	})
+}
+
 // declareBasicStepOverSpec adds the continue+step-over acceptance spec to the
 // enclosing Ginkgo container. It is the correctness gate: set a breakpoint on a
 // line that calls a function, repeatedly Continue to it and StepOver the call,
@@ -942,8 +1048,7 @@ func declareConcurrencySpec() {
 		// The auto-streamed EventGoroutineSnapshot that follows each breakpoint
 		// hit is the delta-bearing one: its Created/Exited are computed relative
 		// to the previous AUTOMATIC snapshot, and only those snapshots advance
-		// that baseline. An on-demand GoroutineSnapshot() between hits is a pure
-		// observation and cannot disturb it (asserted below).
+		// that baseline (declareBaselineOwnershipSpec pins that ownership).
 		nextSnapshot := func(stop string) protocol.GoroutineSnapshotPayload {
 			GinkgoHelper()
 			Expect(h.d.Continue()).To(Succeed(), "Continue to %s", stop)
@@ -1009,9 +1114,12 @@ func declareConcurrencySpec() {
 		workerID, leafID := worker.ID, leaf.ID
 
 		// An on-demand query taken BETWEEN two automatic snapshots returns a
-		// coherent live picture but owns no lifecycle state: it reports no
-		// deltas of its own and must leave the next automatic snapshot's deltas
-		// (asserted at stop #3 below) measured against stop #2.
+		// coherent live picture and reports no deltas of its own. NOTE: at this
+		// stop the live set equals the last automatic snapshot's, so adopting it
+		// would be a no-op — this asserts the query's shape, not baseline
+		// ownership. declareBaselineOwnershipSpec is the discriminating test:
+		// it steps past a `go` statement first, so the query sees a set the
+		// baseline has never seen.
 		onDemand, err := h.d.GoroutineSnapshot()
 		Expect(err).NotTo(HaveOccurred(), "GoroutineSnapshot on demand")
 		Expect(onDemand.Goroutines).NotTo(BeEmpty(), "on-demand snapshot has goroutines")
