@@ -84,6 +84,8 @@ func seedGoroutineMemory(fb *fakeBackend, d debugger.Debugger) goroutineMemoryFi
 	seedU64(fb, fixture.m[1]+layout.MProcid, 22)
 	seedU64(fb, fixture.m[1]+layout.MCurg, fixture.g[1])
 	seedU64(fb, fixture.m[1]+layout.MAlllink, 0)
+	seedU64(fb, fixture.g[0]+layout.GM, fixture.m[0])
+	seedU64(fb, fixture.g[1]+layout.GM, fixture.m[1])
 	fb.seedRegs(debugger.Registers{SP: 0x8800})
 
 	return fixture
@@ -325,6 +327,102 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 			Complete: true,
 			Clipped:  true,
 		}))
+	})
+
+	It("preserves lifecycle state when a beyond-cap current anchor read is incomplete", func() {
+		const (
+			largeAllgsAddr = uint64(0x2000000)
+			tailStackLo    = uint64(0xb0000000)
+		)
+		richCount := debugger.ExportedMaxGoroutineScan()
+		tailCurrent := fixture.g[4]
+
+		seedU64(fb, fixture.layout.Allgs, largeAllgsAddr)
+		seedU64(fb, fixture.layout.Allgs+8, uint64(richCount+1))
+		for i := 0; i < richCount; i++ {
+			gptr := fixture.g[i%3]
+			seedU64(fb, largeAllgsAddr+uint64(i)*8, gptr)
+		}
+		seedU32(fb, tailCurrent+fixture.layout.GAtomicstatus, 4)
+		seedU64(fb, tailCurrent+fixture.layout.GGoid, 104)
+		seedU64(fb, tailCurrent+fixture.layout.GStack+fixture.layout.StackLo, tailStackLo)
+		seedU64(fb, tailCurrent+fixture.layout.GStack+fixture.layout.StackHi, tailStackLo+0x1000)
+		seedU64(fb, tailCurrent+fixture.layout.GM, fixture.m[1])
+		seedU64(fb, fixture.m[1]+fixture.layout.MProcid, 1)
+		seedU64(fb, fixture.m[1]+fixture.layout.MCurg, tailCurrent)
+		seedU64(fb, largeAllgsAddr+uint64(richCount)*8, tailCurrent)
+		fb.seedRegs(debugger.Registers{SP: tailStackLo + 8, TLS: tailCurrent})
+
+		baseline := debugger.ExportedGoroutineSnapshot(d)
+		Expect(baseline.Current).To(Equal(104))
+		Expect(baseline.Goroutines).To(HaveLen(richCount + 1))
+		Expect(baseline.Goroutines[0].ID).To(Equal(104))
+		Expect(baseline.Goroutines[0].Current).To(BeTrue())
+		Expect(baseline.Created).To(BeNil())
+		Expect(baseline.Exited).To(BeNil())
+		currentGoroutines := 0
+		for _, goroutine := range baseline.Goroutines {
+			if goroutine.Current {
+				currentGoroutines++
+			}
+		}
+		Expect(currentGoroutines).To(Equal(1))
+		currentThreads := 0
+		for _, thread := range baseline.Threads {
+			if thread.Current {
+				currentThreads++
+				Expect(thread.GoID).To(Equal(104))
+			}
+		}
+		Expect(currentThreads).To(Equal(1))
+
+		seedU32(fb, fixture.g[2]+fixture.layout.GAtomicstatus, 6)
+		fb.failNextReadAt(tailCurrent + fixture.layout.GStack + fixture.layout.StackLo)
+
+		degraded := debugger.ExportedGoroutineSnapshot(d)
+		recovered := debugger.ExportedGoroutineSnapshot(d)
+
+		Expect(degraded.Goroutines).To(Equal([]protocol.Goroutine{{
+			Status:  "unknown",
+			Current: true,
+		}}))
+		Expect(degraded.Created).To(BeNil())
+		Expect(degraded.Exited).To(BeNil())
+		Expect(recovered.Current).To(Equal(104))
+		Expect(recovered.Created).To(BeNil())
+		Expect(recovered.Exited).To(Equal([]int{103}))
+
+		currentThreads = 0
+		for _, thread := range recovered.Threads {
+			if thread.Current {
+				currentThreads++
+				Expect(thread.GoID).To(Equal(104))
+			}
+		}
+		Expect(currentThreads).To(Equal(1))
+	})
+
+	It("resolves regular step identity without a rich allgs walk", func() {
+		seedU64(fb, fixture.m[1]+fixture.layout.MProcid, 1)
+		fb.seedRegs(debugger.Registers{
+			PC:  0x1234,
+			SP:  0x8800,
+			TLS: fixture.g[1],
+		})
+
+		Expect(d.StepInto()).To(Succeed())
+		fb.pushStop(debugger.StopEvent{
+			Reason: debugger.StopSingleStep,
+			TID:    1,
+			PC:     0x1234,
+		})
+
+		event := mustNextEvent(d)
+		Expect(event.Kind).To(Equal(protocol.EventStepped))
+		var stepped protocol.SteppedPayload
+		Expect(protocol.DecodeEventPayload(event, &stepped)).To(Succeed())
+		Expect(stepped.Goroutine.ID).To(Equal(102))
+		Expect(stepped.Goroutine.Current).To(BeTrue())
 	})
 
 	It("retains a complete goroutine set when current identity is unknown", func() {

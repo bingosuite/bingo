@@ -5,6 +5,7 @@ import {
   appendLifecycle,
   maximumTimelineEntries,
   serializeSnapshot,
+  toSessionViewModel,
   type SessionModel,
 } from "../src/model.js";
 import { snapshot } from "./fixtures.js";
@@ -56,5 +57,41 @@ describe("concurrency model", () => {
       };
     };
     assert.equal(decoded.snapshot.goroutines[0].waitReason, "</script><img src=x onerror=alert(1)>");
+  });
+
+  it("recognizes an unknown synthetic snapshot even when its stop location resolved", () => {
+    const base = snapshot();
+    const view = toSessionViewModel({
+      debugSessionId: "debug",
+      debugSessionName: "debug",
+      sessionId: "session",
+      connection: "connected",
+      sessionState: "suspended",
+      clients: 1,
+      lastStop: "",
+      error: "",
+      seqGap: "",
+      lastSeq: 1,
+      snapshot: {
+        ...base,
+        current: 0,
+        goroutines: [{
+          ...base.goroutines[0]!,
+          id: 0,
+          status: "unknown",
+          current: true,
+          currentLoc: {
+            file: "/tmp/main.go",
+            line: 42,
+            function: "main.run",
+          },
+        }],
+        threads: [],
+      },
+      selectedGoroutine: 0,
+      timeline: [],
+    });
+
+    assert.equal(view.degraded, true);
   });
 });

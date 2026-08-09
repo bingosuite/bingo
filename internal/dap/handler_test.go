@@ -1417,6 +1417,22 @@ func TestDisconnectQueuesKillBeforeFailedResponse(t *testing.T) {
 	}
 }
 
+func TestUnknownStepOmitsThreadID(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	hh.inject(protocol.EventStepped, protocol.SteppedPayload{
+		Goroutine: protocol.Goroutine{Status: "unknown", Current: true},
+	})
+
+	stopped := recvType[*godap.StoppedEvent](hh)
+	if stopped.Body.Reason != "step" {
+		t.Errorf("reason = %q, want step", stopped.Body.Reason)
+	}
+	if stopped.Body.ThreadId != 0 {
+		t.Errorf("threadId = %d, want omitted for unknown goroutine", stopped.Body.ThreadId)
+	}
+}
+
 func TestDisconnectTerminatesLaunchedDebuggee(t *testing.T) {
 	hh := newHarness(t)
 	hh.doHandshake(t)

@@ -88,9 +88,5 @@ function isDegraded(snapshot: Snapshot): boolean {
     return false;
   }
   const goroutine = snapshot.goroutines[0];
-  return (
-    goroutine?.startLoc.file.length === 0 &&
-    goroutine.createdLoc.file.length === 0 &&
-    goroutine.currentLoc.file.length === 0
-  ) ?? false;
+  return goroutine?.id === 0 && goroutine.status === "unknown" && goroutine.current === true;
 }

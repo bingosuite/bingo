@@ -161,6 +161,11 @@ func TestBuildGoroutineListAnchorsCurrentBeyondRichScan(t *testing.T) {
 	if anchorID != got[0].ID {
 		t.Fatalf("anchor id = %d, want %d", anchorID, got[0].ID)
 	}
+	for i := 0; i < maxGoroutineScan; i++ {
+		if got[i+1].ID != i+1 {
+			t.Fatalf("rich goroutine %d has id %d, want preserved prefix id %d", i, got[i+1].ID, i+1)
+		}
+	}
 
 	currentCount := 0
 	for _, g := range got {
@@ -285,6 +290,66 @@ func TestBuildGoroutineListUsesMCurgForSchedulerStop(t *testing.T) {
 	}
 }
 
+func TestUnresolvedCurrentIdentityNeverFallsBackToGoroutineOne(t *testing.T) {
+	const (
+		allgsPtr = uint64(0x1000)
+		realG    = uint64(0x200000)
+		systemG  = uint64(0x300000)
+		mptr     = uint64(0x400000)
+		systemSP = uint64(0xa0000008)
+	)
+	fallback := protocol.Location{File: "runtime.go", Line: 42, Function: "runtime.schedule"}
+
+	for _, tc := range []struct {
+		name        string
+		liveSP      uint64
+		currentGptr uint64
+		seed        func(*goroutineMemoryBackend, *goLayout)
+	}{
+		{
+			name: "no live registers",
+		},
+		{
+			name:        "unresolved g0",
+			liveSP:      systemSP,
+			currentGptr: systemG,
+			seed: func(backend *goroutineMemoryBackend, layout *goLayout) {
+				seedTestGoroutine(backend, layout, systemG, 0, systemSP-8, systemSP+0xff8)
+				backend.seedU64(systemG+uint64(layout.gM), mptr)
+				seedTestM(backend, layout, mptr, 77, 0, 0)
+				backend.seedU64(mptr+uint64(layout.mG0), systemG)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			layout := goroutineTestLayout()
+			backend := newGoroutineMemoryBackend()
+			backend.seedU64(allgsPtr, realG)
+			seedTestGoroutine(backend, layout, realG, 1, 0x1000, 0x2000)
+			if tc.seed != nil {
+				tc.seed(backend, layout)
+			}
+
+			e := &engine{backend: backend}
+			result := e.buildGoroutineListFrom(
+				layout, allgsPtr, 1, tc.liveSP, 0x1234, tc.currentGptr, 0,
+			)
+			if !result.Complete || len(result.Items) != 1 ||
+				result.Items[0].ID != 1 || result.Items[0].Current {
+				t.Fatalf("goroutine walk = %+v, want complete real list with unknown current", result)
+			}
+
+			current := currentGoroutineFrom(protocol.GoroutineSnapshotPayload{
+				Goroutines: result.Items,
+			}, fallback)
+			if current.ID != 0 || current.Status != "unknown" ||
+				!current.Current || current.CurrentLoc != fallback {
+				t.Fatalf("current goroutine = %+v, want honest unknown identity", current)
+			}
+		})
+	}
+}
+
 func TestCurrentGoroutineFromRegisterRejectsUnrelatedPositiveGoID(t *testing.T) {
 	const (
 		mptr      = uint64(0x400000)
@@ -300,9 +365,45 @@ func TestCurrentGoroutineFromRegisterRejectsUnrelatedPositiveGoID(t *testing.T) 
 	seedTestM(backend, layout, mptr, 77, currentG, 0)
 
 	e := &engine{backend: backend}
-	result := e.currentGoroutineFromRegister(layout, candidate, 0xdeadbeef, 0x1234)
+	result := e.currentGoroutineFromRegister(
+		layout, candidate, 0xdeadbeef, 0x1234, currentGoroutineRich,
+	)
 	if !result.Complete || result.Found {
 		t.Fatalf("current goroutine = %+v; want complete rejection of stale positive-goid candidate", result)
+	}
+}
+
+func TestCurrentGoroutineIdentityReadsOnlyRequiredFields(t *testing.T) {
+	const (
+		gptr   = uint64(0x200000)
+		liveSP = uint64(0x8008)
+	)
+	layout := goroutineTestLayout()
+	backend := newGoroutineMemoryBackend()
+	seedTestGoroutine(backend, layout, gptr, 42, 0x8000, 0x9000)
+
+	e := &engine{backend: backend}
+	result := e.currentGoroutineFromRegister(
+		layout, gptr, liveSP, 0x1234, currentGoroutineIdentity,
+	)
+	if !result.Complete || !result.Found ||
+		result.Item.ID != 42 || !result.Item.Current {
+		t.Fatalf("current identity = %+v, want current g42", result)
+	}
+
+	required := []uint64{
+		gptr + uint64(layout.gAtomicstatus),
+		gptr + uint64(layout.gGoid),
+		gptr + uint64(layout.gStack) + uint64(layout.stackLo),
+		gptr + uint64(layout.gStack) + uint64(layout.stackHi),
+	}
+	if len(backend.reads) != len(required) {
+		t.Fatalf("read addresses = %#v, want only %d required identity fields", backend.reads, len(required))
+	}
+	for _, addr := range required {
+		if backend.reads[addr] != 1 {
+			t.Fatalf("reads at %#x = %d, want 1", addr, backend.reads[addr])
+		}
 	}
 }
 
@@ -334,7 +435,9 @@ func TestFindCurrentGoroutineByProcIDContinuesPastRichThreadCap(t *testing.T) {
 	}
 
 	e := &engine{backend: backend}
-	result := e.findCurrentGoroutineByProcIDFrom(layout, mBase, targetID, 0x1234)
+	result := e.findCurrentGoroutineByProcIDFrom(
+		layout, mBase, targetID, 0x1234, currentGoroutineRich,
+	)
 	if !result.Complete || !result.Found ||
 		!result.Item.Current || result.Item.ID != 99 || result.Item.ThreadID != int(targetID) {
 		t.Fatalf("current goroutine = %+v; want id 99 on stopped thread %d", result, targetID)
@@ -359,7 +462,9 @@ func TestFindCurrentGoroutineByProcIDBoundsTargetedContinuation(t *testing.T) {
 	}
 
 	e := &engine{backend: backend}
-	result := e.findCurrentGoroutineByProcIDFrom(layout, mBase, ^uint64(0), 0x1234)
+	result := e.findCurrentGoroutineByProcIDFrom(
+		layout, mBase, ^uint64(0), 0x1234, currentGoroutineRich,
+	)
 	if !result.Complete || result.Found {
 		t.Fatalf("current goroutine = %+v; want complete bounded miss", result)
 	}
