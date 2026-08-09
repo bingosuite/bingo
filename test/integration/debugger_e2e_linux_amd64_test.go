@@ -539,13 +539,32 @@ func declareStepOverlapSignalSpec() {
 // a spinner the interrupt arrives on a foreign thread and is held back until the
 // step completes. The session must still end up suspended and resumable — a
 // dropped or prematurely released interrupt shows up here as a hang.
+//
+// Non-vacuity has three layers, because every racing assertion here also holds
+// on a run that never raced anything:
+//
+//   - Pause must be accepted at least once (the engine was still running, so a
+//     step really was in flight).
+//   - The interrupt must be HELD by the park queue at least once. Pause targets
+//     the main thread, which never traps in this target, and SIGURG/SIGCONT/a
+//     new thread's initial SIGSTOP are absorbed before classification, so a
+//     parked signal stop can only be this interrupt arriving mid-step.
+//   - A final quiet phase with both traps cleared requires an actual
+//     EventPaused, proving the interrupt is delivered end to end.
+//
+// What is deliberately NOT asserted is an EventPaused from the racing loop: an
+// interrupt held across a step is always suppressed rather than surfaced,
+// because the step's own completion clears manualStopPending before the held
+// signal drains. That is the documented pending-interrupt race.
 func declareStepOverlapPauseSpec() {
 	It("stays resumable when a Pause interrupt races an in-flight step",
 		Label("overlap"), func() {
-			p, _, _ := setupOverlap("overlap_pause_target", overlapTargetSrc)
+			p, idA, idB := setupOverlap("overlap_pause_target", overlapTargetSrc)
 
 			iters := envInt("BINGO_E2E_OVERLAP_PAUSE_ITERS", 40)
 			paused := 0
+			pausedEvents := 0
+			heldInterrupts := 0
 			for i := 0; i < iters; i++ {
 				where := fmt.Sprintf("cycle #%d", i)
 
@@ -561,10 +580,13 @@ func declareStepOverlapPauseSpec() {
 				Expect(p.h.d.StepOver()).To(Succeed(), "StepOver %s", where)
 				// Pause immediately: the step may already have completed and
 				// suspended, in which case Pause is legitimately rejected.
+				heldBefore, _ := debugger.LinuxParkedSignalCount(p.h.d)
+				accepted := false
 				if err := p.h.d.Pause(); err != nil {
 					Expect(err).To(MatchError(debugger.ErrNotRunning),
 						"Pause %s failed for an unexpected reason", where)
 				} else {
+					accepted = true
 					paused++
 				}
 
@@ -573,8 +595,22 @@ func declareStepOverlapPauseSpec() {
 					protocol.EventProcessExited, protocol.EventError)
 				Expect(evt.Kind).NotTo(Or(Equal(protocol.EventProcessExited), Equal(protocol.EventError)),
 					"StepOver+Pause %s unexpected %s: %s", where, evt.Kind, evt.Payload)
+				if evt.Kind == protocol.EventPaused {
+					pausedEvents++
+				}
 				p.record(evt, where, false)
 				p.assertArmed(where)
+
+				// The interrupt lands on the main thread, which is never the
+				// thread being stepped here (only the spinners trap), so a
+				// signal stop appearing in the queue across this window is the
+				// Pause interrupt being received and held BY the park queue
+				// while the step was still in flight. Nothing else can produce
+				// one: SIGURG, SIGCONT and a new thread's initial SIGSTOP are
+				// all absorbed before classification.
+				if heldAfter, ok := debugger.LinuxParkedSignalCount(p.h.d); ok && accepted && heldAfter > heldBefore {
+					heldInterrupts++
+				}
 			}
 
 			// Still fully resumable after all that racing.
@@ -585,24 +621,67 @@ func declareStepOverlapPauseSpec() {
 			Expect(evt.Kind).NotTo(Or(Equal(protocol.EventProcessExited), Equal(protocol.EventError)),
 				"final Continue unexpected %s: %s", evt.Kind, evt.Payload)
 
+			// Deterministic end-to-end delivery check. Everything above races,
+			// so none of it can require an EventPaused: an interrupt held
+			// across a step is ALWAYS suppressed rather than surfaced, because
+			// the step's own completion (EventStepped or a queued sibling hit)
+			// clears manualStopPending before the held signal is drained. That
+			// is the documented pending-interrupt race, not a defect.
+			//
+			// To still prove the interrupt is genuinely delivered and not
+			// silently dropped, remove the only competing stop source and pause
+			// a freely running tracee: with both traps cleared, the SIGSTOP that
+			// Pause directs at the main thread is the ONLY stop that can occur,
+			// so EventPaused is required.
+			for _, id := range []int{idA, idB} {
+				Expect(p.h.d.ClearBreakpoint(id)).To(Succeed(), "clear bp %d before the quiet pause", id)
+			}
+			Expect(p.h.d.Continue()).To(Succeed(), "quiet Continue")
+
+			Eventually(func() error { return p.h.d.Pause() }, 30*time.Second, 50*time.Millisecond).
+				Should(Succeed(), "Pause was never accepted against a freely running tracee with no breakpoints set")
+			evt = p.await(30*time.Second,
+				protocol.EventPaused, protocol.EventBreakpointHit, protocol.EventStepped,
+				protocol.EventProcessExited, protocol.EventError)
+			Expect(evt.Kind).To(Equal(protocol.EventPaused),
+				"pausing a freely running tracee with no breakpoints must surface EventPaused, got %s: %s",
+				evt.Kind, evt.Payload)
+
 			AddReportEntry("overlap-pause-iterations", iters)
 			AddReportEntry("overlap-pause-accepted", paused)
+			AddReportEntry("overlap-pause-events-during-race", pausedEvents)
+			AddReportEntry("overlap-pause-interrupts-held-mid-step", heldInterrupts)
 			if parked, ok := debugger.LinuxParkedStopCount(p.h.d); ok {
 				AddReportEntry("overlap-pause-parked-stops", parked)
 			}
+			if held, ok := debugger.LinuxParkedSignalCount(p.h.d); ok {
+				AddReportEntry("overlap-pause-parked-signal-stops", held)
+			}
 
-			// Non-vacuity. Every assertion above also holds on a run where
-			// every Pause was rejected, which is just a plain step loop that
-			// never exercises the race this spec exists for. An accepted Pause
-			// is the proof that the engine was still running — i.e. that the
-			// interrupt genuinely landed against an in-flight step. Note the
-			// converse is deliberately NOT asserted: an accepted Pause need not
-			// produce EventPaused, because a step that self-completes first
-			// clears manualStopPending and the leftover signal is suppressed.
+			// Non-vacuity, in two independent parts.
+			//
+			// 1. Pause was accepted at all — proof the engine was still running
+			//    when the interrupt was issued, i.e. a step really was in
+			//    flight. Without this the loop degenerates into a plain step
+			//    loop and every other assertion still passes.
 			Expect(paused).To(BeNumerically(">", 0),
 				"no Pause was accepted across %d cycles: every one raced a step that had already "+
 					"suspended, so this spec degenerated into a plain step loop and proved nothing "+
 					"about Pause racing an in-flight step", iters)
+
+			// 2. The interrupt actually reached the backend DURING a step and
+			//    was held by the park queue. This is the strong observable:
+			//    Pause targets the main thread, which is never the stepped
+			//    thread here (only the spinners trap), and SIGURG, SIGCONT and
+			//    a new thread's initial SIGSTOP are absorbed before
+			//    classification — so a signal stop entering the queue can only
+			//    be this interrupt. An accepted Pause whose signal never
+			//    reached the queue would mean the overlap never actually
+			//    happened.
+			Expect(heldInterrupts).To(BeNumerically(">", 0),
+				"%d Pause calls were accepted but no interrupt was ever held back mid-step: the "+
+					"signal never raced an in-flight single-step, so the park path this spec "+
+					"covers was never exercised", paused)
 		})
 }
 
