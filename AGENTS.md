@@ -389,10 +389,25 @@ pure-DWARF location, and issues **no backend calls at all** — not
 `emitPaused`/`goroutineSnapshot`, and not even a stack walk. The backend on this
 path is by definition already failing, so any read could delay or prevent the
 one event that restores liveness; clients can ask for frames or a snapshot once
-the session is responsive again. `haltOnError` wraps the pair and, because
-`emit` drops events when the buffer is full, gives the last free slot to the
-`Paused` rather than the `Error` — losing the suspend is what strands the
-session, losing the cause merely loses detail.
+the session is responsive again.
+
+Delivery of that `Paused` is guaranteed by a **reserved buffer slot**. The
+events channel is `eventBufSize + eventBufReserve` deep; ordinary `emit` refuses
+to use the last slot, and only `emitReserved` — used solely by the halt path —
+may. Without it a saturated buffer silently dropped the halt and recreated the
+strand. `haltOnError` therefore emits the cause as an ordinary event (logging it
+instead when no ordinary slot is free, since losing detail is far cheaper than
+losing the suspend) and the `Paused` through `emitReserved`.
+
+**One reserved slot suffices**, because a second halt can never be queued behind
+the first: emitting a halt leaves the engine `stateSuspended` with the tracee
+stopped, a stopped tracee cannot produce the next stop, and the only route back
+to running is a resume — which the hub sends exclusively from inside the suspend
+wait loop it enters *after receiving* that event. The same argument covers the
+ordinary suspending events (`BreakpointHit`/`Stepped`/`Paused`/`Panic`): none can
+still be sitting in the buffer when a halt is handled. The length check needs no
+lock: the loop thread is the only writer, so `len` can only fall as the hub
+drains, and observing room guarantees the send succeeds.
 
 `EventPaused` is the right kind: `EventStepped` is treated as the entry stop by
 the DAP restart path and can auto-continue, `EventBreakpointHit` would claim a
