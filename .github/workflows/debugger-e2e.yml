@@ -65,7 +65,19 @@ jobs:
       # Repeated: the foreign-thread stop this suite races against is timing
       # dependent, so a single green run is weak evidence. Five rounds is the
       # standing bar for the linux wait-side park queue (issue #199).
+      #
+      # BINGO_E2E_CHURN_ITERS is lowered from its 200 default because the churn
+      # TARGET self-terminates via a 180s watchdog (`os.Exit(0)`). Under -race a
+      # cycle costs ~0.75s on a fast hosted runner and ~0.91s on a slow one, so
+      # the 200-iteration default finishes at ~149s or ~181s depending purely on
+      # which machine we land — i.e. it can lose a race with its own watchdog and
+      # report a spurious ProcessExited (seen at iteration 199/200 in run
+      # 31330091994, where every spec on that runner was ~20% slower). 120 leaves
+      # ~40% headroom at the slow rate while five rounds still run 600 cycles
+      # total — 3x the aggregate stress of the single 200-cycle round it replaces.
       - name: E2E churn (multi-thread robustness, 5 rounds)
+        env:
+          BINGO_E2E_CHURN_ITERS: "120"
         run: |
           for round in 1 2 3 4 5; do
             echo "::group::churn round $round"

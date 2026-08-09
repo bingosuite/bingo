@@ -515,6 +515,18 @@ every observable stop, every hit belongs to a known id, no error or unexpected
 exit, both ids still clearable, threads still making progress at the end of the
 run — plus non-vacuity. The `churn` label runs five rounds in CI.
 
+**Sizing rule for these specs — they race their own target's watchdog.** Every
+E2E target self-terminates with `go func() { time.Sleep(180 * time.Second);
+os.Exit(0) }()`. A `-race` cycle costs ~0.8–1.05s and hosted runners vary by
+~20% (run 31330091994 was uniformly that much slower than 31329090064), so an
+iteration count tuned on a fast runner can exceed the watchdog on a slow one and
+surface as a **spurious `ProcessExited`, not a real regression** — that is what
+failed `churn` at iteration 199/200 there. Keep ≥~35% headroom at the slow rate
+when changing `BINGO_E2E_OVERLAP_ITERS` (default 90) or
+`BINGO_E2E_CHURN_ITERS` (200 by default, pinned to 120 for the five-round CI
+loop); prefer more rounds over a longer single round, since rounds reset the
+watchdog while iterations spend it.
+
 ## Architecture-specific traps
 
 Per-arch in [trap_amd64.go](internal/debugger/trap_amd64.go) and
