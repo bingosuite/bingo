@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"flag"
 	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -315,9 +316,9 @@ func TestCountsLine(t *testing.T) {
 			}),
 			contains: []string{
 				"goroutines=10/10+", "threads=4/4",
-				"goroutine scan hit its ceiling",
+				"goroutine total is a lower bound",
 			},
-			absent: []string{"threads=4/4+", "thread scan hit its ceiling"},
+			absent: []string{"threads=4/4+", "thread total is a lower bound"},
 		},
 		{
 			name: "thread scan clipped only",
@@ -326,9 +327,9 @@ func TestCountsLine(t *testing.T) {
 			}),
 			contains: []string{
 				"goroutines=10/10", "threads=4/4+",
-				"thread scan hit its ceiling",
+				"thread total is a lower bound",
 			},
-			absent: []string{"goroutines=10/10+", "goroutine scan hit its ceiling"},
+			absent: []string{"goroutines=10/10+", "goroutine total is a lower bound"},
 		},
 		{
 			name: "both scans clipped",
@@ -337,7 +338,7 @@ func TestCountsLine(t *testing.T) {
 			}),
 			contains: []string{
 				"goroutines=10/10+", "threads=4/4+",
-				"goroutine scan hit its ceiling", "thread scan hit its ceiling",
+				"goroutine total is a lower bound", "thread total is a lower bound",
 			},
 			absent: []string{"omitted from this event"},
 		},
@@ -349,9 +350,9 @@ func TestCountsLine(t *testing.T) {
 			contains: []string{
 				"goroutines=5000/8192+", "threads=32/64",
 				"3192 goroutines omitted from this event",
-				"goroutine scan hit its ceiling",
+				"goroutine total is a lower bound",
 			},
-			absent: []string{"thread scan hit its ceiling"},
+			absent: []string{"thread total is a lower bound"},
 		},
 	}
 
@@ -501,4 +502,63 @@ func TestUsageErrorUsesTheFlagSetUsage(t *testing.T) {
 	if strings.Contains(got, "Usage of ") {
 		t.Fatalf("output = %q, want no stock flag-package header", got)
 	}
+}
+
+// TestCountsLineClaimsOnlyALowerBound pins what the clipped flags may assert.
+// A degraded snapshot sets both without any scan having run, so language naming
+// a scan ceiling would report a cause the debugger never gave.
+func TestCountsLineClaimsOnlyALowerBound(t *testing.T) {
+	degraded := protocol.GoroutineSnapshotPayload{
+		Goroutines: []protocol.Goroutine{{ID: 1, Status: "waiting", Current: true}},
+		Totals: &protocol.SnapshotTotals{
+			Goroutines: 1, Threads: 0,
+			GoroutinesClipped: true, ThreadsClipped: true,
+		},
+	}
+
+	out := countsLine(degraded)
+	if strings.Contains(out, "ceiling") {
+		t.Fatalf("degraded snapshot claims a scan ceiling it never reached:\n%s", out)
+	}
+	if !strings.Contains(out, "lower bound") {
+		t.Fatalf("degraded snapshot does not state its totals are a floor:\n%s", out)
+	}
+	if !strings.Contains(out, "goroutines=1/1+") {
+		t.Fatalf("lower-bound marker missing from the count:\n%s", out)
+	}
+}
+
+// TestRenderWithoutSnapshotStatesNothingKnown guards the zero state: before any
+// snapshot arrives there is no count to report, and printing the zero value
+// would announce a complete runtime of zero goroutines.
+func TestRenderWithoutSnapshotStatesNothingKnown(t *testing.T) {
+	out := captureStdout(t, func() { (&monitor{}).render() })
+
+	if strings.Contains(out, "(complete)") {
+		t.Fatalf("zero state claims a complete runtime:\n%s", out)
+	}
+	if !strings.Contains(out, "counts: (waiting for GoroutineSnapshot)") {
+		t.Fatalf("zero state does not say it is still waiting:\n%s", out)
+	}
+}
+
+// captureStdout runs fn with stdout redirected and returns what it printed.
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	saved := os.Stdout
+	os.Stdout = w
+	done := make(chan string, 1)
+	go func() {
+		var b strings.Builder
+		_, _ = io.Copy(&b, r)
+		done <- b.String()
+	}()
+	fn()
+	_ = w.Close()
+	os.Stdout = saved
+	return <-done
 }

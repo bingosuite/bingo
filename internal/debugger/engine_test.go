@@ -1417,6 +1417,19 @@ var _ = Describe("goroutine events go through the wire contract", func() {
 		Expect(list.Totals.Goroutines).To(BeNumerically(">=", len(list.Goroutines)))
 	})
 
+	It("keeps unresolved stop identity honest when the stream degrades", func() {
+		// The stop event's identity must not come from the packed payload.
+		// Packing bounds DELIVERY and may degrade to empty collections, which
+		// must not turn ID 0 into a real goroutine. This fake has no DWARF, so
+		// the honest identity is the reserved synthetic unknown.
+		snap, current := debugger.ExportedSnapshotWithCurrent(d)
+		Expect(current.ID).To(BeZero())
+		Expect(current.Status).To(Equal("unknown"))
+		Expect(current.Current).To(BeTrue())
+		Expect(eventSize(protocol.EventGoroutineSnapshot, snap)).
+			To(BeNumerically("<=", protocol.MaxGoroutineEventBytes))
+	})
+
 	It("keeps current consistent with what it delivered", func() {
 		snap, err := d.GoroutineSnapshot()
 		Expect(err).NotTo(HaveOccurred())

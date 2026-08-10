@@ -291,6 +291,76 @@ describe("server-omission rendering", () => {
     };
   }
 
+  it("still states server omissions when the graph is empty", () => {
+    // A fully degraded snapshot delivers nothing. Without the note the panel
+    // reads "No goroutines in this snapshot", which a user takes as the
+    // runtime's answer rather than as this event being empty while the
+    // debugger reported thousands.
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    mountConcurrencyView(document, { postMessage() {} })(
+      model({
+        snapshot: {
+          ...snapshot([], []),
+          totals: {
+            goroutines: 8192,
+            threads: 2048,
+            goroutinesClipped: true,
+            threadsClipped: true,
+          },
+        },
+      }),
+    );
+
+    assert.equal(document.querySelectorAll(".tree-node").length, 0);
+    assert.match(
+      document.querySelector(".graph-panel")?.textContent ?? "",
+      /No goroutines in this snapshot/u,
+    );
+    const notes = [...document.querySelectorAll(".server-omitted")]
+      .map((n) => n.textContent ?? "")
+      .join(" | ");
+    assert.notEqual(notes, "", "an empty graph hid what the server left out");
+    assert.match(notes, /lower bound/u);
+  });
+
+  it("still states server omissions when a filter matches nothing", () => {
+    const { document, window } = parseHTML(
+      "<html><body><div id=app></div></body></html>",
+    );
+    mountConcurrencyView(document, { postMessage() {} })(
+      model({
+        snapshot: {
+          ...snapshot(
+            [goroutine(1, 0, { current: true, threadId: 10 })],
+            [thread(10, 1)],
+          ),
+          totals: {
+            goroutines: 8192,
+            threads: 2048,
+            goroutinesClipped: false,
+            threadsClipped: false,
+          },
+        },
+      }),
+    );
+    const search = document.querySelector<HTMLInputElement>(
+      'input[type="search"]',
+    )!;
+    search.value = "no-such-goroutine";
+    search.dispatchEvent(new window.Event("input"));
+
+    assert.equal(document.querySelectorAll(".tree-node").length, 0);
+    const notes = [...document.querySelectorAll(".server-omitted")]
+      .map((n) => n.textContent ?? "")
+      .join(" | ");
+    assert.notEqual(
+      notes,
+      "",
+      "a filter matching nothing hid what the server left out",
+    );
+    assert.match(notes, /were not sent/u);
+  });
+
   it("marks neither count when neither scan clipped", () => {
     const rendered = cards(false, false);
     assert.equal(rendered.goroutines.endsWith("+"), false);

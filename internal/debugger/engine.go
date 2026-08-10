@@ -1559,14 +1559,18 @@ func (e *engine) emitBreakpointHit(bp *breakpointEntry, stop StopEvent) {
 	// Build the concurrency snapshot once: the current goroutine is embedded in
 	// the stop event, then the full snapshot is streamed as its own event. One
 	// build avoids a double allgs scan and a double lifecycle-delta pass.
-	snap := e.goroutineSnapshot()
+	//
+	// The identity comes from the pre-pack scan, not from snap: packing bounds
+	// what may be delivered and can degrade to empty collections, which must
+	// never erase which goroutine this stop is on.
+	snap, current := e.snapshotWithCurrent()
 	currentLoc := e.locForPC(stop.PC)
 	if len(frames) > 0 {
 		currentLoc = frames[0].Location
 	}
 	e.emit(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{
 		Breakpoint: bp.toProtocol(),
-		Goroutine:  currentGoroutineFrom(snap, currentLoc),
+		Goroutine:  currentGoroutineAt(current, currentLoc),
 		Frames:     frames,
 	})
 	e.emit(protocol.EventGoroutineSnapshot, snap)
@@ -1636,7 +1640,7 @@ func (e *engine) emitPaused(stop StopEvent) {
 		e.curTID = stop.TID
 	}
 	frames, _ := e.collectFrames(stop.TID)
-	snap := e.goroutineSnapshot()
+	snap, current := e.snapshotWithCurrent()
 	loc := protocol.Location{}
 	if e.dw != nil {
 		loc = e.dw.locationForPC(stop.PC)
@@ -1646,7 +1650,7 @@ func (e *engine) emitPaused(stop StopEvent) {
 		currentLoc = frames[0].Location
 	}
 	e.emit(protocol.EventPaused, protocol.PausedPayload{
-		Goroutine: currentGoroutineFrom(snap, currentLoc),
+		Goroutine: currentGoroutineAt(current, currentLoc),
 		Location:  loc,
 		Frames:    frames,
 	})
