@@ -1,0 +1,33 @@
+name: Sentinel clear native proof
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-native-proof:
+    name: Linux amd64 native sentinel clear
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Prove the real ptrace clear path
+        run: |
+          set -o pipefail
+          go test -tags e2e -count=1 -v -timeout 60s ./internal/debugger \
+            -run TestNativeSentinelClearFailureFromLiveRemap 2>&1 | tee native-sentinel-proof.log
+
+      - name: Upload native proof log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-sentinel-proof-log
+          path: native-sentinel-proof.log
+          if-no-files-found: error
