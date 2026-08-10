@@ -148,6 +148,12 @@ func (b *linuxBackend) drainParked() (StopEvent, bool) {
 	return ev, true
 }
 
+// completeStepThreadExit is called by the engine only after Wait returned the
+// internal death boundary, so no Wait call overlaps this gate transition.
+func (b *linuxBackend) completeStepThreadExit() {
+	b.stepQueue.completeStepThreadExit()
+}
+
 func (b *linuxBackend) execPtrace(fn func()) { b.tracer.execPtrace(fn) }
 
 // closeTracer releases the dedicated tracer thread. The engine calls this after
@@ -306,6 +312,9 @@ func isAlreadyExited(err error) bool {
 }
 
 func (b *linuxBackend) ContinueProcess() error {
+	if b.stepExitPending {
+		return fmt.Errorf("PTRACE_CONT: stepped-thread exit is awaiting breakpoint reconciliation; kill or restart to recover")
+	}
 	b.endStep()
 	tid := b.traceTID()
 	var err error
@@ -317,6 +326,9 @@ func (b *linuxBackend) ContinueProcess() error {
 }
 
 func (b *linuxBackend) SingleStep(tid int) error {
+	if b.stepExitPending {
+		return fmt.Errorf("PTRACE_SINGLESTEP: stepped-thread exit is awaiting breakpoint reconciliation; kill or restart to recover")
+	}
 	b.beginStep(tid)
 	var err error
 	b.execPtrace(func() { err = syscall.PtraceSingleStep(tid) })
@@ -498,6 +510,14 @@ func (b *linuxBackend) Threads() ([]int, error) {
 //nolint:gocognit,gocyclo // The wait loop is one serialized ptrace state machine.
 func (b *linuxBackend) Wait() (StopEvent, error) {
 	for {
+		// A stepped thread can die before reporting completion. The oldest held
+		// stop supplies a valid ptrace-stopped TID for the engine to reinstall
+		// the disarmed trap, but remains queued until that transaction closes.
+		if ev, ok := b.stepExitBoundary(); ok {
+			b.recordStop(ev.TID)
+			return ev, nil
+		}
+
 		// A parked stop may only be surfaced once no step is outstanding.
 		// Draining here — before blocking in wait4 — is what makes the parked
 		// thread the current stop as soon as the step that displaced it has
@@ -522,13 +542,13 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				b.recordStop(tid)
 				return StopEvent{Reason: StopExited, TID: tid, ExitCode: ws.ExitStatus()}, nil
 			}
-			b.clearStepIfStepped(tid)
+			b.interruptStepIfStepped(tid)
 			continue
 		}
 
 		if ws.Signaled() {
 			if tid != b.pid {
-				b.clearStepIfStepped(tid)
+				b.interruptStepIfStepped(tid)
 				continue
 			}
 			b.purge()
@@ -606,7 +626,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 			case 0:
 				reason, disp := classifyUserStop(true, b.stepping, b.stepTID, tid)
-				if disp == parkStop {
+				if disp == parkStop || b.stepExitPending {
 					// A sibling hit a software breakpoint while another thread
 					// is mid-step. It stays ptrace-stopped where it is; the
 					// engine sees it only once the step has completed and the
@@ -675,7 +695,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		}
 
 		reason, disp := classifyUserStop(false, b.stepping, b.stepTID, tid)
-		if disp == parkStop {
+		if disp == parkStop || b.stepExitPending {
 			b.park(StopEvent{Reason: reason, TID: tid, Signal: int(sig)})
 			continue
 		}
@@ -760,11 +780,12 @@ func (b *linuxBackend) absorbStop(kind absorbKind, tid int, signal int) error {
 	return b.applyAbsorb(b.planAbsorb(kind, tid, signal), tid)
 }
 
-// applyAbsorb carries out an absorbPlan. The gate is released before the resume
-// so an erroring resume cannot leave the step latched behind it.
+// applyAbsorb carries out an absorbPlan. A dying step owner transitions to the
+// reconciliation gate before it is resumed, so no later stop can escape between
+// the thread's exit and the engine restoring its breakpoint transaction.
 func (b *linuxBackend) applyAbsorb(plan absorbPlan, tid int) error {
-	if plan.clearStep {
-		b.clearStepIfStepped(tid)
+	if plan.stepThreadExits {
+		b.interruptStepIfStepped(tid)
 	}
 	if plan.mode == resumeSingleStep {
 		b.countStepRearm()

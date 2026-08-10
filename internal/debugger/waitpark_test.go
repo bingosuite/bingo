@@ -194,11 +194,10 @@ func TestStepQueuePurgeDiscardsHeldStops(t *testing.T) {
 	}
 }
 
-// TestStepQueueSteppedThreadDeathLiftsTheGate covers the liveness hole: if the
-// thread being stepped dies, its completion can never arrive, so without
-// clearing the step bookkeeping the held stops are stranded and the wait loop
-// blocks forever.
-func TestStepQueueSteppedThreadDeathLiftsTheGate(t *testing.T) {
+// TestStepQueueSteppedThreadDeathRequiresReconciliation pins the transaction
+// boundary: hardware-step ownership ends with the thread, but a held sibling
+// remains gated until the engine acknowledges that the removed trap is back.
+func TestStepQueueSteppedThreadDeathRequiresReconciliation(t *testing.T) {
 	const (
 		stepped = 11
 		other   = 12
@@ -210,7 +209,7 @@ func TestStepQueueSteppedThreadDeathLiftsTheGate(t *testing.T) {
 	q.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
 
 	// An unrelated thread dying changes nothing.
-	q.clearStepIfStepped(other)
+	q.interruptStepIfStepped(other)
 	if !q.stepping || q.stepTID != stepped {
 		t.Fatalf("stepping=%v stepTID=%d after an unrelated exit, want the step untouched", q.stepping, q.stepTID)
 	}
@@ -218,12 +217,26 @@ func TestStepQueueSteppedThreadDeathLiftsTheGate(t *testing.T) {
 		t.Fatal("releasable() released a stop while the step was still in flight")
 	}
 
-	q.clearStepIfStepped(stepped)
+	q.interruptStepIfStepped(stepped)
 	if q.stepping || q.stepTID != 0 {
 		t.Fatalf("stepping=%v stepTID=%d after the stepped thread died, want cleared", q.stepping, q.stepTID)
 	}
-	if _, ok := q.releasable(); !ok {
-		t.Fatal("releasable() withheld a stop after the stepped thread died — the queue is stranded")
+	if _, ok := q.releasable(); ok {
+		t.Fatal("releasable() exposed a sibling before engine reconciliation")
+	}
+	boundary, ok := q.stepExitBoundary()
+	if !ok || boundary.Reason != StopStepThreadExited || boundary.TID != foreign {
+		t.Fatalf("stepExitBoundary() = (%+v, %v), want a boundary anchored to tid %d", boundary, ok, foreign)
+	}
+	if q.parkedDepthForTest() != 1 {
+		t.Fatal("the boundary dequeued the sibling stop before reconciliation")
+	}
+	if _, ok := q.stepExitBoundary(); ok {
+		t.Fatal("stepExitBoundary() reported the same transaction twice")
+	}
+	q.completeStepThreadExit()
+	if ev, ok := q.releasable(); !ok || ev.TID != foreign {
+		t.Fatalf("releasable() after reconciliation = (%+v, %v), want tid %d", ev, ok, foreign)
 	}
 }
 
@@ -233,7 +246,7 @@ func TestStepQueueEmptyIsInert(t *testing.T) {
 		t.Fatalf("releasable() = %+v on a fresh queue, want nothing", ev)
 	}
 	q.endStep()
-	q.clearStepIfStepped(1)
+	q.interruptStepIfStepped(1)
 	q.purge()
 	if ev, ok := q.releasable(); ok {
 		t.Fatalf("releasable() = %+v, want nothing", ev)
@@ -371,10 +384,12 @@ func TestStepQueueResumeForFollowsTheLiveStep(t *testing.T) {
 		t.Fatalf("resumeFor after the step = %v, want resumeContinue", got)
 	}
 
-	q.clearStepIfStepped(stepped)
+	q.beginStep(stepped)
+	q.interruptStepIfStepped(stepped)
 	if got := q.resumeFor(stepped); got != resumeContinue {
 		t.Fatalf("resumeFor after a dead stepped thread = %v, want resumeContinue", got)
 	}
+	q.completeStepThreadExit()
 }
 
 // TestStepQueueAbortStepLiftsTheGateAndDropsHeldStops covers the two absorb
@@ -456,8 +471,8 @@ func TestPlanAbsorbRearmsTheStepItConsumedOnTheSteppedThread(t *testing.T) {
 		if got.signal != 0 {
 			t.Fatalf("kind %d re-armed the step carrying signal %d, want none", kind, got.signal)
 		}
-		if got.clearStep {
-			t.Fatalf("kind %d released the gate while the step can still complete", kind)
+		if got.stepThreadExits {
+			t.Fatalf("kind %d marked the live stepped thread as exiting", kind)
 		}
 	}
 }
@@ -469,17 +484,17 @@ func TestPlanAbsorbContinuesAnyOtherThreadWithItsSignal(t *testing.T) {
 		if got.fail || got.mode != resumeContinue || got.signal != absorbSignal {
 			t.Fatalf("kind %d on a foreign thread = %+v, want a continue carrying %d", kind, got, absorbSignal)
 		}
-		if got.clearStep {
-			t.Fatalf("kind %d released the gate from a foreign thread", kind)
+		if got.stepThreadExits {
+			t.Fatalf("kind %d marked a foreign thread as the dying step owner", kind)
 		}
 	}
 }
 
-func TestPlanAbsorbReleasesTheGateForADyingSteppedThread(t *testing.T) {
+func TestPlanAbsorbClosesHardwareStepForADyingSteppedThread(t *testing.T) {
 	q := &stepQueue{stepping: true, stepTID: absorbSteppedTID}
 	got := q.planAbsorb(absorbThreadExit, absorbSteppedTID, absorbSignal)
-	if !got.clearStep {
-		t.Fatalf("absorbThreadExit = %+v, want the gate released so held stops can drain", got)
+	if !got.stepThreadExits {
+		t.Fatalf("absorbThreadExit = %+v, want the dead step owner marked for reconciliation", got)
 	}
 	if got.fail {
 		t.Fatalf("absorbThreadExit = %+v, want a resumable plan", got)

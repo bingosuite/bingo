@@ -68,14 +68,21 @@ func classifyUserStop(trap, stepping bool, stepTID, tid int) (StopReason, stopDi
 //
 // It is deliberately platform-neutral and free of any backend dependency so the
 // ordering and gating rules are unit-testable without a tracee. It carries NO
-// lock: the owning backend must confine every method to its wait loop, which
-// runs one call at a time (see the linux Wait doc comment for the happens-before
-// argument).
+// lock: Wait owns the queue, and the step-state writes made by engine commands
+// happen between successive one-shot Wait calls (see the linux Wait doc comment
+// for the happens-before argument).
 type stepQueue struct {
 	stepping bool // true after SingleStep; classifies the next SIGTRAP
 	stepTID  int  // the exact thread SingleStep was issued against
 
 	parked []StopEvent // held foreign stops, in arrival order
+
+	// A dead step owner cannot produce the completion that normally tells the
+	// engine to reinstall its disarmed breakpoint. The first held user stop
+	// anchors an internal boundary event; parked stops remain gated until the
+	// engine confirms that transaction has been reconciled.
+	stepExitPending  bool
+	stepExitReported bool
 
 	// parkedTotal counts every stop ever held back. It exists solely so the
 	// native regression test can assert it actually exercised the parking path
@@ -95,6 +102,11 @@ type stepQueue struct {
 	// against a real kernel: the failure it prevents is a freeze, which a test
 	// can otherwise only detect as a timeout. Atomic for the same reason.
 	stepRearmTotal atomic.Int64
+
+	// stepExitTotal makes the stepped-thread-death path non-vacuous in the
+	// native regression test. Atomic because the test reads it while the
+	// backend's one-shot Wait goroutine records the transition.
+	stepExitTotal atomic.Int64
 }
 
 // countStepRearm records that an absorbed stop consumed an in-flight step.
@@ -102,6 +114,9 @@ func (q *stepQueue) countStepRearm() { q.stepRearmTotal.Add(1) }
 
 // stepRearmCount reports how many absorbed stops re-armed a single step.
 func (q *stepQueue) stepRearmCount() int { return int(q.stepRearmTotal.Load()) }
+
+// stepExitCount reports how many in-flight steps lost their owning thread.
+func (q *stepQueue) stepExitCount() int { return int(q.stepExitTotal.Load()) }
 
 // park holds a foreign stop until the in-flight step completes. It deliberately
 // does not touch the backend's current-stop bookkeeping: that must keep naming
@@ -137,7 +152,7 @@ func (q *stepQueue) parkedSignalCount() int { return int(q.parkedSignalTotal.Loa
 // is FIFO so the engine observes sibling stops in the order the kernel reported
 // them.
 func (q *stepQueue) releasable() (StopEvent, bool) {
-	if q.stepping || len(q.parked) == 0 {
+	if q.stepping || q.stepExitPending || len(q.parked) == 0 {
 		return StopEvent{}, false
 	}
 	ev := q.parked[0]
@@ -162,13 +177,35 @@ func (q *stepQueue) endStep() {
 	q.stepTID = 0
 }
 
-// clearStepIfStepped ends the step when the stepped thread itself dies. Without
-// it stepping stays true forever, the queue is never released, and the wait loop
-// blocks for a step completion that can no longer happen.
-func (q *stepQueue) clearStepIfStepped(tid int) {
+// interruptStepIfStepped closes the hardware-step ownership when its thread
+// dies, but deliberately keeps the parked-stop gate closed. The engine still
+// owns any breakpoint removed for that step and must reinstall it before a
+// sibling stop can enter normal handling.
+func (q *stepQueue) interruptStepIfStepped(tid int) {
 	if q.stepping && tid == q.stepTID {
 		q.endStep()
+		q.stepExitPending = true
+		q.stepExitReported = false
+		q.stepExitTotal.Add(1)
 	}
+}
+
+// stepExitBoundary reports one internal reconciliation event, anchored to the
+// oldest held stop without dequeuing it. Recording that TID at delivery keeps
+// memory writes paired with a thread that is genuinely ptrace-stopped.
+func (q *stepQueue) stepExitBoundary() (StopEvent, bool) {
+	if !q.stepExitPending || q.stepExitReported || len(q.parked) == 0 {
+		return StopEvent{}, false
+	}
+	q.stepExitReported = true
+	return StopEvent{Reason: StopStepThreadExited, TID: q.parked[0].TID}, true
+}
+
+// completeStepThreadExit opens the parked-stop gate after the engine has
+// reconciled the breakpoint transaction associated with the dead step owner.
+func (q *stepQueue) completeStepThreadExit() {
+	q.stepExitPending = false
+	q.stepExitReported = false
 }
 
 // stepResume says how a thread must be resumed when the wait loop absorbs its
@@ -240,9 +277,9 @@ type absorbPlan struct {
 	mode stepResume
 	// signal is the signal that primitive delivers.
 	signal int
-	// clearStep releases the gate because the stepped thread is going away and
-	// no step completion can ever arrive for it.
-	clearStep bool
+	// stepThreadExits closes hardware-step ownership because its thread is going
+	// away. The parked-stop gate remains closed for engine reconciliation.
+	stepThreadExits bool
 }
 
 // planAbsorb decides, for one absorbed stop, every effect that stop has on the
@@ -253,7 +290,8 @@ type absorbPlan struct {
 // Three shapes fall out of that:
 //
 //   - A dying thread (absorbThreadExit) is never re-armed — there is nothing
-//     left to step — and releases the gate instead, so held stops can drain.
+//     left to step — and transitions to an engine-reconciliation boundary
+//     before held stops can drain.
 //   - absorbExec and absorbUnknownEvent cannot be absorbed on the stepped thread
 //     at all: exec throws away the memory the saved instruction bytes and the
 //     trap live in, and an event we never enabled has no understood stop shape.
@@ -282,7 +320,7 @@ type absorbPlan struct {
 func (q *stepQueue) planAbsorb(kind absorbKind, tid int, signal int) absorbPlan {
 	switch kind {
 	case absorbThreadExit:
-		return absorbPlan{mode: resumeContinue, signal: 0, clearStep: true}
+		return absorbPlan{mode: resumeContinue, signal: 0, stepThreadExits: true}
 	case absorbExec, absorbUnknownEvent:
 		if q.resumeFor(tid) == resumeSingleStep {
 			return absorbPlan{fail: true}
@@ -306,6 +344,7 @@ func (q *stepQueue) planAbsorb(kind absorbKind, tid int, signal int) absorbPlan 
 // the queue exists to prevent.
 func (q *stepQueue) abortStep() {
 	q.endStep()
+	q.completeStepThreadExit()
 	q.purge()
 }
 

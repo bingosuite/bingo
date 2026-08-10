@@ -139,6 +139,20 @@ var _ = Describe("asynchronous halts in handleStop", func() {
 			"the retry must actually reach the backend")
 	})
 
+	It("reports a halt when a dead step owner's breakpoint cannot be reconciled", func() {
+		const bpAddr = uint64(0x4140)
+		arriveAtBreakpoint(fb, d, bpAddr)
+		continueAndConsumeContinued(d)
+
+		fb.failWriteAt(bpAddr, errInjected)
+		fb.pushStop(debugger.StopEvent{
+			Reason: debugger.StopStepThreadExited,
+			TID:    2,
+		})
+
+		expectHaltReported(d, "after stepped thread exited")
+	})
+
 	It("reports a halt when an internal breakpoint cannot be auto-cleared", func() {
 		const addr = uint64(0x4180)
 		fb.seedMem(addr, []byte{0x90, 0x90, 0x90, 0x90})
@@ -164,6 +178,19 @@ var _ = Describe("asynchronous halts in handleStop", func() {
 		fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: 2, PC: addr})
 
 		expectHaltReported(d, "read registers for retired internal breakpoint on thread 2")
+		fb.clearFaults()
+		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
+	})
+
+	It("reports a halt when retired-sentinel bytes cannot be verified", func() {
+		const addr = uint64(0x4198)
+		retireInternalBreakpoint(fb, d, addr)
+		runWithWaitLoop(d)
+
+		fb.failReadAt(addr, errInjected)
+		fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: 2, PC: addr})
+
+		expectHaltReported(d, "inspect retired internal breakpoint")
 		fb.clearFaults()
 		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
 	})
