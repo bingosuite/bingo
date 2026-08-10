@@ -426,85 +426,94 @@ func TestStepQueueAbortStepLiftsTheGateAndDropsHeldStops(t *testing.T) {
 // through planAbsorb, so this table is the gate on all of them at once: before
 // the seam existed, turning any branch's step re-arm back into a plain continue
 // — the freeze this whole queue exists to prevent — passed the entire suite.
-func TestStepQueuePlanAbsorbCoversEveryWaitBranch(t *testing.T) {
-	const (
-		stepped = 5100
-		foreign = 5200
-		sigurg  = 23
-	)
+// Together these pin every branch of Wait that absorbs a stop without returning
+// it, one test per outcome class. They are deliberately separate top-level
+// functions rather than subtests of one: a single function covering all five
+// classes trips the repo's cognitive-complexity limit.
+const (
+	absorbSteppedTID = 5100
+	absorbForeignTID = 5200
+	absorbSignal     = 23
+)
 
-	rearming := []absorbKind{absorbClone, absorbNewThread, absorbPreempt, absorbContinued}
-	fatal := []absorbKind{absorbExec, absorbUnknownEvent}
+// absorbRearmingKinds are the branches that resume the thread and keep going.
+func absorbRearmingKinds() []absorbKind {
+	return []absorbKind{absorbClone, absorbNewThread, absorbPreempt, absorbContinued}
+}
 
-	t.Run("absorbing on the stepped thread re-arms the step it consumed", func(t *testing.T) {
-		for _, kind := range rearming {
-			q := &stepQueue{stepping: true, stepTID: stepped}
-			got := q.planAbsorb(kind, stepped, sigurg)
-			if got.fail || got.mode != resumeSingleStep {
-				t.Fatalf("kind %d on the stepped thread = %+v, want a re-armed step", kind, got)
-			}
-			if got.signal != 0 {
-				t.Fatalf("kind %d re-armed the step carrying signal %d, want none", kind, got.signal)
-			}
-			if got.clearStep {
-				t.Fatalf("kind %d released the gate while the step can still complete", kind)
-			}
-		}
-	})
+// absorbFatalKinds are the branches Wait cannot absorb under an in-flight step.
+func absorbFatalKinds() []absorbKind {
+	return []absorbKind{absorbExec, absorbUnknownEvent}
+}
 
-	t.Run("absorbing on any other thread continues it with its signal", func(t *testing.T) {
-		for _, kind := range rearming {
-			q := &stepQueue{stepping: true, stepTID: stepped}
-			got := q.planAbsorb(kind, foreign, sigurg)
-			if got.fail || got.mode != resumeContinue || got.signal != sigurg {
-				t.Fatalf("kind %d on a foreign thread = %+v, want a continue carrying %d", kind, got, sigurg)
-			}
-			if got.clearStep {
-				t.Fatalf("kind %d released the gate from a foreign thread", kind)
-			}
-		}
-	})
-
-	t.Run("a dying stepped thread releases the gate and is never re-armed", func(t *testing.T) {
-		q := &stepQueue{stepping: true, stepTID: stepped}
-		got := q.planAbsorb(absorbThreadExit, stepped, sigurg)
-		if !got.clearStep {
-			t.Fatalf("absorbThreadExit = %+v, want the gate released so held stops can drain", got)
-		}
-		if got.fail || got.mode != resumeSingleStep && got.mode != resumeContinue {
-			t.Fatalf("absorbThreadExit = %+v, want a resumable plan", got)
-		}
-		if got.mode == resumeSingleStep {
-			t.Fatal("absorbThreadExit re-armed a step on a thread that is exiting")
+func TestPlanAbsorbRearmsTheStepItConsumedOnTheSteppedThread(t *testing.T) {
+	for _, kind := range absorbRearmingKinds() {
+		q := &stepQueue{stepping: true, stepTID: absorbSteppedTID}
+		got := q.planAbsorb(kind, absorbSteppedTID, absorbSignal)
+		if got.fail || got.mode != resumeSingleStep {
+			t.Fatalf("kind %d on the stepped thread = %+v, want a re-armed step", kind, got)
 		}
 		if got.signal != 0 {
-			t.Fatalf("absorbThreadExit delivered signal %d to an exiting thread", got.signal)
+			t.Fatalf("kind %d re-armed the step carrying signal %d, want none", kind, got.signal)
 		}
-	})
+		if got.clearStep {
+			t.Fatalf("kind %d released the gate while the step can still complete", kind)
+		}
+	}
+}
 
-	t.Run("exec and unknown events cannot be absorbed on the stepped thread", func(t *testing.T) {
-		for _, kind := range fatal {
-			q := &stepQueue{stepping: true, stepTID: stepped}
-			if got := q.planAbsorb(kind, stepped, 0); !got.fail {
-				t.Fatalf("kind %d on the stepped thread = %+v, want a refusal", kind, got)
-			}
-			q = &stepQueue{stepping: true, stepTID: stepped}
-			got := q.planAbsorb(kind, foreign, sigurg)
-			if got.fail || got.mode != resumeContinue {
-				t.Fatalf("kind %d on a foreign thread = %+v, want a plain continue", kind, got)
-			}
+func TestPlanAbsorbContinuesAnyOtherThreadWithItsSignal(t *testing.T) {
+	for _, kind := range absorbRearmingKinds() {
+		q := &stepQueue{stepping: true, stepTID: absorbSteppedTID}
+		got := q.planAbsorb(kind, absorbForeignTID, absorbSignal)
+		if got.fail || got.mode != resumeContinue || got.signal != absorbSignal {
+			t.Fatalf("kind %d on a foreign thread = %+v, want a continue carrying %d", kind, got, absorbSignal)
 		}
-	})
+		if got.clearStep {
+			t.Fatalf("kind %d released the gate from a foreign thread", kind)
+		}
+	}
+}
 
-	t.Run("an idle queue never re-arms and never refuses", func(t *testing.T) {
-		for _, kind := range append(append([]absorbKind{}, rearming...), fatal...) {
-			q := &stepQueue{stepping: false, stepTID: stepped}
-			got := q.planAbsorb(kind, stepped, sigurg)
-			if got.fail || got.mode != resumeContinue {
-				t.Fatalf("kind %d with no step in flight = %+v, want a plain continue", kind, got)
-			}
+func TestPlanAbsorbReleasesTheGateForADyingSteppedThread(t *testing.T) {
+	q := &stepQueue{stepping: true, stepTID: absorbSteppedTID}
+	got := q.planAbsorb(absorbThreadExit, absorbSteppedTID, absorbSignal)
+	if !got.clearStep {
+		t.Fatalf("absorbThreadExit = %+v, want the gate released so held stops can drain", got)
+	}
+	if got.fail {
+		t.Fatalf("absorbThreadExit = %+v, want a resumable plan", got)
+	}
+	if got.mode == resumeSingleStep {
+		t.Fatal("absorbThreadExit re-armed a step on a thread that is exiting")
+	}
+	if got.signal != 0 {
+		t.Fatalf("absorbThreadExit delivered signal %d to an exiting thread", got.signal)
+	}
+}
+
+func TestPlanAbsorbRefusesExecAndUnknownEventsOnTheSteppedThread(t *testing.T) {
+	for _, kind := range absorbFatalKinds() {
+		q := &stepQueue{stepping: true, stepTID: absorbSteppedTID}
+		if got := q.planAbsorb(kind, absorbSteppedTID, 0); !got.fail {
+			t.Fatalf("kind %d on the stepped thread = %+v, want a refusal", kind, got)
 		}
-	})
+		q = &stepQueue{stepping: true, stepTID: absorbSteppedTID}
+		got := q.planAbsorb(kind, absorbForeignTID, absorbSignal)
+		if got.fail || got.mode != resumeContinue {
+			t.Fatalf("kind %d on a foreign thread = %+v, want a plain continue", kind, got)
+		}
+	}
+}
+
+func TestPlanAbsorbNeverRearmsOrRefusesWithNoStepInFlight(t *testing.T) {
+	for _, kind := range append(absorbRearmingKinds(), absorbFatalKinds()...) {
+		q := &stepQueue{stepping: false, stepTID: absorbSteppedTID}
+		got := q.planAbsorb(kind, absorbSteppedTID, absorbSignal)
+		if got.fail || got.mode != resumeContinue {
+			t.Fatalf("kind %d with no step in flight = %+v, want a plain continue", kind, got)
+		}
+	}
 }
 
 func TestStepQueuePlanAbsorbForwardsSignalsExceptOnTheSteppedThread(t *testing.T) {
