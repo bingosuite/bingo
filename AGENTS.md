@@ -578,6 +578,21 @@ acknowledgement in rule 5 (see the locking note below):
    `Error → Paused` is emitted, and Continue/Step are rejected; Kill/Restart is
    the safe recovery. This prevents a sibling from replacing `lastBP` while the
    original logical breakpoint is still out of the table.
+
+   **"Once a held stop exists" is a hard requirement, not a convenience.** The
+   boundary needs a TID the engine can `POKEDATA` into, and ptrace can only
+   write through a thread that is *actually stopped* — so with an empty queue
+   there is no legal anchor and no boundary is emitted. `stepExitPending` simply
+   stays set: `Wait` keeps blocking in `wait4`, and the first foreign stop to
+   arrive parks (the park condition includes `stepExitPending`), which supplies
+   the anchor and releases the whole transaction on the next iteration. Whole
+   process death still routes through the main thread and tears down as usual.
+   Nothing is lost that was not already lost before this rule existed — the
+   trap stays lifted for exactly as long as no thread is stopped to reinstall it
+   through — and the step-over case cannot reach it anyway, since the stepped
+   instruction is user code at `bp.addr` and a thread cannot exit executing it.
+   A future change that makes *plain* foreign single-steps common should
+   re-check this empty-queue path rather than assume it.
 6. **Teardown purges inside `Wait`.** `stepQueue.purge` runs on the main thread's
    `PTRACE_EVENT_EXIT`, its real exit, its signal death, and `ECHILD`. There is
    deliberately **no engine-callable purge**: the queue is not part of the
