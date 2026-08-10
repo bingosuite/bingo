@@ -113,14 +113,21 @@ func mainExitCode() int {
 	sessionID := flag.String("session", "", "existing bingo session ID to join (omit to create on launch)")
 	flag.Parse()
 
-	if err := runDAPCLI(ctx, *addr, *sessionID); err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, errDAPDisconnected) {
-			return 0
-		}
+	err := runDAPCLI(ctx, *addr, *sessionID)
+	code := exitCode(err)
+	if code != 0 {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
 	}
-	return 0
+	return code
+}
+
+func exitCode(err error) int {
+	if err == nil ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, errDAPDisconnected) {
+		return 0
+	}
+	return 1
 }
 
 func runDAPCLI(ctx context.Context, addr, sessionID string) error {

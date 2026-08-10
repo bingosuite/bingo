@@ -51,6 +51,24 @@ func (r *testReader) close() {
 	})
 }
 
+func newPipeEditor(t *testing.T, input io.ReadCloser) *Editor {
+	t.Helper()
+	editor, err := NewEditor(&readline.Config{
+		Stdin:              input,
+		Stdout:             io.Discard,
+		Stderr:             io.Discard,
+		FuncIsTerminal:     func() bool { return false },
+		FuncMakeRaw:        func() error { return nil },
+		FuncExitRaw:        func() error { return nil },
+		FuncGetWidth:       func() int { return 80 },
+		FuncOnWidthChanged: func(func()) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return editor
+}
+
 func TestLoopContinuesAfterPartialInterrupt(t *testing.T) {
 	reader := newTestReader(
 		&readline.Result{Line: "locals 123", Error: readline.ErrInterrupt},
@@ -113,22 +131,28 @@ func TestLoopDoesNotDispatchLineReturnedDuringCancellation(t *testing.T) {
 	}
 }
 
+func TestLoopDoesNotDispatchQueuedInputAfterDisconnect(t *testing.T) {
+	reader := newTestReader(
+		&readline.Result{Line: "continue"},
+		&readline.Result{Error: io.EOF},
+	)
+	disconnected := make(chan struct{})
+	close(disconnected)
+
+	Loop(context.Background(), reader, reader.close, disconnected, func(args []string) bool {
+		t.Fatalf("dispatched %v after disconnect", args)
+		return false
+	})
+
+	if got := reader.out.String(); got != "" {
+		t.Fatalf("output = %q, want no goodbye after disconnect", got)
+	}
+}
+
 func TestEditorCloseUnblocksLine(t *testing.T) {
 	input, inputWriter := io.Pipe()
 	t.Cleanup(func() { _ = inputWriter.Close() })
-	editor, err := NewEditor(&readline.Config{
-		Stdin:              input,
-		Stdout:             io.Discard,
-		Stderr:             io.Discard,
-		FuncIsTerminal:     func() bool { return false },
-		FuncMakeRaw:        func() error { return nil },
-		FuncExitRaw:        func() error { return nil },
-		FuncGetWidth:       func() int { return 80 },
-		FuncOnWidthChanged: func(func()) {},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	editor := newPipeEditor(t, input)
 
 	lineDone := make(chan *readline.Result, 1)
 	go func() { lineDone <- editor.Line() }()
@@ -146,22 +170,30 @@ func TestEditorCloseUnblocksLine(t *testing.T) {
 	}
 }
 
+func TestEditorCloseBeforeLine(t *testing.T) {
+	const iterations = 50
+	for i := 0; i < iterations; i++ {
+		input, inputWriter := io.Pipe()
+		editor := newPipeEditor(t, input)
+		closeDone := make(chan error, 1)
+		go func() { closeDone <- editor.Close() }()
+
+		select {
+		case err := <-closeDone:
+			if err != nil {
+				t.Fatalf("iteration %d: Close: %v", i, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d: Close blocked before any Line call", i)
+		}
+		_ = inputWriter.Close()
+	}
+}
+
 func TestEditorCloseDoesNotConsumeBufferedNextLine(t *testing.T) {
 	input, inputWriter := io.Pipe()
 	t.Cleanup(func() { _ = inputWriter.Close() })
-	editor, err := NewEditor(&readline.Config{
-		Stdin:              input,
-		Stdout:             io.Discard,
-		Stderr:             io.Discard,
-		FuncIsTerminal:     func() bool { return false },
-		FuncMakeRaw:        func() error { return nil },
-		FuncExitRaw:        func() error { return nil },
-		FuncGetWidth:       func() int { return 80 },
-		FuncOnWidthChanged: func(func()) {},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	editor := newPipeEditor(t, input)
 
 	loopDone := make(chan struct{})
 	go func() {

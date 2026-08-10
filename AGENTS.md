@@ -99,7 +99,7 @@ follow them so reviews stay about substance, not style.
 | [examples/spawntree](examples/spawntree/) | Concurrency demo target: a deterministic main → supervisor → worker×N goroutine spawn tree for exercising the telemetry stream (see [docs/ConcurrencyTelemetry.md](docs/ConcurrencyTelemetry.md)). |
 | [cmd/githook](cmd/githook/) | Conventional-commits commitlint, wired via [lefthook.yml](lefthook.yml). |
 | [pkg/protocol](pkg/protocol/) | Wire types: `Event`, `Command`, payload structs, `EventKind`, `CommandKind`, `SessionState`. Single source of truth. |
-| [pkg/client](pkg/client/) | Reference Go client. WebSocket-backed. Public surface: `Client` interface + `Create` / `Join` / `ListSessions`. |
+| [pkg/client](pkg/client/) | Reference Go client. WebSocket-backed. Public surface: `Client`, `Create` / `Join` / `ListSessions`, their context-aware `*Context` variants, and the `ErrClosed` teardown sentinel. |
 | [internal/server](internal/server/) | HTTP/WebSocket entry. `Server`, `sessionStore`, `/api/sessions` and `/ws` handlers. |
 | [internal/hub](internal/hub/) | Per-session bridge between connected clients and one `Debugger`. |
 | [internal/dap](internal/dap/) | Debug Adapter Protocol translator. A `Handler` implements `hub.WSConn`, so a DAP/IDE client plugs into a hub session as just another client (ZERO hub changes). |

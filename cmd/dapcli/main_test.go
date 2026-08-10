@@ -3,10 +3,12 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,6 +19,26 @@ import (
 	godap "github.com/google/go-dap"
 	. "github.com/onsi/gomega"
 )
+
+func TestExitCode(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "clean"},
+		{name: "canceled", err: fmt.Errorf("initialize: %w", context.Canceled)},
+		{name: "disconnected", err: fmt.Errorf("request: %w", errDAPDisconnected)},
+		{name: "failure", err: errors.New("malformed DAP frame"), want: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := exitCode(tt.err); got != tt.want {
+				t.Fatalf("exitCode(%v) = %d, want %d", tt.err, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestReadDAPMessageAcceptsSessionAnnouncement(t *testing.T) {
 	g := NewWithT(t)
@@ -226,26 +248,67 @@ func TestRequestErrorIsSuppressedAfterConnectionEnds(t *testing.T) {
 	}
 }
 
-func TestEndConnectionPublishesStateBeforeFailingWaiters(t *testing.T) {
+func TestReadLoopPublishesConnectionBeforeWakingRequest(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(oldProcs)
+
 	server, client := net.Pipe()
 	t.Cleanup(func() { _ = server.Close() })
-	h := newTestDAPCLI(client, io.Discard, func() {})
-	waiter := make(chan pendingResult, 1)
-	h.pending[1] = waiter
-	failure := errors.New("malformed DAP frame")
+	var out bytes.Buffer
+	h := newTestDAPCLI(client, &out, func() {})
+	go h.readLoop()
 
-	h.endConnection(failure)
+	requestDone := make(chan error, 1)
+	go func() {
+		_, err := h.request("threads", &godap.ThreadsRequest{})
+		h.printRequestError("threads", err)
+		requestDone <- err
+	}()
 
-	result := <-waiter
-	if !h.connectionEnded() {
-		t.Fatal("pending request woke before connection state was published")
+	if _, err := readDAPMessage(bufio.NewReader(server)); err != nil {
+		t.Fatalf("read request: %v", err)
 	}
-	if result.err == nil {
-		t.Fatal("pending request did not receive the connection failure")
+
+	h.readMu.Lock()
+	writeDAPFrameTo(server, `{"seq":1,"type":"closed"}`)
+	runtime.Gosched()
+	var requestErr error
+	wokeBeforePublication := false
+	select {
+	case requestErr = <-requestDone:
+		wokeBeforePublication = true
+	default:
+	}
+	h.readMu.Unlock()
+
+	select {
+	case <-h.readDone:
+	case <-time.After(time.Second):
+		t.Fatal("read loop did not stop after protocol failure")
+	}
+	if !wokeBeforePublication {
+		select {
+		case requestErr = <-requestDone:
+		case <-time.After(time.Second):
+			t.Fatal("request waiter did not wake after protocol failure")
+		}
+	}
+	if requestErr == nil {
+		t.Fatal("request returned nil after protocol failure")
+	}
+	if wokeBeforePublication {
+		t.Error("request waiter woke before connection state was published")
+	}
+
+	if got := strings.Count(out.String(), "connection closed:"); got != 1 {
+		t.Fatalf("connection-closed notices = %d, output %q", got, out.String())
+	}
+	if strings.Contains(out.String(), "[error] threads:") {
+		t.Fatalf("request printed a second error before disconnect publication: %q", out.String())
 	}
 	readErr, intentional := h.readOutcome()
-	if !errors.Is(readErr, failure) || intentional {
-		t.Fatalf("read outcome = (%v, %v), want original unintentional failure", readErr, intentional)
+	if readErr == nil || intentional {
+		t.Fatalf("read outcome = (%v, %v), want unintentional protocol failure", readErr, intentional)
 	}
 	if err := sessionEndError(readErr, intentional); err == nil {
 		t.Fatal("unexpected write/read failure was downgraded to graceful exit")
