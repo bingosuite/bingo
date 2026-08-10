@@ -666,6 +666,43 @@ func TestInitializeDoesNotAdvertiseExceptionStops(t *testing.T) {
 	}
 }
 
+func TestDeprecatedPanicEventIsIgnored(t *testing.T) {
+	const panicCompatibilityEvent protocol.EventKind = "Panic"
+	hh := newHarness(t)
+	hh.doHandshake(t)
+
+	hh.handler.mu.Lock()
+	suspendedBefore := hh.handler.suspended
+	hh.handler.mu.Unlock()
+	if suspendedBefore {
+		t.Fatal("handshake left handler suspended")
+	}
+
+	hh.inject(panicCompatibilityEvent, struct {
+		Message   string             `json:"message"`
+		Goroutine protocol.Goroutine `json:"goroutine"`
+		Frames    []protocol.Frame   `json:"frames"`
+	}{
+		Message:   "boom",
+		Goroutine: protocol.Goroutine{ID: 7},
+		Frames:    []protocol.Frame{},
+	})
+
+	hh.handler.mu.Lock()
+	suspendedAfter := hh.handler.suspended
+	hh.handler.mu.Unlock()
+	if suspendedAfter != suspendedBefore {
+		t.Fatalf("suspended changed from %t to %t", suspendedBefore, suspendedAfter)
+	}
+
+	_ = hh.client.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	if _, err := hh.reader.Peek(1); err == nil {
+		t.Fatal("deprecated Panic event emitted a DAP message")
+	} else if nerr, ok := err.(net.Error); !ok || !nerr.Timeout() {
+		t.Fatalf("read after deprecated Panic event: %v", err)
+	}
+}
+
 // TestVariablesExpandsNestedStruct proves a struct local returned in EventLocals
 // with Children is served with a fresh child variablesReference, and that a
 // follow-up variables request on that ref returns the cached children WITHOUT a
