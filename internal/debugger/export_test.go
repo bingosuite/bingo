@@ -214,6 +214,57 @@ func (e *ExportedStepQueue) CompleteStepThreadExit() {
 	e.q.completeStepThreadExit()
 }
 
+// HoldStepOwner retains tid as the reconciliation anchor, as Wait does when the
+// step owner dies with nothing parked.
+func (e *ExportedStepQueue) HoldStepOwner(tid int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.q.holdStepOwner(tid)
+}
+
+// HeldStepOwner reports the retained anchor, so a test can prove the obligation
+// was dropped rather than leaked.
+func (e *ExportedStepQueue) HeldStepOwner() (int, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.q.heldStepOwner()
+}
+
+// ClearHeldStepOwner drops the anchor obligation, as the backend does once it
+// has genuinely resumed that thread.
+func (e *ExportedStepQueue) ClearHeldStepOwner() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.q.clearHeldStepOwner()
+}
+
+// StepExitPending reports whether a stepped-thread exit is still awaiting the
+// engine's reconciliation, which is what the linux backend's resume primitives
+// refuse on.
+func (e *ExportedStepQueue) StepExitPending() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.q.stepExitPending
+}
+
+// AbsorbThreadExit applies the production absorb decision for a dying thread and
+// reports whether that thread was retained as the reconciliation anchor. It
+// mirrors the linux backend's applyAbsorb minus the ptrace call, so a
+// cross-layer test exercises the real decision rather than restating it.
+func (e *ExportedStepQueue) AbsorbThreadExit(tid int) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	plan := e.q.planAbsorb(absorbThreadExit, tid, 0)
+	if plan.stepThreadExits {
+		e.q.interruptStepIfStepped(tid)
+	}
+	if plan.holdStepOwner {
+		e.q.holdStepOwner(tid)
+		return true
+	}
+	return false
+}
+
 func (e *ExportedStepQueue) ParkedDepth() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -224,14 +275,16 @@ func (e *ExportedStepQueue) ParkedDepth() int {
 // stepThreadExitCompleter, which an external test package cannot implement
 // directly. Complete receives the engine's acknowledgement that the dead step
 // owner's breakpoint transaction has been reconciled — the only thing that
-// opens the parked-stop gate.
+// opens the parked-stop gate and releases the thread held as its write anchor.
+// Returning an error models a release that failed non-benignly.
 type ExportedGateBackend struct {
 	Backend
-	Complete func()
+	Complete func() error
 }
 
-func (b *ExportedGateBackend) completeStepThreadExit() {
+func (b *ExportedGateBackend) completeStepThreadExit() error {
 	if b.Complete != nil {
-		b.Complete()
+		return b.Complete()
 	}
+	return nil
 }

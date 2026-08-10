@@ -144,11 +144,16 @@ type threadStepper interface {
 }
 
 // stepThreadExitCompleter closes the linux parked-stop gate after the engine has
-// reinstalled the breakpoint whose hardware step owner died. It is separate from
-// threadStepper because Kill may call endThreadStep concurrently with Wait,
+// reinstalled the breakpoint whose hardware step owner died, and releases the
+// thread the backend held as the write anchor for that reinstall. It is separate
+// from threadStepper because Kill may call endThreadStep concurrently with Wait,
 // whereas this callback runs only in the serialized Wait→engine→Wait handoff.
+//
+// It returns an error because the release is a real ptrace op that can fail. A
+// failure must halt the engine suspended with the gate still closed, not tear
+// the session down: the tracee is intact and Kill/Restart remains the recovery.
 type stepThreadExitCompleter interface {
-	completeStepThreadExit()
+	completeStepThreadExit() error
 }
 
 // stepThreadOverBP single-steps tid over a just-disarmed breakpoint at addr. On
@@ -170,10 +175,11 @@ func (e *engine) endThreadStep() {
 	}
 }
 
-func (e *engine) completeStepThreadExit() {
+func (e *engine) completeStepThreadExit() error {
 	if c, ok := e.backend.(stepThreadExitCompleter); ok {
-		c.completeStepThreadExit()
+		return c.completeStepThreadExit()
 	}
+	return nil
 }
 
 // activeTID resolves the thread the user is currently stopped on. It prefers
@@ -840,11 +846,15 @@ func (e *engine) handleStop(stop StopEvent) {
 		e.emitStepped(stop)
 
 	case StopStepThreadExited:
-		// Wait keeps the actual sibling stop queued and lends us its stopped TID
-		// solely as a safe memory-write anchor. Reinstall before acknowledging
-		// this boundary; only that acknowledgement lets the real stop drain.
+		// The backend is holding a genuinely ptrace-stopped thread solely as a
+		// memory-write anchor — the dying step owner itself, or a sibling whose
+		// real stop stays queued. Reinstall through it FIRST; only the
+		// acknowledgement below releases that anchor and lets held stops drain.
 		if sob := e.steppingOverBP; sob != nil {
 			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
+				// steppingOverBP is deliberately left set: the trap is still out
+				// of the tracee and the engine still owns it, which is also what
+				// keeps the backend's gate closed so Continue/Step are refused.
 				e.setState(stateSuspended)
 				e.haltOnError(protocol.CmdNone, fmt.Errorf(
 					"reinstall breakpoint 0x%x after stepped thread exited; kill or restart to recover safely: %w",
@@ -855,7 +865,16 @@ func (e *engine) handleStop(stop StopEvent) {
 			e.log.Debug("breakpoint reinstalled after stepped thread exited",
 				"addr", fmt.Sprintf("0x%x", sob.addr))
 		}
-		e.completeStepThreadExit()
+		if cerr := e.completeStepThreadExit(); cerr != nil {
+			// The reinstall succeeded but the anchor could not be released, so
+			// the gate stays closed and no waitLoop is started: resuming would
+			// leave a thread stopped that nothing will ever deliver.
+			e.setState(stateSuspended)
+			e.haltOnError(protocol.CmdNone, fmt.Errorf(
+				"reconcile the exited step owner; kill or restart to recover safely: %w",
+				cerr), stop)
+			return
+		}
 		e.setState(stateRunning)
 		go e.waitLoop()
 
