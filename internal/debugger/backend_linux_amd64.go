@@ -196,14 +196,14 @@ func (b *linuxBackend) drainParked() (StopEvent, bool) {
 // it would run a thread whose stop the engine has not been told about. The
 // release itself runs through the tracer thread like every other ptrace op.
 // ESRCH/ENOENT is benign — the thread was mid-exit and simply finished dying —
-// and continueIfTraceeExists already treats it as success.
+// and continueWithoutPendingSignals already treats it as success.
 //
 // A non-benign failure leaves the gate CLOSED and the hold in place. Nothing may
 // drain past a thread we could not release, and reporting the error lets the
 // engine halt suspended rather than resume into a state it cannot describe.
 func (b *linuxBackend) completeStepThreadExit() error {
 	if tid, ok := b.heldStepOwner(); ok {
-		if err := b.continueIfTraceeExists(tid, 0); err != nil {
+		if err := b.continueWithoutPendingSignals(tid); err != nil {
 			return fmt.Errorf("release step owner tid %d held to reconcile its exit: %w", tid, err)
 		}
 		b.clearHeldStepOwner()
@@ -363,7 +363,7 @@ func killProcess(b Backend, pid int, cmd *exec.Cmd, running bool) error {
 		// stepQueue stays wait-loop-owned while a running tracee still has a
 		// waitLoop in flight; only the synchronized signal state is safe to
 		// clear from the engine goroutine.
-		defer lb.pendingSignals.purge()
+		lb.pendingSignals.purge()
 	}
 	if cmd != nil {
 		// SIGKILL via the OS handle is not a ptrace op, so it is safe from any
@@ -418,7 +418,7 @@ func (b *linuxBackend) reapAfterKill() {
 		switch {
 		case err == nil:
 			if ws.Stopped() {
-				_ = b.continueIfTraceeExists(wpid, 0)
+				_ = b.continueWithoutPendingSignals(wpid)
 			}
 			// Exited/Signaled: that thread is reaped; loop for the rest.
 		case isNoChildProcess(err):
@@ -798,7 +798,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 					// is mid-step. It stays ptrace-stopped where it is; the
 					// engine sees it only once the step has completed and the
 					// trap being stepped over is back in place.
-					b.park(StopEvent{Reason: reason, TID: tid})
+					b.park(StopEvent{Reason: reason, TID: tid, Signal: int(sig)})
 					continue
 				}
 				ev := StopEvent{Reason: reason, TID: tid}
@@ -844,6 +844,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			// A brand-new thread is never the one being stepped, but route the
 			// resume through the same helper so no absorb site can drift back
 			// into an unguarded continue.
+			b.pendingSignals.clear(tid)
 			if err := b.absorbStop(absorbNewThread, tid, 0); err != nil {
 				return StopEvent{}, fmt.Errorf("resume new thread tid %d: %w", tid, err)
 			}
@@ -935,9 +936,9 @@ func (b *linuxBackend) continueIfTraceeExists(tid int, signal int) error {
 	if tid == 0 {
 		return nil
 	}
-	resumeSignal, delayed := b.pendingSignals.takeForExplicitResume(tid, signal)
+	current, resumeSignal, delayed := b.pendingSignals.takeForExplicitResume(tid, signal)
 	if err := b.requeueSignal(tid, delayed); err != nil {
-		b.pendingSignals.restore(tid, 0, delayed)
+		b.pendingSignals.restore(tid, current, delayed)
 		return err
 	}
 	var err error
@@ -946,9 +947,11 @@ func (b *linuxBackend) continueIfTraceeExists(tid int, signal int) error {
 	} else {
 		b.execPtrace(func() { err = b.ptraceCont(tid, resumeSignal) })
 	}
-	if err != nil && !isNoSuchProcess(err) {
-		b.pendingSignals.restore(tid, 0, delayed)
-		return err
+	if err != nil {
+		b.pendingSignals.restore(tid, current, delayed)
+		if !isNoSuchProcess(err) {
+			return err
+		}
 	}
 	return nil
 }

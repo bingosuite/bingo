@@ -88,6 +88,21 @@ func TestPendingSignalsDelayedSignalSurvivesLaterCurrentSignal(t *testing.T) {
 	}
 }
 
+func TestPendingSignalsDelayedSignalIsFirstWins(t *testing.T) {
+	var pending pendingSignals
+	const tid = 4001
+
+	pending.delay(tid, 23)
+	pending.delay(tid, 24)
+
+	if got := pending.take(tid); got != 23 {
+		t.Fatalf("take = %d, want first delayed signal 23", got)
+	}
+	if got := pending.take(tid); got != 0 {
+		t.Fatalf("second take = %d, want 0", got)
+	}
+}
+
 func TestPendingSignalsContinueSeparatesCurrentFromDelayed(t *testing.T) {
 	var pending pendingSignals
 	const (
@@ -132,6 +147,22 @@ func TestPendingSignalsContinueCoalescesMatchingSignal(t *testing.T) {
 	}
 }
 
+func TestPendingSignalsRestoreDoesNotReplaceNewerState(t *testing.T) {
+	var pending pendingSignals
+	const tid = 5751
+
+	pending.set(tid, 10)
+	pending.delay(tid, 23)
+	pending.restore(tid, 11, 24)
+
+	if got := pending.take(tid); got != 10 {
+		t.Fatalf("first take = %d, want existing current signal 10", got)
+	}
+	if got := pending.take(tid); got != 23 {
+		t.Fatalf("second take = %d, want existing delayed signal 23", got)
+	}
+}
+
 func TestPendingSignalsExplicitResumeRequeuesDelayedSignal(t *testing.T) {
 	var pending pendingSignals
 	const (
@@ -140,20 +171,21 @@ func TestPendingSignalsExplicitResumeRequeuesDelayedSignal(t *testing.T) {
 	)
 
 	pending.delay(tid, delayedSignal)
-	signal, delayed := pending.takeForExplicitResume(tid, 0)
-	if signal != 0 || delayed != delayedSignal {
-		t.Fatalf("signal-zero resume = (%d, %d), want (0, %d)", signal, delayed, delayedSignal)
+	current, signal, delayed := pending.takeForExplicitResume(tid, 0)
+	if current != 0 || signal != 0 || delayed != delayedSignal {
+		t.Fatalf("signal-zero resume = (%d, %d, %d), want (0, 0, %d)", current, signal, delayed, delayedSignal)
 	}
 
 	pending.delay(tid, delayedSignal)
-	signal, delayed = pending.takeForExplicitResume(tid, delayedSignal)
-	if signal != delayedSignal || delayed != 0 {
-		t.Fatalf("matching resume = (%d, %d), want (%d, 0)", signal, delayed, delayedSignal)
+	current, signal, delayed = pending.takeForExplicitResume(tid, delayedSignal)
+	if current != 0 || signal != delayedSignal || delayed != 0 {
+		t.Fatalf("matching resume = (%d, %d, %d), want (0, %d, 0)", current, signal, delayed, delayedSignal)
 	}
 
+	pending.set(tid, 11)
 	pending.delay(tid, delayedSignal)
-	signal, delayed = pending.takeForExplicitResume(tid, 10)
-	if signal != 10 || delayed != delayedSignal {
-		t.Fatalf("different resume = (%d, %d), want (10, %d)", signal, delayed, delayedSignal)
+	current, signal, delayed = pending.takeForExplicitResume(tid, 10)
+	if current != 11 || signal != 10 || delayed != delayedSignal {
+		t.Fatalf("different resume = (%d, %d, %d), want (11, 10, %d)", current, signal, delayed, delayedSignal)
 	}
 }

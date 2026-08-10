@@ -538,18 +538,15 @@ func TestStepQueueAbortStepLiftsTheGateAndDropsHeldStops(t *testing.T) {
 	}
 }
 
-// TestStepQueuePlanResumeForwardsSignalsExceptOnTheSteppedThread pins the
-// signal half of an absorbed resume.
+// A signal carried by an absorbed stop must remain in the plan even when that
+// plan re-arms a step. applyAbsorb stores it for a later continue while the
+// PTRACE_SINGLESTEP itself still uses signal zero.
 //
 // SIGURG is the only signal any absorb site passes here, and it must reach the
 // thread again on the continue path or Go loses a preemption it was told to
-// take. The stepped thread is the deliberate exception: re-arming its step with
-// the signal attached would execute the handler's first instruction instead of
-// the instruction under the step, so the engine would reinstall the trap over an
-// instruction that never ran and report the same breakpoint again on return.
-//
-// A mutation that forwards the signal on the re-arm path, or that drops it on
-// the continue path, fails here.
+// take. Injecting it on the re-arm would execute the handler's first instruction
+// instead of the instruction under the step, so primitive selection and signal
+// retention are deliberately separate decisions.
 // TestStepQueuePlanAbsorbCoversEveryWaitBranch pins what each wait-loop branch
 // does to an in-flight step. Every branch that resumes a thread inline routes
 // through planAbsorb, so this table is the gate on all of them at once: before
@@ -588,8 +585,8 @@ func TestPlanAbsorbRearmsTheStepItConsumedOnTheSteppedThread(t *testing.T) {
 		if got.fail || got.mode != resumeSingleStep {
 			t.Fatalf("kind %d on the stepped thread = %+v, want a re-armed step", kind, got)
 		}
-		if got.signal != 0 {
-			t.Fatalf("kind %d re-armed the step carrying signal %d, want none", kind, got.signal)
+		if got.signal != absorbSignal {
+			t.Fatalf("kind %d re-armed the step after losing signal %d: got %+v", kind, absorbSignal, got)
 		}
 		if got.stepThreadExits {
 			t.Fatalf("kind %d marked the live stepped thread as exiting", kind)
@@ -718,7 +715,7 @@ func TestPlanAbsorbNeverRearmsOrRefusesWithNoStepInFlight(t *testing.T) {
 	}
 }
 
-func TestStepQueuePlanAbsorbForwardsSignalsExceptOnTheSteppedThread(t *testing.T) {
+func TestStepQueuePlanAbsorbRetainsSignalsAcrossStepRearm(t *testing.T) {
 	const (
 		stepped = 4600
 		foreign = 4700
@@ -735,7 +732,7 @@ func TestStepQueuePlanAbsorbForwardsSignalsExceptOnTheSteppedThread(t *testing.T
 		wantSignal int
 	}{
 		{"foreign thread mid-step keeps its signal", true, stepped, foreign, sigurg, resumeContinue, sigurg},
-		{"stepped thread drops its signal", true, stepped, stepped, sigurg, resumeSingleStep, 0},
+		{"stepped thread retains its signal for delayed delivery", true, stepped, stepped, sigurg, resumeSingleStep, sigurg},
 		{"idle queue keeps the signal", false, 0, foreign, sigurg, resumeContinue, sigurg},
 		{"idle queue keeps it even for the last stepped tid", false, stepped, stepped, sigurg, resumeContinue, sigurg},
 		{"a zero signal stays zero on continue", true, stepped, foreign, 0, resumeContinue, 0},

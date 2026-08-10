@@ -396,7 +396,7 @@ func (q *stepQueue) planAbsorb(kind absorbKind, tid int, signal int) absorbPlan 
 		return absorbPlan{mode: resumeContinue, signal: 0}
 	default:
 		if q.resumeFor(tid) == resumeSingleStep {
-			return absorbPlan{mode: resumeSingleStep, signal: 0}
+			return absorbPlan{mode: resumeSingleStep, signal: signal}
 		}
 		return absorbPlan{mode: resumeContinue, signal: signal}
 	}
