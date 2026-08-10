@@ -409,8 +409,8 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 			SP:  0x8800,
 			TLS: fixture.g[1],
 		})
-
 		Expect(d.StepInto()).To(Succeed())
+		fb.getRegisterCalls = 0
 		fb.pushStop(debugger.StopEvent{
 			Reason: debugger.StopSingleStep,
 			TID:    1,
@@ -423,6 +423,7 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 		Expect(protocol.DecodeEventPayload(event, &stepped)).To(Succeed())
 		Expect(stepped.Goroutine.ID).To(Equal(102))
 		Expect(stepped.Goroutine.Current).To(BeTrue())
+		Expect(fb.getRegisterCalls).To(Equal(1))
 	})
 
 	It("retains a complete goroutine set when current identity is unknown", func() {
