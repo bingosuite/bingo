@@ -2431,7 +2431,8 @@ Goroutines query resolves it, otherwise a transport-only
 for later requests. `stackTrace` returns the stopped stack only for that current
 handle or a request that preserves the omitted/non-positive stop id, and empty
 frames for every other positive thread id; bingo cannot unwind arbitrary
-goroutines yet.
+goroutines yet. `cmd/dapcli` therefore retains an omitted stop id as zero
+instead of carrying a stale positive id into `stackTrace`.
 
 `EventContinued` → DAP `continued` **only for out-of-band resumes**. The Handler
 increments `pendingContinues` before enqueuing its OWN continue and decrements it
