@@ -441,16 +441,16 @@ func (b *linuxBackend) ContinueProcess() error {
 	}
 	b.endStep()
 	tid := b.traceTID()
-	signal, delayed := b.pendingSignals.takeForContinue(tid)
-	if err := b.requeueSignal(tid, delayed); err != nil {
-		b.pendingSignals.restore(tid, signal, delayed)
+	pending := b.pendingSignals.takeForContinue(tid)
+	requeued, err := b.requeueSignals(tid, pending.deferred)
+	if err != nil {
+		b.pendingSignals.restore(tid, pending.withoutDeferredPrefix(requeued))
 		return err
 	}
-	var err error
-	b.execPtrace(func() { err = b.ptraceCont(tid, signal) })
+	b.execPtrace(func() { err = b.ptraceCont(tid, pending.current) })
 	if err != nil {
-		b.pendingSignals.restore(tid, signal, 0)
-		return fmt.Errorf("PTRACE_CONT tid %d signal %d: %w", tid, signal, err)
+		b.pendingSignals.restore(tid, pendingSignalBatch{current: pending.current})
+		return fmt.Errorf("PTRACE_CONT tid %d signal %d: %w", tid, pending.current, err)
 	}
 	return nil
 }
@@ -936,19 +936,24 @@ func (b *linuxBackend) continueIfTraceeExists(tid int, signal int) error {
 	if tid == 0 {
 		return nil
 	}
-	current, resumeSignal, delayed := b.pendingSignals.takeForExplicitResume(tid, signal)
-	if err := b.requeueSignal(tid, delayed); err != nil {
-		b.pendingSignals.restore(tid, current, delayed)
+	pending, resumeSignal := b.pendingSignals.takeForExplicitResume(tid, signal)
+	requeued, err := b.requeueSignals(tid, pending.deferred)
+	if err != nil {
+		b.pendingSignals.restore(tid, pending.withoutDeferredPrefix(requeued))
 		return err
 	}
-	var err error
 	if b.contFn != nil {
 		err = b.contFn(tid, resumeSignal)
 	} else {
 		b.execPtrace(func() { err = b.ptraceCont(tid, resumeSignal) })
 	}
 	if err != nil {
-		b.pendingSignals.restore(tid, current, delayed)
+		// A failed internal resume does not prove retirement. The TID remains
+		// ptrace-stopped, so successfully requeued standard signals cannot be
+		// delivered before a retry and matching tgkill calls coalesce; if ESRCH
+		// instead meant it escaped the stop, set coalesces the fresh delivery
+		// against the restored batch.
+		b.pendingSignals.restore(tid, pending)
 		if !isNoSuchProcess(err) {
 			return err
 		}
@@ -1009,6 +1014,15 @@ func (b *linuxBackend) applyAbsorb(plan absorbPlan, tid int) error {
 		return b.singleStepIfTraceeExists(tid)
 	}
 	return b.continueIfTraceeExists(tid, plan.signal)
+}
+
+func (b *linuxBackend) requeueSignals(tid int, signals []int) (int, error) {
+	for i, signal := range signals {
+		if err := b.requeueSignal(tid, signal); err != nil {
+			return i, err
+		}
+	}
+	return len(signals), nil
 }
 
 func (b *linuxBackend) requeueSignal(tid, signal int) error {
