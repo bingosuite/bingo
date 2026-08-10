@@ -1,12 +1,34 @@
 name: Darwin verification gate
 
-# This workflow is the trusted enforcement path for darwin/arm64 changes that
+# This workflow is the trusted evaluation path for darwin/arm64 changes that
 # cannot execute on GitHub-hosted runners. `pull_request_target` loads this YAML
 # from the base branch. It performs NO repository checkout at all: it fetches the
-# single policy script from the base SHA through the contents API, so there is no
-# working tree that could ever hold PR head or merge content. It then posts the
-# "Darwin E2E verified" status explicitly to the PR head SHA. The workflow's own
-# check belongs to the base SHA and is not the branch-protection signal.
+# single policy script from `github.workflow_sha` through the contents API, so
+# there is no working tree that could ever hold PR head or merge content. It then
+# posts the "Darwin E2E verified" status explicitly to the PR head SHA. The
+# workflow's own check belongs to the base SHA and is not the enforcement signal.
+#
+# ADVISORY STATUS, NOT AN AUTHENTICATED ONE. Every workflow in this repository
+# runs as the same `github-actions[bot]` identity, and the repository's default
+# Actions token permission is write, so a pull-request-authored workflow can post
+# or overwrite the same "Darwin E2E verified" context on the same head SHA.
+# Branch protection binds a status to an App, not to a workflow, so it cannot
+# distinguish this gate from any other Actions writer. Turning the merge queue
+# off does NOT change that. Treat this status as a review aid; genuine
+# enforcement needs either a distinct trusted GitHub App as the status source or
+# native required-review/CODEOWNERS approval, which IS attributable to a human.
+#
+# The trigger is restricted to `main` because the policy is fetched by SHA and
+# statuses are SHA-global: without the filter, a writer could open a pull request
+# against an unprotected branch they control and have this privileged job execute
+# a policy script of their choosing. The policy re-asserts the same scope itself
+# as defense in depth, but under this filter that check is unreachable.
+#
+# A consequence of the filter: this status asserts "verified relative to `main`"
+# about a HEAD COMMIT, not about a pull request. A success is therefore inherited
+# by any other pull request sharing that head SHA — including one on a different
+# base whose diff was never evaluated, since the gate never runs there. Do not
+# consume this context as verification on any base other than `main`.
 #
 # A separate unprivileged `pull_request` workflow runs the proposed HEAD policy
 # tests. Those tests are useful review feedback but are not enforcement because
@@ -14,6 +36,7 @@ name: Darwin verification gate
 
 on:
   pull_request_target:
+    branches: [main]
     types: [opened, synchronize, reopened, edited, labeled, unlabeled]
 
 permissions:
@@ -41,20 +64,24 @@ jobs:
     timeout-minutes: 5
     steps:
       # No checkout: the only code this privileged job runs is the policy script
-      # read from the base SHA, which a pull request cannot influence. Fetching
-      # it through the contents API keeps the workspace empty, so head or merge
-      # content can never appear on disk.
+      # read from `github.workflow_sha` — the commit this very workflow file was
+      # loaded from, which for `pull_request_target` is a base-branch commit and
+      # which a pull request cannot influence. The event's `base.sha` is NOT used
+      # as the policy ref: it is whatever branch the PR targets, and only the
+      # `branches: [main]` filter plus this trusted ref keep an attacker-chosen
+      # base out of the privileged execution path. Fetching through the contents
+      # API keeps the workspace empty, so head or merge content never hits disk.
       - name: Evaluate and publish Darwin verification
         env:
           GH_TOKEN: ${{ github.token }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          POLICY_SHA: ${{ github.workflow_sha }}
           DARWIN_GATE_DECISION_FILE: ${{ runner.temp }}/darwin-gate-decision
         run: |
           set -euo pipefail
 
-          case "$BASE_SHA" in
+          case "$POLICY_SHA" in
             '' | *[!0-9a-fA-F]*)
-              echo "Refusing to fetch policy at a non-SHA base ref." >&2
+              echo "Refusing to fetch policy at a non-SHA trusted ref." >&2
               exit 1
               ;;
           esac
@@ -62,7 +89,7 @@ jobs:
           policy="$RUNNER_TEMP/darwin-verification-gate.sh"
           fetched=true
           gh api \
-            "repos/$GITHUB_REPOSITORY/contents/.github/scripts/darwin-verification-gate.sh?ref=$BASE_SHA" \
+            "repos/$GITHUB_REPOSITORY/contents/.github/scripts/darwin-verification-gate.sh?ref=$POLICY_SHA" \
             --jq '.content' | base64 -d > "$policy" || fetched=false
 
           if [ "$fetched" != true ] || [ ! -s "$policy" ]; then

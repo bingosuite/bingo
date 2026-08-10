@@ -1427,8 +1427,25 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   changes, `justfile`, entitlements, the module graph, repo-wide platform suffixes
   and native sources, plus explicit Go build constraints. The "Darwin
   E2E verified" **commit status is posted explicitly to the PR head SHA** and
-  Darwin-native heads fail until the label is present. `pull_request_target` is
-  a requirement here, not a preference: a
+  Darwin-native heads fail until the label is present.
+
+  **Advisory, not authoritative — read this before relying on the status.**
+  This repository's default Actions permissions are write, and *every* same-repo
+  workflow runs under the single `github-actions[bot]` identity. Any workflow a
+  PR author adds can therefore write the same `Darwin E2E verified` context on
+  any SHA, and branch protection cannot distinguish "which workflow" produced an
+  Actions status — the app binding is per-app, not per-workflow. So this status
+  is a **review aid and audit trail, not a cryptographically enforceable gate**,
+  and it is deliberately not a required check. Do not describe it as tamper-proof
+  and do not "fix" it by disabling the merge queue: queue state is orthogonal to
+  the shared-identity problem. Real enforcement needs either a **distinct trusted
+  GitHub App** publishing its own status context (which branch protection *can*
+  bind to), an org-required workflow (unavailable here), or native
+  required-review/CODEOWNERS if the human review itself is the enforcement. The
+  hardening below removes every attack that does not require an attacker to add
+  a status-writing workflow; it cannot remove that one.
+
+  `pull_request_target` is a requirement here, not a preference: a
   fork-triggered `pull_request` run gets a read-only `GITHUB_TOKEN` (it can
   neither publish the head status nor clear a stale label) and it executes
   workflow YAML taken from the PR head, so a fork could simply rewrite the gate
@@ -1436,11 +1453,23 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   token and base-controlled policy. The usual argument against
   `pull_request_target` — a privileged token combined with untrusted code — is
   eliminated by never checking out or executing head content.
+
+  **Trigger scope and policy source are both pinned to trusted refs.** The
+  trigger is filtered to `branches: [main]`, and the policy script is fetched at
+  **`${{ github.workflow_sha }}`** — the SHA of the commit the running workflow
+  file came from — *not* at `github.event.pull_request.base.sha`. Without both,
+  a same-repo writer could push an unprotected branch carrying a malicious
+  `.github/scripts/darwin-verification-gate.sh`, open a PR against it, and have
+  that attacker-authored policy executed with `pull-requests: write` +
+  `statuses: write`. Never reintroduce an event-derived policy ref, and never
+  widen the branch filter.
+
   The `pull_request_target` workflow and its own job run against the
   base SHA, so that job is deliberately NOT the merge gate. The trusted workflow
   performs **no checkout at all**: it reads the single policy script from the
-  base SHA through the contents API, so no working tree exists that could hold
-  PR head or merge content, and it reads PR metadata/labels through GitHub APIs. Do
+  trusted workflow SHA through the contents API, so no working tree exists that
+  could hold PR head or merge content, and it reads PR metadata/labels through
+  GitHub APIs. Do
   not add `actions/checkout`, or any step that executes head code, consumes head
   artifacts, or builds a shell command from PR content, to this privileged
   workflow. Changed paths are computed from the immutable event base/head SHAs:
@@ -1448,7 +1477,10 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   are structurally diffed by path/mode/type/blob SHA. Never return to the live
   PR-files endpoint — a force-push can change that response while the run still
   publishes to the event's old head SHA. A missing/empty diff or a Git-tree
-  `truncated` response fails closed; path matching stays inside JSON (Git permits
+  `truncated` response fails closed; **both** trees are independently schema-
+  validated before the diff (array shape, non-empty string `path`, six-octal
+  `mode`, `type` ∈ blob/tree/commit, hex `sha` on non-tree entries) and any
+  malformed document fails closed; path matching stays inside JSON (Git permits
   newlines in filenames). The selector is deliberately conservative: repo-wide
   implicit `_darwin*`/`_arm64*` source suffixes, every changed native source
   (`c`/C++/headers/Obj-C/assembly/syso), control-character paths, and any changed
@@ -1456,6 +1488,23 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   This deliberately over-gates Linux/cross-platform constraints rather than
   guessing an incomplete tag universe. `edited` base-retarget events invalidate
   verification; unrelated PR edits preserve the current SHA-bound status.
+
+  **Non-regular tree entries are always gated.** A changed `.go` *symlink*
+  (mode `120000`) stores only its link text, so scanning its blob can never see
+  the Darwin constraint in the file it resolves to; a gitlink/submodule
+  (`type: commit`) has no blob at all. Every changed entry whose mode is not
+  `100644`/`100755` or whose type is not `blob` — on **either** side, so both
+  additions and deletions count — forces verification and is itemized in the
+  log. Only regular blobs are content-scanned.
+
+  **A UTF-8 BOM does not hide a build constraint.** Go 1.25 strips a single
+  leading BOM before parsing, so `\xEF\xBB\xBF//go:build darwin` is a *live*
+  constraint that an anchored `grep` on the raw bytes would miss. The blob
+  scanner reads the first four bytes with `od`, drops exactly one leading UTF-8
+  BOM before matching, and treats a UTF-16 BOM (`fffe`/`feff`) as
+  "gate, don't guess". Blob responses that are not decodable base64, or whose
+  encoding/content fields are missing or wrongly typed, fail closed — never
+  "assume no constraint". This applies to added *and* deleted blobs.
 
   A separate unprivileged
   [.github/workflows/darwin-verification-policy-test.yml](.github/workflows/darwin-verification-policy-test.yml)
@@ -1465,20 +1514,61 @@ side `chan error` — every debugger outcome, failures included, rides the singl
 
   On `synchronize`, `reopened`, or base-changing `edited`, the trusted policy
   best-effort removes `darwin-e2e-verified` and posts failure to the new/current
-  head regardless of label cleanup success. A successful `labeled` event for
-  that exact label posts success to that head; removing it posts failure, with
-  both events re-reading live label state so a remove/re-add race settles to the
-  current truth. A label addition may publish success only after the same head
-  already has a trusted failing gate status; otherwise it fails and asks the
-  maintainer to toggle again. This prevents a queued label event from superseding
-  the still-pending `synchronize` run that would have invalidated the new head.
-  Unrelated label events post nothing, preserving either a legitimate success
-  or a stale-cleanup failure already bound to the same head SHA. Relevant runs
+  head regardless of label cleanup success.
+
+  **Only an authorized human `labeled` event may assert verification.** Success
+  requires, in order: the event action is exactly `labeled` for exactly
+  `darwin-e2e-verified`; the label is still present in live PR metadata; the
+  event **sender** is a `User` (not a bot/app) whose login passes a shape check
+  before it is interpolated into an API path; and
+  `GET /repos/{owner}/{repo}/collaborators/{login}/permission` reports
+  `admin`, `maintain`, or `write` for that exact login. The gate **never** reads
+  prior commit statuses as a readiness signal — the previous `approval_ready`
+  handshake was removed because any same-repo workflow can seed the status it
+  was reading, which made it a self-signed approval. An `unlabeled` event for
+  the verified label **always** publishes failure for a head that needs
+  verification, and never consults live label state: a remove/re-add race must
+  be settled by a *fresh authorized `labeled` event*, not by an unlabel run
+  noticing the label came back. (A head with **no** Darwin-native change is
+  short-circuited to `success` by the scope check before any label arm runs —
+  there is nothing to withdraw, and the same live-generation binding still
+  applies. Both behaviors are pinned by cases in the contract suite so the
+  distinction cannot drift.) Unrelated label
+  events post nothing, preserving either a legitimate success
+  or a stale-cleanup failure already bound to the same head SHA.
+
+  **Every success is bound to the live PR generation.** Commit statuses are
+  SHA-global: two PRs can share one head commit, and a status published for one
+  is visible to the other. So immediately before **each** `post_status success`
+  the gate re-reads live PR metadata and requires that the PR is still `open`,
+  its base ref is still exactly `main`, its live base SHA and head SHA still
+  equal the event's, and the head repo is unchanged. A retarget mid-run, a
+  force-push (including head ABA), a close, or a delayed run from an older event
+  therefore fails closed instead of greening a commit whose context has moved.
+  The policy also re-asserts `base.ref == main` itself rather than trusting the
+  trigger filter — defense in depth for a future misconfiguration, and the only
+  thing that would refuse an alternate-base run before it posted `pending`.
+  Under the deployed `branches: [main]` filter that path is unreachable, because
+  such a run is never dispatched at all.
+
+  **Residual, by design: this status is main-only and is inherited, not
+  scoped.** A commit status belongs to a SHA, not to a pull request, so a
+  success legitimately published for a `main` PR is also *visible* on any other
+  PR that shares that head commit — including one targeting a different base,
+  whose diff against a different merge base may contain Darwin changes that were
+  never verified. No PR-scoped decision can revoke a SHA-scoped signal, and the
+  `branches: [main]` filter means the gate never runs (and so never re-evaluates
+  or overwrites) on those PRs. Therefore: read `Darwin E2E verified` as an
+  assertion about a **head commit relative to `main`**, and do not consume it as
+  verification on any other base. Cross-base assurance needs a PR-scoped
+  mechanism (a trusted App check, or human review), not this status.
+
+  Relevant runs
   post `pending` before evaluation, serialize per PR, and post failure on
   API/decision errors so an old success cannot survive a reopened/error window.
   A status counts as published only when the API accepted it, so a failed POST
   never records a decision.
-  If the base policy cannot be fetched, the trusted workflow posts failure
+  If the trusted policy cannot be fetched, the trusted workflow posts failure
   inline.
   Keep permissions limited to API reads, PR-label cleanup, and
   head commit statuses; never expose secrets or execute untrusted code through
@@ -1497,15 +1587,16 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   serialized per-PR `policy` group. Unrelated labels and non-base edits get a
   per-run group so they can neither queue behind nor displace a queued gating
   run. A verified-label event that replaces a queued `synchronize` still cannot
-  pass: it requires the same head's prior trusted failure, which the superseded
-  run never posted.
+  pass: the live-generation check re-reads the PR, so a head that moved after
+  the label was applied fails closed.
 
   **A run must publish a decision or fail closed.** The gate records its
   terminal outcome (`success`, `failure`, or `ignored`) to
   `DARWIN_GATE_DECISION_FILE`, and a final `if: always()` workflow step — which
   also runs on cancellation — posts an explicit failure when that marker is
   absent. This converts an interrupted run into a failing head status instead of
-  a permanently pending one.
+  a permanently pending one. An unrecognized event action exits without a
+  decision on purpose, so that fallback fails the head closed.
 
   **Only the top-level shell may publish.** `set -E` propagates the policy's ERR
   trap into command-substitution subshells, so an unguarded `$(...)` that fails
@@ -1515,16 +1606,26 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   test enforces that statically — the runtime symptom only reproduces on the
   runner's bash 5, not on macOS's bash 3.2.
 
-  **Merge-queue limitation:** the active default-branch merge queue evaluates
+  **Merge-queue posture:** the active default-branch merge queue evaluates
   required checks on synthetic merge-group SHAs, while this trusted workflow
-  posts only to PR head SHAs. Do not require `Darwin E2E verified` while that
-  queue is active: a missing group status would time out every queue entry, and
-  an Actions-only group publisher is not a safe fix because merge-group content
-  includes PR-authored workflow YAML that can write the same GitHub Actions
-  status context. Keep this status advisory unless the merge queue is disabled,
-  or implement group enforcement with a distinct trusted GitHub App whose status
-  source can be required separately. Current branch protection/rulesets do not
-  require the context, so the present impact remains advisory.
+  posts only to PR head SHAs. Do not require `Darwin E2E verified`: a missing
+  group status would time out every queue entry, and an Actions-only
+  `merge_group` publisher is not a safe fix because merge-group content includes
+  PR-authored workflow YAML that runs with a base-repo write token under the
+  same `github-actions[bot]` identity and can forge or overwrite the context.
+  **Disabling the merge queue does not make this status authentic** — the
+  shared-identity problem above is independent of it. Enforcement requires a
+  distinct trusted GitHub App (or another status source branch protection can
+  bind separately), or replacing the status with native required review /
+  CODEOWNERS. Current branch protection/rulesets do not require the context, so
+  the gate is explicitly advisory.
+
+  The policy's adversarial contract suite lives in
+  [.github/scripts/darwin-verification-gate_test.sh](.github/scripts/darwin-verification-gate_test.sh)
+  and must stay runnable on both macOS bash 3.2 and Linux bash 5 with no new
+  tooling. It mocks `gh` end to end (compare/tree/blob/PR/permission/status
+  APIs) and poisons the commit-status *read* endpoint so any regression that
+  reintroduces status-as-readiness fails loudly.
 
 Build/test commands:
 
