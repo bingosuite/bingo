@@ -106,6 +106,7 @@ int main(int argc, char **argv) {
 		mapped_file = argv[4];
 		ready_file = argv[5];
 		if (pthread_create(&remapper, NULL, remap_sentinel_page, NULL) != 0) return 74;
+		while (access(ready_file, F_OK) != 0) sched_yield();
 	}
 
 	sentinel_target();
