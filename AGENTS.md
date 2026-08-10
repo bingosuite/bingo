@@ -598,12 +598,17 @@ that their stops are *reported later*, after the trap is back:
   is still ptrace-stopped at delivery, so it is a real stop; the alternative —
   peeking at the wait queue before draining — would invert the drain-before-block
   rule that makes a same-address sibling resolve only after the reinstall, i.e.
-  it would defeat the fix. If such a delivery does race a dying process, the
-  engine's ptrace reads fail and degrade through `haltOnError` (`EventError` plus
-  a suspending `EventPaused`) rather than hanging, and the exit surfaces on the
-  following `Wait`. Once the main exit *is* observed, `purge` wins and nothing is
-  delivered afterwards, so the engine never acts on a dead thread. Pinned by
-  `TestLinuxBackendSteppedThreadDeathDeliversHeldStopBeforeExit`.
+  it would defeat the fix. Once the main exit *is* observed, `purge` wins and
+  nothing is delivered afterwards, so the engine never acts on a dead thread.
+  `TestLinuxBackendSteppedThreadDeathDeliversHeldStopBeforeExit` pins exactly
+  three things: the delivery happens, `traceTID` names the delivered thread, and
+  a post-purge drain releases nothing. What it does **not** pin is the behaviour
+  if a delivery races a dying process: the engine's ptrace reads would then fail
+  and take the base's existing `haltOnError` path (`EventError` plus a suspending
+  `EventPaused`, pinned by `engine_halt_test.go`), and the exit surfaces on the
+  following `Wait`. That is inherited engine behaviour this queue neither adds
+  nor changes — do not cite this backend test as evidence for it, and do not
+  treat the degradation as a substitute for the ordering guarantees above.
 - **Kill ownership is unchanged, and no second reaper is added.** Killing a
   *suspended* tracee still reaps through `reapAfterKill`, which loops
   `Wait4(-1, WALL)` and resumes whatever it finds ptrace-stopped: a parked thread

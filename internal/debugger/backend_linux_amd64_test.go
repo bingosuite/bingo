@@ -392,10 +392,14 @@ func TestLinuxBackendHeldSignalSurfacesOnlyWithItsOwnStop(t *testing.T) {
 // behind it. That ordering is deliberate and is the same property that makes a
 // same-address sibling resolve only after the reinstall; inverting it to peek at
 // the wait queue first would defeat the fix. It is safe because a parked thread
-// is still ptrace-stopped when it is delivered, and because a delivery that does
-// race a dying process degrades through the engine's halt path rather than
-// hanging. Once the main exit *is* observed, purge wins and nothing is delivered
-// afterwards, so the engine never acts on a dead thread.
+// is still ptrace-stopped when it is delivered. Once the main exit *is*
+// observed, purge wins and nothing is delivered afterwards, so the engine never
+// acts on a dead thread.
+//
+// This test pins the ordering, the traceTID anchor and the post-purge silence.
+// It deliberately does not claim anything about a delivery that races a dying
+// process: that is the engine's existing haltOnError path (see
+// engine_halt_test.go), not a property of this queue.
 func TestLinuxBackendSteppedThreadDeathDeliversHeldStopBeforeExit(t *testing.T) {
 	const (
 		pid     = 1001
