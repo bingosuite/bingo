@@ -1086,14 +1086,16 @@ stopped TID and the signal argument to the next ptrace resume:
    single-slot value: another stop may move `lastStopTID`, but cannot transfer or
    clear a different TID's signal. Resume removes state transactionally and
    restores it when requeue or ptrace fails.
-2. `ContinueProcess` and `SingleStep(tid)` take only that exact TID's current
-   signal and pass it as ptrace's data argument. Fatal/default and handled
-   ordinary signals therefore leave their actual signal-delivery stop through
-   `PTRACE_CONT`/`PTRACE_SINGLESTEP` with the exact non-zero value.
-3. SIGURG on the exact `stepTID` is different. Injecting it with
-   `PTRACE_SINGLESTEP(SIGURG)` enters the signal frame and reports a trace trap
-   before the instruction the engine promised to step has executed. The #202
-   `resumeAbsorbed` path therefore saves it in `delayedByTID[tid]`, re-arms the
+2. Only `PTRACE_CONT` injects a pending signal. `PTRACE_SINGLESTEP` always uses
+   signal zero and leaves both pending slots intact: injecting any signal while
+   stepping enters its signal frame and reports a trace trap before the
+   instruction the engine promised to step has executed. This state is normally
+   consumed by the automatic continue from `StopSignal`; it remains observable
+   only when that resume fails and the engine suspends through `haltOnError`, in
+   which case later steps must not lose or prematurely inject it. The next
+   exact-TID continue forwards the actual non-zero value.
+3. SIGURG on the exact `stepTID` additionally needs to survive an absorbed stop.
+   The #202 `resumeAbsorbed` path saves it in `delayedByTID[tid]`, re-arms the
    real instruction step with signal zero, and retains the delayed value through
    further steps. The next continue uses exact-TID `tgkill(SIGURG)` followed by
    `PTRACE_CONT(..., 0)`; only the resulting fresh signal-delivery stop resumes
@@ -1301,10 +1303,11 @@ are detected by a `mach_msg` receive loop.
   `waitLoop` → `stopCh` → engine-loop handoff. Regression coverage is
   `TestLinuxBackend*StopTID*`, run under `-race` in the unit-test workflow.
   Non-main thread exits are absorbed inside `Wait`.
-- User-visible signal stops carry per-TID pending delivery state. `ContinueProcess`
-  and `SingleStep` inject only the signal owned by the exact resumed TID; a
-  parked stop does not install that state until delivery. Pause `SIGSTOP` is
-  excluded and all teardown paths purge it. See
+- User-visible signal stops carry per-TID pending delivery state.
+  `ContinueProcess` injects only the signal owned by the exact resumed TID;
+  `SingleStep` always uses signal zero and preserves that state for a later
+  continue. A parked stop does not install pending state until delivery. Pause
+  `SIGSTOP` is excluded and all teardown paths purge it. See
   [Linux signal forwarding](#linux-signal-forwarding).
 - `ReadMemory` uses **`process_vm_readv(2)`** as the fast path, falling back to
   `PTRACE_PEEKDATA` only when it is unavailable or short-reads. `process_vm_readv`
