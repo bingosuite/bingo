@@ -243,6 +243,23 @@ var _ = Describe("Breakpoint clear state transitions", func() {
 			"removing the rolled-back owner must expose no stale reservation")
 	})
 
+	DescribeTable("releases the reservation when fallback thread selection fails",
+		func(threadsErr error, tids []int) {
+			parkOnBreakpoint(0)
+			fb.threadsErr = threadsErr
+			fb.tids = tids
+
+			Expect(d.Continue()).To(MatchError("resume BP: no threads"))
+			expectAddressReserved(bpAddr)
+			Expect(d.ClearBreakpoint(id)).To(Succeed(),
+				"resume rollback must restore the original table owner")
+			Expect(debugger.ExportedSetBreakpointAt(d, bpAddr)).To(Equal(id+1),
+				"removing the rolled-back owner must expose no stale reservation")
+		},
+		Entry("when Threads returns an error", errors.New("injected threads failure"), []int{1}),
+		Entry("when Threads returns no threads", nil, []int{}),
+	)
+
 	It("releases the reservation when restoring the original instruction is rejected", func() {
 		parkOnBreakpoint(1)
 
