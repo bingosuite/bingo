@@ -483,9 +483,14 @@ note below):
    freezes. This generalises what the `SIGURG` branch always did; do not add an
    absorb site that calls `continueIfTraceeExists` directly. Two consequences
    worth knowing: the re-armed step resumes *after* the absorbed event, so the
-   stepped instruction can land one instruction further than the engine asked
-   (a cosmetic `bpResumeStep` PC difference — the reinstall address is
-   unaffected); and the absorbed signal is swallowed on that thread, because
+   stepped instruction can land one instruction further than the engine asked.
+   The reinstall address is unaffected (it is the saved `sob.addr`, not the
+   stopped PC), so a step-over is exact; but a machine-granularity
+   `bpResumeStep` whose instruction is itself the `clone` reports an
+   `EventStepped` PC one instruction beyond single-step semantics. That is a
+   real, very narrow inaccuracy rather than a purely cosmetic one — accepted
+   because the alternative it replaces is a hard freeze. And the absorbed
+   signal is swallowed on that thread, because
    re-delivering it with `PTRACE_SINGLESTEP` would step into the handler instead
    of the instruction under test.
 8. **Two absorb cases cannot re-arm and must fail the wait instead.** On
