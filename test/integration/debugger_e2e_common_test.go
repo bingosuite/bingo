@@ -1207,6 +1207,7 @@ func declareCurrentGoroutineScanSpec() {
 func assertCurrentGoroutineScan(count int) {
 	GinkgoHelper()
 	Expect(count).To(BeNumerically(">", 0), "target count must be positive")
+	const richScanLimit = 8192
 
 	releaseIndex := count - 1
 	if count > 1024 {
@@ -1224,7 +1225,7 @@ func assertCurrentGoroutineScan(count int) {
 	Expect(h.d.Continue()).To(Succeed(), "Continue to current-goroutine worker")
 
 	stopTimeout := 30 * time.Second
-	if count > 8192 {
+	if count > richScanLimit {
 		stopTimeout = 8 * time.Minute
 	}
 	evt := h.waitFor(stopTimeout,
@@ -1265,6 +1266,12 @@ func assertCurrentGoroutineScan(count int) {
 		"snapshot Current must identify the goroutine embedded in BreakpointHit")
 	Expect(currentGoroutines).To(Equal(1), "exactly one snapshot goroutine is current")
 	Expect(currentThreads).To(Equal(1), "exactly one runtime thread is current")
+	if count > richScanLimit {
+		Expect(snap.Goroutines).To(HaveLen(richScanLimit+1),
+			"heavy proof must append one current anchor beyond the full rich prefix")
+		Expect(snap.Goroutines[0].ID).To(Equal(hit.Goroutine.ID),
+			"beyond-prefix current anchor must lead the bounded snapshot")
+	}
 }
 
 // findByStart returns the first goroutine whose start function matches fn, or
