@@ -78,11 +78,21 @@ type stepQueue struct {
 	parked []StopEvent // held foreign stops, in arrival order
 
 	// A dead step owner cannot produce the completion that normally tells the
-	// engine to reinstall its disarmed breakpoint. The first held user stop
-	// anchors an internal boundary event; parked stops remain gated until the
-	// engine confirms that transaction has been reconciled.
+	// engine to reinstall its disarmed breakpoint. An anchor supplies the
+	// ptrace-stopped TID the engine writes that breakpoint back through;
+	// parked stops remain gated until the engine confirms that transaction has
+	// been reconciled.
 	stepExitPending  bool
 	stepExitReported bool
+
+	// heldOwnerTID is the step owner itself, kept at its PTRACE_EVENT_EXIT stop
+	// instead of being resumed, for the case where it dies with nothing parked.
+	// A thread stopped there has not yet run exit_mm, so its address space is
+	// still mapped and PTRACE_POKEDATA through it reaches the breakpoint — it is
+	// a valid write anchor, and with an empty queue it is the only one. Zero
+	// means no thread is held. Released exactly once, and only after the engine
+	// acknowledges the boundary.
+	heldOwnerTID int
 
 	// parkedTotal counts every stop ever held back. It exists solely so the
 	// native regression test can assert it actually exercised the parking path
@@ -107,6 +117,13 @@ type stepQueue struct {
 	// native regression test. Atomic because the test reads it while the
 	// backend's one-shot Wait goroutine records the transition.
 	stepExitTotal atomic.Int64
+
+	// heldOwnerTotal counts how often the dying step owner itself had to be
+	// held as the reconciliation anchor. It is the only observable separating
+	// that path from the parked-sibling one, which the native test would
+	// otherwise pass vacuously by never reaching it. Atomic for the same
+	// reason as the others.
+	heldOwnerTotal atomic.Int64
 }
 
 // countStepRearm records that an absorbed stop consumed an in-flight step.
@@ -160,10 +177,16 @@ func (q *stepQueue) releasable() (StopEvent, bool) {
 	return ev, true
 }
 
-// purge drops every held stop. Called only where the tracee is known to be
-// gone: releasing a held stop afterwards would make the engine issue ptrace ops
-// against a dead thread.
-func (q *stepQueue) purge() { q.parked = nil }
+// purge drops every held stop and any held anchor. Called only where the
+// threads they name are gone or unreachable — the tracee exited, or an exec
+// destroyed the thread group they belonged to. Releasing a held stop afterwards
+// would make the engine issue ptrace ops against a dead thread, and a held
+// anchor is an obligation only while the thread it names is alive and
+// ptrace-stopped, so there is nothing left to resume.
+func (q *stepQueue) purge() {
+	q.parked = nil
+	q.heldOwnerTID = 0
+}
 
 // beginStep records that tid is being single-stepped.
 func (q *stepQueue) beginStep(tid int) {
@@ -190,15 +213,53 @@ func (q *stepQueue) interruptStepIfStepped(tid int) {
 	}
 }
 
-// stepExitBoundary reports one internal reconciliation event, anchored to the
-// oldest held stop without dequeuing it. Recording that TID at delivery keeps
-// memory writes paired with a thread that is genuinely ptrace-stopped.
+// holdStepOwner keeps a dying step owner at its exit stop as the reconciliation
+// anchor rather than resuming it. Only Wait calls this, and only for the exact
+// thread whose step it just lost.
+func (q *stepQueue) holdStepOwner(tid int) {
+	q.heldOwnerTID = tid
+	q.heldOwnerTotal.Add(1)
+}
+
+// heldStepOwner reports the thread held as the anchor, if any. The caller must
+// actually release that thread before clearing the hold.
+func (q *stepQueue) heldStepOwner() (int, bool) {
+	return q.heldOwnerTID, q.heldOwnerTID != 0
+}
+
+// clearHeldStepOwner drops the hold once its thread has genuinely been released.
+func (q *stepQueue) clearHeldStepOwner() { q.heldOwnerTID = 0 }
+
+// heldStepOwnerCount reports how many dying step owners were held as anchors.
+func (q *stepQueue) heldStepOwnerCount() int { return int(q.heldOwnerTotal.Load()) }
+
+// stepExitBoundary reports one internal reconciliation event, anchored to a
+// thread that is genuinely ptrace-stopped so the engine's breakpoint write lands
+// somewhere legal.
+//
+// The held step owner is preferred: when it exists it is the thread whose step
+// was lost, it is stopped at PTRACE_EVENT_EXIT with its address space intact,
+// and it is being kept alive for exactly this purpose. Otherwise the oldest held
+// stop lends its TID without being dequeued — a parked sibling is a stop the
+// engine has not been told about, so it must stay queued and must never be
+// resumed on its behalf.
+//
+// With neither, there is no legal anchor and no boundary is reported. The gate
+// stays closed and Wait blocks on, which is safe: nothing may drain until the
+// engine has reinstalled.
 func (q *stepQueue) stepExitBoundary() (StopEvent, bool) {
-	if !q.stepExitPending || q.stepExitReported || len(q.parked) == 0 {
+	if !q.stepExitPending || q.stepExitReported {
 		return StopEvent{}, false
 	}
+	anchor, ok := q.heldStepOwner()
+	if !ok {
+		if len(q.parked) == 0 {
+			return StopEvent{}, false
+		}
+		anchor = q.parked[0].TID
+	}
 	q.stepExitReported = true
-	return StopEvent{Reason: StopStepThreadExited, TID: q.parked[0].TID}, true
+	return StopEvent{Reason: StopStepThreadExited, TID: anchor}, true
 }
 
 // completeStepThreadExit opens the parked-stop gate after the engine has
@@ -259,9 +320,6 @@ const (
 	absorbContinued
 	// absorbThreadExit is a non-main thread's PTRACE_EVENT_EXIT.
 	absorbThreadExit
-	// absorbExec is PTRACE_EVENT_EXEC, which replaces the image the stepped-over
-	// breakpoint lived in.
-	absorbExec
 	// absorbUnknownEvent is a PTRACE_EVENT we never enabled.
 	absorbUnknownEvent
 )
@@ -280,6 +338,10 @@ type absorbPlan struct {
 	// stepThreadExits closes hardware-step ownership because its thread is going
 	// away. The parked-stop gate remains closed for engine reconciliation.
 	stepThreadExits bool
+	// holdStepOwner keeps the thread at its stop instead of resuming it, because
+	// it is the only anchor the engine can reinstall its breakpoint through. The
+	// caller releases it after the engine acknowledges the boundary.
+	holdStepOwner bool
 }
 
 // planAbsorb decides, for one absorbed stop, every effect that stop has on the
@@ -291,13 +353,16 @@ type absorbPlan struct {
 //
 //   - A dying thread (absorbThreadExit) is never re-armed — there is nothing
 //     left to step — and transitions to an engine-reconciliation boundary
-//     before held stops can drain.
-//   - absorbExec and absorbUnknownEvent cannot be absorbed on the stepped thread
-//     at all: exec throws away the memory the saved instruction bytes and the
-//     trap live in, and an event we never enabled has no understood stop shape.
-//     Re-arming would assume that shape and continuing would resume a tracee
-//     whose software breakpoint is still out of memory, so the caller aborts the
-//     step and surfaces an error rather than guessing.
+//     before held stops can drain. When the dying thread IS the step owner and
+//     nothing is parked, it is also the only thread the engine could write
+//     memory through, so it is held at its exit stop rather than resumed.
+//   - absorbUnknownEvent cannot be absorbed on the stepped thread at all: an
+//     event we never enabled has no understood stop shape, so re-arming would
+//     assume that shape and continuing would resume a tracee whose software
+//     breakpoint is still out of memory. The caller aborts the step and
+//     surfaces an error rather than guessing. (PTRACE_EVENT_EXEC is NOT here:
+//     it invalidates the whole process image for every thread, so it is fatal
+//     unconditionally and never reaches an absorb decision at all — see Wait.)
 //   - Everything else re-arms the step it consumed.
 //
 // The stepped thread is re-armed WITHOUT its signal, and that asymmetry is
@@ -320,8 +385,11 @@ type absorbPlan struct {
 func (q *stepQueue) planAbsorb(kind absorbKind, tid int, signal int) absorbPlan {
 	switch kind {
 	case absorbThreadExit:
+		if q.resumeFor(tid) == resumeSingleStep && len(q.parked) == 0 {
+			return absorbPlan{stepThreadExits: true, holdStepOwner: true}
+		}
 		return absorbPlan{mode: resumeContinue, signal: 0, stepThreadExits: true}
-	case absorbExec, absorbUnknownEvent:
+	case absorbUnknownEvent:
 		if q.resumeFor(tid) == resumeSingleStep {
 			return absorbPlan{fail: true}
 		}
@@ -337,11 +405,11 @@ func (q *stepQueue) planAbsorb(kind absorbKind, tid int, signal int) absorbPlan 
 // abortStep resolves a step that can no longer complete, for the cases where
 // re-arming it would be wrong rather than merely late.
 //
-// It clears the gate AND drops the held stops, because both only make sense
-// while the step they are waiting on can still finish. Callers must follow it
-// with an error: un-latching alone would resume a tracee whose stepped-over
-// software breakpoint is still absent from memory, which is the very corruption
-// the queue exists to prevent.
+// It clears the gate AND drops the held stops and any held anchor, because all
+// of them only make sense while the step they are waiting on can still finish.
+// Callers must follow it with an error: un-latching alone would resume a tracee
+// whose stepped-over software breakpoint is still absent from memory, which is
+// the very corruption the queue exists to prevent.
 func (q *stepQueue) abortStep() {
 	q.endStep()
 	q.completeStepThreadExit()

@@ -4,6 +4,7 @@ package debugger
 
 import (
 	"os/exec"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -414,7 +415,9 @@ func TestLinuxBackendSteppedThreadDeathReconcilesBeforeDelivery(t *testing.T) {
 		t.Fatal("the reconciliation boundary dequeued the held stop")
 	}
 
-	b.completeStepThreadExit()
+	if err := b.completeStepThreadExit(); err != nil {
+		t.Fatalf("completeStepThreadExit() = %v, want success", err)
+	}
 	ev, err = b.Wait()
 	if err != nil {
 		t.Fatalf("Wait() after reconciliation error = %v", err)
@@ -513,7 +516,9 @@ func TestLinuxBackendApplyAbsorbCarriesOutThePlan(t *testing.T) {
 			t.Fatalf("reporting the boundary released %+v; only the engine's acknowledgement may", ev)
 		}
 
-		b.completeStepThreadExit()
+		if err := b.completeStepThreadExit(); err != nil {
+			t.Fatalf("completeStepThreadExit() = %v, want success", err)
+		}
 		ev, ok := b.releasable()
 		if !ok || ev.TID != foreign {
 			t.Fatalf("released (%+v, %t), want the held stop on tid %d after reconciliation", ev, ok, foreign)
@@ -820,12 +825,96 @@ func TestLinuxWaitContinuesThreadsThatAreNotBeingStepped(t *testing.T) {
 	}
 }
 
-// TestLinuxWaitAbortsTheStepItCannotResume covers the two branches that must
-// refuse to absorb a stop on the stepped thread. exec throws away the memory
-// holding the saved instruction bytes and the trap; an event we never enabled
-// has no understood stop shape. Re-arming would assume that shape and continuing
-// would resume a tracee whose software breakpoint is still out of memory, so
-// Wait clears the step and surfaces the error instead of guessing.
+// TestLinuxWaitAlwaysFailsOnExec pins scope A: a post-startup PTRACE_EVENT_EXEC
+// terminates the session unconditionally.
+//
+// execve replaces the image for EVERY thread, so it is not a question about the
+// stop's owner. Every breakpoint address, every saved instruction byte and every
+// tracked thread id describes memory that no longer exists, and no amount of
+// step bookkeeping changes that. The cases below cover the three shapes the
+// previous TID-keyed guard distinguished — the stepped thread, a foreign thread
+// mid-step, and no step in flight at all — and require the same outcome from
+// each: an error, no resume of any kind, and a queue left inert.
+//
+// The kernel reports this stop under the thread-group leader's pid after
+// execve (the execing thread's former tid is only retrievable via
+// PTRACE_GETEVENTMSG), so a build that resumed on a "foreign" tid would be
+// resuming on an identity it cannot even establish.
+//
+// Startup is out of reach by construction and is not tested here: the launch
+// path consumes its own execve stop in startTracedProcess's private Wait4 before
+// PTRACE_O_TRACEEXEC is enabled, and the attach path installs no options at all.
+func TestLinuxWaitAlwaysFailsOnExec(t *testing.T) {
+	const (
+		pid     = 9251
+		stepped = 9252
+		foreign = 9253
+	)
+
+	cases := []struct {
+		name    string
+		execTID int
+		inStep  bool
+	}{
+		{"on the thread being stepped", stepped, true},
+		{"under the leader pid while a foreign thread is stepped", pid, true},
+		{"on a foreign thread mid-step", foreign, true},
+		{"with no step in flight", pid, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &linuxBackend{pid: pid}
+			script := &scriptedWait{stops: []scriptedStop{
+				{tid: tc.execTID, status: stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_EXEC)},
+			}}
+			script.install(b)
+			if tc.inStep {
+				b.beginStep(stepped)
+				b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
+				b.holdStepOwner(stepped)
+			}
+
+			_, err := b.Wait()
+			if err == nil {
+				t.Fatal("Wait() succeeded on an exec; the image every breakpoint " +
+					"belongs to is gone and the session cannot continue")
+			}
+			if !strings.Contains(err.Error(), "process image") {
+				t.Fatalf("Wait() error = %q, want it to name the image replacement", err)
+			}
+			if strings.Contains(err.Error(), "single-stepped") {
+				t.Fatalf("Wait() error = %q, must not claim the reported pid was the "+
+					"stepped thread: after execve the kernel reports the leader's pid", err)
+			}
+			if len(script.ops) != 0 {
+				t.Fatalf("resume ops = %+v, want none: the exec stop must not be "+
+					"continued into an image the debugger cannot describe", script.ops)
+			}
+			if b.stepping || b.stepExitPending {
+				t.Fatalf("step state survived the exec abort: stepping=%v stepExitPending=%v",
+					b.stepping, b.stepExitPending)
+			}
+			if b.parkedDepthForTest() != 0 {
+				t.Fatal("held stops survived the exec abort; they name threads of an image that is gone")
+			}
+			if tid, ok := b.heldStepOwner(); ok {
+				t.Fatalf("heldStepOwner() = (%d, %v) after the exec abort, want the obligation dropped", tid, ok)
+			}
+		})
+	}
+}
+
+// TestLinuxWaitAbortsTheStepItCannotResume covers the remaining branch that must
+// refuse to absorb a stop on the stepped thread: an event we never enabled has
+// no understood stop shape, so re-arming would assume that shape and continuing
+// would resume a tracee whose software breakpoint is still out of memory. Wait
+// clears the step and surfaces the error instead of guessing.
+//
+// Unlike exec this stays TID-keyed — the same event on any other thread is
+// absorbed with a plain continue, which
+// TestLinuxWaitContinuesThreadsThatAreNotBeingStepped's sibling contract in
+// planAbsorb pins.
 func TestLinuxWaitAbortsTheStepItCannotResume(t *testing.T) {
 	const (
 		pid     = 9201
@@ -833,52 +922,137 @@ func TestLinuxWaitAbortsTheStepItCannotResume(t *testing.T) {
 		foreign = 9203
 	)
 
-	cases := []struct {
-		name  string
-		event int
-	}{
-		{"exec", syscall.PTRACE_EVENT_EXEC},
-		{"an event we never enabled", syscall.PTRACE_EVENT_VFORK},
+	b := &linuxBackend{pid: pid}
+	script := &scriptedWait{stops: []scriptedStop{
+		{tid: stepped, status: stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_VFORK)},
+	}}
+	script.install(b)
+	b.beginStep(stepped)
+	b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
+
+	if _, err := b.Wait(); err == nil {
+		t.Fatal("Wait() succeeded; a step that can be neither completed " +
+			"nor re-armed must surface an error")
+	}
+	if len(script.ops) != 0 {
+		t.Fatalf("resume ops = %+v, want none: the tracee must not run on "+
+			"with its software breakpoint still out of memory", script.ops)
+	}
+	if b.stepping {
+		t.Fatal("the step is still latched after the abort: every later " +
+			"foreign stop would be held forever")
+	}
+	if b.parkedDepthForTest() != 0 {
+		t.Fatal("held stops survived the abort")
+	}
+}
+
+// TestLinuxBackendRefusesToResumeWhileAStepExitIsUnreconciled pins the guard
+// that makes "kill or restart" the only recovery after a step-exit
+// reconciliation fails.
+//
+// Both halt paths — a reinstall that failed, and an anchor that could not be
+// released — deliberately leave stepExitPending set. That flag is what refuses
+// the user's next Continue/Step: resuming would run a tracee whose software
+// breakpoint is still out of memory, or leave a thread stopped that nothing will
+// ever deliver. Without this the engine's halt is advisory rather than binding.
+func TestLinuxBackendRefusesToResumeWhileAStepExitIsUnreconciled(t *testing.T) {
+	const (
+		pid     = 9441
+		stepped = 9442
+	)
+
+	newHalted := func() *linuxBackend {
+		b := &linuxBackend{pid: pid}
+		b.recordStop(pid)
+		b.beginStep(stepped)
+		b.interruptStepIfStepped(stepped)
+		b.contFn = func(int, int) error { return nil }
+		b.stepFn = func(int) error { return nil }
+		return b
 	}
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			b := &linuxBackend{pid: pid}
-			script := &scriptedWait{stops: []scriptedStop{
-				{tid: stepped, status: stoppedAt(syscall.SIGTRAP, tc.event)},
-			}}
-			script.install(b)
-			b.beginStep(stepped)
-			b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
+	b := newHalted()
+	err := b.ContinueProcess()
+	if err == nil {
+		t.Fatal("ContinueProcess() succeeded while a step exit was unreconciled")
+	}
+	if !strings.Contains(err.Error(), "awaiting breakpoint reconciliation") {
+		t.Fatalf("ContinueProcess() = %q, want it to name the unreconciled exit", err)
+	}
 
-			if _, err := b.Wait(); err == nil {
-				t.Fatal("Wait() succeeded; a step that can be neither completed " +
-					"nor re-armed must surface an error")
-			}
-			if len(script.ops) != 0 {
-				t.Fatalf("resume ops = %+v, want none: the tracee must not run on "+
-					"with its software breakpoint still out of memory", script.ops)
-			}
-			if b.stepping {
-				t.Fatal("the step is still latched after the abort: every later " +
-					"foreign stop would be held forever")
-			}
-			if b.parkedDepthForTest() != 0 {
-				t.Fatal("held stops survived the abort")
-			}
-		})
+	b = newHalted()
+	err = b.SingleStep(stepped)
+	if err == nil {
+		t.Fatal("SingleStep() succeeded while a step exit was unreconciled")
+	}
+	if !strings.Contains(err.Error(), "awaiting breakpoint reconciliation") {
+		t.Fatalf("SingleStep() = %q, want it to name the unreconciled exit", err)
+	}
+
+	// Reconciling opens the gate again. The resume itself is a real ptrace op
+	// against a pid that does not exist, so only the guard's verdict is asserted:
+	// anything other than the reconciliation refusal means it let the call
+	// through.
+	b = newHalted()
+	b.tracer = newTracerThread()
+	defer b.closeTracer()
+	if err := b.completeStepThreadExit(); err != nil {
+		t.Fatalf("completeStepThreadExit() = %v, want success", err)
+	}
+	if err := b.ContinueProcess(); err != nil &&
+		strings.Contains(err.Error(), "awaiting breakpoint reconciliation") {
+		t.Fatalf("ContinueProcess() still refused after reconciliation: %v", err)
+	}
+}
+
+// deathSpec is the fixture the two parked-anchor death shapes share.
+const (
+	deathPID     = 9301
+	deathStepped = 9302
+	deathForeign = 9303
+)
+
+// requireParkedSiblingAnchor asserts the boundary borrowed the parked sibling's
+// TID without consuming its stop, and without also holding the dying owner.
+func requireParkedSiblingAnchor(t *testing.T, b *linuxBackend) {
+	t.Helper()
+	ev, err := b.Wait()
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if ev.TID != deathForeign || ev.Reason != StopStepThreadExited {
+		t.Fatalf("Wait() = %+v, want a reconciliation boundary anchored to tid %d", ev, deathForeign)
+	}
+	if b.parkedDepthForTest() != 1 {
+		t.Fatal("held stop drained before engine reconciliation")
+	}
+	if b.stepExitCount() != 1 {
+		t.Fatalf("stepExitCount() = %d, want 1", b.stepExitCount())
+	}
+	if tid, ok := b.heldStepOwner(); ok {
+		t.Fatalf("heldStepOwner() = (%d, %v): with a parked anchor available the "+
+			"dying owner must be resumed, not held", tid, ok)
+	}
+}
+
+// requireSiblingNeverResumed is the invariant that separates borrowing a TID
+// from owning the stop attached to it.
+func requireSiblingNeverResumed(t *testing.T, script *scriptedWait) {
+	t.Helper()
+	for _, op := range script.ops {
+		if op.tid == deathForeign {
+			t.Fatalf("resumed the parked sibling on tid %d: its stop has not "+
+				"been delivered, so the engine must never have it running", deathForeign)
+		}
 	}
 }
 
 // TestLinuxWaitReportsReconciliationWhenTheSteppedThreadDies executes both
-// kernel death shapes and requires the internal boundary before held delivery.
+// kernel death shapes with a sibling already parked, and requires the internal
+// boundary before held delivery. With a parked anchor available the dying owner
+// is resumed as before; the empty-queue case is covered separately below.
 func TestLinuxWaitReportsReconciliationWhenTheSteppedThreadDies(t *testing.T) {
-	const (
-		pid     = 9301
-		stepped = 9302
-		foreign = 9303
-	)
-
 	cases := []struct {
 		name   string
 		status syscall.WaitStatus
@@ -889,43 +1063,166 @@ func TestLinuxWaitReportsReconciliationWhenTheSteppedThreadDies(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			b := &linuxBackend{pid: pid}
+			b := &linuxBackend{pid: deathPID}
 			script := &scriptedWait{stops: []scriptedStop{
-				{tid: stepped, status: tc.status},
+				{tid: deathStepped, status: tc.status},
 			}}
 			script.install(b)
-			b.beginStep(stepped)
-			b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
+			b.beginStep(deathStepped)
+			b.park(StopEvent{Reason: StopBreakpoint, TID: deathForeign})
+
+			requireParkedSiblingAnchor(t, b)
+
+			if err := b.completeStepThreadExit(); err != nil {
+				t.Fatalf("completeStepThreadExit() = %v, want success", err)
+			}
+			requireSiblingNeverResumed(t, script)
 
 			ev, err := b.Wait()
 			if err != nil {
-				t.Fatalf("Wait() error = %v", err)
-			}
-			if ev.TID != foreign || ev.Reason != StopStepThreadExited {
-				t.Fatalf("Wait() = %+v, want a reconciliation boundary anchored to tid %d", ev, foreign)
-			}
-			if b.parkedDepthForTest() != 1 {
-				t.Fatal("held stop drained before engine reconciliation")
-			}
-			if b.stepExitCount() != 1 {
-				t.Fatalf("stepExitCount() = %d, want 1", b.stepExitCount())
-			}
-
-			b.completeStepThreadExit()
-			ev, err = b.Wait()
-			if err != nil {
 				t.Fatalf("Wait() after reconciliation error = %v", err)
 			}
-			if ev.TID != foreign || ev.Reason != StopBreakpoint {
-				t.Fatalf("Wait() after reconciliation = %+v, want held stop on tid %d", ev, foreign)
+			if ev.TID != deathForeign || ev.Reason != StopBreakpoint {
+				t.Fatalf("Wait() after reconciliation = %+v, want held stop on tid %d", ev, deathForeign)
 			}
 		})
 	}
 }
 
-// TestLinuxWaitHoldsTheFirstStopAfterTheStepOwnerDies covers the no-queue-yet
-// ordering: a later user stop must become the reconciliation anchor rather than
-// slipping through because hardware stepping was already cleared.
+// TestLinuxWaitHoldsTheDyingStepOwnerAsItsOwnAnchor is the empty-queue case.
+//
+// The engine owns a breakpoint whose trap is out of the tracee and needs a
+// ptrace-stopped thread to write it back through. Resuming the dying owner
+// leaves none, so the reinstall waits for whatever stop happens to arrive next —
+// unbounded, and on a quiet tracee never. Holding the owner at its
+// PTRACE_EVENT_EXIT stop (before exit_mm, so its address space is still mapped)
+// makes the boundary immediate and bounded.
+//
+// The hold must not be resumed before the engine acknowledges, and must be
+// resumed exactly once when it does.
+func TestLinuxWaitHoldsTheDyingStepOwnerAsItsOwnAnchor(t *testing.T) {
+	const (
+		pid     = 9411
+		stepped = 9412
+	)
+
+	b := &linuxBackend{pid: pid}
+	script := &scriptedWait{stops: []scriptedStop{
+		{tid: stepped, status: stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_EXIT)},
+	}}
+	script.install(b)
+	b.recordStop(pid)
+	b.beginStep(stepped)
+
+	ev, err := b.Wait()
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if ev.Reason != StopStepThreadExited || ev.TID != stepped {
+		t.Fatalf("Wait() = %+v, want the boundary anchored to the held owner %d", ev, stepped)
+	}
+	if len(script.ops) != 0 {
+		t.Fatalf("resume ops = %+v before the engine acknowledged: the anchor must "+
+			"stay stopped until the breakpoint has been written back through it", script.ops)
+	}
+	if got := b.traceTID(); got != stepped {
+		t.Fatalf("traceTID() = %d, want %d: the reinstall's PTRACE_POKEDATA targets "+
+			"this thread and it must be the one that is actually stopped", got, stepped)
+	}
+	if got := b.heldStepOwnerCount(); got != 1 {
+		t.Fatalf("heldStepOwnerCount() = %d, want 1", got)
+	}
+
+	if err := b.completeStepThreadExit(); err != nil {
+		t.Fatalf("completeStepThreadExit() = %v, want success", err)
+	}
+	if len(script.ops) != 1 {
+		t.Fatalf("resume ops = %+v, want exactly one release of the held owner", script.ops)
+	}
+	if op := script.ops[0]; op.step || op.tid != stepped || op.signal != 0 {
+		t.Fatalf("released with %+v, want a plain continue of tid %d", op, stepped)
+	}
+	if tid, ok := b.heldStepOwner(); ok {
+		t.Fatalf("heldStepOwner() = (%d, %v) after release, want nothing held", tid, ok)
+	}
+
+	if err := b.completeStepThreadExit(); err != nil {
+		t.Fatalf("second completeStepThreadExit() = %v, want a benign no-op", err)
+	}
+	if len(script.ops) != 1 {
+		t.Fatalf("resume ops = %+v after a second acknowledgement, want the held owner "+
+			"released exactly once", script.ops)
+	}
+}
+
+// TestLinuxWaitTreatsADeadHeldOwnerAsReleased pins the benign half of the
+// release. The anchor is a thread already inside do_exit, so it can finish dying
+// between the boundary and the acknowledgement; ESRCH there means the release
+// achieved exactly what it asked for.
+func TestLinuxWaitTreatsADeadHeldOwnerAsReleased(t *testing.T) {
+	const (
+		pid     = 9421
+		stepped = 9422
+	)
+
+	b := &linuxBackend{pid: pid}
+	b.beginStep(stepped)
+	b.interruptStepIfStepped(stepped)
+	b.holdStepOwner(stepped)
+	b.contFn = func(int, int) error { return syscall.ESRCH }
+
+	if err := b.completeStepThreadExit(); err != nil {
+		t.Fatalf("completeStepThreadExit() = %v, want ESRCH treated as a completed release", err)
+	}
+	if tid, ok := b.heldStepOwner(); ok {
+		t.Fatalf("heldStepOwner() = (%d, %v), want the hold dropped", tid, ok)
+	}
+	if b.stepExitPending {
+		t.Fatal("the gate stayed closed after a benign release")
+	}
+}
+
+// TestLinuxWaitKeepsTheGateClosedWhenTheAnchorCannotBeReleased is the converse.
+// A release that fails for any other reason leaves a thread stopped that nothing
+// will deliver, so neither the hold nor the gate may be dropped: the engine has
+// to halt suspended rather than resume into a state it cannot describe.
+func TestLinuxWaitKeepsTheGateClosedWhenTheAnchorCannotBeReleased(t *testing.T) {
+	const (
+		pid     = 9431
+		stepped = 9432
+		foreign = 9433
+	)
+
+	b := &linuxBackend{pid: pid}
+	b.beginStep(stepped)
+	b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
+	b.interruptStepIfStepped(stepped)
+	b.holdStepOwner(stepped)
+	b.contFn = func(int, int) error { return syscall.EPERM }
+
+	err := b.completeStepThreadExit()
+	if err == nil {
+		t.Fatal("completeStepThreadExit() succeeded despite a failed release")
+	}
+	if !strings.Contains(err.Error(), "release step owner") {
+		t.Fatalf("completeStepThreadExit() = %q, want it to name the failed release", err)
+	}
+	if tid, ok := b.heldStepOwner(); !ok || tid != stepped {
+		t.Fatalf("heldStepOwner() = (%d, %v), want the hold retained after a failed release", tid, ok)
+	}
+	if !b.stepExitPending {
+		t.Fatal("the gate opened after a failed release: a held stop could drain past " +
+			"a thread the backend could not resume")
+	}
+	if _, ok := b.releasable(); ok {
+		t.Fatal("a held stop became releasable after a failed release")
+	}
+}
+
+// TestLinuxWaitHoldsTheFirstStopAfterTheStepOwnerDies covers the one death shape
+// that cannot supply its own anchor: a reaped owner is already gone, so there is
+// no thread to hold and the first later user stop must become the anchor rather
+// than slipping through because hardware stepping was cleared with it.
 func TestLinuxWaitHoldsTheFirstStopAfterTheStepOwnerDies(t *testing.T) {
 	const (
 		pid     = 9401
@@ -935,7 +1232,7 @@ func TestLinuxWaitHoldsTheFirstStopAfterTheStepOwnerDies(t *testing.T) {
 
 	b := &linuxBackend{pid: pid}
 	script := &scriptedWait{stops: []scriptedStop{
-		{tid: stepped, status: stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_EXIT)},
+		{tid: stepped, status: exitedWith(0)},
 		{tid: foreign, status: stoppedAt(syscall.SIGTRAP, 0)},
 	}}
 	script.install(b)
@@ -950,6 +1247,9 @@ func TestLinuxWaitHoldsTheFirstStopAfterTheStepOwnerDies(t *testing.T) {
 	}
 	if b.parkedDepthForTest() != 1 {
 		t.Fatal("first post-death user stop was not retained behind reconciliation")
+	}
+	if tid, ok := b.heldStepOwner(); ok {
+		t.Fatalf("heldStepOwner() = (%d, %v): a reaped thread cannot be an anchor", tid, ok)
 	}
 }
 

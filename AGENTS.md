@@ -396,12 +396,23 @@ branches disagreed and only the signal half was safe.
 On **linux** that death is now caught earlier and more precisely, by the
 `StopStepThreadExited` boundary (park-queue rule 5): the backend refuses to
 release the held stop at all until the engine has reinstalled, so the sibling
-never reaches `handleStop` with `steppingOverBP` still set. The reconcile above
+never reaches `handleStop` with `steppingOverBP` still set. With nothing parked
+the backend holds the dying owner itself as the write anchor and reports the
+boundary immediately, so the reinstall no longer waits for an unrelated thread to
+stop. The reconcile above
 is therefore the **cross-platform backstop** — it is what covers darwin, which
 has no wait-side queue and no boundary event — and a no-op on linux, where
 `steppingOverBP` is already nil by the time the held stop drains. Keep both:
 the boundary is the ordered handoff, the reconcile is the invariant that a
 breakpoint stop never proceeds while a lifted trap is outstanding.
+
+The engine's `StopStepThreadExited` handler therefore has a strict order:
+reinstall through the anchor, *then* acknowledge with `completeStepThreadExit`,
+which is what releases it. Both halves can fail, and both halt suspended rather
+than tearing the session down — a failed reinstall keeps `steppingOverBP` set and
+the anchor held, a failed release keeps the anchor held and the gate closed, and
+in both cases `ContinueProcess`/`SingleStep` refuse while `stepExitPending` so
+Kill/Restart is the only recovery.
 
 **Every asynchronous halt in `handleStop` must be reported with a *suspending*
 event, not a bare `EventError`.** These failures happen after the resume that
@@ -545,8 +556,9 @@ acknowledgement in rule 5 (see the locking note below):
 1. **Park only foreign user-visible stops.** `classifyUserStop` parks a
    `StopBreakpoint`/`StopSignal` only when a step is in flight (`stepping` **and**
    a non-zero `stepTID`) and the stopping TID is not `stepTID`. Everything the
-   loop already absorbs inline stays inline: clone/exec events, non-main thread
-   exits, a new thread's initial `SIGSTOP`, `SIGURG`, `SIGCONT`.
+   loop already absorbs inline stays inline: clone events, non-main thread
+   exits, a new thread's initial `SIGSTOP`, `SIGURG`, `SIGCONT`. (`exec` is the
+   one `PTRACE_EVENT` that is *not* absorbed — see rule 9.)
 2. **Never park the stepped thread's own stop.** Its trap is the step completing
    and its signal is the step's outcome; both must reach the engine or the trap
    is never reinstalled and nothing can ever drain. A `stepping` flag with a zero
@@ -570,33 +582,52 @@ acknowledgement in rule 5 (see the locking note below):
 5. **A dead stepped thread closes through an internal reconciliation boundary.**
    `interruptStepIfStepped` clears hardware ownership (`stepping`/`stepTID`) when
    the exact stepped TID exits, because its completion can never arrive, but it
-   keeps the parked-stop gate closed. Once a held stop exists, `Wait` returns
-   `StopStepThreadExited` anchored to that stop's TID **without dequeuing it**.
-   The engine reinstalls `steppingOverBP`, then calls
+   keeps the parked-stop gate closed. `Wait` then returns `StopStepThreadExited`
+   anchored to a thread that is genuinely ptrace-stopped, **without dequeuing any
+   held stop**. The engine reinstalls `steppingOverBP`, then calls
    `completeStepThreadExit`; only the following `Wait` may deliver the real stop.
    If reinstall fails, the original entry remains owned by `steppingOverBP`,
    `Error → Paused` is emitted, and Continue/Step are rejected; Kill/Restart is
    the safe recovery. This prevents a sibling from replacing `lastBP` while the
    original logical breakpoint is still out of the table.
 
-   **"Once a held stop exists" is a hard requirement, not a convenience.** The
-   boundary needs a TID the engine can `POKEDATA` into, and ptrace can only
-   write through a thread that is *actually stopped* — so with an empty queue
-   there is no legal anchor and no boundary is emitted. `stepExitPending` simply
-   stays set: `Wait` keeps blocking in `wait4`, and the first foreign stop to
-   arrive parks (the park condition includes `stepExitPending`), which supplies
-   the anchor and releases the whole transaction on the next iteration. Whole
+   **The anchor is whichever stopped thread is available, and the dying owner
+   itself is one of them.** The boundary needs a TID the engine can `POKEDATA`
+   into, and ptrace can only write through a thread that is *actually stopped*.
+   Two supply that:
+
+   - **The step owner, held.** When it dies through `PTRACE_EVENT_EXIT` and
+     nothing is parked, `planAbsorb` returns `holdStepOwner` and `applyAbsorb`
+     **skips the resume entirely**, keeping it at that stop. `PTRACE_EVENT_EXIT`
+     fires in `do_exit` *before* `exit_mm`, so its address space is still mapped
+     and a write through it reaches the breakpoint. It is released exactly once,
+     by `completeStepThreadExit`, and only after the engine has reinstalled.
+   - **The oldest parked stop**, which lends its TID without being dequeued.
+     A parked sibling is **never resumed** on the boundary's behalf: the engine
+     has not been told about that stop, so running its thread would be the very
+     corruption the queue exists to prevent.
+
+   The held owner is preferred when both exist. A **reaped** owner
+   (`ws.Exited()`/`ws.Signaled()`) cannot be held — it is already gone — so that
+   shape keeps the original lazy fallback: `stepExitPending` stays set, `Wait`
+   keeps blocking in `wait4`, and the first foreign stop to arrive parks (the
+   park condition includes `stepExitPending`) and supplies the anchor. Whole
    process death still routes through the main thread and tears down as usual.
-   Nothing is lost that was not already lost before this rule existed — the
-   trap stays lifted for exactly as long as no thread is stopped to reinstall it
-   through — and the step-over case cannot reach it anyway, since the stepped
-   instruction is user code at `bp.addr` and a thread cannot exit executing it.
-   A future change that makes *plain* foreign single-steps common should
-   re-check this empty-queue path rather than assume it.
+
+   `completeStepThreadExit` returns an error because that release is a real
+   ptrace op. `ESRCH`/`ENOENT` is benign — the anchor was mid-exit and simply
+   finished dying, which is what the release asked for. Any other failure leaves
+   the hold in place **and the gate closed**, and the engine halts suspended
+   (`Error → Paused`, no new `waitLoop`) rather than resuming past a thread
+   nothing will ever deliver. `ContinueProcess`/`SingleStep` already refuse while
+   `stepExitPending`, so both halt paths make Kill/Restart the only recovery.
+   No path leaks a held owner: it is discharged on a successful acknowledgement,
+   and dropped by `purge` (and therefore by `abortStep`), which runs only where
+   the thread it names is gone or unreachable.
 6. **Teardown purges inside `Wait`.** `stepQueue.purge` runs on the main thread's
-   `PTRACE_EVENT_EXIT`, its real exit, its signal death, and `ECHILD`. There is
-   deliberately **no engine-callable purge**: the queue is not part of the
-   engine's state model.
+   `PTRACE_EVENT_EXIT`, its real exit, its signal death, and `ECHILD`, and drops
+   the held anchor along with the parked stops. There is deliberately **no
+   engine-callable purge**: the queue is not part of the engine's state model.
 7. **Absorbing a stop on the stepped thread must re-arm its step.** Every site
    that handles a stop inline and resumes the thread names its branch to
    `stepQueue.planAbsorb` (via `absorbStop`/`applyAbsorb`) instead of reaching
@@ -663,17 +694,63 @@ acknowledgement in rule 5 (see the locking note below):
    One residual: swapping an `absorbKind`
    *label* between two branches that share a `planAbsorb` row is behaviour-
    preserving and not detected — the decisions are pinned, the names are not.
-8. **Two absorb cases cannot re-arm and must fail the wait instead.** On
-   `PTRACE_EVENT_EXEC` the image the stepped-over breakpoint lived in is gone, so
-   neither completing nor restoring it is meaningful; on an unrecognised
-   `PTRACE_EVENT` (unreachable with the options we set) there is nothing to
-   reason about. Both call `stepQueue.abortStep` — lift the gate *and* drop the
-   held stops, since they name threads of an image that no longer exists — and
-   return an error from `Wait`. The engine turns that into an `EventError` and
-   tears the session down (`engine.go`'s `stopCh` error branch). Un-latching and
-   running on instead would resume a tracee whose software breakpoint is still
-   absent from memory, which is the corruption this whole section exists to
-   prevent.
+8. **An unknown `PTRACE_EVENT` on the stepped thread cannot re-arm and must fail
+   the wait instead.** With only TRACEEXIT/TRACEEXEC/TRACECLONE enabled it is
+   unreachable in practice, and if it were reached there is nothing to reason
+   about: re-arming assumes a stop shape we do not understand, and continuing
+   resumes a tracee whose software breakpoint is still absent from memory. It
+   calls `stepQueue.abortStep` — lift the gate, drop the held stops *and* any
+   held anchor — and returns an error from `Wait`. The engine turns that into an
+   `EventError` and tears the session down (`engine.go`'s `stopCh` error branch).
+   This case stays **TID-keyed**: the same event on any other thread is absorbed
+   with a plain continue.
+9. **`PTRACE_EVENT_EXEC` is fatal unconditionally.** It is deliberately NOT an
+   absorb decision and has no `planAbsorb` row: `execve` replaces the process
+   image for **every** thread, so every breakpoint address, every saved
+   instruction byte and every tracked thread id describes memory that no longer
+   exists. There is nothing to reconcile against whether or not a step was in
+   flight and whichever thread it is reported on, so `Wait` calls `abortStep` and
+   errors immediately, **without resuming the exec stop**. Two facts the error
+   message must respect: after `execve` the kernel reports this stop under the
+   **thread-group leader's pid**, and the execing thread's former tid is only
+   retrievable via `PTRACE_GETEVENTMSG` — so the reported pid must never be
+   described as the stepped TID.
+
+   **bingo's own startup is out of reach by construction**, which is what makes
+   an unconditional rule safe. The launch path consumes its own `execve`
+   `SIGTRAP` in `startTracedProcess`'s private `Wait4` *before* calling
+   `PtraceSetOptions`, so the image bingo itself launched never produces an
+   `EVENT_EXEC` and never reaches `Wait`; `Restart` builds a brand-new debugger
+   and repeats that sequence; and the attach path (`attachToProcess`) currently
+   installs **no ptrace options at all**, so it cannot generate the event either.
+   Keep that ordering if you touch either path.
+
+   That guarantee is about the execve *bingo performed*, not about "nothing
+   execs early". A tracee whose first image immediately execs a second one — a
+   **binfmt interpreter that re-execs**, e.g. Rosetta under emulated
+   linux/amd64 Docker, or some qemu-user setups — really does produce a
+   post-startup `EVENT_EXEC`, and it now kills the session where it used to be
+   silently continued. That is the intended verdict rather than a regression:
+   the entry stop, the DWARF slide and every address derived from them describe
+   the pre-exec image, so the old behaviour worked by coincidence. It is also
+   why the linux E2E suite cannot run under emulated Docker at all — a
+   restriction that already existed for other reasons (these specs require a
+   native kernel), but which now surfaces immediately instead of subtly.
+
+   Making this tolerant is NOT cheap and must not be done with a blind
+   "ignore the first exec": that would re-admit exactly the corruption the rule
+   prevents for a genuine mid-session exec. It needs a verified handshake inside
+   `startTracedProcess` that identifies and re-validates the final image before
+   any DWARF load or breakpoint install.
+
+   One honest limit, shared with **every** `Wait` error and therefore
+   pre-existing rather than introduced here: the engine reports the error and
+   tears down, but does not kill the tracee. `closeTracer` ends the dedicated
+   tracer thread, ptrace attachments are per-thread, so the kernel detaches and
+   the replacement image runs on untraced — and a later `Kill` is a no-op
+   because `done` is already closed. Rule 9 makes that path reachable in more
+   situations than before. Fixing it belongs with the wait-ownership/teardown
+   work (#205/#217), not here.
 
 **Explicit limits — this is NOT an atomic stop-the-world step-over.** Sibling
 threads keep running and keep trapping during a step; the fix only guarantees
@@ -698,18 +775,21 @@ that their stops are *reported later*, after the trap is back:
   `LinuxRetiredInternalBreakpointCount > 0`; an armed-ness probe alone cannot
   distinguish safe recovery from the mid-instruction path.
 - **A stepped thread that dies never releases a held stop directly.** The
-  internal boundary is returned first and records the held TID as `traceTID`, so
-  the engine's reinstall writes through a genuinely stopped thread while the
+  internal boundary is returned first and records the anchor TID as `traceTID`,
+  so the engine's reinstall writes through a genuinely stopped thread while every
   actual `StopEvent` remains FIFO-owned by `Wait`. After acknowledgement, the
-  top-of-loop drain delivers it before blocking in `wait4`; main-process exit
-  still purges anything not yet delivered. The queue, scripted-`Wait`, engine,
+  top-of-loop drain delivers them before blocking in `wait4`; main-process exit
+  still purges anything not yet delivered. When the anchor is the dying owner
+  itself, that acknowledgement is also the only thing that resumes it — and a
+  parked sibling is never resumed at all. The queue, scripted-`Wait`, engine,
   and native raw-`SYS_exit` tests separately pin the gate, exact-TID anchor,
-  breakpoint ownership, and real-kernel path.
+  breakpoint ownership, and real-kernel path for both anchor shapes.
 - **Kill ownership is unchanged, and no second reaper is added.** Killing a
   *suspended* tracee still reaps through `reapAfterKill`, which loops
   `Wait4(-1, WALL)` and resumes whatever it finds ptrace-stopped: a parked thread
-  is ptrace-stopped like any other and is indistinguishable to that loop, so the
-  queue costs it iterations, nothing more. Killing a *running* tracee still
+  — or a held anchor — is ptrace-stopped like any other and is indistinguishable
+  to that loop, so the queue costs it iterations, nothing more. Killing a
+  *running* tracee still
   leaves reaping to the in-flight `waitLoop` (#111 forbids a second `wait4`
   reaper here, and #205 is why a process-global one is dangerous in a shared
   server). The one honest cost: because the drain runs before `wait4`, that
@@ -748,23 +828,31 @@ Only the cumulative diagnostic counters are atomic because native tests read
 them concurrently; do not add a queue mutex.
 
 Regression gates: the classifier table, the queue-mechanics tests **and** the
-resume-decision tests covering rules 7–8 in
+resume-decision tests covering rules 7–9 in
 [waitpark_test.go](internal/debugger/waitpark_test.go) — all host-agnostic, so
 they run and can be mutation-checked on macOS — plus the backend-specific tests
 in [backend_linux_amd64_test.go](internal/debugger/backend_linux_amd64_test.go)
 that pin *when `lastStopTID` moves* (not on park, only on delivery, and `Wait`
 drains before blocking) and drive `Wait` itself over scripted wait statuses so
-every branch's effect on the step is executed rather than merely decided, plus
-the linux-only `overlap` E2E label in
+every branch's effect on the step is executed rather than merely decided —
+including the unconditional exec refusal, the held-owner anchor, its exactly-once
+release, the benign-`ESRCH` release and the gate-stays-closed release failure —
+plus the cross-layer engine-over-real-queue specs in
+[engine_stepqueue_test.go](internal/debugger/engine_stepqueue_test.go) that pin
+reinstall-before-release for both anchor shapes, plus the linux-only `overlap`
+E2E label in
 [debugger_e2e_linux_amd64_test.go](test/integration/debugger_e2e_linux_amd64_test.go):
 step-over overlap, machine-step (`StepInto`) overlap, a foreign ordinary-signal
-storm, `Pause` racing an in-flight step, kill with stops held, and a raw
-`SYS_exit` that kills the exact stepped thread. Those assert
+storm, `Pause` racing an in-flight step, kill with stops held, a raw
+`SYS_exit` that kills the exact stepped thread with a sibling parked, and the
+same raw `SYS_exit` with **nothing** parked so the dying owner anchors itself.
+Those assert
 only invariants the fix guarantees — both logical breakpoints remain tracked at
 every observable stop, every hit belongs to a known id, no error or unexpected
 exit, both ids still clearable, threads still making progress at the end of the
-run — plus non-vacuity: the park counters, the signal number, and (reported, not
-asserted) the rule-7 re-arm counter. The `churn` label runs five rounds in CI.
+run — plus non-vacuity: the park counters, the held-owner counter, the signal
+number, and (reported, not asserted) the rule-7 re-arm counter. The `churn` label
+runs five rounds in CI.
 
 **Non-vacuity is asserted, not assumed.** The overlap those specs provoke is
 inherently racy, so a run that never actually parked a stop proves nothing about
@@ -813,9 +901,33 @@ racy per cycle.
 **`LinuxStepThreadExitCount` is the native evidence for rule 5.** The dedicated
 C/assembly target places a breakpoint directly on `SYS_exit`, installs a hot
 sibling breakpoint while that thread is suspended, then resumes the removed
-instruction. The count proves the exact step owner died; a positive parked count
-proves a sibling stop crossed the gate; and re-setting/clearing the original ID
-proves reconciliation restored logical ownership before that sibling surfaced.
+instruction. The count proves the exact step owner died, and re-setting/clearing
+the original ID proves reconciliation restored logical ownership before the
+sibling surfaced.
+
+That spec asserts `parked + held > 0`, **not** `parked > 0`, and the distinction
+is load-bearing rather than defensive. Which thread anchors the boundary is racy:
+if a sibling has already parked it lends its TID, otherwise the dying owner is
+held. Since the owner-held path resolves the whole transaction in microseconds,
+a fast runner routinely completes it before any sibling parks — that is what the
+original `parked > 0` gate started failing on once holding was introduced, and it
+was the gate that was wrong, not the run. Both anchors are correct, so the honest
+non-vacuity claim is that an anchor existed at all.
+
+**`LinuxHeldStepOwnerCount` is the native evidence for the other anchor shape,
+and the reason there is a second `SYS_exit` target.** The spec above arms a hot
+sibling line *before* resuming, so a sibling stop is essentially always parked by
+the time the owner dies — which means it passes identically whether or not the
+held-owner rule exists. `declareStepOwnerHoldSpec` therefore arms **only** the
+raw `SYS_exit`, so the queue is empty at the death and the dying owner must
+anchor its own reconciliation. Its target spawns one doomed thread at a time on a
+long interval, which does two things: it keeps a second trap from being pending
+when the step begins (that would supply the very sibling anchor the spec exists
+to avoid), and it guarantees a **later** thread reaches the same logical
+breakpoint afterwards. That later hit, carrying the original breakpoint id, is
+what proves the trap was really written back through the held thread — it is
+unreachable if the hold or the reinstall is dropped. The parked count is
+deliberately not asserted there: an empty queue is the premise.
 
 **A held interrupt is usually surfaced, not suppressed — but only usually.** It
 surfaces when it drains while `manualStopPending` is still set, which is the
@@ -992,8 +1104,10 @@ are detected by a `mach_msg` receive loop.
   away (the "parking the thread group" hazard).
 - `Wait` uses `Wait4(-1, …, WALL)` to receive events for any thread.
   `PTRACE_EVENT_*` stops are absorbed (resumed and looped) and never surface
-  to the engine — except the **main thread's** `PTRACE_EVENT_EXIT`, which is the
-  one exit the engine needs. Because `PTRACE_O_TRACEEXIT` stops the leader
+  to the engine — with two exceptions. The **main thread's**
+  `PTRACE_EVENT_EXIT` is the one exit the engine needs, and
+  `PTRACE_EVENT_EXEC` is fatal and fails the wait outright (park-queue rule 9).
+  Because `PTRACE_O_TRACEEXIT` stops the leader
   *before* it dies and the engine tears down on the resulting `StopExited`, the
   real status never resurfaces as a later `wait4` `Exited()`; so `Wait` reads it
   at that stop via `PTRACE_GETEVENTMSG` (a `wait(2)`-encoded status) and reports
@@ -2674,6 +2788,16 @@ through the justfile.
   than the one being single-stepped, and its `recordStop` must happen only when
   the event is actually returned. See
   [foreign-thread stop parking](#foreign-thread-stop-parking-during-a-single-step-linux).
+- **`PtraceSetOptions` on either process path**: the unconditional
+  `PTRACE_EVENT_EXEC` failure (park-queue rule 9) is safe only because bingo's
+  own `execve` is consumed *before* `TRACEEXEC` is enabled, and because
+  `attachToProcess` enables no options at all. Preserve that ordering in
+  `startTracedProcess`. Enabling `TRACEEXEC` on attach would not retroactively
+  produce an event for an exec that already happened, but it WOULD make any
+  later exec by the attached process fatal — decide that deliberately, and note
+  the converse hazard it fixes: with no options at all, an attached process's
+  exec currently arrives as a plain `SIGTRAP` that `Wait` can misread as a
+  breakpoint.
 - **New `EventKind`/`CommandKind`**: if it should reach an IDE, add its
   translation to [internal/dap](internal/dap/) (`translateEvent`/event handlers
   for events, `dispatchRequest` for the reverse). Events with no DAP equivalent

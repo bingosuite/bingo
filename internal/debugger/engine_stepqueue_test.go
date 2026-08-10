@@ -2,6 +2,7 @@ package debugger_test
 
 import (
 	"bytes"
+	"errors"
 	"sync"
 	"time"
 
@@ -41,12 +42,18 @@ type queueBackend struct {
 
 	// watchAddr/order record the actual interleaving of the two operations
 	// whose order is the whole invariant: re-arming the dead step owner's trap,
-	// and releasing the held sibling. Polling either side separately is racy —
-	// the drain follows the reinstall closely enough that a poller can observe
-	// only the end state — so the ordering is recorded as it happens.
+	// and releasing whichever thread the backend was holding — a parked sibling
+	// (whose stop then drains) or the dying owner itself (which is resumed).
+	// Polling either side separately is racy — the drain follows the reinstall
+	// closely enough that a poller can observe only the end state — so the
+	// ordering is recorded as it happens.
 	mu        sync.Mutex
 	watchAddr uint64
 	order     []string
+
+	// releaseErr injects a non-benign failure into the anchor release, the one
+	// backend operation the engine's acknowledgement performs.
+	releaseErr error
 }
 
 func newQueueBackend(fb *fakeBackend) *queueBackend {
@@ -106,7 +113,9 @@ func (b *queueBackend) Wait() (debugger.StopEvent, error) {
 			return debugger.StopEvent{}, debugger.ErrProcessExited
 		}
 		if raw.death {
-			b.q.InterruptStepIfStepped(raw.tid)
+			if b.q.AbsorbThreadExit(raw.tid) {
+				b.note("hold-owner")
+			}
 			continue
 		}
 
@@ -123,7 +132,40 @@ func (b *queueBackend) Wait() (debugger.StopEvent, error) {
 	}
 }
 
+// ContinueProcess mirrors the linux backend's refusal to resume while a
+// stepped-thread exit is still awaiting reconciliation. Without it this fake
+// would happily resume a tracee whose breakpoint is out of memory, and the
+// engine-level "kill or restart is the only recovery" contract would be untested
+// here. The production guard itself is pinned by
+// TestLinuxBackendRefusesToResumeWhileAStepExitIsUnreconciled.
+func (b *queueBackend) ContinueProcess() error {
+	if b.q.StepExitPending() {
+		return errors.New("stepped-thread exit is awaiting breakpoint reconciliation")
+	}
+	return b.fakeBackend.ContinueProcess()
+}
+
 func (b *queueBackend) push(r rawStop) { b.raw <- r }
+
+// acknowledgeStepExit mirrors the linux backend's completeStepThreadExit:
+// release the held anchor if there is one, then open the gate. It is wired in
+// through ExportedGateBackend because an external test package cannot implement
+// the engine's unexported interface method directly.
+//
+// The release is recorded so the reinstall-before-release ordering is
+// observable, and it never touches a parked sibling — only a thread the queue
+// itself retained.
+func (b *queueBackend) acknowledgeStepExit() error {
+	if _, held := b.q.HeldStepOwner(); held {
+		if b.releaseErr != nil {
+			return b.releaseErr
+		}
+		b.note("release-owner")
+		b.q.ClearHeldStepOwner()
+	}
+	b.q.CompleteStepThreadExit()
+	return nil
+}
 
 // noUserEventWithin reports whether the client saw no user-visible event for
 // the whole window. Goroutine snapshots are not user-visible stops and are
@@ -174,7 +216,7 @@ var _ = Describe("Engine over the production park queue", func() {
 		qb.watchAddr = bpAddrA
 		gated := &debugger.ExportedGateBackend{
 			Backend:  qb,
-			Complete: qb.q.CompleteStepThreadExit,
+			Complete: qb.acknowledgeStepExit,
 		}
 		d = debugger.NewWithBackend(gated, nil)
 		debugger.ExportedForceSuspended(d)
@@ -278,5 +320,93 @@ var _ = Describe("Engine over the production park queue", func() {
 		Expect(payload.Breakpoint.ID).To(Equal(idA),
 			"it must resolve to the original breakpoint, not a new or absent one")
 		Expect(fb.peekMem(bpAddrA, len(trap))).To(Equal(trap))
+	})
+
+	// The empty-queue death: nothing is parked, so the dying owner is held as
+	// its own anchor. This is the ordering that matters most there, because the
+	// anchor is a thread the backend must resume itself: the trap has to be
+	// written back THROUGH it before it is let go, or the write has no legal
+	// target left at all.
+	It("reinstalls through the held step owner before releasing it", func() {
+		idA := debugger.ExportedSetBreakpointAt(d, bpAddrA)
+
+		continueAndConsumeContinued(d)
+		qb.push(rawStop{tid: steppedTID, trap: true, pc: bpAddrA})
+		Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventBreakpointHit))
+
+		continueAndConsumeContinued(d)
+		Eventually(func() []byte { return fb.peekMem(bpAddrA, len(trap)) }).
+			ShouldNot(Equal(trap), "the step-over transaction must own A's lifted trap")
+
+		qb.resetOrder()
+		qb.push(rawStop{tid: steppedTID, death: true})
+
+		Eventually(func() []byte { return fb.peekMem(bpAddrA, len(trap)) }).
+			Should(Equal(trap), "the held owner must anchor the reinstall")
+		Eventually(qb.events).Should(Equal([]string{"hold-owner", "reinstall", "release-owner"}),
+			"the owner is held, written through, and only then released")
+		Eventually(func() bool {
+			_, held := qb.q.HeldStepOwner()
+			return held
+		}).Should(BeFalse(), "the anchor obligation must be discharged, not leaked")
+
+		// The logical breakpoint survived a death that produced no sibling stop
+		// at all, which is the whole point of holding the owner.
+		Expect(d.ClearBreakpoint(idA)).To(Succeed(),
+			"the dead step owner's breakpoint must still be tracked by id")
+	})
+
+	// Reinstall failure on the held-owner path. The trap is still out of the
+	// tracee and the engine still owns it, so the anchor must NOT be released
+	// and the session must halt suspended rather than resume or die.
+	It("halts suspended and keeps the anchor when the reinstall fails", func() {
+		debugger.ExportedSetBreakpointAt(d, bpAddrA)
+
+		continueAndConsumeContinued(d)
+		qb.push(rawStop{tid: steppedTID, trap: true, pc: bpAddrA})
+		Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventBreakpointHit))
+
+		continueAndConsumeContinued(d)
+		Eventually(func() []byte { return fb.peekMem(bpAddrA, len(trap)) }).
+			ShouldNot(Equal(trap))
+
+		fb.failWriteAt(bpAddrA, errInjected)
+		qb.push(rawStop{tid: steppedTID, death: true})
+
+		expectHaltReported(d, "after stepped thread exited")
+		Expect(qb.events()).NotTo(ContainElement("release-owner"),
+			"a thread held to anchor a reinstall that failed must stay stopped")
+		_, held := qb.q.HeldStepOwner()
+		Expect(held).To(BeTrue(), "the anchor obligation must survive a failed reinstall")
+
+		fb.clearFaults()
+		Expect(d.Continue()).NotTo(Succeed(),
+			"resuming past an unreconciled step-exit must be refused")
+		Expect(d.Kill()).To(Succeed(), "kill must remain the safe recovery")
+	})
+
+	// Release failure. The reinstall succeeded, so the breakpoint is safe, but a
+	// thread the backend could not resume is still stopped and nothing will ever
+	// deliver it. Halting suspended keeps the session inspectable and killable.
+	It("halts suspended when the anchor cannot be released", func() {
+		debugger.ExportedSetBreakpointAt(d, bpAddrA)
+
+		continueAndConsumeContinued(d)
+		qb.push(rawStop{tid: steppedTID, trap: true, pc: bpAddrA})
+		Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventBreakpointHit))
+
+		continueAndConsumeContinued(d)
+		qb.releaseErr = errInjected
+		qb.push(rawStop{tid: steppedTID, death: true})
+
+		expectHaltReported(d, "reconcile the exited step owner")
+		Expect(fb.peekMem(bpAddrA, len(trap))).To(Equal(trap),
+			"the reinstall must still have happened before the release was attempted")
+		_, held := qb.q.HeldStepOwner()
+		Expect(held).To(BeTrue(), "an anchor that could not be released stays held")
+
+		Expect(d.Continue()).NotTo(Succeed(),
+			"resuming past an unreleased anchor must be refused")
+		Expect(d.Kill()).To(Succeed(), "kill must remain the safe recovery")
 	})
 })
