@@ -12,6 +12,12 @@ import {
 import { envelope, goroutine, snapshot, thread } from "./fixtures.js";
 
 describe("telemetry codec", () => {
+  const minimalGoroutine = (id: number) => ({
+    id,
+    status: "waiting",
+    currentLoc: { file: "", line: 0 },
+  });
+
   it("decodes protocol 1.3 snapshots and emits only the read-only command", () => {
     const decoded = decodeEvent(envelope(1, "GoroutineSnapshot", snapshot()));
     assert.equal(decoded.kind, "GoroutineSnapshot");
@@ -56,6 +62,35 @@ describe("telemetry codec", () => {
     assert.equal(decoded.snapshot?.threads.length, maximumThreads);
   });
 
+  it("accepts 8193 goroutines and rejects 8194", () => {
+    assert.equal(maximumGoroutines, 8193);
+    const accepted = Array.from(
+      { length: maximumGoroutines },
+      (_, index) => minimalGoroutine(index + 1),
+    );
+    const decoded = decodeEvent(
+      envelope(1, "GoroutineSnapshot", {
+        ...snapshot(),
+        goroutines: accepted,
+      }),
+    );
+    assert.equal(decoded.snapshot?.goroutines.length, 8193);
+
+    assert.throws(
+      () =>
+        decodeEvent(
+          envelope(2, "GoroutineSnapshot", {
+            ...snapshot(),
+            goroutines: [
+              ...accepted,
+              minimalGoroutine(maximumGoroutines + 1),
+            ],
+          }),
+        ),
+      /8193 item limit/,
+    );
+  });
+
   it("rejects malformed, incompatible, oversized, and hostile payloads", () => {
     assert.throws(() => decodeEvent("{"), /valid JSON/);
     assert.throws(
@@ -65,19 +100,6 @@ describe("telemetry codec", () => {
     assert.throws(
       () => decodeEvent("x".repeat(maximumEnvelopeBytes + 1)),
       /exceeds 2 MiB/,
-    );
-    assert.throws(
-      () =>
-        decodeEvent(
-          envelope(1, "GoroutineSnapshot", {
-            ...snapshot(),
-            goroutines: Array.from(
-              { length: maximumGoroutines + 1 },
-              (_, index) => goroutine(index + 1),
-            ),
-          }),
-        ),
-      /item limit/,
     );
     assert.throws(
       () =>

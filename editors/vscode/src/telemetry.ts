@@ -3,7 +3,7 @@ import { TextDecoder } from "node:util";
 export const wireProtocolVersion = "1.3";
 export const snapshotCommandKind = "GoroutineSnapshot";
 export const maximumEnvelopeBytes = 2 * 1024 * 1024;
-export const maximumGoroutines = 5000;
+export const maximumGoroutines = 8193;
 export const maximumThreads = 2049;
 export const maximumStringLength = 4096;
 
