@@ -633,8 +633,11 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			continue
 		}
 
-		// SIGURG is Go's goroutine-preemption signal; it must be re-delivered
-		// transparently during both step and continue or scheduling breaks.
+		// SIGURG is Go's goroutine-preemption signal; it is re-delivered on the
+		// continue path so scheduling keeps working. The one thread that does
+		// not get it back is the one being single-stepped, where delivering it
+		// would step the handler rather than the instruction under the step —
+		// see stepQueue.planResume for why that is safe.
 		if sig == syscall.SIGURG {
 			if err := b.resumeAbsorbed(tid, int(sig)); err != nil {
 				return StopEvent{}, fmt.Errorf("resume after SIGURG tid %d: %w", tid, err)
@@ -721,14 +724,13 @@ func (b *linuxBackend) singleStepIfTraceeExists(tid int) error {
 // consumes that step, and a plain continue there would silently cancel it while
 // the step gate stays latched. See stepQueue.resumeFor.
 //
-// The signal is re-delivered only on the continue path. Re-delivering it with
-// PTRACE_SINGLESTEP would run the handler instead of the instruction the engine
-// asked to step, which is why the stepped thread swallows it — the pre-existing
-// SIGURG behaviour this generalises.
+// The primitive and the signal it delivers are both chosen by planResume, which
+// documents why the re-armed step drops the signal.
 func (b *linuxBackend) resumeAbsorbed(tid int, signal int) error {
-	if b.resumeFor(tid) == resumeSingleStep {
+	plan := b.planResume(tid, signal)
+	if plan.mode == resumeSingleStep {
 		b.countStepRearm()
 		return b.singleStepIfTraceeExists(tid)
 	}
-	return b.continueIfTraceeExists(tid, signal)
+	return b.continueIfTraceeExists(tid, plan.signal)
 }

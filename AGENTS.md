@@ -551,9 +551,18 @@ note below):
    `EventStepped` PC one instruction beyond single-step semantics. That is a
    real, very narrow inaccuracy rather than a purely cosmetic one — accepted
    because the alternative it replaces is a hard freeze. And the absorbed
-   signal is swallowed on that thread, because
-   re-delivering it with `PTRACE_SINGLESTEP` would step into the handler instead
-   of the instruction under test.
+   signal is swallowed on that thread: `stepQueue.planResume` chooses the
+   primitive and the delivered signal together, forwarding the signal on the
+   continue path and zeroing it on the re-arm. `PTRACE_SINGLESTEP` with a signal
+   makes the kernel build the signal frame first, so the instruction that
+   executes is the handler's, not the one under the step — the engine would then
+   reinstall the trap over an instruction that never ran and re-report the same
+   breakpoint when the handler returns. `SIGURG` is the **only** signal any
+   absorb site passes (every other passes 0), this is exactly what the pre-park
+   `SIGURG` branch already did, and the runtime sets the goroutine's preempt flag
+   before signalling, so a dropped delivery costs preemption latency and nothing
+   else. Forwarding a signal *through* a re-armed step is a per-TID
+   signal-forwarding question, not a park-queue one, and is out of scope here.
 8. **Two absorb cases cannot re-arm and must fail the wait instead.** On
    `PTRACE_EVENT_EXEC` the image the stepped-over breakpoint lived in is gone, so
    neither completing nor restoring it is meaningful; on an unrecognised
