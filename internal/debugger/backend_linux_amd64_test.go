@@ -459,10 +459,11 @@ func TestLinuxBackendWaitDrainsBeforeBlocking(t *testing.T) {
 // that planAbsorb cannot: that Wait actually acts on the plan it was given.
 //
 // The observable consequences are the reconciliation boundary, the step gate,
-// and the re-arm counter, so this asserts all three. Dropping the clearStep
-// handling latches the hardware-step gate forever, while opening the gate at
-// thread death lets a held stop bypass breakpoint reconciliation. Dropping the
-// re-arm leaves a cancelled hardware step behind the same latch.
+// and the re-arm counter, so this asserts all three. Dropping the
+// stepThreadExits handling latches the hardware-step gate forever — held stops
+// never drain and Wait never returns again — opening the gate at thread death
+// lets a held stop bypass breakpoint reconciliation, and dropping the re-arm
+// leaves a cancelled hardware step behind the same latch.
 //
 // The resumes are issued against thread ids that do not exist, so ptrace fails
 // with ESRCH and the backend swallows it; the bookkeeping under test still runs.
@@ -483,18 +484,35 @@ func TestLinuxBackendApplyAbsorbCarriesOutThePlan(t *testing.T) {
 		return b
 	}
 
-	t.Run("a dying stepped thread keeps held stops gated until reconciliation", func(t *testing.T) {
+	// A dead step owner does not simply release the gate: the engine still owns
+	// the breakpoint that was lifted for that step, and delivering the held stop
+	// before it is reinstalled loses the trap for good. The handoff is therefore
+	// three-phase, and each phase is asserted here because skipping any one of
+	// them either freezes the wait loop or drops a breakpoint silently. In
+	// particular, reporting the boundary must NOT release the stop on its own:
+	// only the engine's acknowledgement may, or the reinstall is racing a
+	// sibling that has already been handed to the engine.
+	t.Run("a dying stepped thread hands the gate to engine reconciliation", func(t *testing.T) {
 		b := newBackend()
 		if err := b.applyAbsorb(b.planAbsorb(absorbThreadExit, stepped, 0), stepped); err != nil {
 			t.Fatalf("applyAbsorb(absorbThreadExit) error = %v", err)
 		}
+		if b.stepping {
+			t.Fatal("hardware-step ownership survived its thread's death")
+		}
 		if ev, ok := b.releasable(); ok {
 			t.Fatalf("released %+v before breakpoint reconciliation", ev)
 		}
+
 		boundary, ok := b.stepExitBoundary()
-		if !ok || boundary.TID != foreign || boundary.Reason != StopStepThreadExited {
-			t.Fatalf("stepExitBoundary() = (%+v, %t), want reconciliation on tid %d", boundary, ok, foreign)
+		if !ok || boundary.Reason != StopStepThreadExited || boundary.TID != foreign {
+			t.Fatalf("stepExitBoundary() = (%+v, %t), want StopStepThreadExited anchored to the held stop's tid %d",
+				boundary, ok, foreign)
 		}
+		if ev, ok := b.releasable(); ok {
+			t.Fatalf("reporting the boundary released %+v; only the engine's acknowledgement may", ev)
+		}
+
 		b.completeStepThreadExit()
 		ev, ok := b.releasable()
 		if !ok || ev.TID != foreign {
