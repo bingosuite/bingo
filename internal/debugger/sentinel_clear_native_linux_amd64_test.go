@@ -25,6 +25,8 @@ const nativeSentinelTarget = `
 #include <sched.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <stdio.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -33,11 +35,20 @@ static const char *before_file;
 static const char *unmapped_file;
 static const char *release_file;
 static const char *mapped_file;
+static const char *ready_file;
 static volatile unsigned int probe_value;
 
 static void marker(const char *path) {
 	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 	if (fd >= 0) close(fd);
+}
+
+static void failure_marker(const char *operation) {
+	int fd = open(unmapped_file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (fd >= 0) {
+		dprintf(fd, "%s errno=%d\n", operation, errno);
+		close(fd);
+	}
 }
 
 __attribute__((noinline, aligned(4096), section(".sentinel")))
@@ -52,12 +63,19 @@ static void *remap_sentinel_page(void *unused) {
 	long page_size = sysconf(_SC_PAGESIZE);
 	uintptr_t page = (uintptr_t)&sentinel_target & ~((uintptr_t)page_size - 1);
 
+	marker(ready_file);
 	while (access(before_file, F_OK) != 0) sched_yield();
 
 	unsigned char *saved = malloc((size_t)page_size);
-	if (saved == NULL) _exit(70);
+	if (saved == NULL) {
+		failure_marker("malloc");
+		_exit(70);
+	}
 	memcpy(saved, (const void *)page, (size_t)page_size);
-	if (munmap((void *)page, (size_t)page_size) != 0) _exit(71);
+	if (munmap((void *)page, (size_t)page_size) != 0) {
+		failure_marker("munmap");
+		_exit(71);
+	}
 	marker(unmapped_file);
 
 	while (access(release_file, F_OK) != 0) sched_yield();
@@ -65,27 +83,34 @@ static void *remap_sentinel_page(void *unused) {
 	void *restored = mmap((void *)page, (size_t)page_size,
 		PROT_READ | PROT_WRITE | PROT_EXEC,
 		MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-	if (restored == MAP_FAILED) _exit(72);
+	if (restored == MAP_FAILED) {
+		failure_marker("mmap");
+		_exit(72);
+	}
 	memcpy(restored, saved, (size_t)page_size);
 	__builtin___clear_cache((char *)restored, (char *)restored + page_size);
-	if (mprotect(restored, (size_t)page_size, PROT_READ | PROT_EXEC) != 0) _exit(73);
+	if (mprotect(restored, (size_t)page_size, PROT_READ | PROT_EXEC) != 0) {
+		failure_marker("mprotect");
+		_exit(73);
+	}
 	marker(mapped_file);
 	return NULL;
 }
 
 int main(int argc, char **argv) {
 	pthread_t remapper;
-	if (argc == 5) {
+	if (argc == 6) {
 		before_file = argv[1];
 		unmapped_file = argv[2];
 		release_file = argv[3];
 		mapped_file = argv[4];
+		ready_file = argv[5];
 		if (pthread_create(&remapper, NULL, remap_sentinel_page, NULL) != 0) return 74;
 	}
 
 	sentinel_target();
 
-	if (argc == 5 && pthread_join(remapper, NULL) != 0) return 75;
+	if (argc == 6 && pthread_join(remapper, NULL) != 0) return 75;
 	return 0;
 }
 `
@@ -207,15 +232,19 @@ func runNativeSentinelRemapExperiment(t *testing.T, binary, source string, break
 	unmappedFile := filepath.Join(dir, "unmapped")
 	releaseFile := filepath.Join(dir, "release")
 	mappedFile := filepath.Join(dir, "mapped")
+	readyFile := filepath.Join(dir, "remapper-ready")
 
 	backend := &observingNativeBackend{Backend: newBackend()}
 	d := newEngine(backend, nil)
 	defer func() { _ = d.Kill() }()
 
 	sentinelAddr := launchAndArmNativeSentinel(t, d, backend, binary, source, breakpointLine,
-		[]string{beforeFile, unmappedFile, releaseFile, mappedFile},
+		[]string{beforeFile, unmappedFile, releaseFile, mappedFile, readyFile},
 		func(addr uint64) {
 			backend.configureSentinelClear(addr, archTrapInstruction(), beforeFile, unmappedFile)
+			if err := waitForNativePath(readyFile, 5*time.Second); err != nil {
+				t.Fatalf("remapper did not start before StepOver: %v", err)
+			}
 		})
 
 	first := waitNativeEvent(t, d, protocol.EventStepped)
@@ -227,6 +256,11 @@ func runNativeSentinelRemapExperiment(t *testing.T, binary, source string, break
 	}
 	if err := waitForNativePath(unmappedFile, time.Second); err != nil {
 		t.Fatalf("tracee never reported the sentinel page unmapped: %v", err)
+	}
+	if status, err := os.ReadFile(unmappedFile); err != nil {
+		t.Fatalf("read sentinel mapping status: %v", err)
+	} else if len(status) != 0 {
+		t.Fatalf("tracee could not unmap the sentinel page: %s", status)
 	}
 	if clears := backend.writesAt(sentinelAddr); !hasNativeClear(clears, true, archTrapInstruction()) {
 		t.Fatalf("expected real WriteMemory failure restoring sentinel at 0x%x; writes=%+v", sentinelAddr, clears)
