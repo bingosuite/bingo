@@ -1705,6 +1705,36 @@ race the walk; only backends that stop the world make the reads race-free. This
 also preserves behavior for stripped binaries / attach-without-DWARF and keeps
 the `fakeBackend` engine unit tests green.
 
+**Coherent metadata reads — the half degradation can't cover.** Degradation
+answers reads that *fail*. It cannot answer reads that all *succeed* while
+being mutually inconsistent, which is the other shape of the same Linux race.
+`allgsMetadata` (`goroutines.go`) prevents that shape instead of detecting it,
+and its read **order** is the whole mechanism:
+
+- `runtime.allgadd` publishes the array pointer **before** the length. Reading
+  the pointer first can therefore pair a stale array with its larger
+  successor's length and walk past the end of the old allocation. The word
+  after a heap object is mapped, so that overrun **succeeds** — the walk
+  reports `Complete: true`, and an unrelated heap object is accepted as a
+  goroutine, fabricating a `Created` and then an `Exited` for a goroutine that
+  never existed.
+- Read the **length first, the pointer second**. This is sound only because
+  `runtime.allgs` is **append-only and never shrinks**, so a length observed
+  before a pointer always fits inside whichever array that pointer names. Do
+  not "simplify" this ordering, and do not assume a wider single read fixes it:
+  `process_vm_readv` takes no lock and is not atomic against the writer's
+  separate word stores.
+- Prefer `runtime.allglen` + `runtime.allgptr`, the runtime's own atomics,
+  which carry the documented contract ("allgptr is updated before allglen.
+  Readers should read allglen before allgptr"). The raw `runtime.allgs` header
+  is a fallback for images lacking those symbols and uses the same
+  length-before-pointer order, but its three words are ordinary
+  compiler-scheduled stores, so it is best-effort where the mirror is
+  guaranteed.
+
+Worst case under the correct order is missing a goroutine created during the
+read, which the runtime explicitly sanctions for lock-free readers. See #235.
+
 **Current goroutine = SP-containment** (platform-independent): the stopped
 thread's SP within `[g.stack.lo, g.stack.hi)`. The current *thread* is the M
 whose `curg` goid equals the current goid. A non-current goroutine's
@@ -3161,7 +3191,10 @@ through the justfile.
   (snapshot on breakpoint/pause/entry, never per-step), the degraded-snapshot
   rule (don't touch `prevGoids` on an unreadable read), and the
   automatic-snapshots-own-the-baseline rule (a `CmdGoroutineSnapshot` query
-  reports no deltas and never advances `prevGoids`).
+  reports no deltas and never advances `prevGoids`), and the
+  length-before-pointer order in `allgsMetadata` (see *Coherent metadata
+  reads*) — reordering it silently reintroduces fabricated goroutines that no
+  completeness check can catch.
 - **Breakpoint ids**: client-visible ids are the hub's session-stable logical
   ids (see
   [Breakpoint identity](#breakpoint-identity--hub-owned-logical-ids)). A new
