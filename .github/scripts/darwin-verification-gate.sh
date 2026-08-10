@@ -21,7 +21,7 @@ readonly darwin_native_exts='swigcxx|swig|f90|for|syso|cpp|cxx|hpp|hxx|cc|hh|sx|
 readonly darwin_native_regex="^(internal/debugger/.*|test/integration/.*|justfile|entitlements\\.plist|go\\.(mod|sum)|(.*/)?[^/]*_(darwin|arm64)(_[^/.]+)*\\.(go|$darwin_native_exts)|(.*/)?[^/]*\\.($darwin_native_exts))\$"
 
 event_action=$(jq -er '.action' "$GITHUB_EVENT_PATH")
-pr_number=$(jq -er '.pull_request.number' "$GITHUB_EVENT_PATH")
+pr_number=$(jq -er '.pull_request.number | select(type == "number" and . > 0 and . == floor) | tostring' "$GITHUB_EVENT_PATH")
 head_sha=$(jq -er '.pull_request.head.sha | select(test("^[0-9a-fA-F]{40,64}$"))' "$GITHUB_EVENT_PATH")
 base_sha=$(jq -er '.pull_request.base.sha | select(test("^[0-9a-fA-F]{40,64}$"))' "$GITHUB_EVENT_PATH")
 base_ref=$(jq -er '.pull_request.base.ref // ""' "$GITHUB_EVENT_PATH")
@@ -230,8 +230,21 @@ scan_blob_for_build_constraint() {
     target=$blob_scan
   fi
 
+  # `//go:build` / `// +build` are the explicit constraint forms, but a cgo file
+  # can be Darwin-specific with none of them: `#cgo darwin CFLAGS: …` inside the
+  # preamble makes the file's native behaviour platform-dependent, and
+  # `import "C"` alone pulls in a C toolchain whose flags may differ per OS.
+  # Both are cheap to detect and gating them only over-gates.
   if grep -Eq '^[[:space:]]*//[[:space:]]*(go:build|\+build)[[:space:]]' \
     "$target"; then
+    return 0
+  fi
+
+  # cgo preambles appear either as `// #cgo …` line comments or as bare `#cgo …`
+  # lines inside the `/* … */` block that precedes `import "C"`. A bare `#cgo`
+  # at the start of a line is not valid Go outside such a comment, so anchoring
+  # there cannot false-positive on real code.
+  if grep -Eq '^[[:space:]]*(//[[:space:]]*)?#cgo[[:space:]]' "$target"; then
     return 0
   fi
 
@@ -317,6 +330,18 @@ merge_base_tree_sha=$(trap - ERR; gh api \
   "repos/$GITHUB_REPOSITORY/git/commits/$merge_base_sha" --jq '.tree.sha')
 head_tree_sha=$(trap - ERR; gh api \
   "repos/$GITHUB_REPOSITORY/git/commits/$head_sha" --jq '.tree.sha')
+
+# These reach a URL path. They come from GitHub, not the PR, but an unexpected
+# shape must not be pasted into a request — reject it here rather than relying
+# on the resulting 404 to fail closed.
+for tree_sha in "$merge_base_tree_sha" "$head_tree_sha"; do
+  case "$tree_sha" in
+    '' | *[!0-9a-fA-F]*)
+      echo "Git commit API returned an invalid tree SHA." >&2
+      false
+      ;;
+  esac
+done
 
 gh api "repos/$GITHUB_REPOSITORY/git/trees/$merge_base_tree_sha?recursive=1" \
   > "$base_tree_json"

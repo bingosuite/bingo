@@ -15,6 +15,10 @@ workflow="$repo_root/.github/workflows/darwin-verification-gate.yml"
 policy_test_workflow="$repo_root/.github/workflows/darwin-verification-policy-test.yml"
 
 tmpdir=$(mktemp -d)
+
+# Injected into every attacker-controlled field of the synthetic event.
+# A `gh` invocation carrying it means the gate consumed PR-authored text.
+untrusted_token='PRTEXTPOISON9f3a'
 trap 'rm -rf "$tmpdir"' EXIT
 
 failures=0
@@ -123,7 +127,7 @@ case "$*" in
     exit 0
     ;;
   *"/pulls/"*/*)
-    echo "mock: mutable pull request sub-resource is banned: $path" >&2
+    echo "mock: mutable pull request sub-resource is banned: $*" >&2
     exit 92
     ;;
   *"/pulls/"*)
@@ -296,6 +300,8 @@ run_case() {
   local gh_expect=''
   local gh_missing=''
   local expect_label_query=''
+  local pr_number=17
+  local head_tree_sha_override=''
 
   local kv key value
   for kv in "$@"; do
@@ -344,6 +350,8 @@ run_case() {
       gh_expect) gh_expect=$value ;;
       gh_missing) gh_missing=$value ;;
       expect_label_query) expect_label_query=$value ;;
+      pr_number) pr_number=$value ;;
+      head_tree_sha_override) head_tree_sha_override=$value ;;
       *)
         fail "$name: unknown harness key '$key'"
         return
@@ -396,15 +404,24 @@ run_case() {
     --arg actor "$actor" \
     --arg actor_type "$actor_type" \
     --argjson changes "$edited_changes" \
+    --arg poison "$untrusted_token" \
+    --argjson pr_number "$pr_number" \
     '{
       action: $action,
       sender: {login: $actor, type: $actor_type},
       label: {name: $label},
       changes: $changes,
       pull_request: {
-        number: 17,
+        number: $pr_number,
         state: "open",
-        head: {sha: $head, repo: {full_name: $head_repo}},
+        title: ($poison + "-title"),
+        body: ($poison + "-body"),
+        head: {
+          sha: $head,
+          ref: ($poison + "-branch"),
+          label: ($poison + "-label"),
+          repo: {full_name: $head_repo}
+        },
         base: {sha: $base, ref: $base_ref}
       }
     }' > "$event"
@@ -458,7 +475,7 @@ run_case() {
     MOCK_MERGE_BASE_SHA="$merge_base_sha" \
     MOCK_HEAD_SHA="$head_sha" \
     MOCK_BASE_TREE_SHA=$(printf 'da%038x' $((case_id * 2))) \
-    MOCK_HEAD_TREE_SHA=$(printf 'da%038x' $((case_id * 2 + 1))) \
+    MOCK_HEAD_TREE_SHA="${head_tree_sha_override:-$(printf 'da%038x' $((case_id * 2 + 1)))}" \
     MOCK_BASE_TREE_ENTRIES="$base_entries" \
     MOCK_HEAD_TREE_ENTRIES="$head_entries" \
     MOCK_BASE_TREE_TRUNCATED="$base_tree_truncated" \
@@ -556,8 +573,9 @@ run_case() {
     fail "$name: gate passed shell metacharacters to gh"
     ok=0
   fi
-  if [ -n "${CASE_UNTRUSTED_TOKEN:-}" ] &&
-    grep -Fq "$CASE_UNTRUSTED_TOKEN" "$work/gh.log"; then
+  # Every synthetic event carries this token in its title, body, head ref and
+  # head label — all attacker-controlled. None may ever reach the API surface.
+  if grep -Fq "$untrusted_token" "$work/gh.log"; then
     fail "$name: gate consumed untrusted pull request content"
     ok=0
   fi
@@ -595,6 +613,22 @@ func Noop() {}
 legacy_source='// +build darwin
 
 package debugger
+'
+
+# A cgo preamble makes a file platform-dependent with no explicit constraint.
+cgo_source='package debugger
+
+/*
+#cgo darwin LDFLAGS: -framework CoreFoundation
+*/
+import "C"
+'
+
+# A comment that merely mentions cgo must not gate.
+cgo_mention_source='package hub
+
+// The debugger uses #cgo directives on darwin, but this file does not.
+func Noop() {}
 '
 
 # A header long enough that a naive fixed-size prefix read would miss the
@@ -642,6 +676,22 @@ run_case "unsupported event actions publish nothing" \
 # ---------------------------------------------------------------------------
 # Blocker 1 + 5: trigger scope, base binding, SHA-global statuses
 # ---------------------------------------------------------------------------
+
+# Both of these values reach a URL path. Neither is PR-authored, but a
+# malformed one must be refused rather than pasted into a request.
+# jq -e exits 4 when the filter selects nothing; any non-zero exit before a
+# decision is recorded makes the workflow's always() fallback fail the head.
+run_case "a non-numeric pull request number is refused before any API call" \
+  pr_number='"17/../../evil"' \
+  expect_exit=4 expect_states='' expect_decision='' \
+  gh_missing='api'
+
+run_case "a malformed tree SHA is refused before the tree is fetched" \
+  head_entries='["internal/hub/hub.go"]' \
+  head_tree_sha_override='not-a-sha' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_output='invalid tree SHA' \
+  gh_missing='/git/trees/'
 
 run_case "a pull request targeting another base is refused outright" \
   base_ref=release-1.x \
@@ -793,6 +843,24 @@ run_case "a legacy // +build constraint gates" \
   blob_contents="$(jq -n --arg src "$legacy_source" '{"0":$src}')" \
   expect_exit=1 expect_states='pending,failure' expect_decision=failure \
   expect_output='internal/hub/legacy.go'
+
+# A cgo preamble is platform-dependent with no explicit build constraint, so a
+# `#cgo darwin` directive must gate on its own.
+run_case "a cgo preamble gates a Go file with no build constraint" \
+  head_entries='["internal/hub/bridge.go"]' \
+  blob_contents="$(jq -n --arg src "$cgo_source" '{"0":$src}')" \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_output='internal/hub/bridge.go'
+
+run_case "deleting a cgo file still gates" \
+  base_entries='["internal/hub/bridge.go"]' head_entries='[]' \
+  blob_contents="$(jq -n --arg src "$cgo_source" '{"0":$src}')" \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure
+
+run_case "merely mentioning cgo in prose does not gate" \
+  head_entries='["internal/hub/notes.go"]' \
+  blob_contents="$(jq -n --arg src "$cgo_mention_source" '{"0":$src}')" \
+  expect_exit=0 expect_states='pending,success' expect_decision=success
 
 run_case "an unconstrained Go file does not gate" \
   head_entries='["internal/hub/plain.go"]' \
@@ -1375,13 +1443,23 @@ trusted_workflow_runs_trusted_policy_only() {
 # injection with statuses:write and pull-requests:write. Untrusted values may
 # only enter through `env:`, where they are variables and not code.
 trusted_workflow_never_interpolates_into_run() {
+  # Covers all four shell-bearing forms an expression could reach: a `run:`
+  # block scalar (`|` or `>`), a single-line `run:`, and an `actions/github-script`
+  # `script:` block. `env:`/`concurrency:` interpolation stays allowed — those
+  # do not build a shell word.
   awk '
-    /^ *run: *\|/ {inside = 1; indent = match($0, /[^ ]/); next}
+    /^ *(run|script): *[|>][-+0-9]* *$/ {
+      inside = 1
+      indent = match($0, /[^ ]/)
+      next
+    }
     inside {
       here = match($0, /[^ ]/)
       if ($0 !~ /^ *$/ && here <= indent) {inside = 0}
     }
     inside && /\$\{\{/ {bad = 1}
+    # A single-line `run:`/`script:` value is a shell word on its own line.
+    !inside && /^ *(run|script): *[^|>]/ && /\$\{\{/ {bad = 1}
     END {exit bad ? 1 : 0}
   ' "$workflow"
 }
@@ -1532,6 +1610,19 @@ gate_uses_immutable_diff() {
     ! grep -Eq 'pulls/[^"]*/files' "$gate"
 }
 
+# The "gate never consumes PR-authored text" invariant is only meaningful while
+# the synthetic event actually carries the poison token in every field an
+# attacker controls. An earlier revision gated that check behind a per-case
+# variable no case ever set, making it silently vacuous.
+harness_poisons_every_attacker_controlled_field() {
+  local field
+  for field in title body ref label; do
+    grep -Eq "$field: \(\\\$poison \+" "$0" || return 1
+  done
+  grep -q '\--arg poison "\$untrusted_token"' "$0" &&
+    grep -q 'grep -Fq "\$untrusted_token" "\$work/gh.log"' "$0"
+}
+
 gate_enforces_the_required_base_ref() {
   grep -q "required_base_ref='main'" "$gate" &&
     grep -q 'base_ref" != "\$required_base_ref' "$gate"
@@ -1584,9 +1675,10 @@ gate_publishes_only_from_the_top_level_shell() {
 
   # Backticks, process substitution and explicit grouping subshells all inherit
   # the ERR trap under `set -E` exactly like `$( )` does. The grouping form is
-  # anchored to command position so parentheses inside regexes and message
-  # strings — of which this script has many — are not false positives.
-  local banned='`|<\(|>\(|(^|[;&|{] *)\([ \t]*[a-z_]'
+  # anchored to command position — line start, after a separator, or after a
+  # block keyword — so parentheses inside regexes and message strings, of which
+  # this script has many, are not false positives.
+  local banned='`|<\(|>\(|((^|[;&|{])[ \t]*|(^|[ \t;&|{])[ \t]*(then|else|do|elif|in)[ \t]+)\([ \t]*[A-Za-z_$]'
   if grep -Eq "$banned" "$region"; then
     printf 'banned subshell form in the ERR-trap region:\n' >&2
     grep -En "$banned" "$region" >&2
@@ -1616,6 +1708,8 @@ check "trusted workflow has no job scope override" \
 check "trusted workflow subscribes to gated actions" \
   trusted_subscribes_to_gated_actions
 check "gate uses immutable diff" gate_uses_immutable_diff
+check "harness poisons every attacker controlled field" \
+  harness_poisons_every_attacker_controlled_field
 check "gate covers every go/build native extension" \
   gate_covers_every_go_build_extension
 check "trusted workflow runs trusted policy only" trusted_workflow_runs_trusted_policy_only
