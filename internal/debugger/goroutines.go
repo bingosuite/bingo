@@ -37,6 +37,9 @@ const (
 	// maxCurrentThreadScan bounds the targeted continuation past the rich allm
 	// prefix. It reads only enough fields to find the stopped M or current g.
 	maxCurrentThreadScan = 2048
+	// maxCurrentIdentityBytes bounds the single bulk read used by regular steps.
+	// Runtime g fields are compact; unusual layouts fall back to individual reads.
+	maxCurrentIdentityBytes = 4096
 	// maxGoStringLen caps a wait-reason string read from tracee memory.
 	maxGoStringLen = 256
 
@@ -271,6 +274,12 @@ type goroutineHeader struct {
 	status uint32
 }
 
+type currentGoroutineFields struct {
+	header goroutineHeader
+	lo     uint64
+	hi     uint64
+}
+
 type currentGoroutineDetail uint8
 
 const (
@@ -362,6 +371,78 @@ func (e *engine) readGoroutineHeader(l *goLayout, gptr uint64) (goroutineHeader,
 
 func (h goroutineHeader) included() bool {
 	return h.goid > 0 && h.status != gStatusDead
+}
+
+func (e *engine) readCurrentGoroutineFields(
+	l *goLayout,
+	gptr uint64,
+	includeStack bool,
+) (currentGoroutineFields, bool) {
+	type identityField struct {
+		offset uint64
+		size   uint64
+	}
+	offsets := []identityField{
+		{offset: uint64(l.gAtomicstatus), size: 4},
+		{offset: uint64(l.gGoid), size: 8},
+	}
+	if includeStack {
+		offsets = append(offsets,
+			identityField{offset: uint64(l.gStack) + uint64(l.stackLo), size: 8},
+			identityField{offset: uint64(l.gStack) + uint64(l.stackHi), size: 8},
+		)
+	}
+	start := offsets[0].offset
+	end := uint64(0)
+	for _, field := range offsets {
+		if field.offset < start {
+			start = field.offset
+		}
+		if field.offset > ^uint64(0)-field.size {
+			return e.readCurrentGoroutineFieldsIndividually(l, gptr, includeStack)
+		}
+		if fieldEnd := field.offset + field.size; fieldEnd > end {
+			end = fieldEnd
+		}
+	}
+	if end < start || end-start > maxCurrentIdentityBytes ||
+		gptr > ^uint64(0)-start {
+		return e.readCurrentGoroutineFieldsIndividually(l, gptr, includeStack)
+	}
+	raw := make([]byte, end-start)
+	if err := e.backend.ReadMemory(gptr+start, raw); err != nil {
+		return currentGoroutineFields{}, false
+	}
+	at := func(offset uint64) []byte {
+		return raw[offset-start:]
+	}
+	fields := currentGoroutineFields{
+		header: goroutineHeader{
+			goid:   int64(binary.LittleEndian.Uint64(at(offsets[1].offset))),
+			status: binary.LittleEndian.Uint32(at(offsets[0].offset)) &^ gScanBit,
+		},
+	}
+	if includeStack {
+		fields.lo = binary.LittleEndian.Uint64(at(offsets[2].offset))
+		fields.hi = binary.LittleEndian.Uint64(at(offsets[3].offset))
+	}
+	return fields, true
+}
+
+func (e *engine) readCurrentGoroutineFieldsIndividually(
+	l *goLayout,
+	gptr uint64,
+	includeStack bool,
+) (currentGoroutineFields, bool) {
+	header, ok := e.readGoroutineHeader(l, gptr)
+	if !ok {
+		return currentGoroutineFields{}, false
+	}
+	if !includeStack {
+		return currentGoroutineFields{header: header}, true
+	}
+	lo, hi, ok := e.readGoroutineStackBounds(l, gptr)
+	return currentGoroutineFields{header: header, lo: lo, hi: hi}, ok
 }
 
 func (e *engine) readGoroutineStackBounds(l *goLayout, gptr uint64) (lo, hi uint64, ok bool) {
@@ -604,13 +685,13 @@ func (e *engine) currentGoroutineFromRegister(
 	gptr, liveSP, livePC uint64,
 	detail currentGoroutineDetail,
 ) currentGoroutineResult {
-	header, ok := e.readGoroutineHeader(l, gptr)
+	fields, ok := e.readCurrentGoroutineFields(l, gptr, true)
 	if !ok {
 		return currentGoroutineResult{}
 	}
-	if header.goid > 0 {
+	if fields.header.goid > 0 {
 		if detail == currentGoroutineIdentity {
-			return e.currentGoroutineIdentityFromHeader(l, gptr, liveSP, true, header)
+			return currentGoroutineIdentityFromFields(liveSP, true, fields)
 		}
 		result := e.readGoroutine(l, gptr, liveSP, livePC)
 		if !result.Complete {
@@ -625,7 +706,7 @@ func (e *engine) currentGoroutineFromRegister(
 		}
 		return currentGoroutineResult{Complete: true}
 	}
-	if header.goid != 0 {
+	if fields.header.goid != 0 {
 		return currentGoroutineResult{Complete: true}
 	}
 	mptr, ok := e.readU64(gptr + uint64(l.gM))
@@ -711,35 +792,30 @@ func (e *engine) readCurrentGoroutineIdentity(
 	gptr, liveSP uint64,
 	requireStack bool,
 ) currentGoroutineResult {
-	header, ok := e.readGoroutineHeader(l, gptr)
+	fields, ok := e.readCurrentGoroutineFields(l, gptr, requireStack)
 	if !ok {
 		return currentGoroutineResult{}
 	}
-	return e.currentGoroutineIdentityFromHeader(l, gptr, liveSP, requireStack, header)
+	return currentGoroutineIdentityFromFields(liveSP, requireStack, fields)
 }
 
-func (e *engine) currentGoroutineIdentityFromHeader(
-	l *goLayout,
-	gptr, liveSP uint64,
+func currentGoroutineIdentityFromFields(
+	liveSP uint64,
 	requireStack bool,
-	header goroutineHeader,
+	fields currentGoroutineFields,
 ) currentGoroutineResult {
-	if !header.included() {
+	if !fields.header.included() {
 		return currentGoroutineResult{Complete: true}
 	}
 	if requireStack {
-		lo, hi, ok := e.readGoroutineStackBounds(l, gptr)
-		if !ok {
-			return currentGoroutineResult{}
-		}
-		if !stackContainsSP(lo, hi, liveSP) {
+		if !stackContainsSP(fields.lo, fields.hi, liveSP) {
 			return currentGoroutineResult{Complete: true}
 		}
 	}
 	return currentGoroutineResult{
 		Item: protocol.Goroutine{
-			ID:      int(header.goid),
-			Status:  goStatusString(header.status),
+			ID:      int(fields.header.goid),
+			Status:  goStatusString(fields.header.status),
 			Current: true,
 		},
 		Found:    true,
@@ -1017,14 +1093,16 @@ func unknownGoroutine(loc protocol.Location) protocol.Goroutine {
 // giving DAP a precise thread id whenever the ABI or stopped M can provide one.
 func (e *engine) targetedCurrentGoroutine(
 	fallbackLoc protocol.Location,
+	tid int,
+	regs Registers,
 ) protocol.Goroutine {
 	l, ok := e.getGoLayout()
 	if !ok {
 		return unknownGoroutine(fallbackLoc)
 	}
-	tid, sp, pc, currentGptr := e.liveRegisters()
+	currentGptr, _ := e.archCurrentGoroutinePointer(regs)
 	current := e.resolveTargetedCurrentGoroutine(
-		l, sp, pc, currentGptr, tid, currentGoroutineIdentity,
+		l, regs.SP, regs.PC, currentGptr, tid, currentGoroutineIdentity,
 	)
 	if !current.Complete || !current.Found {
 		return unknownGoroutine(fallbackLoc)

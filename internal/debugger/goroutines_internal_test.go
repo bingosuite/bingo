@@ -391,19 +391,30 @@ func TestCurrentGoroutineIdentityReadsOnlyRequiredFields(t *testing.T) {
 		t.Fatalf("current identity = %+v, want current g42", result)
 	}
 
-	required := []uint64{
-		gptr + uint64(layout.gAtomicstatus),
-		gptr + uint64(layout.gGoid),
-		gptr + uint64(layout.gStack) + uint64(layout.stackLo),
-		gptr + uint64(layout.gStack) + uint64(layout.stackHi),
+	if len(backend.reads) != 1 || backend.reads[gptr] != 1 {
+		t.Fatalf("read addresses = %#v, want one bounded bulk identity read at %#x", backend.reads, gptr)
 	}
-	if len(backend.reads) != len(required) {
-		t.Fatalf("read addresses = %#v, want only %d required identity fields", backend.reads, len(required))
+}
+
+func TestCurrentGoroutineIdentityWideLayoutKeepsReadsBounded(t *testing.T) {
+	const (
+		gptr   = uint64(0x200000)
+		liveSP = uint64(0x8008)
+	)
+	layout := goroutineTestLayout()
+	layout.gGoid = maxCurrentIdentityBytes * 2
+	backend := newGoroutineMemoryBackend()
+	seedTestGoroutine(backend, layout, gptr, 42, 0x8000, 0x9000)
+
+	e := &engine{backend: backend}
+	result := e.currentGoroutineFromRegister(
+		layout, gptr, liveSP, 0x1234, currentGoroutineIdentity,
+	)
+	if !result.Complete || !result.Found || result.Item.ID != 42 {
+		t.Fatalf("current identity = %+v, want current g42", result)
 	}
-	for _, addr := range required {
-		if backend.reads[addr] != 1 {
-			t.Fatalf("reads at %#x = %d, want 1", addr, backend.reads[addr])
-		}
+	if len(backend.reads) != 4 {
+		t.Fatalf("read addresses = %#v, want four bounded field reads", backend.reads)
 	}
 }
 

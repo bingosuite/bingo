@@ -1439,18 +1439,28 @@ func (e *engine) collectFrames(tid int) ([]protocol.Frame, error) {
 	if e.dw == nil {
 		return nil, nil
 	}
+	frames, _, _, err := e.collectFramesAndRegisters(tid)
+	return frames, err
+}
+
+func (e *engine) collectFramesAndRegisters(
+	tid int,
+) ([]protocol.Frame, int, Registers, error) {
 	if tid == 0 {
 		threads, err := e.backend.Threads()
 		if err != nil || len(threads) == 0 {
-			return nil, fmt.Errorf("StackFrames: no threads")
+			return nil, 0, Registers{}, fmt.Errorf("StackFrames: no threads")
 		}
 		tid = threads[0]
 	}
 	regs, err := e.backend.GetRegisters(tid)
 	if err != nil {
-		return nil, fmt.Errorf("StackFrames: %w", err)
+		return nil, tid, Registers{}, fmt.Errorf("StackFrames: %w", err)
 	}
-	return e.dw.FramesForStack(e.walkStack(regs)), nil
+	if e.dw == nil {
+		return nil, tid, regs, nil
+	}
+	return e.dw.FramesForStack(e.walkStack(regs)), tid, regs, nil
 }
 
 func (e *engine) walkStack(regs Registers) []uint64 {
@@ -1607,7 +1617,7 @@ func (e *engine) emitStepped(stop StopEvent) {
 	// Completing a step suspends for a self-stop, which cancels any pending
 	// Pause the same way a breakpoint hit does (see emitBreakpointHit).
 	e.manualStopPending = false
-	frames, _ := e.collectFrames(stop.TID)
+	frames, tid, regs, regsErr := e.collectFramesAndRegisters(stop.TID)
 	loc := protocol.Location{}
 	if e.dw != nil {
 		loc = e.dw.locationForPC(stop.PC)
@@ -1616,11 +1626,15 @@ func (e *engine) emitStepped(stop StopEvent) {
 	if len(frames) > 0 {
 		currentLoc = frames[0].Location
 	}
+	current := unknownGoroutine(currentLoc)
+	if regsErr == nil {
+		current = e.targetedCurrentGoroutine(currentLoc, tid, regs)
+	}
 	// Steps are high-frequency and must stay cheap: identify the stopped
 	// goroutine through bounded register/stopped-M reads without scanning allgs.
 	// The rich snapshot remains limited to breakpoint/pause/entry stops.
 	e.emit(protocol.EventStepped, protocol.SteppedPayload{
-		Goroutine: e.targetedCurrentGoroutine(currentLoc),
+		Goroutine: current,
 		Location:  loc,
 		Frames:    frames,
 	})
