@@ -51,6 +51,7 @@ var _ = Describe("Linux amd64 debugger backend (ptrace) E2E", Label("linux"), fu
 	declareStepOverlapKillSpec()
 	declareStepOwnerExitSpec()
 	declareStepOwnerHoldSpec()
+	declareLeaderRetirementSpec()
 })
 
 // overlapTargetSrc pounds two breakpoint-able lines from several
@@ -1250,5 +1251,97 @@ func declareStepOwnerHoldSpec() {
 				"the reconciled breakpoint must still be clearable by its id")
 			AddReportEntry("overlap-held-step-owners", held)
 			AddReportEntry("overlap-held-step-owner-exits", exits)
+		})
+}
+
+// dethreadTargetSrc makes a NON-LEADER thread call execve().
+//
+// The kernel's de_thread() then retires the old leader: the execing thread takes
+// over the leader's pid, and the retired task's exit is reported to the tracer as
+// PTRACE_EVENT_EXIT under tid == pid — while the process is very much alive and
+// about to run a new image. Its GETEVENTMSG status decodes to an ordinary
+// "exited, code 0", so nothing at that stop distinguishes it from a real exit.
+//
+// The idle threads exist so the execve genuinely goes through de_thread rather
+// than the single-threaded fast path.
+const dethreadTargetSrc = `#include <pthread.h>
+#include <unistd.h>
+
+static void *idle(void *unused) {
+	(void)unused;
+	for (;;) { usleep(20000); }
+	return NULL;
+}
+
+static void *execer(void *unused) {
+	(void)unused;
+	usleep(400000);
+	char *argv[] = {"/bin/true", NULL};
+	char *envp[] = {NULL};
+	execve("/bin/true", argv, envp);
+	_exit(9);
+	return NULL;
+}
+
+int main(void) {
+	pthread_t i1, i2, e;
+	alarm(180);
+	pthread_create(&i1, NULL, idle, NULL);
+	pthread_create(&i2, NULL, idle, NULL);
+	pthread_create(&e, NULL, execer, NULL);
+	for (;;) { pause(); }
+}
+`
+
+func buildDethreadTarget() string {
+	GinkgoHelper()
+	dir := GinkgoT().TempDir()
+	src := filepath.Join(dir, "dethread_target.c")
+	Expect(os.WriteFile(src, []byte(dethreadTargetSrc), 0o600)).To(Succeed())
+	bin := filepath.Join(dir, "dethread_target")
+	cmd := exec.Command("gcc", "-g", "-O0", "-no-pie", "-pthread", "-std=gnu11", "-o", bin, src)
+	out, err := cmd.CombinedOutput()
+	Expect(err).NotTo(HaveOccurred(), "build de_thread target:\n%s", out)
+	return bin
+}
+
+// declareLeaderRetirementSpec is the native proof for the leader-retirement
+// rule, and the only place the real de_thread() sequence is driven through the
+// whole engine.
+//
+// Before the fix, the retired leader's PTRACE_EVENT_EXIT was taken as proof of
+// whole-process death: the backend purged, read the status, and returned a
+// terminal, so the engine reported EventProcessExited with exit code 0 for a
+// process that was alive and had just replaced its image. The exec that follows
+// was never even seen.
+//
+// The assertion is deliberately about WHICH terminal is reported, not merely
+// that the session ends. Both the buggy and the fixed build end the session, so
+// "it stopped" proves nothing; only the kind distinguishes them. A false
+// ProcessExited(0) is the bug, an EventError naming the image replacement is the
+// fix.
+func declareLeaderRetirementSpec() {
+	It("reports an image replacement, not a process exit, when a non-leader execs",
+		Label("overlap"), func() {
+			h := newE2EHarness(buildDethreadTarget())
+			h.waitFor(20*time.Second, protocol.EventStepped)
+
+			Expect(h.d.Continue()).To(Succeed())
+			evt := awaitFrom(h, 60*time.Second,
+				protocol.EventError, protocol.EventProcessExited,
+				protocol.EventBreakpointHit, protocol.EventStepped)
+
+			Expect(evt.Kind).NotTo(Equal(protocol.EventProcessExited),
+				"the retired leader's PTRACE_EVENT_EXIT was reported as the process "+
+					"exiting, but de_thread() only retired it — the process is alive "+
+					"under the same pid running a new image: %s", evt.Payload)
+			Expect(evt.Kind).To(Equal(protocol.EventError),
+				"a post-startup exec must invalidate the session explicitly: %s", evt.Payload)
+
+			var errPayload protocol.ErrorPayload
+			Expect(json.Unmarshal(evt.Payload, &errPayload)).To(Succeed())
+			Expect(errPayload.Message).To(ContainSubstring("process image"),
+				"the failure must name the image replacement rather than a bare wait error")
+			AddReportEntry("overlap-leader-retirement-message", errPayload.Message)
 		})
 }

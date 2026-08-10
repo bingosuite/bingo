@@ -610,6 +610,18 @@ func (e *engine) loop() {
 					e.emitProcessExited(0)
 				} else {
 					e.emitError(protocol.CmdNone, result.err)
+					// A session-invalidating failure leaves threads stopped and
+					// owned by us — the one that triggered it, plus anything the
+					// park queue was holding. Exiting the loop closes the tracer
+					// thread, and the kernel then detaches every tracee and
+					// resumes it straight into breakpoints that are still
+					// written into its text. Discharge them explicitly instead.
+					if errors.Is(result.err, ErrSessionInvalidated) {
+						// Restoring saved bytes into an image that has already
+						// been replaced would poke old instructions at old
+						// addresses into the NEW one. Nothing of ours is in it.
+						e.discardTracee(!errors.Is(result.err, ErrImageReplaced))
+					}
 				}
 				e.drainCmds()
 				return
@@ -643,6 +655,34 @@ func (e *engine) waitLoop() {
 	select {
 	case e.stopCh <- stopResult{evt: evt, err: err}:
 	case <-e.done:
+	}
+}
+
+// discardTracee gives up the tracee after a session-invalidating backend
+// failure, without going through Kill's state machine (the loop is already on
+// its way out).
+//
+// restore says whether the original instruction bytes should be written back
+// first. They must be for a tracee that still runs the image they came from —
+// that restoration is what makes releasing its threads safe. They must NOT be
+// when an execve already replaced the image: those bytes describe addresses in a
+// program that no longer exists, so writing them would corrupt the new one.
+//
+// A launched process is then SIGKILLed and reaped, which resumes every thread
+// still ptrace-stopped — including anything the park queue held and the thread
+// whose stop failed the wait. An attached process is detached instead; the
+// kernel releases its remaining threads when the tracer thread closes.
+//
+// running is false because the waitLoop that produced this failure has already
+// delivered its result, so killProcess is the sole reaper (see #111).
+func (e *engine) discardTracee(restore bool) {
+	e.endThreadStep()
+	if restore {
+		e.bps.clearAll(e.backend)
+	}
+	if err := e.proc.kill(e.backend, false); err != nil {
+		e.log.Warn("discarding the tracee after a session-invalidating stop failed",
+			"err", err)
 	}
 }
 

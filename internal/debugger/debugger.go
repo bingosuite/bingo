@@ -5,6 +5,7 @@ package debugger
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
@@ -16,6 +17,26 @@ var (
 	ErrAlreadyRunning = errors.New("debugger: process already running")
 	ErrNoProcess      = errors.New("debugger: no process")
 	ErrNotRunning     = errors.New("debugger: process is not running")
+
+	// ErrSessionInvalidated marks a backend failure after which the tracee can
+	// no longer be described, let alone debugged — the process image was
+	// replaced, or a stop arrived in a shape the wait loop cannot interpret.
+	//
+	// It exists because those failures leave threads ptrace-stopped and owned by
+	// us. Simply reporting the error and tearing down abandons them: closing the
+	// tracer thread makes the kernel detach every tracee and RESUME it, with
+	// software breakpoints still written into its text. The engine therefore
+	// discharges the tracee explicitly — restore the original bytes, then kill a
+	// launched process or detach an attached one — before it exits its loop.
+	ErrSessionInvalidated = errors.New("debugger: session invalidated")
+
+	// ErrImageReplaced is the execve case of the above, kept distinct because it
+	// inverts one step of that cleanup: the saved instruction bytes describe an
+	// image that no longer exists, so writing them back would poke old bytes at
+	// old addresses into the NEW image and corrupt it. Breakpoint restoration is
+	// therefore skipped when the image is gone; nothing of ours is in it to
+	// remove.
+	ErrImageReplaced = fmt.Errorf("%w: process image replaced", ErrSessionInvalidated)
 )
 
 // Debugger is the interface consumed by the hub. All methods are goroutine-safe.

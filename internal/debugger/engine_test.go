@@ -3,6 +3,7 @@ package debugger_test
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sync"
 	"syscall"
 	"testing"
@@ -29,6 +30,7 @@ type fakeBackend struct {
 	tids  []int
 
 	stopCh  chan debugger.StopEvent
+	waitErr chan error
 	stopped bool
 
 	continueCalls    int
@@ -38,6 +40,7 @@ type fakeBackend struct {
 	continueCh       chan struct{}
 	writeErr         error
 	getRegistersErr  error
+	writeCount       map[uint64]int
 	setRegisterCalls []setRegistersCall
 
 	// Fault injection for the asynchronous stop-handling error paths. A test
@@ -65,8 +68,10 @@ func newFakeBackend() *fakeBackend {
 		regs:       map[int]debugger.Registers{1: {}},
 		tids:       []int{1},
 		stopCh:     make(chan debugger.StopEvent, 8),
+		waitErr:    make(chan error, 1),
 		writtenAt:  make(map[uint64][]byte),
 		continueCh: make(chan struct{}, 16),
+		writeCount: make(map[uint64]int),
 		writeErrAt: make(map[uint64]error),
 		readErrAt:  make(map[uint64]error),
 	}
@@ -230,10 +235,20 @@ func (f *fakeBackend) WriteMemory(addr uint64, src []byte) error {
 	cp := make([]byte, len(src))
 	copy(cp, src)
 	f.writtenAt[addr] = cp
+	f.writeCount[addr]++
 	for i, b := range src {
 		f.mem[addr+uint64(i)] = b
 	}
 	return nil
+}
+
+// writeCountFor reports how many times addr has been written, which is how a
+// test tells "the engine restored these bytes" from "the engine left them
+// alone" — the value can be identical either way.
+func (f *fakeBackend) writeCountFor(addr uint64) int {
+	f.memMu.RLock()
+	defer f.memMu.RUnlock()
+	return f.writeCount[addr]
 }
 
 func (f *fakeBackend) GetRegisters(tid int) (debugger.Registers, error) {
@@ -260,12 +275,20 @@ func (f *fakeBackend) SetRegisters(tid int, reg debugger.Registers) error {
 }
 
 func (f *fakeBackend) Wait() (debugger.StopEvent, error) {
-	evt, ok := <-f.stopCh
-	if !ok {
-		return debugger.StopEvent{}, debugger.ErrProcessExited
+	select {
+	case err := <-f.waitErr:
+		return debugger.StopEvent{}, err
+	case evt, ok := <-f.stopCh:
+		if !ok {
+			return debugger.StopEvent{}, debugger.ErrProcessExited
+		}
+		return evt, nil
 	}
-	return evt, nil
 }
+
+// failWait makes the next Wait report err instead of a stop, which is how a
+// backend surfaces a stop it cannot interpret at all.
+func (f *fakeBackend) failWait(err error) { f.waitErr <- err }
 
 const eventTimeout = 500 * time.Millisecond
 
@@ -625,6 +648,81 @@ var _ = Describe("Engine", func() {
 			Expect(protocol.DecodeEventPayload(next, &nextHit)).To(Succeed())
 			Expect(nextHit.Breakpoint.ID).To(Equal(firstHit.Breakpoint.ID),
 				"the original logical breakpoint ownership must survive the dead step owner")
+		})
+
+		// A backend failure marked ErrSessionInvalidated means the tracee can no
+		// longer be described: its image was replaced, or a stop arrived in a
+		// shape the wait loop cannot interpret. Those failures leave threads
+		// ptrace-stopped and owned by the debugger, and simply reporting the
+		// error abandons them — the engine's loop exits, closing the tracer
+		// thread, and the kernel then detaches every tracee and RESUMES it
+		// straight into software breakpoints still written in its text.
+		//
+		// The engine must therefore discard the tracee explicitly. Restoring the
+		// original bytes is the half a fake backend can observe; the kill/detach
+		// half runs through the same proc.kill path Kill already uses, whose
+		// reaper resumes every thread still stopped.
+		It("restores the tracee's instructions when a stop invalidates the session", func() {
+			const addr = uint64(0x4300)
+			trap := debugger.ExportedTrapInstruction()
+			fb.seedMem(addr, make([]byte, len(trap)))
+			debugger.ExportedSetBreakpointAt(d, addr)
+			Expect(fb.peekMem(addr, len(trap))).To(Equal(trap),
+				"the breakpoint must be armed before the session is invalidated")
+
+			continueAndConsumeContinued(d)
+			fb.failWait(fmt.Errorf("%w: scripted image replacement",
+				debugger.ErrSessionInvalidated))
+
+			evt := mustNextEvent(d)
+			Expect(evt.Kind).To(Equal(protocol.EventError),
+				"the invalidating cause must still reach the client")
+
+			Eventually(func() []byte { return fb.peekMem(addr, len(trap)) }).
+				ShouldNot(Equal(trap),
+					"the trap was left in the tracee: closing the tracer detaches "+
+						"and resumes every thread, so it would execute an INT3 with "+
+						"no debugger attached")
+		})
+
+		// The exec case inverts the restore. The saved bytes describe addresses
+		// in an image that no longer exists, so writing them back pokes old
+		// instructions into the NEW image and corrupts a process the debugger no
+		// longer understands. Nothing of ours is in that image to remove.
+		It("does not write saved bytes back into a replaced image", func() {
+			const addr = uint64(0x4310)
+			trap := debugger.ExportedTrapInstruction()
+			fb.seedMem(addr, make([]byte, len(trap)))
+			debugger.ExportedSetBreakpointAt(d, addr)
+			Expect(fb.peekMem(addr, len(trap))).To(Equal(trap))
+
+			continueAndConsumeContinued(d)
+			writesBefore := fb.writeCountFor(addr)
+			fb.failWait(fmt.Errorf("%w: scripted exec", debugger.ErrImageReplaced))
+
+			Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventError))
+			Consistently(func() int { return fb.writeCountFor(addr) }).
+				Should(Equal(writesBefore),
+					"the engine restored an old image's instruction bytes after an "+
+						"exec replaced it, which corrupts the new image rather than "+
+						"cleaning up the old one")
+		})
+
+		It("leaves the tracee alone when a wait failure is not session-invalidating", func() {
+			const addr = uint64(0x4320)
+			trap := debugger.ExportedTrapInstruction()
+			fb.seedMem(addr, make([]byte, len(trap)))
+			debugger.ExportedSetBreakpointAt(d, addr)
+
+			continueAndConsumeContinued(d)
+			fb.failWait(errInjected)
+
+			evt := mustNextEvent(d)
+			Expect(evt.Kind).To(Equal(protocol.EventError))
+			Consistently(func() []byte { return fb.peekMem(addr, len(trap)) }).
+				Should(Equal(trap),
+					"an ordinary wait failure keeps its pre-existing behaviour; only "+
+						"a session-invalidating one discards the tracee")
 		})
 
 		It("advances a genuine trap that reuses a retired sentinel address", func() {

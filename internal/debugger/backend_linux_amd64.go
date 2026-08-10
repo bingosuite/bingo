@@ -106,7 +106,25 @@ type linuxBackend struct {
 	// not make the selected thread stopped or suppress normal ptrace errors.
 	lastStopTID atomic.Int64
 
-	// waitFn/contFn/stepFn are the three kernel calls the wait loop makes. Nil
+	// leaderExitStatus/leaderExitStashed hold the wait(2)-encoded status read at
+	// the thread-group leader's PTRACE_EVENT_EXIT, which is EVIDENCE of a
+	// terminal rather than proof of one.
+	//
+	// de_thread() retires the old leader when a NON-leader calls execve(): the
+	// execing thread takes over the leader's pid and the retired task's exit is
+	// reported as EVENT_EXIT under tid == pid while the process lives on. A
+	// leader that merely pthread_exit()s produces the same shape. In both cases
+	// the decoded status is an ordinary "exited, code 0", indistinguishable from
+	// a genuine clean exit — verified against Linux 6.10 — so the terminal can
+	// only be committed once the whole group is actually gone, and must be
+	// retracted when a later exec proves retirement.
+	//
+	// Touched only inside Wait, like the park queue, so it needs no lock.
+	leaderExitStatus  uint
+	leaderExitStashed bool
+
+	// waitFn/contFn/stepFn/eventMsgFn are the four kernel calls the wait loop
+	// makes. Nil
 	// means the real syscall; only tests set them, and they exist because
 	// nothing else can reach the loop's branch bodies.
 	//
@@ -119,9 +137,24 @@ type linuxBackend struct {
 	// back into a bare PTRACE_CONT passed the entire unit suite. Scripting the
 	// wait statuses is what makes those branches executable, so the mutation
 	// fails a test instead of shipping a freeze.
-	waitFn func(ws *syscall.WaitStatus) (int, error)
-	contFn func(tid int, signal int) error
-	stepFn func(tid int) error
+	waitFn     func(ws *syscall.WaitStatus) (int, error)
+	contFn     func(tid int, signal int) error
+	stepFn     func(tid int) error
+	eventMsgFn func(tid int) (uint, error)
+}
+
+// eventMsg reads the message the kernel attached to a PTRACE_EVENT stop: the
+// wait(2)-encoded status at EVENT_EXIT, the execing thread's former tid at
+// EVENT_EXEC. Like the other kernel calls it is seam-able so the wait loop's
+// branches can be driven without a tracee.
+func (b *linuxBackend) eventMsg(tid int) (uint, error) {
+	if b.eventMsgFn != nil {
+		return b.eventMsgFn(tid)
+	}
+	var msg uint
+	var err error
+	b.execPtrace(func() { msg, err = syscall.PtraceGetEventMsg(tid) })
+	return msg, err
 }
 
 // waitAny blocks for the next stop from any thread of the tracee. WALL includes
@@ -174,6 +207,62 @@ func (b *linuxBackend) completeStepThreadExit() error {
 }
 
 func (b *linuxBackend) execPtrace(fn func()) { b.tracer.execPtrace(fn) }
+
+// noteLeaderExit records the status read at the leader's PTRACE_EVENT_EXIT
+// without committing to a terminal. See the field doc for why that stop is not
+// proof the process is dying.
+func (b *linuxBackend) noteLeaderExit(status uint, ok bool) {
+	b.leaderExitStatus = status
+	b.leaderExitStashed = ok
+}
+
+// retractLeaderExit discards a stashed leader exit because an exec proved the
+// leader was retired by de_thread() rather than the process dying. It reports
+// whether anything was actually retracted, purely so the exec diagnostic can say
+// so.
+func (b *linuxBackend) retractLeaderExit() bool {
+	had := b.leaderExitStashed
+	b.leaderExitStashed = false
+	b.leaderExitStatus = 0
+	return had
+}
+
+// commitLeaderExit turns a confirmed group death into the terminal stop.
+//
+// The status wait4 actually reported wins whenever there is one: the
+// thread-group leader's wait status carries the GROUP exit code, whereas the
+// PTRACE_EVENT_EXIT payload is only that TASK's do_exit value. Those differ
+// exactly when the leader dies separately from the group — a leader that
+// pthread_exit()s with 0 while a surviving worker later calls exit_group(7)
+// must report 7, not 0.
+//
+// The stash is the fallback for the one case with no observed status at all:
+// ECHILD, where the group is gone and nothing is left to ask. Reading it at the
+// EVENT_EXIT stop remains mandatory (#94) because that is the only moment it can
+// be read, and it is still what keeps a non-zero exit or a fatal signal from
+// being reported as a clean 0 on that path.
+func (b *linuxBackend) commitLeaderExit(observed StopEvent, haveObserved bool) StopEvent {
+	stashed := b.leaderExitStashed
+	status := syscall.WaitStatus(b.leaderExitStatus)
+	b.leaderExitStashed = false
+	b.leaderExitStatus = 0
+
+	if haveObserved {
+		return observed
+	}
+	if stashed {
+		switch {
+		case status.Signaled():
+			return StopEvent{Reason: StopKilled, TID: b.pid}
+		case status.Exited():
+			return StopEvent{Reason: StopExited, TID: b.pid, ExitCode: status.ExitStatus()}
+		}
+	}
+	return observed
+}
+
+// leaderExitPendingForTest reports whether a terminal is being withheld.
+func (b *linuxBackend) leaderExitPendingForTest() bool { return b.leaderExitStashed }
 
 // closeTracer releases the dedicated tracer thread. The engine calls this after
 // its loop exits (process gone), when no further ptrace ops can be issued.
@@ -552,7 +641,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		if err != nil {
 			if isNoChildProcess(err) {
 				b.purge()
-				return StopEvent{Reason: StopExited, TID: b.pid}, nil
+				return b.commitLeaderExit(StopEvent{Reason: StopExited, TID: b.pid}, false), nil
 			}
 			return StopEvent{}, fmt.Errorf("wait4: %w", err)
 		}
@@ -561,7 +650,8 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			if tid == b.pid {
 				b.purge()
 				b.recordStop(tid)
-				return StopEvent{Reason: StopExited, TID: tid, ExitCode: ws.ExitStatus()}, nil
+				return b.commitLeaderExit(
+					StopEvent{Reason: StopExited, TID: tid, ExitCode: ws.ExitStatus()}, true), nil
 			}
 			b.interruptStepIfStepped(tid)
 			continue
@@ -574,7 +664,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			}
 			b.purge()
 			b.recordStop(tid)
-			return StopEvent{Reason: StopKilled, TID: tid}, nil
+			return b.commitLeaderExit(StopEvent{Reason: StopKilled, TID: tid}, true), nil
 		}
 
 		if !ws.Stopped() {
@@ -601,35 +691,40 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 					}
 					continue
 				}
-				// Main thread is about to exit: nothing parked can ever be
-				// delivered, and acting on it would target a dead thread.
-				b.purge()
-				// Main thread is about to exit. PTRACE_O_TRACEEXIT stops it here
-				// BEFORE it dies, and the engine tears down on this StopExited, so
-				// the real status never resurfaces as a later wait4 Exited()/
-				// Signaled(). Read it now via PTRACE_GETEVENTMSG (a wait(2)-encoded
-				// status) so a non-zero exit or a fatal signal isn't misreported as
-				// a clean exit 0. GETEVENTMSG must run before we resume the thread —
-				// once continued it is gone and the message is unreadable.
-				var msg uint
-				var msgErr error
-				b.execPtrace(func() { msg, msgErr = syscall.PtraceGetEventMsg(tid) })
-				if err := b.continueIfTraceeExists(tid, 0); err != nil {
+				// A stop under the LEADER's id is evidence of a terminal, never
+				// proof of one, so it is stashed rather than acted on.
+				//
+				// de_thread() retires the old leader when a NON-leader calls
+				// execve(): the execing thread takes over the leader's pid and
+				// the retired task's exit surfaces here while the process runs
+				// on under that same pid. A leader that merely pthread_exit()s
+				// is the same shape. Returning a terminal here declares a live
+				// process dead — verified against Linux 6.10, where the retired
+				// leader's status decodes to an ordinary "exited, code 0" that
+				// no heuristic can tell from a real one, and the genuine death
+				// arrives much later.
+				//
+				// PTRACE_O_TRACEEXIT stops the leader BEFORE it dies, so read
+				// the wait(2)-encoded status now via PTRACE_GETEVENTMSG: it is
+				// the authoritative record of a non-zero exit or a fatal signal
+				// (#94), and once the thread is resumed it is unreadable. Then
+				// resume and keep waiting. The terminal is committed when the
+				// group is genuinely gone (the leader's real Exited()/Signaled(),
+				// or ECHILD) and retracted if an exec proves retirement.
+				msg, msgErr := b.eventMsg(tid)
+				b.noteLeaderExit(msg, msgErr == nil)
+				// Route the resume through the ordinary dying-thread absorb.
+				// The leader can be the thread under a single step, and a bare
+				// continue there consumes that step while stepping/stepTID stay
+				// latched: no completion can ever arrive, so every later foreign
+				// stop parks forever and Wait never returns (park-queue rule 7).
+				// Going through absorbThreadExit also lets the leader become the
+				// reconciliation anchor when it owns a lifted trap, in which case
+				// it is deliberately not resumed until the engine has reinstalled.
+				if err := b.absorbStop(absorbThreadExit, tid, 0); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT exiting process tid %d: %w", tid, err)
 				}
-				b.recordStop(tid)
-				if msgErr == nil {
-					status := syscall.WaitStatus(msg)
-					switch {
-					case status.Signaled():
-						return StopEvent{Reason: StopKilled, TID: tid}, nil
-					case status.Exited():
-						return StopEvent{Reason: StopExited, TID: tid, ExitCode: status.ExitStatus()}, nil
-					}
-				}
-				// Status unreadable (e.g. ESRCH racing a Kill) or unexpected shape:
-				// fall back to a clean exit rather than inventing a code.
-				return StopEvent{Reason: StopExited, TID: tid, ExitCode: 0}, nil
+				continue
 
 			case syscall.PTRACE_EVENT_EXEC:
 				// execve replaces the ENTIRE process image, for every thread —
@@ -640,22 +735,30 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				// against and no safe way to carry the session forward. Fail
 				// the wait unconditionally: it is fatal whether or not a step
 				// was in flight and whichever thread it is reported on. The
-				// engine surfaces the error and tears the session down.
+				// error is marked ErrSessionInvalidated so the engine discards
+				// the tracee explicitly instead of abandoning stopped threads.
 				//
-				// The exec stop is deliberately NOT resumed: the tracee is
-				// going nowhere useful and the session is ending. Nor is
-				// startup affected — the launch path consumes its own execve
+				// It is also the retraction point for a stashed leader exit: an
+				// exec here proves de_thread() retired the old leader rather
+				// than the process dying, so that pending terminal must not be
+				// committed.
+				//
+				// The exec stop is deliberately NOT resumed here — the engine's
+				// discard reaps or detaches it, along with anything parked. Nor
+				// is startup affected: the launch path consumes its own execve
 				// stop in startTracedProcess's private Wait4 BEFORE enabling
-				// PTRACE_O_TRACEEXEC, so the first image never reaches here,
-				// and Restart runs on a brand-new debugger.
+				// PTRACE_O_TRACEEXEC, and Restart runs on a brand-new debugger.
+				formerTID, _ := b.eventMsg(tid)
+				retracted := b.retractLeaderExit()
 				b.abortStep()
 				return StopEvent{}, fmt.Errorf(
-					"tracee replaced its process image (PTRACE_EVENT_EXEC reported under pid %d): "+
-						"debugging across an exec is unsupported — every breakpoint address, saved "+
-						"instruction byte and thread id belongs to the image that is now gone. "+
-						"The kernel reports this stop under the thread-group leader's pid, which "+
-						"does not identify the thread that called execve. The session ends here and "+
-						"the replacement image may continue running untraced", tid)
+					"%w (PTRACE_EVENT_EXEC reported under pid %d, "+
+						"execing thread's former tid %d%s): debugging across an exec is unsupported — "+
+						"every breakpoint address, saved instruction byte and thread id belongs to the "+
+						"image that is now gone. After execve the kernel reports this stop under the "+
+						"thread-group leader's pid, which does not identify the thread that called it",
+					ErrImageReplaced, tid, formerTID,
+					map[bool]string{true: ", retiring the previous leader", false: ""}[retracted])
 
 			case 0:
 				reason, disp := classifyUserStop(true, b.stepping, b.stepTID, tid)
@@ -674,16 +777,23 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				return StopEvent{Reason: reason, TID: tid}, nil
 
 			default:
-				// An unrecognised PTRACE_EVENT. We enable only TRACEEXIT,
-				// TRACEEXEC and TRACECLONE, so this is unreachable in practice
-				// and there is nothing to reason about if it is reached. On the
-				// stepped thread that leaves no safe move: continuing cancels
-				// the step with the trap still out of memory, and re-arming
-				// assumes a stop shape we do not understand. Fail loudly rather
-				// than guess.
+				// An unrecognised PTRACE_EVENT. With exactly TRACEEXIT,
+				// TRACEEXEC and TRACECLONE enabled — and PTRACE_TRACEME/ATTACH
+				// rather than SEIZE — the only causes the kernel can report are
+				// CLONE, EXEC and EXIT: FORK/VFORK/VFORK_DONE/SECCOMP each need
+				// an option we never set, and EVENT_STOP needs SEIZE. So this is
+				// unreachable in practice and there is nothing to reason about
+				// if it is reached. On the stepped thread that leaves no safe
+				// move: continuing cancels the step with the trap still out of
+				// memory, and re-arming assumes a stop shape we do not
+				// understand. Fail loudly rather than guess — and mark it
+				// session-invalidating so the engine discharges every stop it
+				// owns instead of leaving them frozen behind a closing tracer.
 				if plan := b.planAbsorb(absorbUnknownEvent, tid, 0); plan.fail {
 					b.abortStep()
-					return StopEvent{}, fmt.Errorf("unhandled ptrace event %d on tid %d while it was being single-stepped", cause, tid)
+					return StopEvent{}, fmt.Errorf(
+						"%w: unhandled ptrace event %d on tid %d while it was being single-stepped",
+						ErrSessionInvalidated, cause, tid)
 				} else if err := b.applyAbsorb(plan, tid); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT trap cause %d tid %d: %w", cause, tid, err)
 				}

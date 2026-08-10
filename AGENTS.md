@@ -622,12 +622,33 @@ acknowledgement in rule 5 (see the locking note below):
    nothing will ever deliver. `ContinueProcess`/`SingleStep` already refuse while
    `stepExitPending`, so both halt paths make Kill/Restart the only recovery.
    No path leaks a held owner: it is discharged on a successful acknowledgement,
-   and dropped by `purge` (and therefore by `abortStep`), which runs only where
-   the thread it names is gone or unreachable.
-6. **Teardown purges inside `Wait`.** `stepQueue.purge` runs on the main thread's
-   `PTRACE_EVENT_EXIT`, its real exit, its signal death, and `ECHILD`, and drops
-   the held anchor along with the parked stops. There is deliberately **no
-   engine-callable purge**: the queue is not part of the engine's state model.
+   dropped by `purge` (and therefore by `abortStep`) where the thread it names is
+   gone or belongs to a replaced image, and otherwise discharged by the engine's
+   explicit discard on a session-invalidating failure (rule 11).
+6. **Teardown purges inside `Wait`.** `stepQueue.purge` runs where the process is
+   confirmed gone — the leader's real exit, its signal death, and `ECHILD` — and
+   drops the held anchor along with the parked stops. It deliberately does NOT
+   run at the leader's `PTRACE_EVENT_EXIT` any more: that stop no longer proves
+   death (rule 10). There is deliberately **no engine-callable purge**: the queue
+   is not part of the engine's state model.
+
+   **A parked TID is not guaranteed to still be alive**, and nothing in the queue
+   invalidates an entry when its thread dies. `TASK_TRACED` carries
+   `TASK_WAKEKILL`, so a group-wide kill pulls a parked thread straight out of
+   its stop with no ptrace op from us. Measured on Linux 6.10: a worker parked at
+   a signal-delivery stop, never touched by the tracer, moved on its own to
+   `PTRACE_EVENT_EXIT` the moment the group was `SIGKILL`ed — and then held
+   there, because *that* stop does wait for a continue. (That is also why
+   `reapAfterKill` must continue every stopped thread it finds: not because the
+   original parked stop survived the kill, but because the kill left the thread
+   at `EVENT_EXIT`.)
+
+   So both paths that use a parked TID must tolerate its death, and they do: the
+   anchor's write can fail, which halts suspended with a `kill or restart`
+   diagnosis rather than corrupting anything, and the release goes through
+   `continueIfTraceeExists`, which treats `ESRCH` as success. Do not add a
+   liveness assumption on the anchor or drain paths, and do not remove that
+   `ESRCH` tolerance.
 7. **Absorbing a stop on the stepped thread must re-arm its step.** Every site
    that handles a stop inline and resumes the thread names its branch to
    `stepQueue.planAbsorb` (via `absorbStop`/`applyAbsorb`) instead of reaching
@@ -714,7 +735,9 @@ acknowledgement in rule 5 (see the locking note below):
    message must respect: after `execve` the kernel reports this stop under the
    **thread-group leader's pid**, and the execing thread's former tid is only
    retrievable via `PTRACE_GETEVENTMSG` — so the reported pid must never be
-   described as the stepped TID.
+   described as the stepped TID. Both are now *in* the message.
+
+   It is also the **retraction point for a stashed leader exit** (rule 10).
 
    **bingo's own startup is out of reach by construction**, which is what makes
    an unconditional rule safe. The launch path consumes its own `execve`
@@ -742,15 +765,89 @@ acknowledgement in rule 5 (see the locking note below):
    prevents for a genuine mid-session exec. It needs a verified handshake inside
    `startTracedProcess` that identifies and re-validates the final image before
    any DWARF load or breakpoint install.
+10. **A stop under the LEADER's id is evidence of a terminal, never proof of
+    one.** `de_thread()` retires the old leader when a **non-leader** calls
+    `execve()`: the execing thread takes over the leader's pid and the retired
+    task's exit is delivered as `PTRACE_EVENT_EXIT` under `tid == pid` while the
+    process runs on. A leader that merely `pthread_exit()`s is the same shape.
+    Verified against Linux 6.10 — the observed sequence is
 
-   One honest limit, shared with **every** `Wait` error and therefore
-   pre-existing rather than introduced here: the engine reports the error and
-   tears down, but does not kill the tracee. `closeTracer` ends the dedicated
-   tracer thread, ptrace attachments are per-thread, so the kernel detaches and
-   the replacement image runs on untraced — and a later `Kill` is a no-op
-   because `done` is already closed. Rule 9 makes that path reachable in more
-   situations than before. Fixing it belongs with the wait-ownership/teardown
-   work (#205/#217), not here.
+        (LEADER-ID) EVENT_EXIT  msg -> "exited, code 0"   <- process ALIVE
+        siblings    EVENT_EXIT + real exits
+        (LEADER-ID) EVENT_EXEC  msg = execing thread's FORMER tid
+        (LEADER-ID) EVENT_EXIT + real exit                 <- the actual death
+
+    and the retired leader's status is byte-for-byte an ordinary clean exit, so
+    **no status heuristic can work**. Returning a terminal there reports a dead
+    process to the client while the tracee is alive under the same pid.
+
+    So `Wait` **stashes** the `GETEVENTMSG` status (which must still be read
+    before resuming — that stop is the only moment it can be read at all, #94),
+    resumes the leader, and keeps waiting. It **commits** the terminal only on
+    genuine group death — the leader's real `Exited()`/`Signaled()`, or `ECHILD`
+    — and it **retracts** the stash on `EVENT_EXEC`, which is positive proof of
+    retirement. The stash lives on `linuxBackend` (it is not queue state) and,
+    like `parked`, is touched only inside `Wait`, so it needs no lock.
+
+    **An observed `wait4` status beats the stash**, and the direction is
+    load-bearing rather than arbitrary. `GETEVENTMSG` at `EVENT_EXIT` yields that
+    *task's* `do_exit` value, whereas the leader's real wait status carries the
+    **group** exit code (`wait_task_zombie` reports `group_exit_code` once
+    `SIGNAL_GROUP_EXIT` is set). They diverge exactly in the scenario this rule
+    exists for: measured on Linux 6.10, a `main` that calls `pthread_exit(0)`
+    stashes `exited, code 0` while the process is alive, and a worker that later
+    calls `exit(3)` — or `abort()`s — is reaped as code 3 / signal 6. Preferring
+    the stash would report a clean `0` for both, which is the very class of
+    misreport #94 exists to prevent. The stash is therefore the fallback for the
+    one commit point with no observed status at all, `ECHILD`.
+
+    Consequence to know: `EventProcessExited` for an ordinary exit is now emitted
+    at real group death rather than at the leader's `EVENT_EXIT`. The exit *code*
+    is unchanged. If a stop is parked when the group dies, the leader's zombie is
+    not reapable until the engine drains it, so the terminal is reported after
+    that drain — later, but never lost, because `Wait` drains before blocking and
+    the step machinery always resolves through the owner's death boundary.
+    Trading a false terminal for a **lost** one would be strictly worse than the
+    bug this fixes, so that whole ordering — leader exit stashed, dead step owner
+    reconciled, held sibling delivered, terminal finally committed with the
+    authoritative code — is pinned end to end by
+    `TestLinuxWaitStillCommitsTheTerminalWithStopsHeld`.
+11. **The fatal branches must not abandon the stops they own.** Rules 8 and 9
+    give up on the tracee, and `abortStep` drops the queue's *record* of the
+    threads it was holding — but those threads are still ptrace-stopped, as is the thread
+    whose stop triggered the failure. Leaving them is not merely untidy:
+    `tracerThread.close()` ends the locked OS thread, and the kernel then
+    detaches every tracee and **resumes** it, straight into software breakpoints
+    still written in its text.
+
+    Both branches therefore wrap `ErrSessionInvalidated`, and the engine's
+    `stopCh` error branch discards the tracee explicitly before returning:
+    `endThreadStep`, `bps.clearAll` (restore the original bytes **first** — that
+    is what makes the release safe), then `proc.kill(backend, running:false)`.
+    For a launched tracee `reapAfterKill` loops `Wait4(-1, WALL)` and continues
+    every thread it finds stopped, which discharges the parked stops and the
+    trigger stop; for an attached one the detach is safe because the traps are
+    already gone. `running` is false because the `waitLoop` that produced the
+    failure has already delivered its result, so `killProcess` is the sole
+    reaper (#111). Only these two branches carry the marker: ordinary `wait4`
+    failures deliberately keep their pre-existing behaviour, which still leaks a
+    detach-and-resume, and closing that generic class belongs with the
+    wait-ownership work (#205/#217).
+
+    The exec case inverts one step. `ErrImageReplaced` (which wraps
+    `ErrSessionInvalidated`) suppresses the restore, because writing saved bytes
+    back would poke instructions from the OLD image at OLD addresses into the new
+    one. Nothing of ours is in that image to remove.
+
+    What this does **not** claim: a fully clean release of an ATTACHED tracee.
+    `killProcess` detaches the leader and the kernel releases the remaining
+    threads when the tracer thread closes, but a thread parked at a software
+    breakpoint still has its PC one trap-width past the trap on amd64 and
+    `abortStep` has already discarded the metadata needed to rewind it, and
+    `bps.clearAll` ignores individual restore failures. A launched tracee is
+    killed so none of that matters; an attached one may resume mid-instruction.
+    Fixing that needs per-TID quiescing, checked restoration and PC repair, which
+    is out of scope here — do not describe attached release as safe.
 
 **Explicit limits — this is NOT an atomic stop-the-world step-over.** Sibling
 threads keep running and keep trapping during a step; the fix only guarantees
@@ -828,7 +925,7 @@ Only the cumulative diagnostic counters are atomic because native tests read
 them concurrently; do not add a queue mutex.
 
 Regression gates: the classifier table, the queue-mechanics tests **and** the
-resume-decision tests covering rules 7–9 in
+resume-decision tests covering rules 7–11 in
 [waitpark_test.go](internal/debugger/waitpark_test.go) — all host-agnostic, so
 they run and can be mutation-checked on macOS — plus the backend-specific tests
 in [backend_linux_amd64_test.go](internal/debugger/backend_linux_amd64_test.go)
@@ -836,16 +933,21 @@ that pin *when `lastStopTID` moves* (not on park, only on delivery, and `Wait`
 drains before blocking) and drive `Wait` itself over scripted wait statuses so
 every branch's effect on the step is executed rather than merely decided —
 including the unconditional exec refusal, the held-owner anchor, its exactly-once
-release, the benign-`ESRCH` release and the gate-stays-closed release failure —
+release, the benign-`ESRCH` release, the gate-stays-closed release failure, the
+deferred/committed/retracted leader exit and the session-invalidated marker —
 plus the cross-layer engine-over-real-queue specs in
 [engine_stepqueue_test.go](internal/debugger/engine_stepqueue_test.go) that pin
-reinstall-before-release for both anchor shapes, plus the linux-only `overlap`
+reinstall-before-release for both anchor shapes, plus the engine specs that pin
+rule 11 (a session-invalidating wait failure restores the tracee's instructions;
+an ordinary one does not), plus the linux-only `overlap`
 E2E label in
 [debugger_e2e_linux_amd64_test.go](test/integration/debugger_e2e_linux_amd64_test.go):
 step-over overlap, machine-step (`StepInto`) overlap, a foreign ordinary-signal
 storm, `Pause` racing an in-flight step, kill with stops held, a raw
-`SYS_exit` that kills the exact stepped thread with a sibling parked, and the
-same raw `SYS_exit` with **nothing** parked so the dying owner anchors itself.
+`SYS_exit` that kills the exact stepped thread with a sibling parked, the
+same raw `SYS_exit` with **nothing** parked so the dying owner anchors itself,
+and a **non-leader `execve`** whose `de_thread()` leader retirement must surface
+as an image-replacement error rather than a fabricated process exit.
 Those assert
 only invariants the fix guarantees — both logical breakpoints remain tracked at
 every observable stop, every hit belongs to a known id, no error or unexpected
@@ -1107,12 +1209,16 @@ are detected by a `mach_msg` receive loop.
   to the engine — with two exceptions. The **main thread's**
   `PTRACE_EVENT_EXIT` is the one exit the engine needs, and
   `PTRACE_EVENT_EXEC` is fatal and fails the wait outright (park-queue rule 9).
-  Because `PTRACE_O_TRACEEXIT` stops the leader
-  *before* it dies and the engine tears down on the resulting `StopExited`, the
-  real status never resurfaces as a later `wait4` `Exited()`; so `Wait` reads it
-  at that stop via `PTRACE_GETEVENTMSG` (a `wait(2)`-encoded status) and reports
-  the true `ExitCode`, or `StopKilled` on signal death. Returning a hardcoded 0
-  here dropped every tracee's exit code (#94).
+  `PTRACE_O_TRACEEXIT` stops the leader
+  *before* it dies, and that stop is the only moment its `wait(2)`-encoded status
+  can be read, so `Wait` reads it there via `PTRACE_GETEVENTMSG` — returning a
+  hardcoded 0 instead dropped every tracee's exit code (#94). It does **not**
+  report a terminal there: that stop is also what `de_thread()` produces when a
+  non-leader execs, so the status is stashed and the terminal is committed only
+  once the group is genuinely gone (rule 10). Where a real `wait4` status is
+  available it wins, because the leader's wait status carries the GROUP exit code
+  while the `EVENT_EXIT` payload is only that task's `do_exit` value; the stash is
+  the fallback for `ECHILD`, where there is no observed status at all.
 - ptrace stops are per-thread. The backend records the last stopped TID and
   targets `ContinueProcess` / memory writes at that TID, not blindly at the
   process PID. `lastStopTID` is `atomic.Int64`: `Wait` records stops from the
