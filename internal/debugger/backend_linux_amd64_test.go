@@ -5,6 +5,7 @@ package debugger
 import (
 	"os/exec"
 	"sync"
+	"syscall"
 	"testing"
 )
 
@@ -460,5 +461,400 @@ func TestLinuxBackendWaitDrainsBeforeBlocking(t *testing.T) {
 	}
 	if got := b.traceTID(); got != foreign {
 		t.Fatalf("traceTID() = %d, want the delivered thread %d", got, foreign)
+	}
+}
+
+// TestLinuxBackendApplyAbsorbCarriesOutThePlan pins the half of the absorb path
+// that planAbsorb cannot: that Wait actually acts on the plan it was given.
+//
+// The two observable consequences are the step gate and the re-arm counter, so
+// this asserts both. Dropping the clearStep handling latches the gate forever —
+// held stops never drain and Wait never returns again — and dropping the
+// re-arm leaves a cancelled hardware step behind the same latch.
+//
+// The resumes are issued against thread ids that do not exist, so ptrace fails
+// with ESRCH and the backend swallows it; the bookkeeping under test still runs.
+func TestLinuxBackendApplyAbsorbCarriesOutThePlan(t *testing.T) {
+	const (
+		pid     = 7001
+		stepped = 7002
+		foreign = 7003
+		sigurg  = 23
+	)
+
+	newBackend := func() *linuxBackend {
+		b := &linuxBackend{pid: pid, tracer: newTracerThread()}
+		t.Cleanup(b.closeTracer)
+		b.recordStop(pid)
+		b.beginStep(stepped)
+		b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
+		return b
+	}
+
+	t.Run("a dying stepped thread releases the gate so held stops drain", func(t *testing.T) {
+		b := newBackend()
+		if err := b.applyAbsorb(b.planAbsorb(absorbThreadExit, stepped, 0), stepped); err != nil {
+			t.Fatalf("applyAbsorb(absorbThreadExit) error = %v", err)
+		}
+		ev, ok := b.releasable()
+		if !ok {
+			t.Fatal("the held stop is still gated after the stepped thread exited: Wait would block forever")
+		}
+		if ev.TID != foreign {
+			t.Fatalf("released %+v, want the held stop on tid %d", ev, foreign)
+		}
+	})
+
+	t.Run("absorbing on the stepped thread re-arms the step and holds the gate", func(t *testing.T) {
+		b := newBackend()
+		before := b.stepRearmCount()
+		if err := b.applyAbsorb(b.planAbsorb(absorbPreempt, stepped, sigurg), stepped); err != nil {
+			t.Fatalf("applyAbsorb(absorbPreempt) error = %v", err)
+		}
+		if after := b.stepRearmCount(); after != before+1 {
+			t.Fatalf("step re-arms = %d, want %d: the consumed step was not re-armed", after, before+1)
+		}
+		if _, ok := b.releasable(); ok {
+			t.Fatal("the gate opened while the re-armed step is still in flight")
+		}
+	})
+
+	t.Run("absorbing on any other thread neither re-arms nor opens the gate", func(t *testing.T) {
+		b := newBackend()
+		before := b.stepRearmCount()
+		if err := b.applyAbsorb(b.planAbsorb(absorbPreempt, foreign, sigurg), foreign); err != nil {
+			t.Fatalf("applyAbsorb(absorbPreempt) error = %v", err)
+		}
+		if after := b.stepRearmCount(); after != before {
+			t.Fatalf("step re-arms = %d, want %d: a foreign thread must not re-arm the step", after, before)
+		}
+		if _, ok := b.releasable(); ok {
+			t.Fatal("a foreign absorb opened the step gate")
+		}
+	})
+}
+
+// resumeOp records one ptrace resume the wait loop issued.
+type resumeOp struct {
+	step   bool
+	tid    int
+	signal int
+}
+
+// scriptedWait drives linuxBackend.Wait over a fixed list of wait statuses,
+// capturing the resume each branch performs instead of touching the kernel.
+type scriptedWait struct {
+	stops []scriptedStop
+	next  int
+	ops   []resumeOp
+}
+
+type scriptedStop struct {
+	tid    int
+	status syscall.WaitStatus
+}
+
+func (s *scriptedWait) install(b *linuxBackend) {
+	b.waitFn = func(ws *syscall.WaitStatus) (int, error) {
+		if s.next >= len(s.stops) {
+			return 0, syscall.ECHILD
+		}
+		stop := s.stops[s.next]
+		s.next++
+		*ws = stop.status
+		return stop.tid, nil
+	}
+	b.contFn = func(tid int, signal int) error {
+		s.ops = append(s.ops, resumeOp{tid: tid, signal: signal})
+		return nil
+	}
+	b.stepFn = func(tid int) error {
+		s.ops = append(s.ops, resumeOp{step: true, tid: tid})
+		return nil
+	}
+}
+
+// stoppedAt builds the wait status the kernel reports for a ptrace-stop.
+// PTRACE_EVENT stops ride SIGTRAP with the event number in the high half.
+func stoppedAt(sig syscall.Signal, event int) syscall.WaitStatus {
+	return syscall.WaitStatus(uint32(event)<<16 | uint32(sig)<<8 | 0x7f)
+}
+
+func exitedWith(code int) syscall.WaitStatus {
+	return syscall.WaitStatus(uint32(code) << 8)
+}
+
+// TestLinuxWaitResumesTheSteppedThreadWithASingleStep executes every wait-loop
+// branch that resumes a thread inline and pins the primitive it used.
+//
+// This is rule 7's regression gate at the call site. planAbsorb decides that a
+// stop absorbed on the stepped thread must be re-armed with PTRACE_SINGLESTEP
+// rather than continued, but a branch is free to ignore it: before these cases
+// existed, rewriting any of them back into a bare continueIfTraceeExists passed
+// the whole unit suite, and the cost is a hung tracee — the cancelled step never
+// completes, stepping/stepTID stay latched, and every later foreign stop is held
+// forever inside Wait.
+//
+// Each case scripts one absorbed stop on the thread being stepped, then the main
+// thread exiting so Wait terminates.
+func TestLinuxWaitResumesTheSteppedThreadWithASingleStep(t *testing.T) {
+	const (
+		pid     = 9001
+		stepped = 9002
+	)
+
+	cases := []struct {
+		name   string
+		status syscall.WaitStatus
+	}{
+		{"clone", stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_CLONE)},
+		{"async preemption SIGURG", stoppedAt(syscall.SIGURG, 0)},
+		{"SIGCONT", stoppedAt(syscall.SIGCONT, 0)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &linuxBackend{pid: pid}
+			script := &scriptedWait{stops: []scriptedStop{
+				{tid: stepped, status: tc.status},
+				{tid: pid, status: exitedWith(0)},
+			}}
+			script.install(b)
+			b.beginStep(stepped)
+
+			ev, err := b.Wait()
+			if err != nil {
+				t.Fatalf("Wait() error = %v", err)
+			}
+			if ev.Reason != StopExited {
+				t.Fatalf("Wait() = %+v, want the main thread's exit", ev)
+			}
+			if len(script.ops) != 1 {
+				t.Fatalf("resume ops = %+v, want exactly one", script.ops)
+			}
+			if op := script.ops[0]; !op.step || op.tid != stepped {
+				t.Fatalf("resumed with %+v; absorbing on the stepped thread must "+
+					"re-arm its single step, or the step is cancelled while the "+
+					"gate stays latched and Wait hangs", op)
+			}
+		})
+	}
+}
+
+// TestLinuxWaitContinuesThreadsThatAreNotBeingStepped is the converse gate: the
+// same branches must NOT single-step a thread that is not the stepped one, and
+// must forward the signal that thread stopped with.
+func TestLinuxWaitContinuesThreadsThatAreNotBeingStepped(t *testing.T) {
+	const (
+		pid     = 9101
+		stepped = 9102
+		other   = 9103
+	)
+
+	cases := []struct {
+		name   string
+		status syscall.WaitStatus
+		signal int
+	}{
+		{"clone", stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_CLONE), 0},
+		{"new thread group-stop", stoppedAt(syscall.SIGSTOP, 0), 0},
+		{"async preemption SIGURG", stoppedAt(syscall.SIGURG, 0), int(syscall.SIGURG)},
+		{"SIGCONT", stoppedAt(syscall.SIGCONT, 0), 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &linuxBackend{pid: pid}
+			script := &scriptedWait{stops: []scriptedStop{
+				{tid: other, status: tc.status},
+				{tid: pid, status: exitedWith(0)},
+			}}
+			script.install(b)
+			b.beginStep(stepped)
+
+			if _, err := b.Wait(); err != nil {
+				t.Fatalf("Wait() error = %v", err)
+			}
+			if len(script.ops) != 1 {
+				t.Fatalf("resume ops = %+v, want exactly one", script.ops)
+			}
+			op := script.ops[0]
+			if op.step {
+				t.Fatalf("resumed tid %d with a single step: only the stepped "+
+					"thread may be re-armed", op.tid)
+			}
+			if op.tid != other || op.signal != tc.signal {
+				t.Fatalf("resumed %+v, want a continue of tid %d with signal %d",
+					op, other, tc.signal)
+			}
+		})
+	}
+}
+
+// TestLinuxWaitAbortsTheStepItCannotResume covers the two branches that must
+// refuse to absorb a stop on the stepped thread. exec throws away the memory
+// holding the saved instruction bytes and the trap; an event we never enabled
+// has no understood stop shape. Re-arming would assume that shape and continuing
+// would resume a tracee whose software breakpoint is still out of memory, so
+// Wait clears the step and surfaces the error instead of guessing.
+func TestLinuxWaitAbortsTheStepItCannotResume(t *testing.T) {
+	const (
+		pid     = 9201
+		stepped = 9202
+		foreign = 9203
+	)
+
+	cases := []struct {
+		name  string
+		event int
+	}{
+		{"exec", syscall.PTRACE_EVENT_EXEC},
+		{"an event we never enabled", syscall.PTRACE_EVENT_VFORK},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &linuxBackend{pid: pid}
+			script := &scriptedWait{stops: []scriptedStop{
+				{tid: stepped, status: stoppedAt(syscall.SIGTRAP, tc.event)},
+			}}
+			script.install(b)
+			b.beginStep(stepped)
+			b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
+
+			if _, err := b.Wait(); err == nil {
+				t.Fatal("Wait() succeeded; a step that can be neither completed " +
+					"nor re-armed must surface an error")
+			}
+			if len(script.ops) != 0 {
+				t.Fatalf("resume ops = %+v, want none: the tracee must not run on "+
+					"with its software breakpoint still out of memory", script.ops)
+			}
+			if b.stepping {
+				t.Fatal("the step is still latched after the abort: every later " +
+					"foreign stop would be held forever")
+			}
+			if b.parkedDepthForTest() != 0 {
+				t.Fatal("held stops survived the abort")
+			}
+		})
+	}
+}
+
+// TestLinuxWaitReleasesTheGateWhenTheSteppedThreadDies pins G1 at the call site:
+// a step completion can never arrive for a thread that is gone, so the gate must
+// open and the stops held behind it must drain.
+func TestLinuxWaitReleasesTheGateWhenTheSteppedThreadDies(t *testing.T) {
+	const (
+		pid     = 9301
+		stepped = 9302
+		foreign = 9303
+	)
+
+	cases := []struct {
+		name   string
+		status syscall.WaitStatus
+	}{
+		{"reported by PTRACE_EVENT_EXIT", stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_EXIT)},
+		{"reaped", exitedWith(0)},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &linuxBackend{pid: pid}
+			script := &scriptedWait{stops: []scriptedStop{
+				{tid: stepped, status: tc.status},
+			}}
+			script.install(b)
+			b.beginStep(stepped)
+			b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
+
+			ev, err := b.Wait()
+			if err != nil {
+				t.Fatalf("Wait() error = %v", err)
+			}
+			if ev.TID != foreign || ev.Reason != StopBreakpoint {
+				t.Fatalf("Wait() = %+v, want the held stop on tid %d; the gate did "+
+					"not open when the stepped thread died", ev, foreign)
+			}
+		})
+	}
+}
+
+// TestLinuxWaitClaimsTheResumeTargetOnlyOnDelivery pins G4 through the wait loop
+// itself: parking a stop must not make its thread the current stop.
+//
+// lastStopTID is what the next TID-less ContinueProcess and every memory write
+// target. A parked thread is stopped but the engine has not been told about it,
+// so claiming it at park time points those operations at a thread the engine is
+// not working on — while the thread it IS working on, the one mid-step, is left
+// without a resume target. Recording only on delivery keeps the invariant that
+// the delivered stop's TID is the resume target.
+//
+// The resume target is sampled from inside the wait loop, because a claim made
+// at park time is otherwise overwritten by the next delivery before any test
+// could see it — which is exactly why this went unnoticed.
+func TestLinuxWaitClaimsTheResumeTargetOnlyOnDelivery(t *testing.T) {
+	const (
+		pid     = 9401
+		stepped = 9402
+		foreign = 9403
+	)
+
+	b := &linuxBackend{pid: pid}
+	script := &scriptedWait{stops: []scriptedStop{
+		{tid: foreign, status: stoppedAt(syscall.SIGTRAP, 0)},
+		{tid: stepped, status: stoppedAt(syscall.SIGTRAP, 0)},
+	}}
+	script.install(b)
+
+	var targets []int
+	inner := b.waitFn
+	b.waitFn = func(ws *syscall.WaitStatus) (int, error) {
+		targets = append(targets, b.traceTID())
+		return inner(ws)
+	}
+
+	b.recordStop(pid)
+	b.beginStep(stepped)
+
+	ev, err := b.Wait()
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if ev.Reason != StopSingleStep || ev.TID != stepped {
+		t.Fatalf("Wait() = %+v, want the step completing on tid %d; the foreign "+
+			"breakpoint must stay held", ev, stepped)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("sampled %d resume targets, want 2", len(targets))
+	}
+	if targets[1] == foreign {
+		t.Fatalf("parking the stop on tid %d made it the resume target: the "+
+			"engine would resume a thread it was never told about, and the "+
+			"thread it is stepping would be left without one", foreign)
+	}
+	if targets[1] != pid {
+		t.Fatalf("resume target after parking = %d, want it unchanged at %d",
+			targets[1], pid)
+	}
+	if got := b.traceTID(); got != stepped {
+		t.Fatalf("resume target = %d, want %d after the step was delivered", got, stepped)
+	}
+	if b.parkedDepthForTest() != 1 {
+		t.Fatalf("held stops = %d, want the foreign breakpoint still held",
+			b.parkedDepthForTest())
+	}
+
+	ev, err = b.Wait()
+	if err != nil {
+		t.Fatalf("second Wait() error = %v", err)
+	}
+	if ev.TID != foreign || ev.Reason != StopBreakpoint {
+		t.Fatalf("second Wait() = %+v, want the held breakpoint on tid %d", ev, foreign)
+	}
+	if got := b.traceTID(); got != foreign {
+		t.Fatalf("resume target = %d, want %d: a delivered stop must become the "+
+			"resume target", got, foreign)
 	}
 }

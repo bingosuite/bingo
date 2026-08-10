@@ -105,6 +105,32 @@ type linuxBackend struct {
 	// for TID-less memory operations. Atomicity defines that snapshot; it does
 	// not make the selected thread stopped or suppress normal ptrace errors.
 	lastStopTID atomic.Int64
+
+	// waitFn/contFn/stepFn are the three kernel calls the wait loop makes. Nil
+	// means the real syscall; only tests set them, and they exist because
+	// nothing else can reach the loop's branch bodies.
+	//
+	// Which primitive a branch resumes with is the whole subject of rule 7: a
+	// branch that plain-continues the stepped thread cancels its hardware step
+	// while leaving stepping/stepTID latched, so every later foreign stop is
+	// held forever and Wait never returns again. That decision is pure and
+	// table-tested in planAbsorb, but the seven call sites choosing to consult
+	// it are not — with a live tracee as the only way in, turning any of them
+	// back into a bare PTRACE_CONT passed the entire unit suite. Scripting the
+	// wait statuses is what makes those branches executable, so the mutation
+	// fails a test instead of shipping a freeze.
+	waitFn func(ws *syscall.WaitStatus) (int, error)
+	contFn func(tid int, signal int) error
+	stepFn func(tid int) error
+}
+
+// waitAny blocks for the next stop from any thread of the tracee. WALL includes
+// clone()d threads.
+func (b *linuxBackend) waitAny(ws *syscall.WaitStatus) (int, error) {
+	if b.waitFn != nil {
+		return b.waitFn(ws)
+	}
+	return syscall.Wait4(-1, ws, syscall.WALL, nil)
 }
 
 // drainParked returns the next held stop if one may be surfaced now, recording
@@ -481,8 +507,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		}
 
 		var ws syscall.WaitStatus
-		// WALL includes clone()d threads.
-		tid, err := syscall.Wait4(-1, &ws, syscall.WALL, nil)
+		tid, err := b.waitAny(&ws)
 		if err != nil {
 			if isNoChildProcess(err) {
 				b.purge()
@@ -523,17 +548,16 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 			switch cause {
 			case syscall.PTRACE_EVENT_CLONE:
-				if err := b.resumeAbsorbed(tid, 0); err != nil {
+				if err := b.absorbStop(absorbClone, tid, 0); err != nil {
 					return StopEvent{}, fmt.Errorf("resume clone parent tid %d: %w", tid, err)
 				}
 				continue
 
 			case syscall.PTRACE_EVENT_EXIT:
 				if tid != b.pid {
-					if err := b.continueIfTraceeExists(tid, 0); err != nil {
+					if err := b.absorbStop(absorbThreadExit, tid, 0); err != nil {
 						return StopEvent{}, fmt.Errorf("PTRACE_CONT exiting thread tid %d: %w", tid, err)
 					}
-					b.clearStepIfStepped(tid)
 					continue
 				}
 				// Main thread is about to exit: nothing parked can ever be
@@ -572,11 +596,10 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				// re-armed nor completed. Nothing can restore the old trap
 				// because the memory it lived in is gone. Fail the wait instead:
 				// the engine reports it and tears the session down cleanly.
-				if b.resumeFor(tid) == resumeSingleStep {
+				if plan := b.planAbsorb(absorbExec, tid, 0); plan.fail {
 					b.abortStep()
 					return StopEvent{}, fmt.Errorf("tracee exec'd on tid %d while it was being single-stepped: the stepped-over breakpoint cannot be restored in the new image", tid)
-				}
-				if err := b.continueIfTraceeExists(tid, 0); err != nil {
+				} else if err := b.applyAbsorb(plan, tid); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT exec tid %d: %w", tid, err)
 				}
 				continue
@@ -605,11 +628,10 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				// the step with the trap still out of memory, and re-arming
 				// assumes a stop shape we do not understand. Fail loudly rather
 				// than guess.
-				if b.resumeFor(tid) == resumeSingleStep {
+				if plan := b.planAbsorb(absorbUnknownEvent, tid, 0); plan.fail {
 					b.abortStep()
 					return StopEvent{}, fmt.Errorf("unhandled ptrace event %d on tid %d while it was being single-stepped", cause, tid)
-				}
-				if err := b.continueIfTraceeExists(tid, 0); err != nil {
+				} else if err := b.applyAbsorb(plan, tid); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT trap cause %d tid %d: %w", cause, tid, err)
 				}
 				continue
@@ -627,7 +649,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			// A brand-new thread is never the one being stepped, but route the
 			// resume through the same helper so no absorb site can drift back
 			// into an unguarded continue.
-			if err := b.resumeAbsorbed(tid, 0); err != nil {
+			if err := b.absorbStop(absorbNewThread, tid, 0); err != nil {
 				return StopEvent{}, fmt.Errorf("resume new thread tid %d: %w", tid, err)
 			}
 			continue
@@ -637,16 +659,16 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		// continue path so scheduling keeps working. The one thread that does
 		// not get it back is the one being single-stepped, where delivering it
 		// would step the handler rather than the instruction under the step —
-		// see stepQueue.planResume for why that is safe.
+		// see stepQueue.planAbsorb for why that is safe.
 		if sig == syscall.SIGURG {
-			if err := b.resumeAbsorbed(tid, int(sig)); err != nil {
+			if err := b.absorbStop(absorbPreempt, tid, int(sig)); err != nil {
 				return StopEvent{}, fmt.Errorf("resume after SIGURG tid %d: %w", tid, err)
 			}
 			continue
 		}
 
 		if sig == syscall.SIGCONT {
-			if err := b.resumeAbsorbed(tid, 0); err != nil {
+			if err := b.absorbStop(absorbContinued, tid, 0); err != nil {
 				return StopEvent{}, fmt.Errorf("resume after SIGCONT tid %d: %w", tid, err)
 			}
 			continue
@@ -699,7 +721,11 @@ func (b *linuxBackend) continueIfTraceeExists(tid int, signal int) error {
 		return nil
 	}
 	var err error
-	b.execPtrace(func() { err = syscall.PtraceCont(tid, signal) })
+	if b.contFn != nil {
+		err = b.contFn(tid, signal)
+	} else {
+		b.execPtrace(func() { err = syscall.PtraceCont(tid, signal) })
+	}
 	if err != nil && !isNoSuchProcess(err) {
 		return err
 	}
@@ -711,23 +737,35 @@ func (b *linuxBackend) singleStepIfTraceeExists(tid int) error {
 		return nil
 	}
 	var err error
-	b.execPtrace(func() { err = syscall.PtraceSingleStep(tid) })
+	if b.stepFn != nil {
+		err = b.stepFn(tid)
+	} else {
+		b.execPtrace(func() { err = syscall.PtraceSingleStep(tid) })
+	}
 	if err != nil && !isNoSuchProcess(err) {
 		return err
 	}
 	return nil
 }
 
-// resumeAbsorbed resumes a thread whose stop Wait handled internally instead of
+// absorbStop resumes a thread whose stop Wait handled internally instead of
 // reporting it. Every absorb site must go through here: the kernel delivers one
 // stop per resume, so absorbing an event on the thread the engine is stepping
 // consumes that step, and a plain continue there would silently cancel it while
-// the step gate stays latched. See stepQueue.resumeFor.
+// the step gate stays latched. See stepQueue.planAbsorb.
 //
-// The primitive and the signal it delivers are both chosen by planResume, which
-// documents why the re-armed step drops the signal.
-func (b *linuxBackend) resumeAbsorbed(tid int, signal int) error {
-	plan := b.planResume(tid, signal)
+// Callers handle plan.fail themselves, because each failing branch has its own
+// diagnosis to report.
+func (b *linuxBackend) absorbStop(kind absorbKind, tid int, signal int) error {
+	return b.applyAbsorb(b.planAbsorb(kind, tid, signal), tid)
+}
+
+// applyAbsorb carries out an absorbPlan. The gate is released before the resume
+// so an erroring resume cannot leave the step latched behind it.
+func (b *linuxBackend) applyAbsorb(plan absorbPlan, tid int) error {
+	if plan.clearStep {
+		b.clearStepIfStepped(tid)
+	}
 	if plan.mode == resumeSingleStep {
 		b.countStepRearm()
 		return b.singleStepIfTraceeExists(tid)
