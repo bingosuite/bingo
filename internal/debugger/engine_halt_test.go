@@ -235,8 +235,6 @@ var _ = Describe("asynchronous halts in handleStop", func() {
 		fb.failContinue(errInjected)
 		fb.pushStop(debugger.StopEvent{Reason: debugger.StopSingleStep, TID: 1, PC: bpAddr + 4})
 		expectHaltReported(d, "continue after breakpoint step")
-		expectHaltReported(d, "continue after breakpoint step")
-
 		fb.clearFaults()
 		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
 	})

@@ -4,6 +4,7 @@ package debugger
 
 import (
 	"errors"
+	"fmt"
 	"os/exec"
 	"reflect"
 	"strings"
@@ -452,6 +453,72 @@ func TestLinuxBackendFailedResumeRetainsPendingSignal(t *testing.T) {
 	}
 }
 
+func TestLinuxBackendFailedResumeESRCHRetainsPendingSignal(t *testing.T) {
+	const tid = 5501
+	b, calls := newRecordingLinuxBackend(t, tid)
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGSEGV)})
+	b.ptraceSyscall6Fn = func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
+		*calls = append(*calls, linuxResumeCall{
+			trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
+		})
+		return 0, 0, syscall.ESRCH
+	}
+
+	if err := b.ContinueProcess(); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("ContinueProcess() error = %v, want %v", err, syscall.ESRCH)
+	}
+	b.ptraceSyscall6Fn = func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
+		*calls = append(*calls, linuxResumeCall{
+			trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
+		})
+		return 0, 0, 0
+	}
+	if err := b.ContinueProcess(); err != nil {
+		t.Fatalf("retry ContinueProcess() error = %v", err)
+	}
+
+	want := []linuxResumeCall{
+		wantLinuxResume(syscall.PTRACE_CONT, tid, int(syscall.SIGSEGV)),
+		wantLinuxResume(syscall.PTRACE_CONT, tid, int(syscall.SIGSEGV)),
+	}
+	if !reflect.DeepEqual(*calls, want) {
+		t.Fatalf("resume calls = %+v, want exact ESRCH retry tuple %+v", *calls, want)
+	}
+}
+
+func TestLinuxBackendInternalResumeESRCHRetainsPendingSignal(t *testing.T) {
+	const tid = 5751
+	b, calls := newRecordingLinuxBackend(t, tid)
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGABRT)})
+	b.ptraceSyscall6Fn = func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
+		*calls = append(*calls, linuxResumeCall{
+			trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
+		})
+		return 0, 0, syscall.ESRCH
+	}
+
+	if err := b.continueIfTraceeExists(tid, 0); err != nil {
+		t.Fatalf("continueIfTraceeExists() error = %v", err)
+	}
+	b.ptraceSyscall6Fn = func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
+		*calls = append(*calls, linuxResumeCall{
+			trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
+		})
+		return 0, 0, 0
+	}
+	if err := b.ContinueProcess(); err != nil {
+		t.Fatalf("ContinueProcess() after ESRCH error = %v", err)
+	}
+
+	want := []linuxResumeCall{
+		wantLinuxResume(syscall.PTRACE_CONT, tid, 0),
+		wantLinuxResume(syscall.PTRACE_CONT, tid, int(syscall.SIGABRT)),
+	}
+	if !reflect.DeepEqual(*calls, want) {
+		t.Fatalf("resume calls = %+v, want retained exact signal %+v", *calls, want)
+	}
+}
+
 func TestLinuxBackendInternalResumesDoNotTransferPendingSignals(t *testing.T) {
 	const (
 		tid             = 6001
@@ -511,8 +578,8 @@ func TestLinuxBackendSteppedSIGURGWaitsForFreshDeliveryStop(t *testing.T) {
 	b.recordStop(tid)
 
 	b.beginStep(tid)
-	if err := b.resumeAbsorbed(tid, int(syscall.SIGURG)); err != nil {
-		t.Fatalf("resumeAbsorbed(step SIGURG) error = %v", err)
+	if err := b.absorbStop(absorbPreempt, tid, int(syscall.SIGURG)); err != nil {
+		t.Fatalf("absorbStop(step SIGURG) error = %v", err)
 	}
 	b.endStep()
 	if err := b.SingleStep(tid); err != nil {
@@ -523,8 +590,8 @@ func TestLinuxBackendSteppedSIGURGWaitsForFreshDeliveryStop(t *testing.T) {
 	if err := b.ContinueProcess(); err != nil {
 		t.Fatalf("ContinueProcess() error = %v", err)
 	}
-	if err := b.resumeAbsorbed(tid, int(syscall.SIGURG)); err != nil {
-		t.Fatalf("resumeAbsorbed(fresh SIGURG delivery) error = %v", err)
+	if err := b.absorbStop(absorbPreempt, tid, int(syscall.SIGURG)); err != nil {
+		t.Fatalf("absorbStop(fresh SIGURG delivery) error = %v", err)
 	}
 
 	wantResumes := []linuxResumeCall{
@@ -559,8 +626,8 @@ func TestLinuxBackendCurrentSignalPrecedesDelayedSIGURG(t *testing.T) {
 	if err := b.ContinueProcess(); err != nil {
 		t.Fatalf("ContinueProcess() error = %v", err)
 	}
-	if err := b.resumeAbsorbed(tid, int(syscall.SIGURG)); err != nil {
-		t.Fatalf("resumeAbsorbed(fresh SIGURG delivery) error = %v", err)
+	if err := b.absorbStop(absorbPreempt, tid, int(syscall.SIGURG)); err != nil {
+		t.Fatalf("absorbStop(fresh SIGURG delivery) error = %v", err)
 	}
 
 	wantResumes := []linuxResumeCall{
@@ -590,8 +657,8 @@ func TestLinuxBackendPauseStillSuppressesSIGSTOPWithDelayedSIGURG(t *testing.T) 
 	if err := b.ContinueProcess(); err != nil {
 		t.Fatalf("ContinueProcess() error = %v", err)
 	}
-	if err := b.resumeAbsorbed(tid, int(syscall.SIGURG)); err != nil {
-		t.Fatalf("resumeAbsorbed(fresh SIGURG delivery) error = %v", err)
+	if err := b.absorbStop(absorbPreempt, tid, int(syscall.SIGURG)); err != nil {
+		t.Fatalf("absorbStop(fresh SIGURG delivery) error = %v", err)
 	}
 
 	wantResumes := []linuxResumeCall{
@@ -643,12 +710,21 @@ func TestLinuxBackendFailedSIGURGRequeueRestoresDelayedSignal(t *testing.T) {
 }
 
 func TestLinuxBackendExitingThreadDropsCurrentAndDelayedSignals(t *testing.T) {
-	const tid = 6501
-	b, calls := newRecordingLinuxBackend(t, tid)
+	const (
+		tid             = 6501
+		otherTID        = 6502
+		unrelatedSignal = int(syscall.SIGUSR2)
+	)
+	b := &linuxBackend{pid: tid}
+	var calls []linuxResumeCall
 	b.pendingSignals.set(tid, int(syscall.SIGUSR1))
 	b.pendingSignals.delay(tid, int(syscall.SIGURG))
-	b.tgkillFn = func(tgid, targetTID int, signal syscall.Signal) error {
-		t.Fatalf("tgkill(%d, %d, %d) called for exiting thread", tgid, targetTID, signal)
+	b.pendingSignals.set(otherTID, unrelatedSignal)
+	b.contFn = func(targetTID int, signal int) error {
+		calls = append(calls, wantLinuxResume(syscall.PTRACE_CONT, targetTID, signal))
+		if got := b.pendingSignals.take(targetTID); got != 0 {
+			return fmt.Errorf("pending signal %d remained when exiting tid %d resumed", got, targetTID)
+		}
 		return nil
 	}
 
@@ -657,11 +733,14 @@ func TestLinuxBackendExitingThreadDropsCurrentAndDelayedSignals(t *testing.T) {
 	}
 
 	want := []linuxResumeCall{wantLinuxResume(syscall.PTRACE_CONT, tid, 0)}
-	if !reflect.DeepEqual(*calls, want) {
-		t.Fatalf("resume calls = %+v, want %+v", *calls, want)
+	if !reflect.DeepEqual(calls, want) {
+		t.Fatalf("resume calls = %+v, want %+v", calls, want)
 	}
 	if got := b.pendingSignals.take(tid); got != 0 {
 		t.Fatalf("pending signal after exit resume = %d, want 0", got)
+	}
+	if got := b.pendingSignals.take(otherTID); got != unrelatedSignal {
+		t.Fatalf("unrelated signal after exit resume = %d, want %d", got, unrelatedSignal)
 	}
 }
 
@@ -970,6 +1049,7 @@ func TestLinuxBackendApplyAbsorbCarriesOutThePlan(t *testing.T) {
 
 	t.Run("absorbing on the stepped thread re-arms the step and holds the gate", func(t *testing.T) {
 		b := newBackend()
+		b.pendingSignals.set(stepped, int(syscall.SIGUSR1))
 		before := b.stepRearmCount()
 		if err := b.applyAbsorb(b.planAbsorb(absorbPreempt, stepped, sigurg), stepped); err != nil {
 			t.Fatalf("applyAbsorb(absorbPreempt) error = %v", err)
@@ -979,6 +1059,12 @@ func TestLinuxBackendApplyAbsorbCarriesOutThePlan(t *testing.T) {
 		}
 		if _, ok := b.releasable(); ok {
 			t.Fatal("the gate opened while the re-armed step is still in flight")
+		}
+		if got := b.pendingSignals.take(stepped); got != int(syscall.SIGUSR1) {
+			t.Fatalf("current signal after re-arm = %d, want %d", got, syscall.SIGUSR1)
+		}
+		if got := b.pendingSignals.take(stepped); got != sigurg {
+			t.Fatalf("delayed signal after re-arm = %d, want %d", got, sigurg)
 		}
 	})
 
@@ -1607,6 +1693,66 @@ func TestLinuxWaitMarksFatalStopsSessionInvalidating(t *testing.T) {
 	}
 }
 
+func TestLinuxWaitCloneAbsorbPreservesPendingSignalOnSteppedThread(t *testing.T) {
+	const (
+		pid     = 9151
+		stepped = 9152
+	)
+	b := &linuxBackend{pid: pid}
+	script := &scriptedWait{stops: []scriptedStop{
+		{tid: stepped, status: stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_CLONE)},
+		{tid: stepped, status: stoppedAt(syscall.SIGTRAP, 0)},
+	}}
+	script.install(b)
+	b.pendingSignals.set(stepped, int(syscall.SIGUSR1))
+	b.beginStep(stepped)
+
+	ev, err := b.Wait()
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if ev.Reason != StopSingleStep || ev.TID != stepped {
+		t.Fatalf("Wait() = %+v, want the re-armed step completion on tid %d", ev, stepped)
+	}
+	want := []resumeOp{{step: true, tid: stepped}}
+	if !reflect.DeepEqual(script.ops, want) {
+		t.Fatalf("resume ops = %+v, want %+v", script.ops, want)
+	}
+	if got := b.pendingSignals.take(stepped); got != int(syscall.SIGUSR1) {
+		t.Fatalf("pending signal after clone absorb = %d, want %d", got, syscall.SIGUSR1)
+	}
+}
+
+func TestLinuxWaitClearsReusedTIDStateBeforeNewThreadResume(t *testing.T) {
+	const (
+		pid       = 9201
+		newThread = 9202
+	)
+	b := &linuxBackend{pid: pid}
+	script := &scriptedWait{stops: []scriptedStop{
+		{tid: newThread, status: stoppedAt(syscall.SIGSTOP, 0)},
+		{tid: pid, status: exitedWith(0)},
+	}}
+	script.install(b)
+	b.pendingSignals.set(newThread, int(syscall.SIGUSR1))
+	b.pendingSignals.delay(newThread, int(syscall.SIGURG))
+	b.contFn = func(tid int, signal int) error {
+		if got := b.pendingSignals.take(tid); got != 0 {
+			return fmt.Errorf("stale signal %d remained on reused tid %d", got, tid)
+		}
+		script.ops = append(script.ops, resumeOp{tid: tid, signal: signal})
+		return nil
+	}
+
+	if _, err := b.Wait(); err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	want := []resumeOp{{tid: newThread}}
+	if !reflect.DeepEqual(script.ops, want) {
+		t.Fatalf("resume ops = %+v, want %+v", script.ops, want)
+	}
+}
+
 // TestLinuxWaitAlwaysFailsOnExec pins scope A: a post-startup PTRACE_EVENT_EXEC
 // terminates the session unconditionally.
 //
@@ -1647,6 +1793,8 @@ func TestLinuxWaitAlwaysFailsOnExec(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			b := &linuxBackend{pid: pid}
+			b.pendingSignals.set(pid, int(syscall.SIGUSR1))
+			b.pendingSignals.delay(stepped, int(syscall.SIGURG))
 			script := &scriptedWait{stops: []scriptedStop{
 				{tid: tc.execTID, status: stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_EXEC)},
 			}}
@@ -1682,6 +1830,12 @@ func TestLinuxWaitAlwaysFailsOnExec(t *testing.T) {
 			}
 			if tid, ok := b.heldStepOwner(); ok {
 				t.Fatalf("heldStepOwner() = (%d, %v) after the exec abort, want the obligation dropped", tid, ok)
+			}
+			if got := b.pendingSignals.take(pid); got != 0 {
+				t.Fatalf("pending signal after exec abort = %d, want process-wide purge", got)
+			}
+			if got := b.pendingSignals.take(stepped); got != 0 {
+				t.Fatalf("delayed signal after exec abort = %d, want process-wide purge", got)
 			}
 		})
 	}
@@ -1914,6 +2068,8 @@ func TestLinuxWaitHoldsTheDyingStepOwnerAsItsOwnAnchor(t *testing.T) {
 	if got := b.heldStepOwnerCount(); got != 1 {
 		t.Fatalf("heldStepOwnerCount() = %d, want 1", got)
 	}
+	b.pendingSignals.set(stepped, int(syscall.SIGUSR1))
+	b.pendingSignals.delay(stepped, int(syscall.SIGURG))
 
 	if err := b.completeStepThreadExit(); err != nil {
 		t.Fatalf("completeStepThreadExit() = %v, want success", err)
@@ -1926,6 +2082,9 @@ func TestLinuxWaitHoldsTheDyingStepOwnerAsItsOwnAnchor(t *testing.T) {
 	}
 	if tid, ok := b.heldStepOwner(); ok {
 		t.Fatalf("heldStepOwner() = (%d, %v) after release, want nothing held", tid, ok)
+	}
+	if got := b.pendingSignals.take(stepped); got != 0 {
+		t.Fatalf("pending signal after held-owner release = %d, want 0", got)
 	}
 
 	if err := b.completeStepThreadExit(); err != nil {
@@ -1951,6 +2110,8 @@ func TestLinuxWaitTreatsADeadHeldOwnerAsReleased(t *testing.T) {
 	b.beginStep(stepped)
 	b.interruptStepIfStepped(stepped)
 	b.holdStepOwner(stepped)
+	b.pendingSignals.set(stepped, int(syscall.SIGUSR1))
+	b.pendingSignals.delay(stepped, int(syscall.SIGURG))
 	b.contFn = func(int, int) error { return syscall.ESRCH }
 
 	if err := b.completeStepThreadExit(); err != nil {
@@ -1961,6 +2122,9 @@ func TestLinuxWaitTreatsADeadHeldOwnerAsReleased(t *testing.T) {
 	}
 	if b.stepExitPending {
 		t.Fatal("the gate stayed closed after a benign release")
+	}
+	if got := b.pendingSignals.take(stepped); got != 0 {
+		t.Fatalf("pending signal after ESRCH release = %d, want 0 for conclusively dying owner", got)
 	}
 }
 
