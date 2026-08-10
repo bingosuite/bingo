@@ -27,6 +27,7 @@ type fakeBackend struct {
 	memMu        sync.RWMutex
 	mem          map[uint64]byte
 	readFailures map[uint64]int
+	readCount    map[uint64]int
 	regs         map[int]debugger.Registers
 	tids         []int
 
@@ -71,6 +72,7 @@ func newFakeBackend() *fakeBackend {
 	return &fakeBackend{
 		mem:          make(map[uint64]byte),
 		readFailures: make(map[uint64]int),
+		readCount:    make(map[uint64]int),
 		regs:         map[int]debugger.Registers{1: {}},
 		tids:         []int{1},
 		stopCh:       make(chan debugger.StopEvent, 8),
@@ -227,6 +229,7 @@ func (f *fakeBackend) SingleStep(tid int) error {
 }
 
 func (f *fakeBackend) ReadMemory(addr uint64, dst []byte) error {
+	f.readCount[addr]++
 	if err := f.faultFor("read", addr); err != nil {
 		return err
 	}

@@ -13,12 +13,14 @@ type goroutineMemoryBackend struct {
 	regs   Registers
 	regErr error
 	reads  map[uint64]int
+	fails  map[uint64]int
 }
 
 func newGoroutineMemoryBackend() *goroutineMemoryBackend {
 	return &goroutineMemoryBackend{
 		mem:   make(map[uint64]byte),
 		reads: make(map[uint64]int),
+		fails: make(map[uint64]int),
 	}
 }
 
@@ -97,10 +99,18 @@ func (b *goroutineMemoryBackend) PauseSignal() int       { return 0 }
 
 func (b *goroutineMemoryBackend) ReadMemory(addr uint64, dst []byte) error {
 	b.reads[addr]++
+	if b.fails[addr] > 0 {
+		b.fails[addr]--
+		return errors.New("injected read failure")
+	}
 	for i := range dst {
 		dst[i] = b.mem[addr+uint64(i)]
 	}
 	return nil
+}
+
+func (b *goroutineMemoryBackend) failNextReadAt(addr uint64) {
+	b.fails[addr]++
 }
 
 func (b *goroutineMemoryBackend) WriteMemory(addr uint64, src []byte) error {
@@ -137,7 +147,7 @@ func TestBuildGoroutineListAnchorsCurrentBeyondRichScan(t *testing.T) {
 	layout := goroutineTestLayout()
 
 	backend := newGoroutineMemoryBackend()
-	length := uint64(maxGoroutineScan + 4)
+	length := uint64(maxGoroutineScan + 1)
 	currentIndex := length - 1
 	for i := uint64(0); i < length; i++ {
 		gptr := gBase + i*gStride
@@ -366,55 +376,112 @@ func TestCurrentGoroutineFromRegisterRejectsUnrelatedPositiveGoID(t *testing.T) 
 
 	e := &engine{backend: backend}
 	result := e.currentGoroutineFromRegister(
-		layout, candidate, 0xdeadbeef, 0x1234, currentGoroutineRich,
+		layout, candidate, 0xdeadbeef, 0x1234,
 	)
 	if !result.Complete || result.Found {
 		t.Fatalf("current goroutine = %+v; want complete rejection of stale positive-goid candidate", result)
 	}
 }
 
-func TestCurrentGoroutineIdentityReadsOnlyRequiredFields(t *testing.T) {
+func TestBuildGoroutineListTreatsSpeculativeRegisterHintFailuresAsMisses(t *testing.T) {
 	const (
-		gptr   = uint64(0x200000)
-		liveSP = uint64(0x8008)
+		allgsPtr  = uint64(0x1000)
+		realG     = uint64(0x200000)
+		candidate = uint64(0x300000)
+		mptr      = uint64(0x400000)
 	)
-	layout := goroutineTestLayout()
-	backend := newGoroutineMemoryBackend()
-	seedTestGoroutine(backend, layout, gptr, 42, 0x8000, 0x9000)
+	for _, tc := range []struct {
+		name string
+		seed func(*goroutineMemoryBackend, *goLayout)
+		fail func(*goroutineMemoryBackend, *goLayout) uint64
+	}{
+		{
+			name: "invalid positive goid",
+			seed: func(backend *goroutineMemoryBackend, layout *goLayout) {
+				seedTestGoroutine(backend, layout, candidate, 88, 0xa0000000, 0xa0001000)
+			},
+		},
+		{
+			name: "unreadable candidate header",
+			fail: func(_ *goroutineMemoryBackend, layout *goLayout) uint64 {
+				return candidate + uint64(layout.gAtomicstatus)
+			},
+		},
+		{
+			name: "unreadable candidate m",
+			seed: func(backend *goroutineMemoryBackend, layout *goLayout) {
+				seedTestGoroutine(backend, layout, candidate, 0, 0xa0000000, 0xa0001000)
+			},
+			fail: func(_ *goroutineMemoryBackend, layout *goLayout) uint64 {
+				return candidate + uint64(layout.gM)
+			},
+		},
+		{
+			name: "unreadable m.g0",
+			seed: func(backend *goroutineMemoryBackend, layout *goLayout) {
+				seedTestGoroutine(backend, layout, candidate, 0, 0xa0000000, 0xa0001000)
+				backend.seedU64(candidate+uint64(layout.gM), mptr)
+			},
+			fail: func(_ *goroutineMemoryBackend, layout *goLayout) uint64 {
+				return mptr + uint64(layout.mG0)
+			},
+		},
+		{
+			name: "unreadable m.gsignal",
+			seed: func(backend *goroutineMemoryBackend, layout *goLayout) {
+				seedTestGoroutine(backend, layout, candidate, 0, 0xa0000000, 0xa0001000)
+				backend.seedU64(candidate+uint64(layout.gM), mptr)
+				backend.seedU64(mptr+uint64(layout.mG0), 0)
+			},
+			fail: func(_ *goroutineMemoryBackend, layout *goLayout) uint64 {
+				return mptr + uint64(layout.mGsignal)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			layout := goroutineTestLayout()
+			backend := newGoroutineMemoryBackend()
+			backend.seedU64(allgsPtr, realG)
+			seedTestGoroutine(backend, layout, realG, 1, 0x1000, 0x2000)
+			if tc.seed != nil {
+				tc.seed(backend, layout)
+			}
+			var failAddr uint64
+			if tc.fail != nil {
+				failAddr = tc.fail(backend, layout)
+				backend.failNextReadAt(failAddr)
+			}
 
-	e := &engine{backend: backend}
-	result := e.currentGoroutineFromRegister(
-		layout, gptr, liveSP, 0x1234, currentGoroutineIdentity,
-	)
-	if !result.Complete || !result.Found ||
-		result.Item.ID != 42 || !result.Item.Current {
-		t.Fatalf("current identity = %+v, want current g42", result)
-	}
-
-	if len(backend.reads) != 1 || backend.reads[gptr] != 1 {
-		t.Fatalf("read addresses = %#v, want one bounded bulk identity read at %#x", backend.reads, gptr)
-	}
-}
-
-func TestCurrentGoroutineIdentityWideLayoutKeepsReadsBounded(t *testing.T) {
-	const (
-		gptr   = uint64(0x200000)
-		liveSP = uint64(0x8008)
-	)
-	layout := goroutineTestLayout()
-	layout.gGoid = maxCurrentIdentityBytes * 2
-	backend := newGoroutineMemoryBackend()
-	seedTestGoroutine(backend, layout, gptr, 42, 0x8000, 0x9000)
-
-	e := &engine{backend: backend}
-	result := e.currentGoroutineFromRegister(
-		layout, gptr, liveSP, 0x1234, currentGoroutineIdentity,
-	)
-	if !result.Complete || !result.Found || result.Item.ID != 42 {
-		t.Fatalf("current identity = %+v, want current g42", result)
-	}
-	if len(backend.reads) != 4 {
-		t.Fatalf("read addresses = %#v, want four bounded field reads", backend.reads)
+			e := &engine{backend: backend}
+			hint := e.currentGoroutineFromRegister(
+				layout, candidate, 0xdeadbeef, 0x1234,
+			)
+			if !hint.Complete || hint.Found {
+				t.Fatalf("register hint = %+v, want complete miss", hint)
+			}
+			if failAddr != 0 {
+				backend.failNextReadAt(failAddr)
+			}
+			result := e.buildGoroutineListFrom(
+				layout, allgsPtr, 1, 0xdeadbeef, 0x1234, candidate, 0,
+			)
+			if !result.Complete || result.AnchorID != 0 ||
+				len(result.Items) != 1 || result.Items[0].ID != 1 ||
+				result.Items[0].Current {
+				t.Fatalf("goroutine walk = %+v, want complete rich set with unknown current", result)
+			}
+			_, current := snapshotGoroutineIDs(result.Items, result.AnchorID)
+			if current != 0 {
+				t.Fatalf("snapshot current = %d, want honest unknown identity", current)
+			}
+			selected := currentGoroutineFrom(
+				protocol.GoroutineSnapshotPayload{Goroutines: result.Items},
+				protocol.Location{},
+			)
+			if selected.ID != 0 || selected.Status != "unknown" || !selected.Current {
+				t.Fatalf("selected current = %+v, want synthetic unknown", selected)
+			}
+		})
 	}
 }
 
@@ -447,7 +514,7 @@ func TestFindCurrentGoroutineByProcIDContinuesPastRichThreadCap(t *testing.T) {
 
 	e := &engine{backend: backend}
 	result := e.findCurrentGoroutineByProcIDFrom(
-		layout, mBase, targetID, 0x1234, currentGoroutineRich,
+		layout, mBase, targetID, 0x1234,
 	)
 	if !result.Complete || !result.Found ||
 		!result.Item.Current || result.Item.ID != 99 || result.Item.ThreadID != int(targetID) {
@@ -474,7 +541,7 @@ func TestFindCurrentGoroutineByProcIDBoundsTargetedContinuation(t *testing.T) {
 
 	e := &engine{backend: backend}
 	result := e.findCurrentGoroutineByProcIDFrom(
-		layout, mBase, ^uint64(0), 0x1234, currentGoroutineRich,
+		layout, mBase, ^uint64(0), 0x1234,
 	)
 	if !result.Complete || result.Found {
 		t.Fatalf("current goroutine = %+v; want complete bounded miss", result)

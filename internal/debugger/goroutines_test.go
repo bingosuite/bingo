@@ -377,6 +377,10 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 		Expect(currentThreads).To(Equal(1))
 
 		seedU32(fb, fixture.g[2]+fixture.layout.GAtomicstatus, 6)
+		// The first failure rejects the speculative register hint; the second
+		// proves the same required stack bound still degrades when the rooted
+		// allgs tail walk reaches it.
+		fb.failNextReadAt(tailCurrent + fixture.layout.GStack + fixture.layout.StackLo)
 		fb.failNextReadAt(tailCurrent + fixture.layout.GStack + fixture.layout.StackLo)
 
 		degraded := debugger.ExportedGoroutineSnapshot(d)
@@ -402,7 +406,7 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 		Expect(currentThreads).To(Equal(1))
 	})
 
-	It("resolves regular step identity without a rich allgs walk", func() {
+	It("keeps regular step identity synthetic without reading runtime lists", func() {
 		seedU64(fb, fixture.m[1]+fixture.layout.MProcid, 1)
 		fb.seedRegs(debugger.Registers{
 			PC:  0x1234,
@@ -411,6 +415,7 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 		})
 		Expect(d.StepInto()).To(Succeed())
 		fb.getRegisterCalls = 0
+		fb.readCount = make(map[uint64]int)
 		fb.pushStop(debugger.StopEvent{
 			Reason: debugger.StopSingleStep,
 			TID:    1,
@@ -421,8 +426,17 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 		Expect(event.Kind).To(Equal(protocol.EventStepped))
 		var stepped protocol.SteppedPayload
 		Expect(protocol.DecodeEventPayload(event, &stepped)).To(Succeed())
-		Expect(stepped.Goroutine.ID).To(Equal(102))
+		Expect(stepped.Goroutine.ID).To(BeZero())
+		Expect(stepped.Goroutine.Status).To(Equal("unknown"))
 		Expect(stepped.Goroutine.Current).To(BeTrue())
+		Expect(fb.readCount[fixture.layout.Allgs]).To(BeZero(),
+			"regular steps must not read the runtime.allgs root")
+		Expect(fb.readCount[fixture.layout.Allm]).To(BeZero(),
+			"regular steps must not read the runtime.allm root")
+		Expect(fb.readCount[allgsArrayAddr]).To(BeZero(),
+			"regular steps must not walk runtime.allgs")
+		Expect(fb.readCount[mBaseAddr+fixture.layout.MProcid]).To(BeZero(),
+			"regular steps must not walk runtime.allm")
 		Expect(fb.getRegisterCalls).To(Equal(1))
 	})
 
