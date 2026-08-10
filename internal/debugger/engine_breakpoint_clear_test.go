@@ -245,7 +245,8 @@ var _ = Describe("Breakpoint clear state transitions", func() {
 
 	DescribeTable("releases the reservation when fallback thread selection fails",
 		func(threadsErr error, tids []int) {
-			parkOnBreakpoint(0)
+			parkOnBreakpoint(1)
+			debugger.ExportedForgetLastBreakpointTID(d)
 			fb.threadsErr = threadsErr
 			fb.tids = tids
 
