@@ -37,17 +37,25 @@ type fakeBackend struct {
 	continueCh       chan struct{}
 	writeErr         error
 	getRegistersErr  error
+	setRegisterCalls []setRegistersCall
 
 	// Fault injection for the asynchronous stop-handling error paths. A test
 	// arms a fault and only then pushes the stop event that reaches the
 	// faulting code, so the arming is already ordered before the engine's
 	// read; faultMu makes that explicit rather than leaning on the channel's
 	// happens-before edge, and keeps -race quiet if a waitLoop is in flight.
-	faultMu    sync.Mutex
-	threadsErr error
-	regsErr    error
-	writeErrAt map[uint64]error
-	readErrAt  map[uint64]error
+	faultMu     sync.Mutex
+	threadsErr  error
+	regsErr     error
+	setRegsErr  error
+	continueErr error
+	writeErrAt  map[uint64]error
+	readErrAt   map[uint64]error
+}
+
+type setRegistersCall struct {
+	tid int
+	reg debugger.Registers
 }
 
 func newFakeBackend() *fakeBackend {
@@ -77,6 +85,18 @@ func (f *fakeBackend) failRegisters(err error) {
 	f.regsErr = err
 }
 
+func (f *fakeBackend) failSetRegisters(err error) {
+	f.faultMu.Lock()
+	defer f.faultMu.Unlock()
+	f.setRegsErr = err
+}
+
+func (f *fakeBackend) failContinue(err error) {
+	f.faultMu.Lock()
+	defer f.faultMu.Unlock()
+	f.continueErr = err
+}
+
 func (f *fakeBackend) failWriteAt(addr uint64, err error) {
 	f.faultMu.Lock()
 	defer f.faultMu.Unlock()
@@ -94,6 +114,8 @@ func (f *fakeBackend) clearFaults() {
 	defer f.faultMu.Unlock()
 	f.threadsErr = nil
 	f.regsErr = nil
+	f.setRegsErr = nil
+	f.continueErr = nil
 	f.writeErrAt = make(map[uint64]error)
 	f.readErrAt = make(map[uint64]error)
 }
@@ -144,12 +166,13 @@ func (f *fakeBackend) peekMem(addr uint64, n int) []byte {
 func (f *fakeBackend) ContinueProcess() error {
 	f.faultMu.Lock()
 	f.continueCalls++
+	err := f.continueErr
 	f.faultMu.Unlock()
 	select {
 	case f.continueCh <- struct{}{}:
 	default:
 	}
-	return nil
+	return err
 }
 
 // continueCount reads the resume counter under the lock. Assertions that poll
@@ -217,6 +240,12 @@ func (f *fakeBackend) GetRegisters(tid int) (debugger.Registers, error) {
 }
 
 func (f *fakeBackend) SetRegisters(tid int, reg debugger.Registers) error {
+	f.faultMu.Lock()
+	defer f.faultMu.Unlock()
+	f.setRegisterCalls = append(f.setRegisterCalls, setRegistersCall{tid: tid, reg: reg})
+	if f.setRegsErr != nil {
+		return f.setRegsErr
+	}
 	f.regs[tid] = reg
 	return nil
 }
@@ -519,6 +548,42 @@ var _ = Describe("Engine", func() {
 			if ok {
 				Expect(evt.Kind).NotTo(Equal(protocol.EventBreakpointHit))
 			}
+		})
+
+		It("rewinds a delayed sibling hit after an internal breakpoint is auto-cleared", func() {
+			trap := debugger.ExportedTrapInstruction()
+			if len(trap) != 1 {
+				Skip("the delayed-PC hazard requires an architecture that advances past its trap")
+			}
+
+			const (
+				sentinelAddr = bpAddr + 0x100
+				firstTID     = 1
+				siblingTID   = 2
+			)
+			fb.tids = []int{firstTID, siblingTID}
+			fb.seedMem(sentinelAddr, []byte{0x90})
+			fb.regs[firstTID] = debugger.Registers{PC: sentinelAddr + 1}
+			debugger.ExportedSetStepOverBreakpointAt(d, sentinelAddr)
+
+			continueAndConsumeContinued(d)
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: firstTID})
+			Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventStepped))
+			Expect(fb.peekMem(sentinelAddr, len(trap))).NotTo(Equal(trap),
+				"the one-shot sentinel must be restored before the delayed hit surfaces")
+
+			fb.regs[siblingTID] = debugger.Registers{PC: sentinelAddr + 1}
+			continueAndConsumeContinued(d)
+			before := fb.continueCount()
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: siblingTID})
+
+			Eventually(fb.continueCount).Should(BeNumerically(">", before))
+			Expect(fb.regs[siblingTID].PC).To(Equal(sentinelAddr),
+				"the delayed hit must resume at the restored instruction, not one byte into it")
+			Expect(fb.setRegisterCalls).NotTo(BeEmpty())
+			last := fb.setRegisterCalls[len(fb.setRegisterCalls)-1]
+			Expect(last.tid).To(Equal(siblingTID))
+			Expect(last.reg.PC).To(Equal(sentinelAddr))
 		})
 	})
 
