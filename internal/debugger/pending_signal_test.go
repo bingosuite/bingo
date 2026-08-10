@@ -88,25 +88,6 @@ func TestPendingSignalsDelayedSignalSurvivesLaterCurrentSignal(t *testing.T) {
 	}
 }
 
-func TestPendingSignalsStepConsumesOnlyCurrentSignal(t *testing.T) {
-	var pending pendingSignals
-	const (
-		tid           = 4001
-		delayedSignal = 23
-		currentSignal = 10
-	)
-
-	pending.delay(tid, delayedSignal)
-	pending.set(tid, currentSignal)
-
-	if got := pending.takeForStep(tid); got != currentSignal {
-		t.Fatalf("takeForStep = %d, want current signal %d", got, currentSignal)
-	}
-	if got := pending.take(tid); got != delayedSignal {
-		t.Fatalf("delayed signal after takeForStep = %d, want %d", got, delayedSignal)
-	}
-}
-
 func TestPendingSignalsContinueSeparatesCurrentFromDelayed(t *testing.T) {
 	var pending pendingSignals
 	const (

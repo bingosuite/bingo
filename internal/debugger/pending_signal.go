@@ -6,8 +6,8 @@ import "sync"
 // produced them until that exact thread is resumed. A current signal-delivery
 // stop has priority over SIGURG delayed through an interrupted single-step, but
 // the two cannot overwrite each other. Wait writes from its one-shot goroutine
-// while ContinueProcess and SingleStep consume on the engine loop, so this state
-// needs synchronization even though the parked-stop FIFO does not.
+// while ContinueProcess consumes on the engine loop, so this state needs
+// synchronization even though the parked-stop FIFO does not.
 type pendingSignals struct {
 	mu           sync.Mutex
 	currentByTID map[int]int
@@ -61,14 +61,6 @@ func (p *pendingSignals) takeForContinue(tid int) (signal, delayed int) {
 		return signal, 0
 	}
 	return signal, delayed
-}
-
-func (p *pendingSignals) takeForStep(tid int) int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	signal := p.currentByTID[tid]
-	delete(p.currentByTID, tid)
-	return signal
 }
 
 func (p *pendingSignals) takeForExplicitResume(tid, signal int) (resumeSignal, delayed int) {
