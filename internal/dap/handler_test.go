@@ -1460,9 +1460,7 @@ func TestUnknownStepOmitsThreadID(t *testing.T) {
 		t.Fatalf("non-current stack enqueued %d CmdFrames, want %d", got, framesBefore)
 	}
 
-	hh.sendReq("stackTrace", &godap.StackTraceRequest{
-		Arguments: godap.StackTraceArguments{ThreadId: 7},
-	})
+	hh.sendReq("stackTrace", &godap.StackTraceRequest{})
 	hh.cmds.waitForCommand(t, protocol.CmdFrames)
 	hh.inject(protocol.EventFrames, protocol.FramesPayload{Frames: []protocol.Frame{{
 		Index:    0,
@@ -1470,7 +1468,7 @@ func TestUnknownStepOmitsThreadID(t *testing.T) {
 	}}})
 	current := recvType[*godap.StackTraceResponse](hh)
 	if len(current.Body.StackFrames) != 1 || current.Body.StackFrames[0].Name != "main.worker" {
-		t.Fatalf("current stack = %+v", current.Body.StackFrames)
+		t.Fatalf("thread-id-free current stack = %+v", current.Body.StackFrames)
 	}
 }
 
@@ -1508,6 +1506,26 @@ func TestUnknownStepUsesOneSyntheticStackTarget(t *testing.T) {
 	stack := recvType[*godap.StackTraceResponse](hh)
 	if len(stack.Body.StackFrames) != 1 || stack.Body.StackFrames[0].Name != "main.worker" {
 		t.Fatalf("synthetic stopped stack = %+v", stack.Body.StackFrames)
+	}
+}
+
+func TestUnknownStepServesStackWithoutThreadQuery(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	hh.inject(protocol.EventStepped, protocol.SteppedPayload{
+		Goroutine: protocol.Goroutine{Status: "unknown", Current: true},
+	})
+	_ = recvType[*godap.StoppedEvent](hh)
+
+	hh.sendReq("stackTrace", &godap.StackTraceRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdFrames)
+	hh.inject(protocol.EventFrames, protocol.FramesPayload{Frames: []protocol.Frame{{
+		Index:    0,
+		Location: protocol.Location{Function: "main.worker", File: "/x/main.go", Line: 20},
+	}}})
+	stack := recvType[*godap.StackTraceResponse](hh)
+	if len(stack.Body.StackFrames) != 1 || stack.Body.StackFrames[0].Name != "main.worker" {
+		t.Fatalf("thread-id-free stack = %+v", stack.Body.StackFrames)
 	}
 }
 
