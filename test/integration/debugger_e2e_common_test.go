@@ -711,6 +711,66 @@ func declareClearBreakpointSpec() {
 	})
 }
 
+// declareInFlightBreakpointReservationSpec enters the public-command window
+// while A is temporarily absent from the breakpoint table. Its e2e-only actor
+// probe holds stop delivery across resume, Set, Clear, and Set so the native
+// interleaving is deterministic on both backends. The target must then progress
+// to B, after which a fresh A gets the next ID and the un-cleared control
+// re-arms under that same ID.
+func declareInFlightBreakpointReservationSpec() {
+	It("reserves a breakpoint address for the full in-flight step-off", Label("breakpoints"), func() {
+		lineA := markerLine(twoBPTargetSrc, "// BP_A")
+		lineB := markerLine(twoBPTargetSrc, "// BP_B")
+		bin := buildTarget("reservation_target", twoBPTargetSrc)
+		h := newE2EHarness(bin)
+		h.waitFor(15*time.Second, protocol.EventStepped)
+
+		bpA, err := h.d.SetBreakpoint("reservation_target.go", lineA)
+		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint A")
+		bpB, err := h.d.SetBreakpoint("reservation_target.go", lineB)
+		Expect(err).NotTo(HaveOccurred(), "SetBreakpoint B")
+
+		Expect(h.d.Continue()).To(Succeed(), "Continue to A")
+		evt := h.waitFor(15*time.Second,
+			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit), "reach A")
+		Expect(bpLine(evt)).To(Equal(lineA), "park on A")
+
+		probe, err := debugger.ProbeInFlightBreakpointReservation(
+			h.d, "reservation_target.go", lineA, bpA.ID)
+		Expect(err).NotTo(HaveOccurred(), "run native in-flight reservation probe")
+		Expect(probe.FirstSetConflict).To(BeTrue(), probe.FirstSetError)
+		Expect(probe.ClearSucceeded).To(BeTrue(), probe.ClearError)
+		Expect(probe.ClearedSetConflict).To(BeTrue(), probe.ClearedSetError)
+
+		evt = h.waitFor(15*time.Second,
+			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit),
+			"cancelled A must resume and reach B")
+		Expect(bpLine(evt)).To(Equal(lineB),
+			"cancelled A must not leave a trap behind")
+
+		rearmedA, err := h.d.SetBreakpoint("reservation_target.go", lineA)
+		Expect(err).NotTo(HaveOccurred(), "A must be settable after ownership ends")
+		Expect(rearmedA.ID).To(Equal(bpB.ID+1),
+			"rejected Sets must not consume breakpoint IDs")
+		Expect(h.d.ClearBreakpoint(bpB.ID)).To(Succeed(), "clear B while parked")
+
+		Expect(h.d.Continue()).To(Succeed(), "continue from cleared B to fresh A")
+		evt = h.waitFor(15*time.Second,
+			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit), "fresh A must be hit")
+		Expect(bpID(evt)).To(Equal(rearmedA.ID), "fresh A must report its assigned ID")
+
+		Expect(h.d.Continue()).To(Succeed(), "step off and re-hit live A")
+		evt = h.waitFor(15*time.Second,
+			protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit), "live A must re-arm")
+		Expect(bpID(evt)).To(Equal(rearmedA.ID),
+			"un-cleared A must re-arm under its original ID")
+	})
+}
+
 // declareKillRunningSpec asserts Kill terminates a RUNNING tracee, not just a
 // suspended one. It Continues the process (so it is genuinely running, past the
 // launch stop), then Kills and asserts the engine tears down — proving Kill
@@ -855,6 +915,13 @@ func bpLine(evt protocol.Event) int {
 	var hit protocol.BreakpointHitPayload
 	Expect(json.Unmarshal(evt.Payload, &hit)).To(Succeed(), "decode BreakpointHit")
 	return hit.Breakpoint.Location.Line
+}
+
+func bpID(evt protocol.Event) int {
+	GinkgoHelper()
+	var hit protocol.BreakpointHitPayload
+	Expect(json.Unmarshal(evt.Payload, &hit)).To(Succeed(), "decode BreakpointHit")
+	return hit.Breakpoint.ID
 }
 
 // declareConcurrencySpec is the data-foundation gate for concurrency

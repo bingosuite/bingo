@@ -375,6 +375,14 @@ never reported or reinstalled. Failed restoration leaves the entry enabled and
 all pending state intact. `clearAll` applies the same
 invalidation/cancellation rules for Kill.
 
+The non-nil `steppingOverBP` also reserves its address for the entire in-flight
+step, even after a Clear disables the retained entry. Public `SetBreakpoint`
+rejects that same resolved address before `breakpointTable.set` or any backend
+memory access, while different addresses remain settable. Do not put the
+temporarily disarmed entry back in `byAddr` to reserve it: `atAddr` classifies
+real `StopBreakpoint` events and must describe only installed traps. The
+reservation ends when step-off ownership clears `steppingOverBP`.
+
 If `bps.reinstall` ever fails after a single-step, **suspend instead of
 resuming**. Running without the trap is a runaway process; reporting the
 error lets the operator intervene.
@@ -2596,7 +2604,8 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   `pause` (async-interrupt / manual-stop round-trip), `stepping`
   (StepInto crosses into a callee, StepOut returns to the caller), `inspect`
   (StackFrames chain + Locals + Goroutines at a breakpoint), `breakpoints`
-  (a cleared breakpoint stops firing), `kill` (Kill terminates a
+  (a cleared breakpoint stops firing and an in-flight step-off reserves its
+  temporarily table-less address), `kill` (Kill terminates a
   freely-running tracee), `exit` (EventProcessExited reports the tracee's real
   exit code), `signals` (linux-only: fatal and ordinary signal forwarding plus
   the shared Pause-suppression control), `overlap` (linux-only: a foreign thread's breakpoint stop

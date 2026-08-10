@@ -79,7 +79,7 @@ func ExportedSetBreakpointAt(d Debugger, addr uint64) int {
 	e := d.(*engine)
 	var id int
 	err := e.dispatch(func() error {
-		entry, err := e.bps.set(e.backend, "<direct-addr>", 0, addr)
+		entry, err := e.setBreakpoint("<direct-addr>", 0, addr)
 		if err != nil {
 			return err
 		}
@@ -95,7 +95,7 @@ func ExportedSetBreakpointAt(d Debugger, addr uint64) int {
 func ExportedSetBreakpointAtErr(d Debugger, addr uint64) error {
 	e := d.(*engine)
 	return e.dispatch(func() error {
-		_, err := e.bps.set(e.backend, "<direct-addr>", 0, addr)
+		_, err := e.setBreakpoint("<direct-addr>", 0, addr)
 		return err
 	})
 }

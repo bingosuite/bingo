@@ -36,9 +36,12 @@ type fakeBackend struct {
 	continueCalls    int
 	singleStepCalls  []int
 	stopProcessCalls int
+	readCalls        []uint64
+	writeCalls       []uint64
 	writtenAt        map[uint64][]byte
 	continueCh       chan struct{}
 	writeErr         error
+	singleStepErr    error
 	getRegistersErr  error
 	writeCount       map[uint64]int
 	setRegisterCalls []setRegistersCall
@@ -206,6 +209,11 @@ func (f *fakeBackend) Threads() ([]int, error) {
 
 func (f *fakeBackend) SingleStep(tid int) error {
 	f.singleStepCalls = append(f.singleStepCalls, tid)
+	if f.singleStepErr != nil {
+		err := f.singleStepErr
+		f.singleStepErr = nil
+		return err
+	}
 	return nil
 }
 
@@ -213,6 +221,7 @@ func (f *fakeBackend) ReadMemory(addr uint64, dst []byte) error {
 	if err := f.faultFor("read", addr); err != nil {
 		return err
 	}
+	f.readCalls = append(f.readCalls, addr)
 	f.memMu.RLock()
 	defer f.memMu.RUnlock()
 	for i := range dst {
@@ -222,6 +231,7 @@ func (f *fakeBackend) ReadMemory(addr uint64, dst []byte) error {
 }
 
 func (f *fakeBackend) WriteMemory(addr uint64, src []byte) error {
+	f.writeCalls = append(f.writeCalls, addr)
 	if f.writeErr != nil {
 		err := f.writeErr
 		f.writeErr = nil

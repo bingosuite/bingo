@@ -10,6 +10,10 @@ import (
 
 var errBreakpointExists = errors.New("breakpoint already installed at address")
 
+func breakpointExists(addr uint64, file string, line int) error {
+	return fmt.Errorf("%w: 0x%x (%s:%d)", errBreakpointExists, addr, file, line)
+}
+
 type breakpointEntry struct {
 	id            int
 	addr          uint64
@@ -53,7 +57,7 @@ func newBreakpointTable() *breakpointTable {
 // and records the entry. Returns errBreakpointExists if already installed.
 func (t *breakpointTable) set(b Backend, file string, line int, addr uint64) (*breakpointEntry, error) {
 	if _, exists := t.byAddr[addr]; exists {
-		return nil, fmt.Errorf("%w: 0x%x (%s:%d)", errBreakpointExists, addr, file, line)
+		return nil, breakpointExists(addr, file, line)
 	}
 
 	trap := archTrapInstruction()

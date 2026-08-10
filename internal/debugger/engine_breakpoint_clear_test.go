@@ -35,6 +35,17 @@ var _ = Describe("Breakpoint clear state transitions", func() {
 		ExpectWithOffset(1, fb.peekMem(bpAddr, len(trap))).To(Equal(original[:len(trap)]))
 	}
 
+	expectAddressReserved := func(addr uint64) {
+		readsBefore := len(fb.readCalls)
+		writesBefore := len(fb.writeCalls)
+		err := debugger.ExportedSetBreakpointAtErr(d, addr)
+		ExpectWithOffset(1, errors.Is(err, debugger.ExportedErrBreakpointExists)).To(BeTrue())
+		ExpectWithOffset(1, fb.readCalls).To(HaveLen(readsBefore),
+			"reserved SetBreakpoint must reject before backend ReadMemory")
+		ExpectWithOffset(1, fb.writeCalls).To(HaveLen(writesBefore),
+			"reserved SetBreakpoint must reject before backend WriteMemory")
+	}
+
 	parkOnBreakpoint := func(tid int) {
 		hitPC := bpAddr
 		if len(trap) == 1 {
@@ -99,11 +110,14 @@ var _ = Describe("Breakpoint clear state transitions", func() {
 
 		Expect(d.ClearBreakpoint(id)).To(Succeed())
 		Expect(d.ClearBreakpoint(id)).To(MatchError(ContainSubstring("not found")))
+		expectAddressReserved(bpAddr)
 		fb.pushStop(debugger.StopEvent{Reason: debugger.StopSingleStep, TID: 1, PC: bpAddr + uint64(len(trap))})
 		waitForContinue()
 
 		expectOriginalInstruction()
 		Expect(d.ClearBreakpoint(id)).To(MatchError(ContainSubstring("not found")))
+		Expect(debugger.ExportedSetBreakpointAt(d, bpAddr)).To(Equal(id+1),
+			"Continue completion must release the cancelled address reservation")
 	})
 
 	It("cancels an in-flight reinstall and still performs the StepInto action", func() {
@@ -112,6 +126,7 @@ var _ = Describe("Breakpoint clear state transitions", func() {
 		Expect(d.StepInto()).To(Succeed())
 		Expect(fb.singleStepCalls).To(HaveLen(1))
 		Expect(d.ClearBreakpoint(id)).To(Succeed())
+		expectAddressReserved(bpAddr)
 		fb.pushStop(debugger.StopEvent{Reason: debugger.StopSingleStep, TID: 1, PC: bpAddr + uint64(len(trap))})
 
 		Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventStepped))
@@ -122,6 +137,8 @@ var _ = Describe("Breakpoint clear state transitions", func() {
 		default:
 		}
 		Expect(d.ClearBreakpoint(id)).To(MatchError(ContainSubstring("not found")))
+		Expect(debugger.ExportedSetBreakpointAt(d, bpAddr)).To(Equal(id+1),
+			"Step completion must release the cancelled address reservation")
 	})
 
 	It("preserves the parked entry when restoring its bytes fails", func() {
@@ -149,12 +166,25 @@ var _ = Describe("Breakpoint clear state transitions", func() {
 
 		continueAndConsumeContinued(d)
 		Expect(fb.singleStepCalls).To(HaveLen(1))
+		expectAddressReserved(bpAddr)
+		const otherAddr = uint64(0x2900)
+		fb.seedMem(otherAddr, original)
+		otherID := debugger.ExportedSetBreakpointAt(d, otherAddr)
+		Expect(otherID).To(Equal(id+1),
+			"a rejected same-address Set must not consume an ID")
 		fb.pushStop(debugger.StopEvent{Reason: debugger.StopSingleStep, TID: 1, PC: bpAddr + uint64(len(trap))})
 		waitForContinue()
 
 		Expect(fb.peekMem(bpAddr, len(trap))).To(Equal(trap))
-		Expect(d.ClearBreakpoint(id)).To(Succeed(),
-			"the live entry must return to the table under its original ID")
+		fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: 1, PC: bpAddr})
+		evt := mustNextEvent(d)
+		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit))
+		var payload protocol.BreakpointHitPayload
+		Expect(protocol.DecodeEventPayload(evt, &payload)).To(Succeed())
+		Expect(payload.Breakpoint.ID).To(Equal(id),
+			"the un-cleared breakpoint must re-arm under its original ID")
+		Expect(d.ClearBreakpoint(otherID)).To(Succeed(),
+			"the different-address Set must retain independent table ownership")
 	})
 
 	It("does not reinstall a cleared in-flight breakpoint when stop-PC inspection fails", func() {
@@ -162,6 +192,7 @@ var _ = Describe("Breakpoint clear state transitions", func() {
 
 		Expect(d.StepInto()).To(Succeed())
 		Expect(d.ClearBreakpoint(id)).To(Succeed())
+		expectAddressReserved(bpAddr)
 		fb.getRegistersErr = errors.New("injected register failure")
 		fb.pushStop(debugger.StopEvent{Reason: debugger.StopSingleStep, TID: 1})
 
@@ -171,6 +202,8 @@ var _ = Describe("Breakpoint clear state transitions", func() {
 			"an asynchronous stop-handling failure must re-enter the suspended state")
 		expectOriginalInstruction()
 		Expect(d.ClearBreakpoint(id)).To(MatchError(ContainSubstring("not found")))
+		Expect(debugger.ExportedSetBreakpointAt(d, bpAddr)).To(Equal(id+1),
+			"failed stop inspection must release step-off ownership")
 
 		stepsBeforeRetry := len(fb.singleStepCalls)
 		continueAndConsumeContinued(d)
@@ -184,6 +217,7 @@ var _ = Describe("Breakpoint clear state transitions", func() {
 
 		continueAndConsumeContinued(d)
 		Expect(d.ClearBreakpoint(id)).To(Succeed())
+		expectAddressReserved(bpAddr)
 		fb.pushStop(debugger.StopEvent{
 			Reason: debugger.StopSignal,
 			TID:    1,
@@ -193,6 +227,45 @@ var _ = Describe("Breakpoint clear state transitions", func() {
 
 		expectOriginalInstruction()
 		Expect(d.ClearBreakpoint(id)).To(MatchError(ContainSubstring("not found")))
+		Expect(debugger.ExportedSetBreakpointAt(d, bpAddr)).To(Equal(id+1),
+			"signal completion must release step-off ownership")
+	})
+
+	It("releases the reservation when starting the single-step is rejected", func() {
+		parkOnBreakpoint(1)
+
+		fb.singleStepErr = errors.New("injected single-step failure")
+		Expect(d.Continue()).To(MatchError(ContainSubstring("injected single-step failure")))
+		expectAddressReserved(bpAddr)
+		Expect(d.ClearBreakpoint(id)).To(Succeed(),
+			"resume rollback must restore the original table owner")
+		Expect(debugger.ExportedSetBreakpointAt(d, bpAddr)).To(Equal(id+1),
+			"removing the rolled-back owner must expose no stale reservation")
+	})
+
+	It("releases the reservation when restoring the original instruction is rejected", func() {
+		parkOnBreakpoint(1)
+
+		fb.writeErr = errors.New("injected resume restore failure")
+		Expect(d.Continue()).To(MatchError(ContainSubstring("injected resume restore failure")))
+		expectAddressReserved(bpAddr)
+		Expect(d.ClearBreakpoint(id)).To(Succeed(),
+			"restore rollback must keep the original table owner retryable")
+		Expect(debugger.ExportedSetBreakpointAt(d, bpAddr)).To(Equal(id+1),
+			"removing the rolled-back owner must expose no stale reservation")
+	})
+
+	It("releases the reservation after a reinstall error ends step-off ownership", func() {
+		parkOnBreakpoint(1)
+
+		continueAndConsumeContinued(d)
+		expectAddressReserved(bpAddr)
+		fb.writeErr = errors.New("injected reinstall failure")
+		fb.pushStop(debugger.StopEvent{Reason: debugger.StopSingleStep, TID: 1, PC: bpAddr + uint64(len(trap))})
+
+		Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventError))
+		Expect(debugger.ExportedSetBreakpointAt(d, bpAddr)).To(Equal(id+1),
+			"reinstall failure must not leave stale step-off ownership")
 	})
 
 	It("does not resurrect a cleared breakpoint in the stepped-thread death backstop", func() {
