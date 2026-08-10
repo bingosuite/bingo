@@ -615,6 +615,21 @@ that their stops are *reported later*, after the trap is back:
   `Kill` and the event-stream close to complete. Do not "fix" this with a purge
   on kill: `purge` is `Wait`-owned (rule 6) and draining before blocking is what
   makes a same-address sibling resolve after the reinstall (rule 3).
+- **The `kill` label itself never exercises the queue.** `declareKillRunningSpec`
+  sets no breakpoints — it launches, `Continue`s, and `Kill`s — so the engine
+  never single-steps, `beginStep` is never called, nothing is ever parked, and
+  `resumeFor` returns `resumeContinue` for every absorbed stop, which is the
+  pre-change `continueIfTraceeExists` verbatim. A failure in that label is
+  therefore not attributable to the queue. The one seen (native run
+  `31344255645`) hung in `startTracedProcess`'s `Wait4(pid)` waiting for a *new*
+  tracee's execve stop, and is the pre-existing #205 hazard: `engine.Kill`
+  injects a synthetic `StopExited`, so the loop can reach `stateExited` while the
+  real `waitLoop` is still blocked in the process-global `Wait4(-1, WALL)`. That
+  orphan absorbs the SIGKILLed threads' deaths, loops back, blocks again with no
+  statuses left, and can then collect the *next* iteration's child exec stop
+  before discovering `done` is closed and exiting — which is why no second
+  `wait4` frame survives in the timeout dump. Fixing it belongs with #205/#217,
+  not here.
 
 **No lock, and none is needed.** `parked` is touched only inside `Wait`.
 Successive `Wait` calls run on different one-shot `waitLoop` goroutines that the
