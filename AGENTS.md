@@ -1095,12 +1095,13 @@ stopped TID and the signal argument to the next ptrace resume:
    which case later steps must not lose or prematurely inject it. The next
    exact-TID continue forwards the actual non-zero value.
 3. SIGURG on the exact `stepTID` additionally needs to survive an absorbed stop.
-   The #202 `resumeAbsorbed` path saves it in `delayedByTID[tid]`, re-arms the
+   The #202 `applyAbsorb` path saves it in `delayedByTID[tid]`, re-arms the
    real instruction step with signal zero, and retains the delayed value through
    further steps. The next continue uses exact-TID `tgkill(SIGURG)` followed by
    `PTRACE_CONT(..., 0)`; only the resulting fresh signal-delivery stop resumes
    with `PTRACE_CONT(..., SIGURG)`. A simultaneous current signal has priority
-   while the delayed SIGURG is requeued, and matching SIGURG instances coalesce.
+   while the delayed SIGURG is requeued, matching SIGURG instances coalesce, and
+   the first delayed signal wins until it has been requeued.
 4. The parked-stop FIFO from #202 retains the signal inside the `StopEvent`.
    Parking never touches pending state. `drainParked` performs the same
    signal-before-TID delivery handoff as a live `Wait` result.
@@ -1109,12 +1110,14 @@ stopped TID and the signal argument to the next ptrace resume:
    TID has delayed SIGURG. Clone `SIGSTOP`, `SIGCONT`, ptrace events and spurious
    breakpoint traps remain internal Wait-loop cases with signal zero.
 6. Internal continues clear current state only for their own TID and preserve or
-   requeue delayed state; internal single-steps suppress current state but retain
-   delayed SIGURG. A non-main thread's death clears both slots **before** any
-   exit-stop continue, while exec, process exit, Kill/detach and tracer shutdown
-   purge all state to prevent TID reuse. The maps are mutex-protected because
-   `Wait` publishes from its goroutine while the engine consumes them; unlike
-   `stepQueue`, this state crosses goroutines.
+   requeue delayed state; internal single-steps leave both slots intact. A failed
+   exact-TID continue restores the captured current signal even for `ESRCH`;
+   only a path that has conclusively observed thread/image death clears first.
+   Non-main thread exit, held-owner release and clone initial-stop handling clear
+   their TID **before** any resume, while exec, process exit, Kill/detach and
+   tracer shutdown purge all state to prevent TID reuse. The maps are
+   mutex-protected because `Wait` publishes from its goroutine while the engine
+   consumes them; unlike `stepQueue`, this state crosses goroutines.
 
 The host-agnostic map tests, linux backend raw ptrace-tuple tests, the `signals`
 E2E label (one SIGSEGV/SIGABRT output followed by signal death, one handled
@@ -1127,6 +1130,12 @@ discriminator pins two one-byte instruction advances, exact
 return, and post-handler exit. The overlap spec must observe a signal-specific
 parked-stop count increase; signal outputs plus generic parked traps are not
 proof that a signal was held during a step.
+
+The delayed-SIGURG transaction necessarily recreates delivery with `tgkill`.
+It preserves the exact signal number and target TID, but not the original
+`siginfo_t` or ordering relative to signals that arrive during the re-step.
+Preserving those details requires the broader wait-ownership work, not a
+process-global pending-signal scalar in this layer.
 
 **Composition constraint for #205:** a future process-wide wait broker may own
 the raw `wait4`, but it must route the complete `(TID, signal)` status to the
@@ -1360,7 +1369,7 @@ are detected by a `mach_msg` receive loop.
   launch→run→Kill cycle (`BINGO_E2E_KILL_ITERS`).
 - `SIGURG` re-delivery is mandatory here too. A sibling SIGURG is re-delivered
   immediately on that sibling's continue. A SIGURG on `stepTID` consumes the
-  outstanding step, so `resumeAbsorbed` reissues the instruction step with zero
+  outstanding step, so `applyAbsorb` reissues the instruction step with zero
   and saves SIGURG per TID; the next continue requeues it to that TID and forwards
   it only from the fresh signal-delivery stop. Never use
   `PTRACE_SINGLESTEP(SIGURG)` or inject delayed SIGURG directly from the

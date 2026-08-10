@@ -35,6 +35,9 @@ func (p *pendingSignals) delay(tid, signal int) {
 	if p.delayedByTID == nil {
 		p.delayedByTID = make(map[int]int)
 	}
+	if p.delayedByTID[tid] != 0 {
+		return
+	}
 	p.delayedByTID[tid] = signal
 }
 
@@ -63,16 +66,17 @@ func (p *pendingSignals) takeForContinue(tid int) (signal, delayed int) {
 	return signal, delayed
 }
 
-func (p *pendingSignals) takeForExplicitResume(tid, signal int) (resumeSignal, delayed int) {
+func (p *pendingSignals) takeForExplicitResume(tid, signal int) (current, resumeSignal, delayed int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	current = p.currentByTID[tid]
 	delete(p.currentByTID, tid)
 	delayed = p.delayedByTID[tid]
 	delete(p.delayedByTID, tid)
 	if signal == delayed {
-		return signal, 0
+		return current, signal, 0
 	}
-	return signal, delayed
+	return current, signal, delayed
 }
 
 func (p *pendingSignals) restore(tid, signal, delayed int) {
@@ -85,13 +89,17 @@ func (p *pendingSignals) restore(tid, signal, delayed int) {
 		if p.currentByTID == nil {
 			p.currentByTID = make(map[int]int)
 		}
-		p.currentByTID[tid] = signal
+		if p.currentByTID[tid] == 0 {
+			p.currentByTID[tid] = signal
+		}
 	}
 	if delayed != 0 {
 		if p.delayedByTID == nil {
 			p.delayedByTID = make(map[int]int)
 		}
-		p.delayedByTID[tid] = delayed
+		if p.delayedByTID[tid] == 0 {
+			p.delayedByTID[tid] = delayed
+		}
 	}
 }
 
