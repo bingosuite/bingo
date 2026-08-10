@@ -1,7 +1,10 @@
 // Exposes internal symbols to debugger_test. Compiled only during `go test`.
 package debugger
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 func ExportedTrapInstruction() []byte {
 	return archTrapInstruction()
@@ -131,5 +134,104 @@ func ExportedFillEventBuffer(d Debugger, free int) {
 		return nil
 	}); err != nil {
 		panic("ExportedFillEventBuffer: " + err.Error())
+	}
+}
+
+// ExportedStepQueue exposes the production park-queue primitives to the
+// external engine tests. It holds a real stepQueue and only delegates, so a
+// test built on it exercises the shipped gating rules rather than a
+// re-statement of them: mutating releasable, interruptStepIfStepped or
+// stepExitBoundary changes what such a test observes.
+//
+// It exists because the queue's contract spans two layers — the backend decides
+// WHEN a held stop may surface, the engine decides WHAT must be repaired before
+// it does — and neither layer's own tests can observe the other's state.
+// The production stepQueue is deliberately lock-free: in the linux backend it is
+// reached only from Wait, on one goroutine. A test that also inspects it from
+// the spec goroutine has to supply that serialization itself, so every method
+// here takes mu. The guarded calls are the real production methods, so the
+// gating rules under test are still the shipped ones.
+type ExportedStepQueue struct {
+	mu sync.Mutex
+	q  stepQueue
+}
+
+func (e *ExportedStepQueue) BeginStep(tid int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.q.beginStep(tid)
+}
+
+func (e *ExportedStepQueue) EndStep() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.q.endStep()
+}
+
+// Stepping reports the in-flight single-step bookkeeping classifyUserStop needs.
+func (e *ExportedStepQueue) Stepping() (bool, int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.q.stepping, e.q.stepTID
+}
+
+// Classify runs the production park/surface decision for a user-visible stop.
+// It reports the reason the engine should see and whether the stop must be held.
+func (e *ExportedStepQueue) Classify(trap bool, tid int) (StopReason, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	reason, disp := classifyUserStop(trap, e.q.stepping, e.q.stepTID, tid)
+	return reason, disp == parkStop
+}
+
+func (e *ExportedStepQueue) Park(ev StopEvent) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.q.park(ev)
+}
+
+func (e *ExportedStepQueue) Releasable() (StopEvent, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.q.releasable()
+}
+
+func (e *ExportedStepQueue) StepExitBoundary() (StopEvent, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.q.stepExitBoundary()
+}
+
+func (e *ExportedStepQueue) InterruptStepIfStepped(tid int) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.q.interruptStepIfStepped(tid)
+}
+
+func (e *ExportedStepQueue) CompleteStepThreadExit() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.q.completeStepThreadExit()
+}
+
+func (e *ExportedStepQueue) ParkedDepth() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.q.parkedDepthForTest()
+}
+
+// ExportedGateBackend adapts a Backend to the engine's unexported
+// stepThreadExitCompleter, which an external test package cannot implement
+// directly. Complete receives the engine's acknowledgement that the dead step
+// owner's breakpoint transaction has been reconciled — the only thing that
+// opens the parked-stop gate.
+type ExportedGateBackend struct {
+	Backend
+	Complete func()
+}
+
+func (b *ExportedGateBackend) completeStepThreadExit() {
+	if b.Complete != nil {
+		b.Complete()
 	}
 }
