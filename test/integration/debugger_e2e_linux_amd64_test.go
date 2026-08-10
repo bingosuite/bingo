@@ -490,6 +490,10 @@ func declareStepOverlapSpec() {
 		Expect(parked).To(BeNumerically(">", 0),
 			"no foreign stop was ever parked across %d cycles: this run never "+
 				"exercised the rule under test", iters)
+		retired, ok := debugger.LinuxRetiredInternalBreakpointCount(h.d)
+		Expect(ok).To(BeTrue(), "retired internal-breakpoint hook unavailable")
+		Expect(retired).To(BeNumerically(">", 0),
+			"no delayed sibling hit reached the engine after its one-shot breakpoint was cleared")
 
 		AddReportEntry("overlap-iterations", iters)
 		AddReportEntry("overlap-hits-A", hits[bpA.ID])
@@ -497,6 +501,7 @@ func declareStepOverlapSpec() {
 		AddReportEntry("overlap-goroutines", len(goroutines))
 		AddReportEntry("overlap-stepover-resolved-as-breakpoint", stepOverDeliveredForeign)
 		AddReportEntry("overlap-parked-stops", parked)
+		AddReportEntry("overlap-retired-internal-breakpoint-hits", retired)
 	})
 }
 

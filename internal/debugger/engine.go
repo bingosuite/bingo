@@ -93,6 +93,15 @@ type engine struct {
 	stepOverFile string
 	stepOverLine int
 
+	// Linux can report a sibling's already-queued hit after a one-shot internal
+	// breakpoint has been restored and removed from bps. Remembering those
+	// addresses is what distinguishes that stale hit from a genuine foreign
+	// SIGTRAP, whose live PC must not be rewound. They stay retired for this
+	// engine's lifetime because per-thread wait statuses offer no point at which
+	// every already-queued sibling hit is known to have drained.
+	retiredInternalBreakpoints    map[uint64]struct{}
+	retiredInternalBreakpointHits int
+
 	// manualStopPending records that a Pause request has fired the backend's
 	// interrupt signal (PauseSignal — SIGSTOP on linux, SIGUSR2 on darwin) at
 	// the tracee and we are awaiting the resulting signal-delivery stop, which
@@ -612,6 +621,9 @@ func (e *engine) handleStop(stop StopEvent) {
 			"found", bp != nil,
 			"steppingOverBP", e.steppingOverBP != nil)
 		if bp == nil {
+			if e.resumeRetiredInternalBreakpoint(stop) {
+				return
+			}
 			// Spurious SIGTRAP — a BRK we did not install (Go runtime
 			// internal trap or libc assertion). On ARM64 PC points AT the
 			// BRK; ContinueProcess with signal=0 leaves PC unchanged and
@@ -630,14 +642,10 @@ func (e *engine) handleStop(stop StopEvent) {
 		e.log.Debug("StopBreakpoint matched", "file", bp.file, "line", bp.line,
 			"addr", fmt.Sprintf("0x%x", bp.addr))
 		e.rewindToBreakpoint(stop)
-		if bp.file == stepOverNextFile {
-			_ = e.bps.clear(e.backend, bp.id)
-			e.lastBP = nil
-			e.emitStepped(stop)
-			return
-		}
-		if bp.file == stepOutReturnFile {
-			_ = e.bps.clear(e.backend, bp.id)
+		if bp.file == stepOverNextFile || bp.file == stepOutReturnFile {
+			if !e.retireInternalBreakpoint(bp, stop) {
+				return
+			}
 			e.lastBP = nil
 			e.emitStepped(stop)
 			return
@@ -821,6 +829,61 @@ func (e *engine) handleStop(stop StopEvent) {
 		e.setState(stateRunning)
 		go e.waitLoop()
 	}
+}
+
+func (e *engine) retireInternalBreakpoint(bp *breakpointEntry, stop StopEvent) bool {
+	if err := e.bps.clear(e.backend, bp.id); err != nil {
+		e.setState(stateSuspended)
+		e.haltOnError(protocol.CmdNone,
+			fmt.Errorf("clear internal breakpoint 0x%x: %w", bp.addr, err), stop)
+		return false
+	}
+	if e.retiredInternalBreakpoints == nil {
+		e.retiredInternalBreakpoints = make(map[uint64]struct{})
+	}
+	e.retiredInternalBreakpoints[bp.addr] = struct{}{}
+	return true
+}
+
+// resumeRetiredInternalBreakpoint handles a sibling that executed a one-shot
+// sentinel before another thread cleared it, but whose kernel stop reached the
+// engine only afterwards. On amd64 the live RIP is then one byte into the
+// restored instruction; treating it as a generic SIGTRAP preserves that RIP and
+// corrupts execution.
+func (e *engine) resumeRetiredInternalBreakpoint(stop StopEvent) bool {
+	if _, ok := e.retiredInternalBreakpoints[stop.PC]; !ok {
+		return false
+	}
+
+	regs, err := e.backend.GetRegisters(stop.TID)
+	if err != nil {
+		e.setState(stateSuspended)
+		e.haltOnError(protocol.CmdNone,
+			fmt.Errorf("read registers for retired internal breakpoint on thread %d: %w", stop.TID, err), stop)
+		return true
+	}
+	if regs.PC != stop.PC {
+		regs.PC = stop.PC
+		if err := e.backend.SetRegisters(stop.TID, regs); err != nil {
+			e.setState(stateSuspended)
+			e.haltOnError(protocol.CmdNone,
+				fmt.Errorf("rewind retired internal breakpoint on thread %d: %w", stop.TID, err), stop)
+			return true
+		}
+	}
+
+	e.log.Debug("resuming delayed sibling hit on retired internal breakpoint",
+		"tid", stop.TID, "pc", fmt.Sprintf("0x%x", stop.PC))
+	if err := e.backend.ContinueProcess(); err != nil {
+		e.setState(stateSuspended)
+		e.haltOnError(protocol.CmdNone,
+			fmt.Errorf("continue after retired internal breakpoint on thread %d: %w", stop.TID, err), stop)
+		return true
+	}
+	e.retiredInternalBreakpointHits++
+	e.setState(stateRunning)
+	go e.waitLoop()
+	return true
 }
 
 func (e *engine) populateStopPC(stop StopEvent, rewind bool) (StopEvent, error) {

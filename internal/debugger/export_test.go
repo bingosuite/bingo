@@ -97,6 +97,16 @@ func ExportedSetBreakpointAtErr(d Debugger, addr uint64) error {
 	})
 }
 
+func ExportedSetStepOverBreakpointAt(d Debugger, addr uint64) {
+	e := d.(*engine)
+	if err := e.dispatch(func() error {
+		_, err := e.bps.set(e.backend, stepOverNextFile, 0, addr)
+		return err
+	}); err != nil {
+		panic("ExportedSetStepOverBreakpointAt: " + err.Error())
+	}
+}
+
 // ExportedFillEventBuffer emits filler events until exactly free ORDINARY slots
 // remain in the engine's event buffer. Ordinary emits can never occupy the
 // reserved halt slot, so free=0 means the buffer is full for every normal event

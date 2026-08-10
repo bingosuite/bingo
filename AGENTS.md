@@ -298,7 +298,15 @@ See `engine.resumeFromBreakpoint` and the `StopSingleStep` branch of
 
 Internal sentinel BP files: `<stepover-next>`, `<stepout-return>`,
 `<direct-addr>` (test helper). These get auto-cleared when hit and emit
-`EventStepped`, not `EventBreakpointHit`.
+`EventStepped`, not `EventBreakpointHit`. The engine remembers the addresses of
+auto-cleared stepping sentinels: Linux can deliver a sibling's already-queued hit
+after the trap has been restored, when amd64 RIP is still one byte past the old
+INT3. A later stop at a remembered address is rewound and resumed silently
+instead of entering the generic spurious-SIGTRAP path mid-instruction. The
+precise retired-address set avoids broadly reclassifying unrelated
+tracee-generated `raise(SIGTRAP)` stops. Retired addresses live for the engine's
+lifetime: per-thread wait statuses provide no safe point at which every
+already-queued sibling hit is known to have drained.
 
 If `bps.reinstall` ever fails after a single-step, **suspend instead of
 resuming**. Running without the trap is a runaway process; reporting the
@@ -517,17 +525,14 @@ that their stops are *reported later*, after the trap is back:
   Callers already tolerate this; the `churn` spec always has.
 - Queue depth is bounded by the live thread count — a ptrace-stopped thread
   cannot stop again until it is resumed (G7) — so no cap is needed.
-- Out of scope: a user `ClearBreakpoint` of an address a parked stop refers to
-  still surfaces that stop as a spurious trap when it is finally delivered. The
-  same is true of the engine's auto-cleared `<stepover-next>` sentinel if a
-  parked stop names it. Both land in the engine's pre-existing spurious-SIGTRAP
-  path, which advances PC by one trap length from an already-rewound PC and so
-  resumes mid-instruction on amd64. That path is *far* more often reached
-  inline, by a kernel-queued trap the queue never sees (measured: dozens of
-  spurious-trap warnings per overlap run against **zero** parked stops whose
-  trap had gone), so it is an engine-level hazard, not a queue-level one, and
-  guarding only the parked variant would be unexercised code. Fixing it needs
-  engine changes and is tracked separately.
+- A user `ClearBreakpoint` of an address a parked stop refers to still surfaces
+  that stop as a generic SIGTRAP. One-shot engine sentinels are different: their
+  retired addresses are remembered, so delayed sibling hits are rewound and
+  resumed safely even when they were queued in the kernel and never entered this
+  FIFO. The focused engine test pins the exact `SetRegisters(tid, rewoundPC)`
+  operation, and the plain native overlap spec requires
+  `LinuxRetiredInternalBreakpointCount > 0`; an armed-ness probe alone cannot
+  distinguish safe recovery from the mid-instruction path.
 - **A stepped thread that dies with stops still held releases them, and that
   delivery deliberately precedes an already-queued main-thread exit.** Because
   the drain runs at the top of the `Wait` loop, before blocking in `wait4`, a
