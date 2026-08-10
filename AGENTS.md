@@ -1442,8 +1442,9 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   GitHub App** publishing its own status context (which branch protection *can*
   bind to), an org-required workflow (unavailable here), or native
   required-review/CODEOWNERS if the human review itself is the enforcement. The
-  hardening below removes every attack that does not require an attacker to add
-  a status-writing workflow; it cannot remove that one.
+  hardening below closes every bypass found in review that does not require an
+  attacker to add a status-writing workflow; it cannot close that one, and no
+  audit can prove the list exhaustive.
 
   `pull_request_target` is a requirement here, not a preference: a
   fork-triggered `pull_request` run gets a read-only `GITHUB_TOKEN` (it can
@@ -1489,15 +1490,35 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   This deliberately over-gates Linux/cross-platform constraints rather than
   guessing an incomplete tag universe.
 
+  **PR-authored text is never consumed.** The gate reads only structural fields
+  from the event (numbers, SHAs, refs, the sender login, the label name) and
+  never the title, body, head branch name, or head label — all of which an
+  attacker sets freely and any of which could otherwise reach a shell word or an
+  API path. The contract suite injects a poison token into every one of those
+  fields on **every** synthetic event and fails the case if the token appears in
+  any `gh` invocation. A separate static contract asserts the harness still
+  injects it and still asserts on it, because an earlier revision gated that
+  check behind a per-case variable no case ever set — making it silently vacuous.
+
   **Only `.go` blobs are content-scanned, so everything else must be caught by
-  name.** The native-source extension list is exactly what `go/build` compiles —
-  `c cc cpp cxx m mm h hh hpp hxx f F for f90 s S sx swig swigcxx syso` — and a
-  contract test asserts it stays complete. Shrinking it reopens a real bypass:
+  name.** The native-source extension list covers every extension `go/build`
+  compiles — `c cc cpp cxx m h hh hpp hxx f F for f90 s S sx swig swigcxx syso`
+  — plus `.mm`, which Go itself does not accept but which is conventional for
+  Objective-C++ and therefore gated anyway. A contract test asserts the list
+  stays complete. Shrinking it reopens a real bypass:
   an untagged cgo wrapper plus a darwin-only `shim_darwin.sx` ships machine code
   the gate never looked at. Plain `.go` is deliberately **absent** from that
   bare-extension list (every Go change would gate and the constraint scan would
   become dead code) but **present** in the `_darwin`/`_arm64` suffix
   alternation, where the filename itself is the constraint.
+
+  **A `.go` blob also gates on a cgo preamble**, not just on `//go:build` /
+  `// +build`. A `#cgo darwin LDFLAGS: …` directive — bare inside the `/* … */`
+  block before `import "C"`, or as a `// #cgo …` line comment — makes the file
+  platform-dependent with no explicit constraint anywhere in it. A bare `#cgo`
+  at the start of a line is not valid Go outside such a comment, so the anchored
+  match cannot false-positive; prose that merely mentions `#cgo` mid-line does
+  not gate. Both behaviours are pinned by cases.
   `edited` base-retarget events invalidate
   verification; unrelated PR edits preserve the current SHA-bound status.
 
