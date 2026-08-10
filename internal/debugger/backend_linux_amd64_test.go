@@ -698,6 +698,60 @@ func TestLinuxWaitPreservesTheSignalOfAHeldStop(t *testing.T) {
 	}
 }
 
+// TestLinuxWaitDeliversTheSignalItStoppedOn gates the signal capture on the
+// path that returns a stop straight to the engine instead of holding it. That
+// value is not decoration: the engine tells a Pause interrupt from an ordinary
+// signal by comparing it against PauseSignal(), so a stop delivered with its
+// signal zeroed is not a vaguer version of the truth, it is a different stop.
+// The held-stop capture is a separate line with its own gate, above.
+func TestLinuxWaitDeliversTheSignalItStoppedOn(t *testing.T) {
+	const (
+		pid     = 9601
+		stepped = 9602
+		worker  = 9603
+	)
+
+	tests := []struct {
+		name   string
+		inStep bool
+		tid    int
+		signal syscall.Signal
+	}{
+		{name: "no step in flight", tid: worker, signal: syscall.SIGUSR1},
+		// G6: the stepped thread's own signal is the outcome of its step, so it
+		// is delivered rather than held — and it has to arrive with its signal
+		// or the engine cannot tell what stopped it.
+		{name: "the stepped thread's own signal", inStep: true, tid: stepped, signal: syscall.SIGUSR2},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &linuxBackend{pid: pid}
+			script := &scriptedWait{stops: []scriptedStop{
+				{tid: tc.tid, status: stoppedAt(tc.signal, 0)},
+			}}
+			script.install(b)
+			b.recordStop(pid)
+			if tc.inStep {
+				b.beginStep(stepped)
+			}
+
+			ev, err := b.Wait()
+			if err != nil {
+				t.Fatalf("Wait() error = %v", err)
+			}
+			if ev.Reason != StopSignal || ev.TID != tc.tid {
+				t.Fatalf("Wait() = %+v, want a signal stop on tid %d", ev, tc.tid)
+			}
+			if ev.Signal != int(tc.signal) {
+				t.Fatalf("Wait() delivered signal %d, want %d: the engine "+
+					"compares this against PauseSignal() to tell a Pause "+
+					"interrupt from an ordinary signal", ev.Signal, int(tc.signal))
+			}
+		})
+	}
+}
+
 // TestLinuxWaitContinuesThreadsThatAreNotBeingStepped is the converse gate: the
 // same branches must NOT single-step a thread that is not the stepped one, and
 // must forward the signal that thread stopped with.

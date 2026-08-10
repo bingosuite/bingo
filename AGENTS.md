@@ -627,7 +627,15 @@ acknowledgement in rule 5 (see the locking note below):
    value under test comes from the test. `TestLinuxWaitPreservesTheSignalOfAHeldStop`
    drives `Wait` so the number comes off a scripted wait status through the
    production copy, and asserts the exact signal rather than merely a nonzero
-   one. One residual: swapping an `absorbKind`
+   one. **There are two such copies, and each needs its own gate**: the park
+   site, and the ordinary inline `return` that hands a stop straight to the
+   engine. Gating only the park site left the inline one free — zeroing it
+   passed the whole suite, including the E2E, which counts stops by reason and
+   accepts the `signal 0` rendering. That copy is what the engine compares
+   against `PauseSignal()` to tell a Pause interrupt from an ordinary signal, so
+   `TestLinuxWaitDeliversTheSignalItStoppedOn` pins it by exact value on both
+   paths through it (no step in flight, and G6's stepped-thread-own-signal).
+   One residual: swapping an `absorbKind`
    *label* between two branches that share a `planAbsorb` row is behaviour-
    preserving and not detected — the decisions are pinned, the names are not.
 8. **Two absorb cases cannot re-arm and must fail the wait instead.** On
