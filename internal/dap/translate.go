@@ -113,11 +113,28 @@ func dapThreads(gs []protocol.Goroutine) []godap.Thread {
 	}
 	out := make([]godap.Thread, 0, len(gs))
 	for _, g := range gs {
-		name := "goroutine " + strconv.Itoa(g.ID)
-		if g.Status != "" {
-			name += " (" + g.Status + ")"
-		}
-		out = append(out, godap.Thread{Id: threadID(g.ID), Name: name})
+		out = append(out, dapThread(g))
 	}
 	return out
+}
+
+func dapThread(g protocol.Goroutine) godap.Thread {
+	name := "goroutine " + strconv.Itoa(g.ID)
+	if g.Status != "" {
+		name += " (" + g.Status + ")"
+	}
+	return godap.Thread{Id: threadID(g.ID), Name: name}
+}
+
+// dapStoppedThread returns the one thread a client should inspect after a stop
+// whose event omitted threadId. A fresh Goroutines query can often resolve the
+// identity while the process is suspended; otherwise ID 1 is explicitly a
+// transport-only synthetic handle, not a claim that runtime g1 stopped.
+func dapStoppedThread(gs []protocol.Goroutine) (godap.Thread, bool) {
+	for _, g := range gs {
+		if g.Current && g.ID > 0 {
+			return dapThread(g), true
+		}
+	}
+	return godap.Thread{Id: 1, Name: "stopped goroutine (unknown)"}, false
 }

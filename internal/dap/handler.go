@@ -95,6 +95,11 @@ type Handler struct {
 	startCmd      string
 	restartReqSeq int
 	curThreadID   int
+	// stopThreadUnknown records that the suspending event honestly omitted
+	// stopped.threadId. The first subsequent threads response is collapsed to
+	// one resolved or synthetic stopped-thread handle so clients do not request
+	// the same stopped stack once for every goroutine.
+	stopThreadUnknown bool
 
 	// restartWasSuspended is the suspended view this connection held when it
 	// issued the in-flight restart, captured before onRestart clears it

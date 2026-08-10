@@ -147,7 +147,7 @@ func TestBuildGoroutineListAnchorsCurrentBeyondRichScan(t *testing.T) {
 	layout := goroutineTestLayout()
 
 	backend := newGoroutineMemoryBackend()
-	length := uint64(maxGoroutineScan + 1)
+	length := uint64(maxGoroutineScan + 4)
 	currentIndex := length - 1
 	for i := uint64(0); i < length; i++ {
 		gptr := gBase + i*gStride

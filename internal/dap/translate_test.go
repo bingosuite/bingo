@@ -115,6 +115,23 @@ func TestDapThreadsMapsGoroutines(t *testing.T) {
 	}
 }
 
+func TestDapStoppedThread(t *testing.T) {
+	resolved, ok := dapStoppedThread([]protocol.Goroutine{
+		{ID: 1, Status: "waiting"},
+		{ID: 7, Status: "running", Current: true},
+	})
+	if !ok || resolved.Id != 7 || resolved.Name != "goroutine 7 (running)" {
+		t.Fatalf("resolved stopped thread = %+v, %v", resolved, ok)
+	}
+
+	unknown, ok := dapStoppedThread([]protocol.Goroutine{
+		{ID: 1, Status: "waiting"},
+	})
+	if ok || unknown.Id != 1 || unknown.Name != "stopped goroutine (unknown)" {
+		t.Fatalf("unknown stopped thread = %+v, %v", unknown, ok)
+	}
+}
+
 func TestBuildVarTree(t *testing.T) {
 	h := &Handler{varCache: make(map[int][]godap.Variable)}
 	out := h.buildVarTree([]protocol.Variable{

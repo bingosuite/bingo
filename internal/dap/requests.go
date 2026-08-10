@@ -371,12 +371,21 @@ func (h *Handler) onThreads(req *godap.ThreadsRequest) {
 func (h *Handler) onStackTrace(req *godap.StackTraceRequest) {
 	h.mu.Lock()
 	suspended := h.suspended
-	if suspended {
+	currentThreadID := h.curThreadID
+	requestedThreadID := req.Arguments.ThreadId
+	if suspended && currentThreadID > 0 && requestedThreadID == currentThreadID {
 		h.framesQ = append(h.framesQ, req.Seq)
 	}
 	h.mu.Unlock()
 
 	if !suspended {
+		h.send(&godap.StackTraceResponse{
+			Response: h.response(req.Seq, "stackTrace"),
+			Body:     godap.StackTraceResponseBody{StackFrames: []godap.StackFrame{}},
+		})
+		return
+	}
+	if currentThreadID == 0 || requestedThreadID != currentThreadID {
 		h.send(&godap.StackTraceResponse{
 			Response: h.response(req.Seq, "stackTrace"),
 			Body:     godap.StackTraceResponseBody{StackFrames: []godap.StackFrame{}},

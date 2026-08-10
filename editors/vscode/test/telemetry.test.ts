@@ -66,14 +66,14 @@ describe("telemetry codec", () => {
     assert.equal(maximumGoroutines, 8193);
     const accepted = Array.from(
       { length: maximumGoroutines },
-      (_, index) => minimalGoroutine(index + 1),
+      (_, index) => goroutine(index + 1),
     );
-    const decoded = decodeEvent(
-      envelope(1, "GoroutineSnapshot", {
-        ...snapshot(),
-        goroutines: accepted,
-      }),
-    );
+    const acceptedEnvelope = envelope(1, "GoroutineSnapshot", {
+      ...snapshot(),
+      goroutines: accepted,
+    });
+    assert.ok(acceptedEnvelope.byteLength > 2 * 1024 * 1024);
+    const decoded = decodeEvent(acceptedEnvelope);
     assert.equal(decoded.snapshot?.goroutines.length, 8193);
 
     assert.throws(
@@ -99,7 +99,7 @@ describe("telemetry codec", () => {
     );
     assert.throws(
       () => decodeEvent("x".repeat(maximumEnvelopeBytes + 1)),
-      /exceeds 2 MiB/,
+      /exceeds 8 MiB/,
     );
     assert.throws(
       () =>

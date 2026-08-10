@@ -81,6 +81,7 @@ func (h *Handler) onSessionState(evt protocol.Event) {
 	switch p.State {
 	case protocol.StateSuspended:
 		h.suspended = true
+		h.stopThreadUnknown = tid == 0
 		h.mu.Unlock()
 		h.sendStopped("pause", tid)
 	case protocol.StateExited:
@@ -127,6 +128,7 @@ func (h *Handler) onStop(evt protocol.Event) {
 	restarting := h.restarting
 	stopOnEntry := h.stopOnEntry
 	h.curThreadID = tid
+	h.stopThreadUnknown = tid == 0
 
 	// The first stop after Launch/Attach is the entry stop: fire `initialized`
 	// (breakpoints can now resolve against the loaded image) but withhold the
@@ -198,6 +200,7 @@ func (h *Handler) onProcessExited(evt protocol.Event) {
 	h.mu.Lock()
 	h.suspended = false
 	h.sessionState = protocol.StateExited
+	h.stopThreadUnknown = false
 	h.mu.Unlock()
 
 	h.send(&godap.ExitedEvent{Event: h.event("exited"), Body: godap.ExitedEventBody{ExitCode: p.ExitCode}})
@@ -339,6 +342,7 @@ func (h *Handler) onFrames(evt protocol.Event) {
 func (h *Handler) onGoroutines(evt protocol.Event) {
 	var p protocol.GoroutinesPayload
 	_ = protocol.DecodeEventPayload(evt, &p)
+	current, resolved := dapStoppedThread(p.Goroutines)
 
 	h.mu.Lock()
 	seq, ok := 0, false
@@ -346,14 +350,27 @@ func (h *Handler) onGoroutines(evt protocol.Event) {
 		seq, ok = h.threadsQ[0], true
 		h.threadsQ = h.threadsQ[1:]
 	}
+	collapse := ok && h.stopThreadUnknown
+	if collapse {
+		h.curThreadID = current.Id
+		if resolved {
+			h.stopThreadUnknown = false
+		}
+	} else if ok && resolved {
+		h.curThreadID = current.Id
+	}
 	h.mu.Unlock()
 
 	if !ok {
 		return
 	}
+	threads := dapThreads(p.Goroutines)
+	if collapse {
+		threads = []godap.Thread{current}
+	}
 	h.send(&godap.ThreadsResponse{
 		Response: h.response(seq, "threads"),
-		Body:     godap.ThreadsResponseBody{Threads: dapThreads(p.Goroutines)},
+		Body:     godap.ThreadsResponseBody{Threads: threads},
 	})
 }
 

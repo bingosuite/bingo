@@ -48,6 +48,18 @@ func (r *cmdRecorder) kinds() []protocol.CommandKind {
 	return out
 }
 
+func (r *cmdRecorder) count(kind protocol.CommandKind) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var count int
+	for _, cmd := range r.cmds {
+		if cmd.Kind == kind {
+			count++
+		}
+	}
+	return count
+}
+
 // waitForCommand polls until a command of kind appears or the deadline passes.
 func (r *cmdRecorder) waitForCommand(t *testing.T, kind protocol.CommandKind) protocol.Command {
 	t.Helper()
@@ -86,18 +98,6 @@ func (r *cmdRecorder) waitForCommands(t *testing.T, kind protocol.CommandKind, c
 	}
 	t.Fatalf("timed out waiting for %d commands of kind %s; saw %v", count, kind, r.kinds())
 	return nil
-}
-
-func (r *cmdRecorder) count(kind protocol.CommandKind) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	count := 0
-	for _, cmd := range r.cmds {
-		if cmd.Kind == kind {
-			count++
-		}
-	}
-	return count
 }
 
 func (r *cmdRecorder) requireNoAdditionalCommands(t *testing.T, kind protocol.CommandKind, expected int) {
@@ -1164,7 +1164,9 @@ func TestStackTraceAndVariablesCorrelation(t *testing.T) {
 	}
 
 	// stackTrace → Frames command → EventFrames → StackTraceResponse.
-	hh.sendReq("stackTrace", &godap.StackTraceRequest{})
+	hh.sendReq("stackTrace", &godap.StackTraceRequest{
+		Arguments: godap.StackTraceArguments{ThreadId: 1},
+	})
 	hh.cmds.waitForCommand(t, protocol.CmdFrames)
 	hh.inject(protocol.EventFrames, protocol.FramesPayload{Frames: []protocol.Frame{
 		{Index: 0, Location: protocol.Location{Function: "main.f", File: "/x/main.go", Line: 12}},
@@ -1430,6 +1432,82 @@ func TestUnknownStepOmitsThreadID(t *testing.T) {
 	}
 	if stopped.Body.ThreadId != 0 {
 		t.Errorf("threadId = %d, want omitted for unknown goroutine", stopped.Body.ThreadId)
+	}
+
+	hh.sendReq("threads", &godap.ThreadsRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdGoroutines)
+	hh.inject(protocol.EventGoroutines, protocol.GoroutinesPayload{
+		Goroutines: []protocol.Goroutine{
+			{ID: 1, Status: "waiting"},
+			{ID: 7, Status: "running", Current: true},
+			{ID: 9, Status: "waiting"},
+		},
+	})
+	threads := recvType[*godap.ThreadsResponse](hh)
+	if len(threads.Body.Threads) != 1 || threads.Body.Threads[0].Id != 7 {
+		t.Fatalf("threads after unknown stop = %+v, want only resolved current g7", threads.Body.Threads)
+	}
+
+	framesBefore := hh.cmds.count(protocol.CmdFrames)
+	hh.sendReq("stackTrace", &godap.StackTraceRequest{
+		Arguments: godap.StackTraceArguments{ThreadId: 1},
+	})
+	nonCurrent := recvType[*godap.StackTraceResponse](hh)
+	if len(nonCurrent.Body.StackFrames) != 0 {
+		t.Fatalf("non-current stack = %+v, want empty", nonCurrent.Body.StackFrames)
+	}
+	if got := hh.cmds.count(protocol.CmdFrames); got != framesBefore {
+		t.Fatalf("non-current stack enqueued %d CmdFrames, want %d", got, framesBefore)
+	}
+
+	hh.sendReq("stackTrace", &godap.StackTraceRequest{
+		Arguments: godap.StackTraceArguments{ThreadId: 7},
+	})
+	hh.cmds.waitForCommand(t, protocol.CmdFrames)
+	hh.inject(protocol.EventFrames, protocol.FramesPayload{Frames: []protocol.Frame{{
+		Index:    0,
+		Location: protocol.Location{Function: "main.worker", File: "/x/main.go", Line: 20},
+	}}})
+	current := recvType[*godap.StackTraceResponse](hh)
+	if len(current.Body.StackFrames) != 1 || current.Body.StackFrames[0].Name != "main.worker" {
+		t.Fatalf("current stack = %+v", current.Body.StackFrames)
+	}
+}
+
+func TestUnknownStepUsesOneSyntheticStackTarget(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	hh.inject(protocol.EventStepped, protocol.SteppedPayload{
+		Goroutine: protocol.Goroutine{Status: "unknown", Current: true},
+	})
+	_ = recvType[*godap.StoppedEvent](hh)
+
+	hh.sendReq("threads", &godap.ThreadsRequest{})
+	hh.cmds.waitForCommand(t, protocol.CmdGoroutines)
+	hh.inject(protocol.EventGoroutines, protocol.GoroutinesPayload{
+		Goroutines: []protocol.Goroutine{
+			{ID: 1, Status: "waiting"},
+			{ID: 9, Status: "waiting"},
+		},
+	})
+	threads := recvType[*godap.ThreadsResponse](hh)
+	if len(threads.Body.Threads) != 1 ||
+		threads.Body.Threads[0].Id != 1 ||
+		threads.Body.Threads[0].Name != "stopped goroutine (unknown)" {
+		t.Fatalf("threads after unresolved stop = %+v", threads.Body.Threads)
+	}
+
+	hh.sendReq("stackTrace", &godap.StackTraceRequest{
+		Arguments: godap.StackTraceArguments{ThreadId: 1},
+	})
+	hh.cmds.waitForCommand(t, protocol.CmdFrames)
+	hh.inject(protocol.EventFrames, protocol.FramesPayload{Frames: []protocol.Frame{{
+		Index:    0,
+		Location: protocol.Location{Function: "main.worker", File: "/x/main.go", Line: 20},
+	}}})
+	stack := recvType[*godap.StackTraceResponse](hh)
+	if len(stack.Body.StackFrames) != 1 || stack.Body.StackFrames[0].Name != "main.worker" {
+		t.Fatalf("synthetic stopped stack = %+v", stack.Body.StackFrames)
 	}
 }
 
@@ -1907,7 +1985,7 @@ func TestJoinExistingSuspendedSession(t *testing.T) {
 	hh.sendReq("threads", &godap.ThreadsRequest{})
 	hh.cmds.waitForCommand(t, protocol.CmdGoroutines)
 	hh.inject(protocol.EventGoroutines, protocol.GoroutinesPayload{
-		Goroutines: []protocol.Goroutine{{ID: 7, Status: "running"}},
+		Goroutines: []protocol.Goroutine{{ID: 7, Status: "running", Current: true}},
 	})
 	thr := recvType[*godap.ThreadsResponse](hh)
 	if len(thr.Body.Threads) != 1 || thr.Body.Threads[0].Id != 7 {

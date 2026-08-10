@@ -1273,6 +1273,10 @@ func assertCurrentGoroutineScan(count int) {
 		"BreakpointHit must carry a real nonzero goroutine id")
 	Expect(hit.Goroutine.CurrentLoc).To(Equal(hit.Frames[0].Location),
 		"BreakpointHit goroutine location must match the real stopped thread's innermost frame")
+	Expect(hit.Frames[0].Location.Function).To(Equal("main.breakpointWorker"),
+		"the real stopped TID must independently resolve the breakpoint frame")
+	Expect(hit.Frames[0].Location.Line).To(Equal(line),
+		"the real stopped TID must resolve the marked breakpoint line")
 	Expect(hit.Goroutine.StartLoc.Function).To(Equal("main.worker"),
 		"current goroutine start location must independently resolve the argumentless worker")
 	Expect(hit.Goroutine.CreatedLoc.Function).To(Equal("main.spawnWorker"),
@@ -1291,6 +1295,8 @@ func assertCurrentGoroutineScan(count int) {
 		"snapshot current anchor must retain independently decoded start metadata")
 	Expect(snapshotCurrent.CreatedLoc.Line).To(Equal(spawnLine),
 		"snapshot current anchor must retain independently decoded creation metadata")
+	Expect(snapshotCurrent.CurrentLoc).To(Equal(hit.Frames[0].Location),
+		"snapshot current location must independently agree with the stopped frame")
 	Expect(snapshotThread.GoID).To(Equal(snap.Current),
 		"the uniquely current runtime thread must run snapshot Current")
 	if count > richScanLimit {
