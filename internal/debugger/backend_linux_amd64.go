@@ -834,17 +834,16 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 		}
 
 		if sig == syscall.SIGSTOP && tid != b.pid {
-			// A newly cloned thread's initial group-stop. With
-			// PTRACE_O_TRACECLONE the kernel auto-attaches it and it inherits
-			// our ptrace options, so we just resume THIS thread. Crucially we
-			// must NOT touch the rest of the group: another thread may be
-			// stopped at a breakpoint waiting for the engine, and a
-			// group-continue here would let it run away (the exact "parking the
-			// thread group" hazard that kept clone tracing disabled before).
-			// A brand-new thread is never the one being stepped, but route the
-			// resume through the same helper so no absorb site can drift back
-			// into an unguarded continue.
-			b.pendingSignals.clear(tid)
+			// This is normally a new clone's initial group-stop, but the raw
+			// predicate is not proof of newness: an existing worker, including
+			// the active step owner, can report the same stop. Clearing that
+			// owner's retained signal would lose it when the step is re-armed
+			// with signal zero. Other TIDs retain the established reuse cleanup.
+			if b.resumeFor(tid) != resumeSingleStep {
+				b.pendingSignals.clear(tid)
+			}
+			// Resume only this thread. A group-continue could release a sibling
+			// parked at a breakpoint before the engine has handled its stop.
 			if err := b.absorbStop(absorbNewThread, tid, 0); err != nil {
 				return StopEvent{}, fmt.Errorf("resume new thread tid %d: %w", tid, err)
 			}
