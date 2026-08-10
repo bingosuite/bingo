@@ -2322,7 +2322,9 @@ reuses the normalized management endpoint, validates protocol 1.3 envelopes,
 payload/string/count limits and seq gaps, and reconnects only while the DAP
 session lives. It sends `CmdGoroutineSnapshot` once after every successful
 WebSocket join and thereafter only for explicit Refresh—never run control.
-The recreatable webview receives validated view models through a
+The observer accepts at most 8 MiB per envelope and 8,193 goroutines (the rich
+8,192 prefix plus one current anchor); the recreatable webview receives
+validated view models through a
 ready/rendered-ack protocol. Every document has a generation token; async
 `postMessage` completions may mutate delivery state only while their captured
 view and generation are current, even when an old and new render share a
@@ -2418,8 +2420,17 @@ snapshot section).
 Suspending events carry the runtime goid when it is known. An ID-0 synthetic
 unknown omits DAP's optional `stopped.threadId`; never clamp an unresolved stop
 to 1, because that identifies the unrelated real g1. `threads` responses may
-still assign the lone synthetic entry a transport-only positive handle because
-DAP requires every listed `Thread.id` to be non-zero.
+still assign a synthetic entry a transport-only positive handle because DAP
+requires every listed `Thread.id` to be non-zero. VS Code interprets an omitted
+`stopped.threadId` as a request to fetch every returned thread's stack. To keep
+the cheap synthetic step honest without amplifying one step into thousands of
+identical `CmdFrames`, the first `threads` response after an unknown stop is
+collapsed to exactly one entry: the current goroutine if that explicit
+Goroutines query resolves it, otherwise a transport-only
+`stopped goroutine (unknown)`. A resolved query restores normal full responses
+for later requests. `stackTrace` returns the stopped stack only for that current
+handle and empty frames for every other thread id; bingo cannot unwind arbitrary
+goroutines yet.
 
 `EventContinued` → DAP `continued` **only for out-of-band resumes**. The Handler
 increments `pendingContinues` before enqueuing its OWN continue and decrements it
