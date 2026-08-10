@@ -1,0 +1,178 @@
+name: SIGURG StepDrop Proof
+
+# Throwaway, evidence-only workflow (no production change). It empirically
+# proves, on native linux/amd64 ptrace, the L5 signal-disambiguation hypothesis
+# and that PR #221 (refreshed head 82325fef, was c01226c3) closes it.
+#
+#   Hypothesis (auditor): main@0509b53 drops a SIGURG pending on the stepped
+#   thread because singleStepIfTraceeExists issues PTRACE_SINGLESTEP with signal
+#   0 (stdlib PtraceSingleStep hardcodes data=0), whereas the sibling/continue
+#   arm forwards it.
+#
+# #221 design at this head: single-step NEVER injects (all PTRACE_SINGLESTEP use
+# data=0). Any signal pending on the stepped thread (fault or async SIGURG) is
+# recorded via pendingSignals.delay and forwarded on the NEXT PTRACE_CONT
+# (requeueSignal tgkill + ptraceCont(tid,signal)). So injection is CONT-only by
+# design; the fix vs main is the delay + CONT requeue bookkeeping, not a
+# signal-carrying single-step.
+#
+# Discriminator (real code, not a synthetic harness): PR #221 ships its own
+# native exact-TID test, TestLinuxSteppingThreadSIGURGIsForwardedAfterInstruction
+# Step. A C target installs a SIGURG handler and a hand-written asm step_target
+# that exits 42 iff the handler ran (SIGURG delivered) or 43 if it was dropped.
+# The test queues SIGURG on the exact stepped TID, single-steps, and asserts the
+# exact resume + tgkill-requeue sequence and a terminal exit code of 42.
+#
+#   A) Unmutated 82325fef ................... test PASSES  (SIGURG forwarded, 42)
+#   B) Mutate resumeAbsorbed to drop like main  test FAILS  (exit 43, no requeue)
+#   C) Mutate to inject SIGURG on SINGLESTEP .. test FAILS  (traps in handler frame)
+#
+# B is the mutation discriminator: it proves the test actually detects the drop,
+# so A's pass is meaningful. C shows why #221 delays+forwards on CONT instead of
+# injecting on the step.
+
+on:
+  push:
+    branches: [xsachax-sigurg-stepdrop-proof]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  proof:
+    name: SIGURG step-drop discriminator (linux/amd64 ptrace)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.5"
+
+      - name: Environment / ptrace policy
+        run: |
+          set -x
+          uname -a
+          cc --version | head -1
+          go version
+          cat /proc/sys/kernel/yama/ptrace_scope || true
+          echo "base commit under test:"; git rev-parse HEAD
+
+      - name: Confirm the fix line is present at HEAD
+        run: |
+          echo "resumeAbsorbed at HEAD (must contain pendingSignals.delay):"
+          sed -n '/func (b \*linuxBackend) resumeAbsorbed/,/^}/p' internal/debugger/backend_linux_amd64.go
+          grep -q 'b.pendingSignals.delay(tid, signal)' internal/debugger/backend_linux_amd64.go \
+            || { echo "FIX LINE MISSING — wrong base commit"; exit 1; }
+
+      # ---- A) UNMUTATED: the fix forwards SIGURG (expect PASS, many iterations) ----
+      - name: "A) Unmutated 82325fef — native exact-TID SIGURG-on-step test (expect PASS)"
+        run: |
+          set -o pipefail
+          go test -tags e2e -race -count=20 -v -timeout 300s \
+            ./internal/debugger -run '^TestLinuxSteppingThreadSIGURGIsForwardedAfterInstructionStep$' \
+            2>&1 | tee /tmp/A-e2e.log
+
+      - name: "A) Unmutated — targeted unit proofs (CONT-forward, step-preserves-not-injects, stepped-SIGURG-waits, sibling-isolation, pause-never) (expect PASS)"
+        run: |
+          set -o pipefail
+          # Auditor-requested controls, satisfied by #221's own suite at head 82325fef:
+          #  - sibling SIGURG uses the continue-with-signal arm ... InternalResumesDoNotTransferPendingSignals + ContinueForwardsDeliveredSignalOnce
+          #  - no-inject-on-step control (step preserves, never forwards) .. SingleStepPreservesSignalUntilMatchingTIDContinues
+          #  - stepped SIGURG waits for a fresh delivery stop ............... SteppedSIGURGWaitsForFreshDeliveryStop  (B mutates this)
+          #  - Pause SIGSTOP is never forwarded ............................ PauseSignalIsNeverForwarded
+          go test -race -count=5 -v -timeout 120s ./internal/debugger -run \
+            '^(TestLinuxBackendSteppedSIGURGWaitsForFreshDeliveryStop|TestLinuxBackendContinueForwardsDeliveredSignalOnce|TestLinuxBackendSingleStepPreservesSignalUntilMatchingTIDContinues|TestLinuxBackendPauseSignalIsNeverForwarded|TestLinuxBackendInternalResumesDoNotTransferPendingSignals)$' \
+            2>&1 | tee /tmp/A-unit.log
+
+      # ---- B) DROP MUTATION == main behavior (expect the test to FAIL) ----
+      - name: "B) Mutate: drop SIGURG on the step re-issue like main (remove pendingSignals.delay)"
+        run: |
+          set -x
+          before=$(grep -c 'b.pendingSignals.delay(tid, signal)' internal/debugger/backend_linux_amd64.go)
+          test "$before" = "1" || { echo "expected exactly 1 delay call site, found $before"; exit 1; }
+          sed -i '/b\.pendingSignals\.delay(tid, signal)/d' internal/debugger/backend_linux_amd64.go
+          echo "--- diff (must be exactly one deleted line) ---"
+          git --no-pager diff -- internal/debugger/backend_linux_amd64.go | tee /tmp/B.patch
+          # numstat: added<TAB>removed<TAB>path  -> want 0 removed? no: 0 added, 1 removed
+          numstat=$(git diff --numstat -- internal/debugger/backend_linux_amd64.go)
+          echo "numstat: $numstat"
+          echo "$numstat" | awk '{ if ($1 != 0 || $2 != 1) { print "unexpected mutation footprint"; exit 1 } }'
+          echo "resumeAbsorbed after drop-mutation:"
+          sed -n '/func (b \*linuxBackend) resumeAbsorbed/,/^}/p' internal/debugger/backend_linux_amd64.go
+
+      - name: "B) Compile guard — mutated tree must still build (isolate assertion-failure from build-failure)"
+        run: |
+          set -o pipefail
+          go test -tags e2e -run '^$' ./internal/debugger 2>&1 | tee /tmp/B-compile.log
+          echo "compiles OK"
+
+      - name: "B) Drop-mutation — native test MUST FAIL (SIGURG dropped -> exit 43, no tgkill requeue)"
+        run: |
+          set -o pipefail
+          if go test -tags e2e -race -count=1 -v -timeout 120s \
+               ./internal/debugger -run '^TestLinuxSteppingThreadSIGURGIsForwardedAfterInstructionStep$' \
+               2>&1 | tee /tmp/B-e2e.log ; then
+            echo "::error::UNEXPECTED PASS under drop-mutation — discriminator ineffective"
+            exit 1
+          fi
+          echo "EXPECTED FAILURE under drop-mutation. Evidence:"
+          grep -E 'want handler-returning exit 42|tgkill calls|resume calls|StopExited|ExitCode' /tmp/B-e2e.log | head -20 || true
+
+      - name: "B) Drop-mutation — unit stepped-SIGURG proof MUST FAIL too"
+        run: |
+          set -o pipefail
+          if go test -race -count=1 -v -timeout 120s \
+               ./internal/debugger -run '^TestLinuxBackendSteppedSIGURGWaitsForFreshDeliveryStop$' \
+               2>&1 | tee /tmp/B-unit.log ; then
+            echo "::error::UNEXPECTED PASS under drop-mutation (unit)"
+            exit 1
+          fi
+          echo "EXPECTED FAILURE (unit) under drop-mutation."
+
+      - name: "B) Restore unmutated tree"
+        run: git checkout -- internal/debugger/backend_linux_amd64.go
+
+      # ---- C) INJECT-ON-SINGLESTEP MUTATION (informational: shows why #221 delays instead) ----
+      - name: "C) Mutate: inject SIGURG on PTRACE_SINGLESTEP instead of delaying (informational)"
+        continue-on-error: true
+        run: |
+          set -x
+          python3 - <<'PY'
+          import io, re, sys
+          p = "internal/debugger/backend_linux_amd64.go"
+          s = open(p).read()
+          old = ("\t\tb.pendingSignals.delay(tid, signal)\n"
+                 "\t\tb.countStepRearm()\n"
+                 "\t\treturn b.singleStepIfTraceeExists(tid)\n")
+          new = ("\t\tb.countStepRearm()\n"
+                 "\t\treturn b.ptraceResume(syscall.PTRACE_SINGLESTEP, tid, signal)\n")
+          if old not in s:
+              print("MUTATION-C anchor not found; skipping"); sys.exit(0)
+          open(p, "w").write(s.replace(old, new, 1))
+          print("MUTATION-C applied")
+          PY
+          git --no-pager diff -- internal/debugger/backend_linux_amd64.go | tee /tmp/C.patch
+          if git diff --quiet -- internal/debugger/backend_linux_amd64.go ; then
+            echo "MUTATION-C not applied; skipping run"; exit 0
+          fi
+          go test -tags e2e -run '^$' ./internal/debugger >/tmp/C-compile.log 2>&1 || { echo "C did not compile"; cat /tmp/C-compile.log; git checkout -- internal/debugger/backend_linux_amd64.go; exit 0; }
+          if go test -tags e2e -race -count=1 -v -timeout 120s \
+               ./internal/debugger -run '^TestLinuxSteppingThreadSIGURGIsForwardedAfterInstructionStep$' \
+               2>&1 | tee /tmp/C-e2e.log ; then
+            echo "::warning::MUTATION-C unexpectedly PASSED (injecting on singlestep did not break the step-PC assertion)"
+          else
+            echo "EXPECTED: injecting SIGURG on the single-step FAILS (stops in handler frame; first-step PC != stepPC+1). Evidence:"
+            grep -E 'first-step PC|want 0x|StopSingleStep' /tmp/C-e2e.log | head -10 || true
+          fi
+          git checkout -- internal/debugger/backend_linux_amd64.go
+
+      - name: Upload proof logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sigurg-stepdrop-proof-logs
+          path: /tmp/*.log
+          if-no-files-found: warn
