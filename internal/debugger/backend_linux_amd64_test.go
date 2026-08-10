@@ -993,94 +993,104 @@ func TestLinuxBackendWaitDrainsBeforeBlocking(t *testing.T) {
 // The resumes are issued against thread ids that do not exist, so ptrace fails
 // with ESRCH and the backend swallows it; the bookkeeping under test still runs.
 func TestLinuxBackendApplyAbsorbCarriesOutThePlan(t *testing.T) {
+	t.Run("a dying stepped thread hands the gate to engine reconciliation", testApplyAbsorbThreadExit)
+	t.Run("absorbing on the stepped thread re-arms the step and holds the gate", testApplyAbsorbSteppedPreempt)
+	t.Run("absorbing on any other thread neither re-arms nor opens the gate", testApplyAbsorbForeignPreempt)
+}
+
+func newApplyAbsorbBackend(t *testing.T) *linuxBackend {
 	const (
 		pid     = 7001
 		stepped = 7002
 		foreign = 7003
-		sigurg  = 23
 	)
 
-	newBackend := func() *linuxBackend {
-		b := &linuxBackend{pid: pid, tracer: newTracerThread()}
-		t.Cleanup(b.closeTracer)
-		b.recordStop(pid)
-		b.beginStep(stepped)
-		b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
-		return b
+	b := &linuxBackend{pid: pid, tracer: newTracerThread()}
+	t.Cleanup(b.closeTracer)
+	b.recordStop(pid)
+	b.beginStep(stepped)
+	b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
+	return b
+}
+
+// A dead step owner does not simply release the gate: the engine still owns
+// the breakpoint that was lifted for that step, and delivering the held stop
+// before it is reinstalled loses the trap for good.
+func testApplyAbsorbThreadExit(t *testing.T) {
+	const (
+		stepped = 7002
+		foreign = 7003
+	)
+	b := newApplyAbsorbBackend(t)
+	if err := b.applyAbsorb(b.planAbsorb(absorbThreadExit, stepped, 0), stepped); err != nil {
+		t.Fatalf("applyAbsorb(absorbThreadExit) error = %v", err)
+	}
+	if b.stepping {
+		t.Fatal("hardware-step ownership survived its thread's death")
+	}
+	if ev, ok := b.releasable(); ok {
+		t.Fatalf("released %+v before breakpoint reconciliation", ev)
 	}
 
-	// A dead step owner does not simply release the gate: the engine still owns
-	// the breakpoint that was lifted for that step, and delivering the held stop
-	// before it is reinstalled loses the trap for good. The handoff is therefore
-	// three-phase, and each phase is asserted here because skipping any one of
-	// them either freezes the wait loop or drops a breakpoint silently. In
-	// particular, reporting the boundary must NOT release the stop on its own:
-	// only the engine's acknowledgement may, or the reinstall is racing a
-	// sibling that has already been handed to the engine.
-	t.Run("a dying stepped thread hands the gate to engine reconciliation", func(t *testing.T) {
-		b := newBackend()
-		if err := b.applyAbsorb(b.planAbsorb(absorbThreadExit, stepped, 0), stepped); err != nil {
-			t.Fatalf("applyAbsorb(absorbThreadExit) error = %v", err)
-		}
-		if b.stepping {
-			t.Fatal("hardware-step ownership survived its thread's death")
-		}
-		if ev, ok := b.releasable(); ok {
-			t.Fatalf("released %+v before breakpoint reconciliation", ev)
-		}
+	boundary, ok := b.stepExitBoundary()
+	if !ok || boundary.Reason != StopStepThreadExited || boundary.TID != foreign {
+		t.Fatalf("stepExitBoundary() = (%+v, %t), want StopStepThreadExited anchored to the held stop's tid %d",
+			boundary, ok, foreign)
+	}
+	if ev, ok := b.releasable(); ok {
+		t.Fatalf("reporting the boundary released %+v; only the engine's acknowledgement may", ev)
+	}
 
-		boundary, ok := b.stepExitBoundary()
-		if !ok || boundary.Reason != StopStepThreadExited || boundary.TID != foreign {
-			t.Fatalf("stepExitBoundary() = (%+v, %t), want StopStepThreadExited anchored to the held stop's tid %d",
-				boundary, ok, foreign)
-		}
-		if ev, ok := b.releasable(); ok {
-			t.Fatalf("reporting the boundary released %+v; only the engine's acknowledgement may", ev)
-		}
+	if err := b.completeStepThreadExit(); err != nil {
+		t.Fatalf("completeStepThreadExit() = %v, want success", err)
+	}
+	ev, ok := b.releasable()
+	if !ok || ev.TID != foreign {
+		t.Fatalf("released (%+v, %t), want the held stop on tid %d after reconciliation", ev, ok, foreign)
+	}
+}
 
-		if err := b.completeStepThreadExit(); err != nil {
-			t.Fatalf("completeStepThreadExit() = %v, want success", err)
-		}
-		ev, ok := b.releasable()
-		if !ok || ev.TID != foreign {
-			t.Fatalf("released (%+v, %t), want the held stop on tid %d after reconciliation", ev, ok, foreign)
-		}
-	})
+func testApplyAbsorbSteppedPreempt(t *testing.T) {
+	const (
+		stepped = 7002
+		sigurg  = 23
+	)
+	b := newApplyAbsorbBackend(t)
+	b.pendingSignals.set(stepped, int(syscall.SIGUSR1))
+	before := b.stepRearmCount()
+	if err := b.applyAbsorb(b.planAbsorb(absorbPreempt, stepped, sigurg), stepped); err != nil {
+		t.Fatalf("applyAbsorb(absorbPreempt) error = %v", err)
+	}
+	if after := b.stepRearmCount(); after != before+1 {
+		t.Fatalf("step re-arms = %d, want %d: the consumed step was not re-armed", after, before+1)
+	}
+	if _, ok := b.releasable(); ok {
+		t.Fatal("the gate opened while the re-armed step is still in flight")
+	}
+	if got := b.pendingSignals.take(stepped); got != int(syscall.SIGUSR1) {
+		t.Fatalf("current signal after re-arm = %d, want %d", got, syscall.SIGUSR1)
+	}
+	if got := b.pendingSignals.take(stepped); got != sigurg {
+		t.Fatalf("delayed signal after re-arm = %d, want %d", got, sigurg)
+	}
+}
 
-	t.Run("absorbing on the stepped thread re-arms the step and holds the gate", func(t *testing.T) {
-		b := newBackend()
-		b.pendingSignals.set(stepped, int(syscall.SIGUSR1))
-		before := b.stepRearmCount()
-		if err := b.applyAbsorb(b.planAbsorb(absorbPreempt, stepped, sigurg), stepped); err != nil {
-			t.Fatalf("applyAbsorb(absorbPreempt) error = %v", err)
-		}
-		if after := b.stepRearmCount(); after != before+1 {
-			t.Fatalf("step re-arms = %d, want %d: the consumed step was not re-armed", after, before+1)
-		}
-		if _, ok := b.releasable(); ok {
-			t.Fatal("the gate opened while the re-armed step is still in flight")
-		}
-		if got := b.pendingSignals.take(stepped); got != int(syscall.SIGUSR1) {
-			t.Fatalf("current signal after re-arm = %d, want %d", got, syscall.SIGUSR1)
-		}
-		if got := b.pendingSignals.take(stepped); got != sigurg {
-			t.Fatalf("delayed signal after re-arm = %d, want %d", got, sigurg)
-		}
-	})
-
-	t.Run("absorbing on any other thread neither re-arms nor opens the gate", func(t *testing.T) {
-		b := newBackend()
-		before := b.stepRearmCount()
-		if err := b.applyAbsorb(b.planAbsorb(absorbPreempt, foreign, sigurg), foreign); err != nil {
-			t.Fatalf("applyAbsorb(absorbPreempt) error = %v", err)
-		}
-		if after := b.stepRearmCount(); after != before {
-			t.Fatalf("step re-arms = %d, want %d: a foreign thread must not re-arm the step", after, before)
-		}
-		if _, ok := b.releasable(); ok {
-			t.Fatal("a foreign absorb opened the step gate")
-		}
-	})
+func testApplyAbsorbForeignPreempt(t *testing.T) {
+	const (
+		foreign = 7003
+		sigurg  = 23
+	)
+	b := newApplyAbsorbBackend(t)
+	before := b.stepRearmCount()
+	if err := b.applyAbsorb(b.planAbsorb(absorbPreempt, foreign, sigurg), foreign); err != nil {
+		t.Fatalf("applyAbsorb(absorbPreempt) error = %v", err)
+	}
+	if after := b.stepRearmCount(); after != before {
+		t.Fatalf("step re-arms = %d, want %d: a foreign thread must not re-arm the step", after, before)
+	}
+	if _, ok := b.releasable(); ok {
+		t.Fatal("a foreign absorb opened the step gate")
+	}
 }
 
 // resumeOp records one ptrace resume the wait loop issued.
@@ -1792,52 +1802,57 @@ func TestLinuxWaitAlwaysFailsOnExec(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			b := &linuxBackend{pid: pid}
-			b.pendingSignals.set(pid, int(syscall.SIGUSR1))
-			b.pendingSignals.delay(stepped, int(syscall.SIGURG))
-			script := &scriptedWait{stops: []scriptedStop{
-				{tid: tc.execTID, status: stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_EXEC)},
-			}}
-			script.install(b)
-			if tc.inStep {
-				b.beginStep(stepped)
-				b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
-				b.holdStepOwner(stepped)
-			}
-
-			_, err := b.Wait()
-			if err == nil {
-				t.Fatal("Wait() succeeded on an exec; the image every breakpoint " +
-					"belongs to is gone and the session cannot continue")
-			}
-			if !strings.Contains(err.Error(), "process image") {
-				t.Fatalf("Wait() error = %q, want it to name the image replacement", err)
-			}
-			if strings.Contains(err.Error(), "single-stepped") {
-				t.Fatalf("Wait() error = %q, must not claim the reported pid was the "+
-					"stepped thread: after execve the kernel reports the leader's pid", err)
-			}
-			if len(script.ops) != 0 {
-				t.Fatalf("resume ops = %+v, want none: the exec stop must not be "+
-					"continued into an image the debugger cannot describe", script.ops)
-			}
-			if b.stepping || b.stepExitPending {
-				t.Fatalf("step state survived the exec abort: stepping=%v stepExitPending=%v",
-					b.stepping, b.stepExitPending)
-			}
-			if b.parkedDepthForTest() != 0 {
-				t.Fatal("held stops survived the exec abort; they name threads of an image that is gone")
-			}
-			if tid, ok := b.heldStepOwner(); ok {
-				t.Fatalf("heldStepOwner() = (%d, %v) after the exec abort, want the obligation dropped", tid, ok)
-			}
-			if got := b.pendingSignals.take(pid); got != 0 {
-				t.Fatalf("pending signal after exec abort = %d, want process-wide purge", got)
-			}
-			if got := b.pendingSignals.take(stepped); got != 0 {
-				t.Fatalf("delayed signal after exec abort = %d, want process-wide purge", got)
-			}
+			assertLinuxWaitFailsOnExec(t, pid, stepped, foreign, tc.execTID, tc.inStep)
 		})
+	}
+}
+
+func assertLinuxWaitFailsOnExec(t *testing.T, pid, stepped, foreign, execTID int, inStep bool) {
+	t.Helper()
+	b := &linuxBackend{pid: pid}
+	b.pendingSignals.set(pid, int(syscall.SIGUSR1))
+	b.pendingSignals.delay(stepped, int(syscall.SIGURG))
+	script := &scriptedWait{stops: []scriptedStop{
+		{tid: execTID, status: stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_EXEC)},
+	}}
+	script.install(b)
+	if inStep {
+		b.beginStep(stepped)
+		b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
+		b.holdStepOwner(stepped)
+	}
+
+	_, err := b.Wait()
+	if err == nil {
+		t.Fatal("Wait() succeeded on an exec; the image every breakpoint " +
+			"belongs to is gone and the session cannot continue")
+	}
+	if !strings.Contains(err.Error(), "process image") {
+		t.Fatalf("Wait() error = %q, want it to name the image replacement", err)
+	}
+	if strings.Contains(err.Error(), "single-stepped") {
+		t.Fatalf("Wait() error = %q, must not claim the reported pid was the "+
+			"stepped thread: after execve the kernel reports the leader's pid", err)
+	}
+	if len(script.ops) != 0 {
+		t.Fatalf("resume ops = %+v, want none: the exec stop must not be "+
+			"continued into an image the debugger cannot describe", script.ops)
+	}
+	if b.stepping || b.stepExitPending {
+		t.Fatalf("step state survived the exec abort: stepping=%v stepExitPending=%v",
+			b.stepping, b.stepExitPending)
+	}
+	if b.parkedDepthForTest() != 0 {
+		t.Fatal("held stops survived the exec abort; they name threads of an image that is gone")
+	}
+	if tid, ok := b.heldStepOwner(); ok {
+		t.Fatalf("heldStepOwner() = (%d, %v) after the exec abort, want the obligation dropped", tid, ok)
+	}
+	if got := b.pendingSignals.take(pid); got != 0 {
+		t.Fatalf("pending signal after exec abort = %d, want process-wide purge", got)
+	}
+	if got := b.pendingSignals.take(stepped); got != 0 {
+		t.Fatalf("delayed signal after exec abort = %d, want process-wide purge", got)
 	}
 }
 
