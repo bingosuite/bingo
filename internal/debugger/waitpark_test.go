@@ -240,6 +240,111 @@ func TestStepQueueSteppedThreadDeathRequiresReconciliation(t *testing.T) {
 	}
 }
 
+// TestStepQueueAnchorsOnTheHeldOwnerWhenNothingIsParked is the empty-queue half
+// of the same boundary. The dying owner is retained at its exit stop and becomes
+// the anchor itself, so the reinstall no longer waits for an unrelated thread to
+// stop — which, before this, could be arbitrarily long or never.
+func TestStepQueueAnchorsOnTheHeldOwnerWhenNothingIsParked(t *testing.T) {
+	const stepped = 31
+
+	var q stepQueue
+	q.beginStep(stepped)
+	q.interruptStepIfStepped(stepped)
+	if _, ok := q.stepExitBoundary(); ok {
+		t.Fatal("stepExitBoundary() reported a boundary with no anchor at all")
+	}
+
+	q.holdStepOwner(stepped)
+	boundary, ok := q.stepExitBoundary()
+	if !ok || boundary.Reason != StopStepThreadExited || boundary.TID != stepped {
+		t.Fatalf("stepExitBoundary() = (%+v, %v), want a boundary anchored to the held owner %d",
+			boundary, ok, stepped)
+	}
+	if _, ok := q.stepExitBoundary(); ok {
+		t.Fatal("stepExitBoundary() reported the same transaction twice")
+	}
+	if tid, held := q.heldStepOwner(); !held || tid != stepped {
+		t.Fatalf("heldStepOwner() = (%d, %v) after the boundary, want the owner still held "+
+			"until the engine acknowledges", tid, held)
+	}
+	if got := q.heldStepOwnerCount(); got != 1 {
+		t.Fatalf("heldStepOwnerCount() = %d, want 1: the native spec's non-vacuity "+
+			"gate depends on this counter advancing", got)
+	}
+}
+
+// TestStepQueuePrefersTheHeldOwnerOverAParkedSibling pins which thread anchors
+// the boundary when both are available. The held owner is the one the backend
+// is keeping alive for this and the one it will release; a parked sibling's stop
+// belongs to the engine's normal delivery order and must not be conflated with
+// the anchor.
+func TestStepQueuePrefersTheHeldOwnerOverAParkedSibling(t *testing.T) {
+	const (
+		stepped = 41
+		foreign = 42
+	)
+
+	var q stepQueue
+	q.beginStep(stepped)
+	q.interruptStepIfStepped(stepped)
+	q.holdStepOwner(stepped)
+	q.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
+
+	boundary, ok := q.stepExitBoundary()
+	if !ok || boundary.TID != stepped {
+		t.Fatalf("stepExitBoundary() = (%+v, %v), want the held owner %d", boundary, ok, stepped)
+	}
+	if q.parkedDepthForTest() != 1 {
+		t.Fatal("the boundary consumed the parked sibling instead of the held owner")
+	}
+}
+
+// TestStepQueueReleasesTheHeldOwnerOnlyOnce covers the clear/release pairing.
+// The backend releases the thread and then clears the hold; a second
+// acknowledgement must find nothing to release, or a dead tid would be
+// PTRACE_CONTed again.
+func TestStepQueueReleasesTheHeldOwnerOnlyOnce(t *testing.T) {
+	const stepped = 51
+
+	var q stepQueue
+	q.beginStep(stepped)
+	q.interruptStepIfStepped(stepped)
+	q.holdStepOwner(stepped)
+
+	if tid, ok := q.heldStepOwner(); !ok || tid != stepped {
+		t.Fatalf("heldStepOwner() = (%d, %v), want the owner held", tid, ok)
+	}
+	q.clearHeldStepOwner()
+	q.completeStepThreadExit()
+
+	if tid, ok := q.heldStepOwner(); ok {
+		t.Fatalf("heldStepOwner() = (%d, %v) after release, want nothing held", tid, ok)
+	}
+}
+
+// TestStepQueuePurgeDropsTheHeldOwnerObligation covers teardown. purge runs only
+// where the threads it names are gone or unreachable, so the hold must not
+// survive it: an obligation to resume a thread that no longer exists would be
+// carried forever and, worse, would keep the boundary claiming a dead anchor.
+func TestStepQueuePurgeDropsTheHeldOwnerObligation(t *testing.T) {
+	const stepped = 61
+
+	var q stepQueue
+	q.beginStep(stepped)
+	q.interruptStepIfStepped(stepped)
+	q.holdStepOwner(stepped)
+	q.park(StopEvent{Reason: StopBreakpoint, TID: stepped + 1})
+
+	q.purge()
+
+	if tid, ok := q.heldStepOwner(); ok {
+		t.Fatalf("heldStepOwner() = (%d, %v) after purge, want nothing held", tid, ok)
+	}
+	if _, ok := q.stepExitBoundary(); ok {
+		t.Fatal("stepExitBoundary() still reported an anchor after purge")
+	}
+}
+
 func TestStepQueueEmptyIsInert(t *testing.T) {
 	var q stepQueue
 	if ev, ok := q.releasable(); ok {
@@ -392,11 +497,12 @@ func TestStepQueueResumeForFollowsTheLiveStep(t *testing.T) {
 	q.completeStepThreadExit()
 }
 
-// TestStepQueueAbortStepLiftsTheGateAndDropsHeldStops covers the two absorb
-// cases that cannot re-arm the step — exec replaces the image the breakpoint
-// lived in, and an unknown ptrace event has no safe interpretation. Both must
-// leave the queue inert so the failing Wait tears the session down instead of
-// stranding held stops behind a step that can never finish.
+// TestStepQueueAbortStepLiftsTheGateAndDropsHeldStops covers the absorb cases
+// that cannot re-arm the step — an unknown ptrace event has no safe
+// interpretation, and an exec has thrown the whole image away. Both must leave
+// the queue inert, holding neither a stop nor an anchor, so the failing Wait
+// tears the session down instead of stranding state behind a step that can never
+// finish.
 func TestStepQueueAbortStepLiftsTheGateAndDropsHeldStops(t *testing.T) {
 	const (
 		stepped = 4400
@@ -407,14 +513,22 @@ func TestStepQueueAbortStepLiftsTheGateAndDropsHeldStops(t *testing.T) {
 	q.beginStep(stepped)
 	q.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
 	q.park(StopEvent{Reason: StopSignal, TID: foreign + 1, Signal: 11})
+	q.interruptStepIfStepped(stepped)
+	q.holdStepOwner(stepped)
 
 	q.abortStep()
 
 	if q.stepping {
 		t.Fatal("abortStep left the step gate latched — every later foreign stop would park forever")
 	}
+	if q.stepExitPending {
+		t.Fatal("abortStep left the reconciliation gate closed")
+	}
 	if got := len(q.parked); got != 0 {
 		t.Fatalf("%d stops still held after abortStep, want 0 — they name threads the engine must not act on", got)
+	}
+	if tid, ok := q.heldStepOwner(); ok {
+		t.Fatalf("heldStepOwner() = (%d, %v) after abortStep, want the obligation dropped", tid, ok)
 	}
 	if _, ok := q.releasable(); ok {
 		t.Fatal("abortStep left a releasable stop behind")
@@ -457,8 +571,14 @@ func absorbRearmingKinds() []absorbKind {
 }
 
 // absorbFatalKinds are the branches Wait cannot absorb under an in-flight step.
+//
+// PTRACE_EVENT_EXEC is deliberately NOT one of them and has no absorb row at
+// all: it invalidates the image for every thread, so Wait fails on it
+// unconditionally rather than asking what to do with the stop. That contract is
+// pinned at the wait-loop level (TestLinuxWaitAlwaysFailsOnExec), because a
+// table row here could only ever describe a decision production no longer makes.
 func absorbFatalKinds() []absorbKind {
-	return []absorbKind{absorbExec, absorbUnknownEvent}
+	return []absorbKind{absorbUnknownEvent}
 }
 
 func TestPlanAbsorbRearmsTheStepItConsumedOnTheSteppedThread(t *testing.T) {
@@ -490,14 +610,22 @@ func TestPlanAbsorbContinuesAnyOtherThreadWithItsSignal(t *testing.T) {
 	}
 }
 
+// TestPlanAbsorbClosesHardwareStepForADyingSteppedThread covers the dying step
+// owner with a sibling already parked: that sibling is the anchor, so the owner
+// is resumed and left to finish dying.
 func TestPlanAbsorbClosesHardwareStepForADyingSteppedThread(t *testing.T) {
 	q := &stepQueue{stepping: true, stepTID: absorbSteppedTID}
+	q.park(StopEvent{Reason: StopBreakpoint, TID: absorbForeignTID})
 	got := q.planAbsorb(absorbThreadExit, absorbSteppedTID, absorbSignal)
 	if !got.stepThreadExits {
 		t.Fatalf("absorbThreadExit = %+v, want the dead step owner marked for reconciliation", got)
 	}
 	if got.fail {
 		t.Fatalf("absorbThreadExit = %+v, want a resumable plan", got)
+	}
+	if got.holdStepOwner {
+		t.Fatalf("absorbThreadExit = %+v, want the parked sibling to anchor the "+
+			"boundary rather than holding the owner as well", got)
 	}
 	if got.mode == resumeSingleStep {
 		t.Fatal("absorbThreadExit re-armed a step on a thread that is exiting")
@@ -507,7 +635,66 @@ func TestPlanAbsorbClosesHardwareStepForADyingSteppedThread(t *testing.T) {
 	}
 }
 
-func TestPlanAbsorbRefusesExecAndUnknownEventsOnTheSteppedThread(t *testing.T) {
+// TestPlanAbsorbHoldsTheDyingStepOwnerWhenNothingIsParked is the empty-queue
+// half of the same decision.
+//
+// The engine still owns a breakpoint whose trap is out of the tracee, and
+// PTRACE_POKEDATA needs a thread that is genuinely ptrace-stopped to write it
+// back through. With nothing parked, the dying owner is the only such thread —
+// it is stopped at PTRACE_EVENT_EXIT, before exit_mm, so its address space is
+// still mapped. Resuming it there leaves no anchor at all and the reinstall
+// waits on whatever stop happens to arrive next.
+func TestPlanAbsorbHoldsTheDyingStepOwnerWhenNothingIsParked(t *testing.T) {
+	q := &stepQueue{stepping: true, stepTID: absorbSteppedTID}
+	got := q.planAbsorb(absorbThreadExit, absorbSteppedTID, absorbSignal)
+	if !got.holdStepOwner {
+		t.Fatalf("absorbThreadExit with an empty queue = %+v, want the owner held "+
+			"as the reconciliation anchor", got)
+	}
+	if !got.stepThreadExits {
+		t.Fatalf("absorbThreadExit = %+v, want the dead step owner marked for reconciliation", got)
+	}
+	if got.fail || got.mode == resumeSingleStep {
+		t.Fatalf("absorbThreadExit = %+v, want no resume at all for a held owner", got)
+	}
+}
+
+// TestPlanAbsorbNeverHoldsAThreadThatIsNotTheStepOwner keeps the hold narrow. A
+// thread that is merely exiting has no breakpoint transaction attached to it, so
+// holding it would freeze an unrelated thread forever.
+func TestPlanAbsorbNeverHoldsAThreadThatIsNotTheStepOwner(t *testing.T) {
+	cases := []struct {
+		name     string
+		stepping bool
+		tid      int
+	}{
+		{"a foreign thread during a step", true, absorbForeignTID},
+		{"the last stepped tid with no step in flight", false, absorbSteppedTID},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q := &stepQueue{stepping: tc.stepping, stepTID: absorbSteppedTID}
+			got := q.planAbsorb(absorbThreadExit, tc.tid, 0)
+			if got.holdStepOwner {
+				t.Fatalf("absorbThreadExit(%d) = %+v, want no hold", tc.tid, got)
+			}
+			if got.mode != resumeContinue {
+				t.Fatalf("absorbThreadExit(%d) = %+v, want a plain continue", tc.tid, got)
+			}
+		})
+	}
+}
+
+// TestPlanAbsorbRefusesUnknownEventsOnTheSteppedThread pins the one remaining
+// TID-keyed refusal. An event we never enabled has no understood stop shape, so
+// it is fatal on the thread under the step and harmless anywhere else.
+//
+// exec used to share this row and no longer does: it is fatal for every thread
+// unconditionally, so the two contracts are tested separately on purpose. A
+// mutation that re-couples them — making unknown events unconditionally fatal,
+// or making exec TID-keyed again — fails one of the two.
+func TestPlanAbsorbRefusesUnknownEventsOnTheSteppedThread(t *testing.T) {
 	for _, kind := range absorbFatalKinds() {
 		q := &stepQueue{stepping: true, stepTID: absorbSteppedTID}
 		if got := q.planAbsorb(kind, absorbSteppedTID, 0); !got.fail {

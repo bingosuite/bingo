@@ -50,6 +50,7 @@ var _ = Describe("Linux amd64 debugger backend (ptrace) E2E", Label("linux"), fu
 	declareStepOverlapPauseDeliverySpec()
 	declareStepOverlapKillSpec()
 	declareStepOwnerExitSpec()
+	declareStepOwnerHoldSpec()
 })
 
 // overlapTargetSrc pounds two breakpoint-able lines from several
@@ -175,6 +176,100 @@ func buildStepOwnerExitTarget() string {
 		"-pthread", "-std=gnu11", "-o", binPath, cPath, asmPath)
 	out, err := cmd.CombinedOutput()
 	Expect(err).NotTo(HaveOccurred(), "build stepped-thread-exit target:\n%s", out)
+	return binPath
+}
+
+// stepOwnerHoldTargetSrc is the same raw-SYS_exit hazard as
+// stepOwnerExitTargetSrc, with the manufactured sibling anchor deliberately
+// removed.
+//
+// A spawner produces one doomed thread at a time, each of which walks into the
+// same raw SYS_exit breakpoint. Nothing else in this target is breakpointed, so
+// when the step owner dies there is normally NOTHING parked — which is exactly
+// the case the held-owner anchor exists for. The later doomed threads are what
+// prove the reinstall really happened: they hit the SAME logical breakpoint
+// after the reconciliation, which is impossible if the trap was left out of the
+// tracee or the entry was orphaned.
+//
+// The spawner is a loop rather than a fixed set of staggered threads so the next
+// hit is always ~one interval away from whenever the debugger becomes ready,
+// instead of being pinned to wall-clock offsets the debugger's own DWARF load
+// and breakpoint round-trips can overrun.
+//
+// It `pthread_join`s each doomed thread before creating the next, which is what
+// makes the spec deterministic rather than merely likely:
+//
+//   - Only ONE thread can ever be at or near the breakpoint, so no second trap
+//     can be pending when the step begins — a pending trap would park and supply
+//     exactly the sibling anchor this spec exists to do without.
+//   - The join blocks for as long as the dying thread is held at its
+//     PTRACE_EVENT_EXIT stop (the kernel clears and wakes the join futex in
+//     mm_release, which is past that stop), so the NEXT doomed thread cannot
+//     even be created until the engine has reinstalled and released the anchor.
+//     Its later hit therefore proves the trap was physically written back.
+//
+// A raw SYS_exit thread is joinable: exit(2) still performs the
+// CLONE_CHILD_CLEARTID futex wake that pthread_join waits on. Verified against
+// glibc before this spec was written.
+const stepOwnerHoldTargetSrc = `#include <pthread.h>
+#include <unistd.h>
+
+extern void die_now(void);
+
+static void *doom(void *unused) {
+	(void)unused;
+	die_now();
+	return NULL;
+}
+
+static void *spawner(void *unused) {
+	(void)unused;
+	for (;;) {
+		pthread_t t;
+		if (pthread_create(&t, NULL, doom, NULL) == 0) {
+			pthread_join(t, NULL);
+		}
+		usleep(200000);
+	}
+}
+
+int main(void) {
+	pthread_t s;
+	alarm(180);
+	pthread_create(&s, NULL, spawner, NULL);
+	for (;;) {
+		pause();
+	}
+}
+`
+
+const stepOwnerHoldTargetAsm = `.file 1 "step_owner_hold_target.S"
+.text
+.globl die_now
+.type die_now,@function
+die_now:
+	movq $60, %rax
+	xorq %rdi, %rdi
+.loc 1 9 0
+	syscall # STEP_OWNER_HOLD
+	ud2
+.size die_now, .-die_now
+.section .note.GNU-stack,"",@progbits
+`
+
+func buildStepOwnerHoldTarget() string {
+	GinkgoHelper()
+	dir := GinkgoT().TempDir()
+	cPath := filepath.Join(dir, "step_owner_hold_target.c")
+	asmPath := filepath.Join(dir, "step_owner_hold_target.S")
+	Expect(os.WriteFile(cPath, []byte(stepOwnerHoldTargetSrc), 0o600)).To(Succeed())
+	Expect(os.WriteFile(asmPath, []byte(stepOwnerHoldTargetAsm), 0o600)).To(Succeed())
+
+	binPath := filepath.Join(dir, "step_owner_hold_target")
+	cmd := exec.Command("gcc", "-g", "-O0", "-fno-omit-frame-pointer", "-no-pie",
+		"-pthread", "-std=gnu11", "-o", binPath, cPath, asmPath)
+	out, err := cmd.CombinedOutput()
+	Expect(err).NotTo(HaveOccurred(), "build held-step-owner target:\n%s", out)
 	return binPath
 }
 
@@ -1008,6 +1103,15 @@ func declareStepOverlapKillSpec() {
 // the restored instruction dies instead of producing StopSingleStep. Hot sibling
 // threads trap while that transaction is open. Their stop must remain queued
 // until the engine has reinstalled the original logical breakpoint.
+//
+// Which thread anchors that reconciliation is racy and both answers are correct:
+// a sibling that has already parked lends its TID, and otherwise the dying owner
+// is held as its own anchor. The non-vacuity gate is therefore that an anchor of
+// SOME kind was established, not specifically a parked one — the owner-held path
+// resolves the whole transaction in microseconds, so on a fast runner no sibling
+// ever needs to park here. declareStepOwnerHoldSpec pins the owner-held path
+// exclusively; this spec's own content is that the stop which follows the death
+// still carries the SIBLING breakpoint's identity.
 func declareStepOwnerExitSpec() {
 	It("reconciles the removed breakpoint before surfacing a stop held behind a dead step owner",
 		Label("overlap"), func() {
@@ -1050,8 +1154,11 @@ func declareStepOwnerExitSpec() {
 				"the target never killed the exact thread under single-step")
 			parked, ok := debugger.LinuxParkedStopCount(h.d)
 			Expect(ok).To(BeTrue(), "parked-stop hook unavailable")
-			Expect(parked).To(BeNumerically(">", 0),
-				"no sibling stop was held behind the dead step owner")
+			held, ok := debugger.LinuxHeldStepOwnerCount(h.d)
+			Expect(ok).To(BeTrue(), "held-step-owner hook unavailable")
+			Expect(parked+held).To(BeNumerically(">", 0),
+				"the dead step owner's transaction was never anchored on a stopped "+
+					"thread, so nothing proves the reinstall had a legal write target")
 
 			Expect(h.d.ClearBreakpoint(deathBP.ID)).To(Succeed(),
 				"clear reconciled thread-exit breakpoint")
@@ -1059,5 +1166,89 @@ func declareStepOwnerExitSpec() {
 				"clear sibling breakpoint")
 			AddReportEntry("overlap-step-owner-exits", exits)
 			AddReportEntry("overlap-step-owner-exit-parked-stops", parked)
+			AddReportEntry("overlap-step-owner-exit-held-owners", held)
+		})
+}
+
+// declareStepOwnerHoldSpec is the empty-queue half of the same abnormal
+// transaction, and the only spec that exercises the held-owner anchor against a
+// real kernel.
+//
+// declareStepOwnerExitSpec manufactures the anchor: it arms a hot sibling line
+// before resuming, so by the time the step owner dies a sibling stop is already
+// parked and lends its TID. That is a legitimate path, but it means that spec
+// passes identically whether or not the held-owner rule exists. Here the ONLY
+// armed breakpoint is the raw SYS_exit itself, so when its thread dies mid-step
+// the queue is empty and the dying owner has to anchor its own reconciliation —
+// held at its PTRACE_EVENT_EXIT stop, written through, then released.
+//
+// What makes it mutation-sensitive rather than merely green:
+//
+//   - A LATER doomed thread must hit the SAME logical breakpoint id. Its thread
+//     cannot even be created until the held owner is released (the spawner joins
+//     each doomed thread, and the join futex is only woken past the exit stop),
+//     so that hit is proof the trap was written back into the tracee through the
+//     held owner and the entry stayed in the table. Drop the hold and the
+//     reinstall has no anchor at all; skip the reinstall and the second hit
+//     never comes.
+//   - LinuxHeldStepOwnerCount must have advanced, or the run reconciled through
+//     some parked sibling and proves nothing about this path. The parked-sibling
+//     path cannot increment it.
+//   - LinuxStepThreadExitCount must have advanced, or no step owner ever died.
+//
+// The parked count is deliberately NOT asserted: an empty queue is the premise.
+func declareStepOwnerHoldSpec() {
+	It("anchors reconciliation on the dying step owner when no sibling stop is held",
+		Label("overlap"), func() {
+			deathLine := markerLine(stepOwnerHoldTargetAsm, "# STEP_OWNER_HOLD")
+			h := newE2EHarness(buildStepOwnerHoldTarget())
+			h.waitFor(20*time.Second, protocol.EventStepped)
+
+			deathBP, err := h.d.SetBreakpoint("step_owner_hold_target.S", deathLine)
+			Expect(err).NotTo(HaveOccurred(), "set raw thread-exit breakpoint")
+
+			Expect(h.d.Continue()).To(Succeed())
+			evt := awaitFrom(h, 30*time.Second,
+				protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+			Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit),
+				"raw thread-exit breakpoint did not stop: %s", evt.Payload)
+			var hit protocol.BreakpointHitPayload
+			Expect(json.Unmarshal(evt.Payload, &hit)).To(Succeed())
+			Expect(hit.Breakpoint.ID).To(Equal(deathBP.ID))
+
+			// Resuming single-steps the restored SYS_exit, so this exact thread
+			// dies instead of completing its step — with nothing parked behind
+			// it. The next stop can only be a LATER doomed thread arriving at
+			// the same breakpoint, which requires the reinstall to have gone
+			// through the held owner.
+			Expect(h.d.Continue()).To(Succeed(),
+				"single-step the raw SYS_exit instruction")
+			evt = awaitFrom(h, 60*time.Second,
+				protocol.EventBreakpointHit, protocol.EventStepped,
+				protocol.EventProcessExited, protocol.EventError)
+			Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit),
+				"no later thread reached the breakpoint after the step owner died: %s", evt.Payload)
+			Expect(json.Unmarshal(evt.Payload, &hit)).To(Succeed())
+			Expect(hit.Breakpoint.ID).To(Equal(deathBP.ID),
+				"the reinstalled breakpoint must keep its original identity")
+
+			_, err = h.d.SetBreakpoint("step_owner_hold_target.S", deathLine)
+			Expect(err).To(MatchError(ContainSubstring("already installed")),
+				"the dead owner must not orphan the original logical breakpoint")
+
+			held, ok := debugger.LinuxHeldStepOwnerCount(h.d)
+			Expect(ok).To(BeTrue(), "held-step-owner hook unavailable")
+			Expect(held).To(BeNumerically(">", 0),
+				"the run never held a dying step owner as its own anchor, so it says "+
+					"nothing about the empty-queue reconciliation path")
+			exits, ok := debugger.LinuxStepThreadExitCount(h.d)
+			Expect(ok).To(BeTrue(), "stepped-thread-exit hook unavailable")
+			Expect(exits).To(BeNumerically(">", 0),
+				"the target never killed the exact thread under single-step")
+
+			Expect(h.d.ClearBreakpoint(deathBP.ID)).To(Succeed(),
+				"the reconciled breakpoint must still be clearable by its id")
+			AddReportEntry("overlap-held-step-owners", held)
+			AddReportEntry("overlap-held-step-owner-exits", exits)
 		})
 }

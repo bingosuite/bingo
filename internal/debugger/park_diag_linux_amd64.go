@@ -83,6 +83,27 @@ func LinuxStepThreadExitCount(d Debugger) (int, bool) {
 	return b.stepExitCount(), true
 }
 
+// LinuxHeldStepOwnerCount reports how many dying step owners the wait loop kept
+// at their exit stop as the engine's memory-write anchor, instead of resuming
+// them and waiting for some other thread to stop.
+//
+// It is the non-vacuity gate for the empty-queue half of the reconciliation
+// path. The parked-sibling half advances LinuxParkedStopCount, so without this
+// counter a native run that only ever reconciled through a queued sibling would
+// pass a spec that claims to cover the owner-held case. Returns (0, false) for a
+// non-engine Debugger.
+func LinuxHeldStepOwnerCount(d Debugger) (int, bool) {
+	e, ok := d.(*engine)
+	if !ok {
+		return 0, false
+	}
+	b, ok := e.backend.(*linuxBackend)
+	if !ok {
+		return 0, false
+	}
+	return b.heldStepOwnerCount(), true
+}
+
 // LinuxRetiredInternalBreakpointCount reports how many delayed sibling hits
 // were recovered after another thread auto-cleared the one-shot sentinel.
 //

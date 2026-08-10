@@ -149,9 +149,28 @@ func (b *linuxBackend) drainParked() (StopEvent, bool) {
 }
 
 // completeStepThreadExit is called by the engine only after Wait returned the
-// internal death boundary, so no Wait call overlaps this gate transition.
-func (b *linuxBackend) completeStepThreadExit() {
+// internal death boundary AND the engine has reinstalled the breakpoint that
+// boundary exists to protect, so no Wait call overlaps this gate transition.
+//
+// Releasing the anchor is the last step, and only ever the step owner we held
+// ourselves: a parked sibling lent its TID without being dequeued, so resuming
+// it would run a thread whose stop the engine has not been told about. The
+// release itself runs through the tracer thread like every other ptrace op.
+// ESRCH/ENOENT is benign — the thread was mid-exit and simply finished dying —
+// and continueIfTraceeExists already treats it as success.
+//
+// A non-benign failure leaves the gate CLOSED and the hold in place. Nothing may
+// drain past a thread we could not release, and reporting the error lets the
+// engine halt suspended rather than resume into a state it cannot describe.
+func (b *linuxBackend) completeStepThreadExit() error {
+	if tid, ok := b.heldStepOwner(); ok {
+		if err := b.continueIfTraceeExists(tid, 0); err != nil {
+			return fmt.Errorf("release step owner tid %d held to reconcile its exit: %w", tid, err)
+		}
+		b.clearHeldStepOwner()
+	}
 	b.stepQueue.completeStepThreadExit()
+	return nil
 }
 
 func (b *linuxBackend) execPtrace(fn func()) { b.tracer.execPtrace(fn) }
@@ -510,9 +529,11 @@ func (b *linuxBackend) Threads() ([]int, error) {
 //nolint:gocognit,gocyclo // The wait loop is one serialized ptrace state machine.
 func (b *linuxBackend) Wait() (StopEvent, error) {
 	for {
-		// A stepped thread can die before reporting completion. The oldest held
-		// stop supplies a valid ptrace-stopped TID for the engine to reinstall
-		// the disarmed trap, but remains queued until that transaction closes.
+		// A stepped thread can die before reporting completion. Reconciling
+		// that needs a genuinely ptrace-stopped TID for the engine to reinstall
+		// the disarmed trap through: the dying owner itself when nothing is
+		// parked (held at its exit stop for exactly this), otherwise the oldest
+		// held stop, which lends its TID but stays queued.
 		if ev, ok := b.stepExitBoundary(); ok {
 			b.recordStop(ev.TID)
 			return ev, nil
@@ -611,18 +632,30 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				return StopEvent{Reason: StopExited, TID: tid, ExitCode: 0}, nil
 
 			case syscall.PTRACE_EVENT_EXEC:
-				// execve replaces the image the stepped-over breakpoint and its
-				// saved instruction bytes belong to, so the step can be neither
-				// re-armed nor completed. Nothing can restore the old trap
-				// because the memory it lived in is gone. Fail the wait instead:
-				// the engine reports it and tears the session down cleanly.
-				if plan := b.planAbsorb(absorbExec, tid, 0); plan.fail {
-					b.abortStep()
-					return StopEvent{}, fmt.Errorf("tracee exec'd on tid %d while it was being single-stepped: the stepped-over breakpoint cannot be restored in the new image", tid)
-				} else if err := b.applyAbsorb(plan, tid); err != nil {
-					return StopEvent{}, fmt.Errorf("PTRACE_CONT exec tid %d: %w", tid, err)
-				}
-				continue
+				// execve replaces the ENTIRE process image, for every thread —
+				// not just the one that called it. Breakpoint addresses, the
+				// original instruction bytes saved behind each trap and the
+				// thread ids the engine is tracking all describe an image that
+				// no longer exists, so there is nothing left to reconcile
+				// against and no safe way to carry the session forward. Fail
+				// the wait unconditionally: it is fatal whether or not a step
+				// was in flight and whichever thread it is reported on. The
+				// engine surfaces the error and tears the session down.
+				//
+				// The exec stop is deliberately NOT resumed: the tracee is
+				// going nowhere useful and the session is ending. Nor is
+				// startup affected — the launch path consumes its own execve
+				// stop in startTracedProcess's private Wait4 BEFORE enabling
+				// PTRACE_O_TRACEEXEC, so the first image never reaches here,
+				// and Restart runs on a brand-new debugger.
+				b.abortStep()
+				return StopEvent{}, fmt.Errorf(
+					"tracee replaced its process image (PTRACE_EVENT_EXEC reported under pid %d): "+
+						"debugging across an exec is unsupported — every breakpoint address, saved "+
+						"instruction byte and thread id belongs to the image that is now gone. "+
+						"The kernel reports this stop under the thread-group leader's pid, which "+
+						"does not identify the thread that called execve. The session ends here and "+
+						"the replacement image may continue running untraced", tid)
 
 			case 0:
 				reason, disp := classifyUserStop(true, b.stepping, b.stepTID, tid)
@@ -782,10 +815,17 @@ func (b *linuxBackend) absorbStop(kind absorbKind, tid int, signal int) error {
 
 // applyAbsorb carries out an absorbPlan. A dying step owner transitions to the
 // reconciliation gate before it is resumed, so no later stop can escape between
-// the thread's exit and the engine restoring its breakpoint transaction.
+// the thread's exit and the engine restoring its breakpoint transaction. When
+// the plan holds that owner it is deliberately NOT resumed here: it is the
+// engine's only memory-write anchor, and completeStepThreadExit releases it once
+// the reinstall is done.
 func (b *linuxBackend) applyAbsorb(plan absorbPlan, tid int) error {
 	if plan.stepThreadExits {
 		b.interruptStepIfStepped(tid)
+	}
+	if plan.holdStepOwner {
+		b.holdStepOwner(tid)
+		return nil
 	}
 	if plan.mode == resumeSingleStep {
 		b.countStepRearm()
