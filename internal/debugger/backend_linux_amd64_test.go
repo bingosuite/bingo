@@ -230,7 +230,7 @@ func testLinuxBackendStoppedMemoryStopTIDOrdered(t *testing.T) {
 			b := newStopTIDRaceBackend(t)
 			result := make(chan error)
 			go func() {
-				b.recordStop(b.pid + 1)
+				b.recordStop(b.pid - 1)
 				result <- nil
 			}()
 			if err := <-result; err != nil {
