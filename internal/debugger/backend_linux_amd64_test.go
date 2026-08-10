@@ -49,6 +49,13 @@ func recordingPtraceSyscall(calls *[]linuxResumeCall, errno syscall.Errno) func(
 	}
 }
 
+func recordingTgkill(calls *[]linuxTgkillCall) func(int, int, syscall.Signal) error {
+	return func(tgid, tid int, signal syscall.Signal) error {
+		*calls = append(*calls, linuxTgkillCall{tgid: tgid, tid: tid, signal: int(signal)})
+		return nil
+	}
+}
+
 func newRecordingLinuxBackend(t *testing.T, pid int) (*linuxBackend, *[]linuxResumeCall) {
 	t.Helper()
 	calls := &[]linuxResumeCall{}
@@ -462,6 +469,132 @@ func TestLinuxBackendFailedResumeESRCHRetainsPendingSignal(t *testing.T) {
 	}
 }
 
+func TestLinuxBackendDistinctSignalDuringStepPreservesBothExactTIDResumes(t *testing.T) {
+	const (
+		pid = 5601
+		tid = 5602
+	)
+	b, calls := newRecordingLinuxBackend(t, pid)
+	var tgkills []linuxTgkillCall
+	b.tgkillFn = recordingTgkill(&tgkills)
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGUSR1)})
+	b.ptraceSyscall6Fn = recordingPtraceSyscall(calls, syscall.EIO)
+
+	if err := b.ContinueProcess(); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("ContinueProcess() error = %v, want %v", err, syscall.EIO)
+	}
+	b.ptraceSyscall6Fn = recordingPtraceSyscall(calls, 0)
+	if err := b.SingleStep(tid); err != nil {
+		t.Fatalf("SingleStep() error = %v", err)
+	}
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGUSR2)})
+	if err := b.ContinueProcess(); err != nil {
+		t.Fatalf("ContinueProcess() after distinct signal error = %v", err)
+	}
+
+	wantResumes := []linuxResumeCall{
+		wantLinuxResume(syscall.PTRACE_CONT, tid, int(syscall.SIGUSR1)),
+		wantLinuxResume(syscall.PTRACE_SINGLESTEP, tid, 0),
+		wantLinuxResume(syscall.PTRACE_CONT, tid, int(syscall.SIGUSR2)),
+	}
+	if !reflect.DeepEqual(*calls, wantResumes) {
+		t.Fatalf("resume calls = %+v, want exact tuples %+v", *calls, wantResumes)
+	}
+	wantTgkills := []linuxTgkillCall{{
+		tgid: pid, tid: tid, signal: int(syscall.SIGUSR1),
+	}}
+	if !reflect.DeepEqual(tgkills, wantTgkills) {
+		t.Fatalf("tgkill calls = %+v, want older signal requeued to exact tid %+v", tgkills, wantTgkills)
+	}
+	if pending := b.pendingSignals.takeForContinue(tid); pending.current != 0 ||
+		len(pending.deferred) != 0 {
+		t.Fatalf("pending signals after successful continue = %+v, want empty", pending)
+	}
+}
+
+func TestLinuxBackendPartialDeferredRequeueRestoresOnlyUnsentSignals(t *testing.T) {
+	const (
+		pid = 5701
+		tid = 5702
+	)
+	b, calls := newRecordingLinuxBackend(t, pid)
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGUSR1)})
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGUSR2)})
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGALRM)})
+	b.pendingSignals.delay(tid, int(syscall.SIGURG))
+
+	var attempts []linuxTgkillCall
+	b.tgkillFn = func(tgid, targetTID int, signal syscall.Signal) error {
+		attempts = append(attempts, linuxTgkillCall{tgid: tgid, tid: targetTID, signal: int(signal)})
+		if len(attempts) == 2 {
+			return syscall.EAGAIN
+		}
+		return nil
+	}
+
+	if err := b.ContinueProcess(); !errors.Is(err, syscall.EAGAIN) {
+		t.Fatalf("ContinueProcess() error = %v, want %v", err, syscall.EAGAIN)
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("ptrace calls after failed requeue = %+v, want none", *calls)
+	}
+	if err := b.ContinueProcess(); err != nil {
+		t.Fatalf("retry ContinueProcess() error = %v", err)
+	}
+
+	wantAttempts := []linuxTgkillCall{
+		{tgid: pid, tid: tid, signal: int(syscall.SIGUSR1)},
+		{tgid: pid, tid: tid, signal: int(syscall.SIGUSR2)},
+		{tgid: pid, tid: tid, signal: int(syscall.SIGUSR2)},
+		{tgid: pid, tid: tid, signal: int(syscall.SIGURG)},
+	}
+	if !reflect.DeepEqual(attempts, wantAttempts) {
+		t.Fatalf("tgkill attempts = %+v, want successful prefixes not restored %+v", attempts, wantAttempts)
+	}
+	wantResumes := []linuxResumeCall{
+		wantLinuxResume(syscall.PTRACE_CONT, tid, int(syscall.SIGALRM)),
+	}
+	if !reflect.DeepEqual(*calls, wantResumes) {
+		t.Fatalf("resume calls = %+v, want newest signal injected %+v", *calls, wantResumes)
+	}
+}
+
+func TestLinuxBackendFailedResumeDoesNotRestoreRequeuedSignals(t *testing.T) {
+	const (
+		pid = 5721
+		tid = 5722
+	)
+	b, calls := newRecordingLinuxBackend(t, pid)
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGUSR1)})
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGUSR2)})
+
+	var tgkills []linuxTgkillCall
+	b.tgkillFn = recordingTgkill(&tgkills)
+	b.ptraceSyscall6Fn = recordingPtraceSyscall(calls, syscall.EIO)
+	if err := b.ContinueProcess(); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("ContinueProcess() error = %v, want %v", err, syscall.EIO)
+	}
+
+	b.ptraceSyscall6Fn = recordingPtraceSyscall(calls, 0)
+	if err := b.ContinueProcess(); err != nil {
+		t.Fatalf("retry ContinueProcess() error = %v", err)
+	}
+
+	wantTgkills := []linuxTgkillCall{{
+		tgid: pid, tid: tid, signal: int(syscall.SIGUSR1),
+	}}
+	if !reflect.DeepEqual(tgkills, wantTgkills) {
+		t.Fatalf("tgkill calls = %+v, want already-requeued signal sent only once %+v", tgkills, wantTgkills)
+	}
+	wantResumes := []linuxResumeCall{
+		wantLinuxResume(syscall.PTRACE_CONT, tid, int(syscall.SIGUSR2)),
+		wantLinuxResume(syscall.PTRACE_CONT, tid, int(syscall.SIGUSR2)),
+	}
+	if !reflect.DeepEqual(*calls, wantResumes) {
+		t.Fatalf("resume calls = %+v, want current signal retained across failure %+v", *calls, wantResumes)
+	}
+}
+
 func TestLinuxBackendInternalResumeESRCHRetainsPendingSignal(t *testing.T) {
 	const tid = 5751
 	b, calls := newRecordingLinuxBackend(t, tid)
@@ -482,6 +615,45 @@ func TestLinuxBackendInternalResumeESRCHRetainsPendingSignal(t *testing.T) {
 	}
 	if !reflect.DeepEqual(*calls, want) {
 		t.Fatalf("resume calls = %+v, want retained exact signal %+v", *calls, want)
+	}
+}
+
+func TestLinuxBackendInternalResumeESRCHRetainsRequeuedSignals(t *testing.T) {
+	const (
+		pid = 5771
+		tid = 5772
+	)
+	b, calls := newRecordingLinuxBackend(t, pid)
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGUSR1)})
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGUSR2)})
+
+	var tgkills []linuxTgkillCall
+	b.tgkillFn = recordingTgkill(&tgkills)
+	b.ptraceSyscall6Fn = recordingPtraceSyscall(calls, syscall.ESRCH)
+	if err := b.continueIfTraceeExists(tid, 0); err != nil {
+		t.Fatalf("continueIfTraceeExists() error = %v", err)
+	}
+
+	b.ptraceSyscall6Fn = recordingPtraceSyscall(calls, 0)
+	if err := b.ContinueProcess(); err != nil {
+		t.Fatalf("ContinueProcess() after ESRCH error = %v", err)
+	}
+
+	// The failed CONT leaves the TID stopped, so the second standard signal
+	// requeue coalesces with the first instead of creating another delivery.
+	wantTgkills := []linuxTgkillCall{
+		{tgid: pid, tid: tid, signal: int(syscall.SIGUSR1)},
+		{tgid: pid, tid: tid, signal: int(syscall.SIGUSR1)},
+	}
+	if !reflect.DeepEqual(tgkills, wantTgkills) {
+		t.Fatalf("tgkill calls = %+v, want conservative ESRCH retry %+v", tgkills, wantTgkills)
+	}
+	wantResumes := []linuxResumeCall{
+		wantLinuxResume(syscall.PTRACE_CONT, tid, 0),
+		wantLinuxResume(syscall.PTRACE_CONT, tid, int(syscall.SIGUSR2)),
+	}
+	if !reflect.DeepEqual(*calls, wantResumes) {
+		t.Fatalf("resume calls = %+v, want exact retry tuples %+v", *calls, wantResumes)
 	}
 }
 
@@ -537,10 +709,7 @@ func TestLinuxBackendSteppedSIGURGWaitsForFreshDeliveryStop(t *testing.T) {
 	)
 	b, calls := newRecordingLinuxBackend(t, pid)
 	var tgkills []linuxTgkillCall
-	b.tgkillFn = func(tgid, targetTID int, signal syscall.Signal) error {
-		tgkills = append(tgkills, linuxTgkillCall{tgid: tgid, tid: targetTID, signal: int(signal)})
-		return nil
-	}
+	b.tgkillFn = recordingTgkill(&tgkills)
 	b.recordStop(tid)
 
 	b.beginStep(tid)
@@ -582,10 +751,7 @@ func TestLinuxBackendCurrentSignalPrecedesDelayedSIGURG(t *testing.T) {
 	)
 	b, calls := newRecordingLinuxBackend(t, pid)
 	var tgkills []linuxTgkillCall
-	b.tgkillFn = func(tgid, targetTID int, signal syscall.Signal) error {
-		tgkills = append(tgkills, linuxTgkillCall{tgid: tgid, tid: targetTID, signal: int(signal)})
-		return nil
-	}
+	b.tgkillFn = recordingTgkill(&tgkills)
 	b.pendingSignals.delay(tid, int(syscall.SIGURG))
 	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGUSR1)})
 
@@ -613,10 +779,7 @@ func TestLinuxBackendPauseStillSuppressesSIGSTOPWithDelayedSIGURG(t *testing.T) 
 	const tid = 6301
 	b, calls := newRecordingLinuxBackend(t, tid)
 	var tgkills []linuxTgkillCall
-	b.tgkillFn = func(tgid, targetTID int, signal syscall.Signal) error {
-		tgkills = append(tgkills, linuxTgkillCall{tgid: tgid, tid: targetTID, signal: int(signal)})
-		return nil
-	}
+	b.tgkillFn = recordingTgkill(&tgkills)
 	b.pendingSignals.delay(tid, int(syscall.SIGURG))
 	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: b.PauseSignal()})
 
@@ -707,6 +870,78 @@ func TestLinuxBackendExitingThreadDropsCurrentAndDelayedSignals(t *testing.T) {
 	}
 	if got := b.pendingSignals.take(otherTID); got != unrelatedSignal {
 		t.Fatalf("unrelated signal after exit resume = %d, want %d", got, unrelatedSignal)
+	}
+}
+
+func TestLinuxWaitDeathPathsClearOnlyDeadTIDSignals(t *testing.T) {
+	tests := []struct {
+		name   string
+		status syscall.WaitStatus
+	}{
+		{name: "wait reports exited", status: exitedWith(7)},
+		{name: "wait reports signaled", status: signaledBy(syscall.SIGKILL)},
+		{name: "ptrace event exit", status: stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_EXIT)},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			testLinuxWaitDeathPathClearsOnlyDeadTIDSignals(t, tc.status)
+		})
+	}
+}
+
+func testLinuxWaitDeathPathClearsOnlyDeadTIDSignals(t *testing.T, status syscall.WaitStatus) {
+	t.Helper()
+	const (
+		pid        = 6601
+		deadTID    = 6602
+		otherTID   = 6603
+		observerID = 6604
+	)
+	leaderStatus := uint(exitedWith(71))
+	b := &linuxBackend{pid: pid}
+	script := &scriptedWait{stops: []scriptedStop{
+		{tid: deadTID, status: status},
+		{tid: observerID, status: stoppedAt(syscall.SIGUSR2, 0)},
+	}}
+	script.install(b)
+	b.noteLeaderExit(leaderStatus, true)
+
+	b.pendingSignals.set(deadTID, int(syscall.SIGUSR1))
+	b.pendingSignals.set(deadTID, int(syscall.SIGUSR2))
+	b.pendingSignals.delay(deadTID, int(syscall.SIGURG))
+	b.pendingSignals.set(otherTID, int(syscall.SIGALRM))
+	b.pendingSignals.set(otherTID, int(syscall.SIGTERM))
+	b.pendingSignals.delay(otherTID, int(syscall.SIGURG))
+
+	var tgkills []linuxTgkillCall
+	b.tgkillFn = recordingTgkill(&tgkills)
+
+	ev, err := b.Wait()
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if ev.Reason != StopSignal || ev.TID != observerID {
+		t.Fatalf("Wait() = %+v, want observer signal stop on tid %d", ev, observerID)
+	}
+	assertPendingSignalBatch(t, "dead tid", b.pendingSignals.takeForContinue(deadTID), pendingSignalBatch{})
+	assertPendingSignalBatch(t, "unrelated tid", b.pendingSignals.takeForContinue(otherTID), pendingSignalBatch{
+		current:  int(syscall.SIGTERM),
+		deferred: []int{int(syscall.SIGALRM), int(syscall.SIGURG)},
+	})
+	if len(tgkills) != 0 {
+		t.Fatalf("tgkill calls = %+v, want none while retiring tid %d", tgkills, deadTID)
+	}
+	if !b.leaderExitStashed || b.leaderExitStatus != leaderStatus {
+		t.Fatalf("leader exit changed to stashed=%v status=%d, want stashed status %d",
+			b.leaderExitStashed, b.leaderExitStatus, leaderStatus)
+	}
+}
+
+func assertPendingSignalBatch(t *testing.T, label string, got, want pendingSignalBatch) {
+	t.Helper()
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("%s pending state = %+v, want %+v", label, got, want)
 	}
 }
 
@@ -1114,6 +1349,10 @@ func stoppedAt(sig syscall.Signal, event int) syscall.WaitStatus {
 
 func exitedWith(code int) syscall.WaitStatus {
 	return syscall.WaitStatus(uint32(code) << 8)
+}
+
+func signaledBy(signal syscall.Signal) syscall.WaitStatus {
+	return syscall.WaitStatus(signal)
 }
 
 // TestLinuxWaitResumesTheSteppedThreadWithASingleStep executes every wait-loop
