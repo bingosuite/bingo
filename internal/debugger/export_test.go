@@ -73,6 +73,20 @@ func ExportedForceRunning(d Debugger) {
 	}
 }
 
+// ExportedForgetLastBreakpointTID zeroes lastBPTID while the engine stays
+// parked on its breakpoint, reproducing a stop that named no thread. That is
+// the only state in which resumeFromBreakpoint falls back to Backend.Threads
+// to pick the step-off thread.
+func ExportedForgetLastBreakpointTID(d Debugger) {
+	e := d.(*engine)
+	if err := e.dispatch(func() error {
+		e.lastBPTID = 0
+		return nil
+	}); err != nil {
+		panic("ExportedForgetLastBreakpointTID: " + err.Error())
+	}
+}
+
 // ExportedSetBreakpointAt installs a BP at addr bypassing DWARF lookup.
 // File is "<direct-addr>". Panics on failure.
 func ExportedSetBreakpointAt(d Debugger, addr uint64) int {
