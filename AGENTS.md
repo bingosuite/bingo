@@ -393,6 +393,16 @@ same-address spec, removing it fails both (`engine_test.go` →
 the reconcile the `StopSignal` branch has always done; before it, the two
 branches disagreed and only the signal half was safe.
 
+On **linux** that death is now caught earlier and more precisely, by the
+`StopStepThreadExited` boundary (park-queue rule 5): the backend refuses to
+release the held stop at all until the engine has reinstalled, so the sibling
+never reaches `handleStop` with `steppingOverBP` still set. The reconcile above
+is therefore the **cross-platform backstop** — it is what covers darwin, which
+has no wait-side queue and no boundary event — and a no-op on linux, where
+`steppingOverBP` is already nil by the time the held stop drains. Keep both:
+the boundary is the ordered handoff, the reconcile is the invariant that a
+breakpoint stop never proceeds while a lifted trap is outstanding.
+
 **Every asynchronous halt in `handleStop` must be reported with a *suspending*
 event, not a bare `EventError`.** These failures happen after the resume that
 led to them already returned `nil` and emitted `EventContinued`, so the hub has
