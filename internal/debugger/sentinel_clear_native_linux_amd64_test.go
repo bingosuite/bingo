@@ -33,6 +33,7 @@ static const char *before_file;
 static const char *unmapped_file;
 static const char *release_file;
 static const char *mapped_file;
+static volatile unsigned int probe_value;
 
 static void marker(const char *path) {
 	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -41,9 +42,9 @@ static void marker(const char *path) {
 
 __attribute__((noinline, aligned(4096), section(".sentinel")))
 static void sentinel_target(void) {
-	atomic_signal_fence(memory_order_seq_cst); // PROBE_BREAKPOINT
-	atomic_signal_fence(memory_order_seq_cst); // PROBE_SENTINEL
-	atomic_signal_fence(memory_order_seq_cst);
+	probe_value = 1; // PROBE_BREAKPOINT
+	probe_value += 1; // PROBE_SENTINEL
+	probe_value += 2;
 }
 
 static void *remap_sentinel_page(void *unused) {
