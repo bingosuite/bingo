@@ -531,7 +531,21 @@ func declareStepOverlapSignalSpec() {
 		Label("overlap"), func() {
 			p, bpA, bpB := setupOverlap("overlap_signal_target", overlapSignalTargetSrc)
 
-			iters := envInt("BINGO_E2E_OVERLAP_SIGNAL_ITERS", 80)
+			iters := envInt("BINGO_E2E_OVERLAP_SIGNAL_ITERS", 40)
+			// Machine steps per cycle. A foreign signal is only *held* if it
+			// lands while a step is outstanding, and that window is a few tens
+			// of microseconds against a cycle time dominated by the storm
+			// itself — so the way to make the held-signal population reliable
+			// is to spend more of the run inside a step, not to storm harder
+			// (a faster storm costs a ptrace round-trip per signal and would
+			// dominate the runtime). A burst of machine steps multiplies the
+			// exposure for a per-step cost far below one cycle. Measured: 80
+			// cycles x 1 step gave 12 / 2 / 0 held signals across three native
+			// runs — the zero run is what made this necessary. 40 x 13 windows
+			// is ~6.5x the exposure at roughly the same wall time, since the
+			// halved cycle count pays for the steps: sizing is two-sided here,
+			// because every target self-exits on a 180s watchdog.
+			steps := envInt("BINGO_E2E_OVERLAP_SIGNAL_STEPS", 12)
 			for i := 0; i < iters; i++ {
 				where := fmt.Sprintf("cycle #%d", i)
 				late := i >= iters*3/4
@@ -544,6 +558,18 @@ func declareStepOverlapSignalSpec() {
 					"Continue %s unexpected %s: %s", where, evt.Kind, evt.Payload)
 				p.record(evt, where, late)
 				p.assertArmed(where)
+
+				for s := 0; s < steps; s++ {
+					stepWhere := fmt.Sprintf("%s step #%d", where, s)
+					Expect(p.h.d.StepInto()).To(Succeed(), "StepInto %s", stepWhere)
+					evt = p.await(30*time.Second,
+						protocol.EventStepped, protocol.EventBreakpointHit,
+						protocol.EventProcessExited, protocol.EventError)
+					Expect(evt.Kind).To(Or(Equal(protocol.EventStepped), Equal(protocol.EventBreakpointHit)),
+						"StepInto %s unexpected %s: %s", stepWhere, evt.Kind, evt.Payload)
+					p.record(evt, stepWhere, late)
+					p.assertArmed(stepWhere)
+				}
 
 				Expect(p.h.d.StepOver()).To(Succeed(), "StepOver %s", where)
 				evt = p.await(30*time.Second,
@@ -594,8 +620,8 @@ func declareStepOverlapSignalSpec() {
 			parkedSignals, ok := debugger.LinuxParkedSignalCount(p.h.d)
 			Expect(ok).To(BeTrue(), "parked-signal hook unavailable")
 			Expect(parkedSignals).To(BeNumerically(">", 0),
-				"no signal stop was ever held back across %d cycles: the queued "+
-					"signal path was not exercised", iters)
+				"no signal stop was ever held back across %d cycles x %d steps: "+
+					"the queued signal path was not exercised", iters, steps)
 			// Liveness: threads are still making progress at the end of the
 			// run. A thread resumed while another was left stopped would drop
 			// out permanently, since every spinner is LockOSThread'd.
@@ -603,6 +629,7 @@ func declareStepOverlapSignalSpec() {
 				"fewer than two goroutines still hitting breakpoints in the final quarter — a thread was stranded")
 
 			AddReportEntry("overlap-signal-iterations", iters)
+			AddReportEntry("overlap-signal-steps-per-cycle", steps)
 			AddReportEntry("overlap-signal-stops", p.signalOutputs)
 			AddReportEntry("overlap-signal-goroutines", len(p.goroutines))
 			AddReportEntry("overlap-signal-late-goroutines", len(p.lateGoroutines))
