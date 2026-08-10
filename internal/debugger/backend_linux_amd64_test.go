@@ -381,10 +381,67 @@ func TestLinuxBackendInternalContinueClearsOnlyItsPendingSignal(t *testing.T) {
 	}
 }
 
+func TestLinuxBackendTeardownContinueDiscardsPendingBeforeResume(t *testing.T) {
+	const (
+		exitingTID      = 6003
+		unrelatedTID    = 6004
+		unrelatedSignal = int(syscall.SIGUSR2)
+	)
+	b, calls := newRecordingLinuxBackend(t, exitingTID)
+	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: exitingTID, Signal: int(syscall.SIGSEGV)})
+	b.pendingSignals.delay(exitingTID, int(syscall.SIGURG))
+	b.pendingSignals.set(unrelatedTID, unrelatedSignal)
+
+	if err := b.continueDiscardingPending(exitingTID); err != nil {
+		t.Fatalf("continueDiscardingPending() error = %v", err)
+	}
+	if got := b.pendingSignals.take(exitingTID); got != 0 {
+		t.Fatalf("exiting TID retained signal %d, want 0", got)
+	}
+	if got := b.pendingSignals.take(unrelatedTID); got != unrelatedSignal {
+		t.Fatalf("teardown continue changed unrelated TID's signal: got %d, want %d", got, unrelatedSignal)
+	}
+
+	want := []linuxResumeCall{
+		wantLinuxResume(syscall.PTRACE_CONT, exitingTID, 0),
+	}
+	if !reflect.DeepEqual(*calls, want) {
+		t.Fatalf("resume calls = %+v, want %+v", *calls, want)
+	}
+}
+
+func TestLinuxBackendImageReplacementContinuePurgesPendingBeforeResume(t *testing.T) {
+	const (
+		execTID      = 6005
+		destroyedTID = 6006
+	)
+	b, calls := newRecordingLinuxBackend(t, execTID)
+	b.pendingSignals.delay(execTID, int(syscall.SIGURG))
+	b.pendingSignals.set(destroyedTID, int(syscall.SIGUSR2))
+	b.pendingSignals.delay(destroyedTID, int(syscall.SIGURG))
+
+	if err := b.continueDiscardingAllPending(execTID); err != nil {
+		t.Fatalf("continueDiscardingAllPending() error = %v", err)
+	}
+	if got := b.pendingSignals.take(execTID); got != 0 {
+		t.Fatalf("exec TID retained signal %d, want 0", got)
+	}
+	if got := b.pendingSignals.take(destroyedTID); got != 0 {
+		t.Fatalf("destroyed sibling retained signal %d, want 0", got)
+	}
+
+	want := []linuxResumeCall{
+		wantLinuxResume(syscall.PTRACE_CONT, execTID, 0),
+	}
+	if !reflect.DeepEqual(*calls, want) {
+		t.Fatalf("resume calls = %+v, want %+v", *calls, want)
+	}
+}
+
 func TestLinuxBackendInternalSingleStepDelaysSIGURGUntilExactContinue(t *testing.T) {
 	const (
-		tid             = 6003
-		unrelatedTID    = 6004
+		tid             = 6007
+		unrelatedTID    = 6008
 		unrelatedSignal = int(syscall.SIGUSR2)
 	)
 	b, calls := newRecordingLinuxBackend(t, tid)

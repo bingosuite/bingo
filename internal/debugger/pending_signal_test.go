@@ -81,6 +81,22 @@ func TestPendingSignalsDelaySurvivesLaterSignal(t *testing.T) {
 	}
 }
 
+func TestPendingSignalsDelayKeepsFirstSignal(t *testing.T) {
+	var pending pendingSignals
+	const (
+		tid          = 3501
+		firstSignal  = 23
+		secondSignal = 10
+	)
+
+	pending.delay(tid, firstSignal)
+	pending.delay(tid, secondSignal)
+
+	if got := pending.take(tid); got != firstSignal {
+		t.Fatalf("take = %d, want first delayed signal %d", got, firstSignal)
+	}
+}
+
 func TestPendingSignalsTakeForStepLeavesDelayedSignalPending(t *testing.T) {
 	var pending pendingSignals
 	const (

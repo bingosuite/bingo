@@ -645,10 +645,14 @@ stopped TID and the signal argument to the next ptrace resume:
    signal `0` becomes SIGURG, a matching explicit SIGURG coalesces with it, and
    a different explicit signal re-queues SIGURG with exact-TID `tgkill`. The
    stepping-thread `PTRACE_SINGLESTEP` retry is the only internal resume that
-   preserves it. Per-thread exit/exec and process exit, Kill/detach, and tracer
-   shutdown purge it. The map is mutex-protected because `Wait` publishes from
-   its goroutine while the engine consumes it; unlike `stepQueue`, this state
-   crosses goroutines.
+   preserves it. Resumes that cannot be delivery points — a new clone's initial
+   SIGSTOP, non-main thread exit, and the suspended-Kill reaper — discard that
+   TID's state **before** continuing it. Exec destroys every sibling TID and
+   therefore purges all pending signals before resuming the replacement image.
+   Main-process exit, Kill/detach and tracer shutdown likewise purge all state
+   before any teardown resume. The map is mutex-protected because `Wait`
+   publishes from its goroutine while the engine consumes it; unlike
+   `stepQueue`, this state crosses goroutines.
 
 The host-agnostic map tests, linux backend raw ptrace-tuple tests, the `signals`
 E2E label (one SIGSEGV/SIGABRT output followed by signal death, one handled

@@ -35,7 +35,9 @@ func (p *pendingSignals) delay(tid, signal int) {
 	if p.delayedByTID == nil {
 		p.delayedByTID = make(map[int]int)
 	}
-	p.delayedByTID[tid] = signal
+	if _, exists := p.delayedByTID[tid]; !exists {
+		p.delayedByTID[tid] = signal
+	}
 }
 
 func (p *pendingSignals) take(tid int) int {

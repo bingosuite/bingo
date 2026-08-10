@@ -230,7 +230,7 @@ func killProcess(b Backend, pid int, cmd *exec.Cmd, running bool) error {
 		// stepQueue stays wait-loop-owned while a running tracee still has a
 		// waitLoop in flight; only the synchronized signal state is safe to
 		// clear from the engine goroutine.
-		defer lb.pendingSignals.purge()
+		lb.pendingSignals.purge()
 	}
 	if cmd != nil {
 		// SIGKILL via the OS handle is not a ptrace op, so it is safe from any
@@ -285,7 +285,7 @@ func (b *linuxBackend) reapAfterKill() {
 		switch {
 		case err == nil:
 			if ws.Stopped() {
-				_ = b.continueIfTraceeExists(wpid, 0)
+				_ = b.continueDiscardingPending(wpid)
 			}
 			// Exited/Signaled: that thread is reaped; loop for the rest.
 		case isNoChildProcess(err):
@@ -588,11 +588,10 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 			case syscall.PTRACE_EVENT_EXIT:
 				if tid != b.pid {
-					if err := b.continueIfTraceeExists(tid, 0); err != nil {
+					b.clearStepIfStepped(tid)
+					if err := b.continueDiscardingPending(tid); err != nil {
 						return StopEvent{}, fmt.Errorf("PTRACE_CONT exiting thread tid %d: %w", tid, err)
 					}
-					b.pendingSignals.clear(tid)
-					b.clearStepIfStepped(tid)
 					continue
 				}
 				// Main thread is about to exit: nothing parked can ever be
@@ -626,8 +625,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				return StopEvent{Reason: StopExited, TID: tid, ExitCode: 0}, nil
 
 			case syscall.PTRACE_EVENT_EXEC:
-				b.pendingSignals.clear(tid)
-				if err := b.continueIfTraceeExists(tid, 0); err != nil {
+				if err := b.continueDiscardingAllPending(tid); err != nil {
 					return StopEvent{}, fmt.Errorf("PTRACE_CONT exec tid %d: %w", tid, err)
 				}
 				continue
@@ -674,7 +672,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 			// stopped at a breakpoint waiting for the engine, and a
 			// group-continue here would let it run away (the exact "parking the
 			// thread group" hazard that kept clone tracing disabled before).
-			if err := b.continueIfTraceeExists(tid, 0); err != nil {
+			if err := b.continueDiscardingPending(tid); err != nil {
 				return StopEvent{}, fmt.Errorf("PTRACE_CONT new thread tid %d: %w", tid, err)
 			}
 			continue
@@ -786,6 +784,16 @@ func (b *linuxBackend) continueIfTraceeExists(tid int, signal int) error {
 		return err
 	}
 	return nil
+}
+
+func (b *linuxBackend) continueDiscardingPending(tid int) error {
+	b.pendingSignals.clear(tid)
+	return b.continueIfTraceeExists(tid, 0)
+}
+
+func (b *linuxBackend) continueDiscardingAllPending(tid int) error {
+	b.pendingSignals.purge()
+	return b.continueIfTraceeExists(tid, 0)
 }
 
 func (b *linuxBackend) singleStepIfTraceeExists(tid int) error {
