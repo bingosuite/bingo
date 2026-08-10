@@ -86,6 +86,14 @@ func TestReadLoopContinuesAfterSessionAnnouncement(t *testing.T) {
 	}).WithTimeout(time.Second).Should(Equal("session-live"))
 }
 
+func TestSetThreadPreservesUnknownStopIdentity(t *testing.T) {
+	h := &dapCLI{curThread: 7}
+	h.setThread(0)
+	if got := h.thread(); got != 0 {
+		t.Fatalf("thread = %d, want unknown stopped thread 0", got)
+	}
+}
+
 func writeDAPFrame(buffer *bytes.Buffer, content string) {
 	_, _ = fmt.Fprintf(buffer, "Content-Length: %d\r\n\r\n%s", len(content), content)
 }
