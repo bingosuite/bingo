@@ -373,7 +373,9 @@ func (h *Handler) onStackTrace(req *godap.StackTraceRequest) {
 	suspended := h.suspended
 	currentThreadID := h.curThreadID
 	requestedThreadID := req.Arguments.ThreadId
-	if suspended && currentThreadID > 0 && requestedThreadID == currentThreadID {
+	servable := suspended &&
+		(requestedThreadID <= 0 || currentThreadID > 0 && requestedThreadID == currentThreadID)
+	if servable {
 		h.framesQ = append(h.framesQ, req.Seq)
 	}
 	h.mu.Unlock()
@@ -385,7 +387,7 @@ func (h *Handler) onStackTrace(req *godap.StackTraceRequest) {
 		})
 		return
 	}
-	if currentThreadID == 0 || requestedThreadID != currentThreadID {
+	if !servable {
 		h.send(&godap.StackTraceResponse{
 			Response: h.response(req.Seq, "stackTrace"),
 			Body:     godap.StackTraceResponseBody{StackFrames: []godap.StackFrame{}},
