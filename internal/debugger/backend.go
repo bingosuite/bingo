@@ -46,11 +46,12 @@ func setPID(b Backend, pid int) {
 type StopReason uint8
 
 const (
-	StopBreakpoint StopReason = iota // software breakpoint (int3 / brk)
-	StopSingleStep                   // single-step completed
-	StopSignal                       // any other signal
-	StopExited                       // process exit()
-	StopKilled                       // killed externally
+	StopBreakpoint       StopReason = iota // software breakpoint (int3 / brk)
+	StopSingleStep                         // single-step completed
+	StopStepThreadExited                   // stepped TID exited; reconcile before releasing held stops
+	StopSignal                             // any other signal
+	StopExited                             // process exit()
+	StopKilled                             // killed externally
 )
 
 // StopEvent is what Backend.Wait returns. PC may be zero; the engine resolves

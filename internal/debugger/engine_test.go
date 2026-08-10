@@ -23,9 +23,10 @@ func TestDebugger(t *testing.T) {
 // fakeBackend is an in-process Backend. Tests seed mem/regs, push StopEvents
 // to drive the state machine, and inspect recorded calls afterward.
 type fakeBackend struct {
-	mem  map[uint64]byte
-	regs map[int]debugger.Registers
-	tids []int
+	memMu sync.RWMutex
+	mem   map[uint64]byte
+	regs  map[int]debugger.Registers
+	tids  []int
 
 	stopCh  chan debugger.StopEvent
 	stopped bool
@@ -137,6 +138,8 @@ func (f *fakeBackend) faultFor(kind string, addr uint64) error {
 }
 
 func (f *fakeBackend) seedMem(addr uint64, data []byte) {
+	f.memMu.Lock()
+	defer f.memMu.Unlock()
 	for i, b := range data {
 		f.mem[addr+uint64(i)] = b
 	}
@@ -156,6 +159,8 @@ func (f *fakeBackend) closeStop() {
 }
 
 func (f *fakeBackend) peekMem(addr uint64, n int) []byte {
+	f.memMu.RLock()
+	defer f.memMu.RUnlock()
 	out := make([]byte, n)
 	for i := range out {
 		out[i] = f.mem[addr+uint64(i)]
@@ -203,6 +208,8 @@ func (f *fakeBackend) ReadMemory(addr uint64, dst []byte) error {
 	if err := f.faultFor("read", addr); err != nil {
 		return err
 	}
+	f.memMu.RLock()
+	defer f.memMu.RUnlock()
 	for i := range dst {
 		dst[i] = f.mem[addr+uint64(i)]
 	}
@@ -218,6 +225,8 @@ func (f *fakeBackend) WriteMemory(addr uint64, src []byte) error {
 	if err := f.faultFor("write", addr); err != nil {
 		return err
 	}
+	f.memMu.Lock()
+	defer f.memMu.Unlock()
 	cp := make([]byte, len(src))
 	copy(cp, src)
 	f.writtenAt[addr] = cp
@@ -584,6 +593,119 @@ var _ = Describe("Engine", func() {
 			last := fb.setRegisterCalls[len(fb.setRegisterCalls)-1]
 			Expect(last.tid).To(Equal(siblingTID))
 			Expect(last.reg.PC).To(Equal(sentinelAddr))
+		})
+
+		It("reinstalls the removed breakpoint before a held sibling stop follows a stepped-thread exit", func() {
+			const siblingTID = 2
+
+			continueAndConsumeContinued(d)
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: 1, PC: bpAddr})
+			first := mustNextEvent(d)
+			Expect(first.Kind).To(Equal(protocol.EventBreakpointHit))
+			var firstHit protocol.BreakpointHitPayload
+			Expect(protocol.DecodeEventPayload(first, &firstHit)).To(Succeed())
+
+			continueAndConsumeContinued(d)
+			Expect(fb.peekMem(bpAddr, len(debugger.ExportedTrapInstruction()))).
+				NotTo(Equal(debugger.ExportedTrapInstruction()),
+					"the step-off transaction must own the removed trap")
+
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopStepThreadExited, TID: siblingTID})
+			Eventually(func() []byte {
+				return fb.peekMem(bpAddr, len(debugger.ExportedTrapInstruction()))
+			}).Should(Equal(debugger.ExportedTrapInstruction()),
+				"the internal death boundary must reinstall before the real stop drains")
+
+			fb.regs[siblingTID] = debugger.Registers{PC: bpAddr + uint64(len(debugger.ExportedTrapInstruction()))}
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: siblingTID, PC: bpAddr})
+
+			next := mustNextEvent(d)
+			Expect(next.Kind).To(Equal(protocol.EventBreakpointHit))
+			var nextHit protocol.BreakpointHitPayload
+			Expect(protocol.DecodeEventPayload(next, &nextHit)).To(Succeed())
+			Expect(nextHit.Breakpoint.ID).To(Equal(firstHit.Breakpoint.ID),
+				"the original logical breakpoint ownership must survive the dead step owner")
+		})
+
+		It("advances a genuine trap that reuses a retired sentinel address", func() {
+			const (
+				sentinelAddr = bpAddr + 0x180
+				siblingTID   = 2
+			)
+			trap := debugger.ExportedTrapInstruction()
+			retireInternalBreakpoint(fb, d, sentinelAddr)
+			fb.seedMem(sentinelAddr, trap)
+
+			livePC := sentinelAddr
+			if len(trap) == 1 {
+				livePC++
+			}
+			fb.regs[siblingTID] = debugger.Registers{PC: livePC}
+			runWithWaitLoop(d)
+			before := fb.continueCount()
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: siblingTID, PC: sentinelAddr})
+
+			Eventually(fb.continueCount).Should(BeNumerically(">", before))
+			Expect(fb.regs[siblingTID].PC).To(Equal(sentinelAddr+uint64(len(trap))),
+				"a live trap must be advanced, not rewound and re-executed")
+			Expect(fb.setRegisterCalls).NotTo(BeEmpty())
+			last := fb.setRegisterCalls[len(fb.setRegisterCalls)-1]
+			Expect(last.tid).To(Equal(siblingTID),
+				"the live-trap correction must mutate the exact stopped thread")
+			Expect(last.reg.PC).To(Equal(sentinelAddr + uint64(len(trap))))
+		})
+
+		It("does not rewind a retired sentinel after its restored bytes change", func() {
+			const (
+				sentinelAddr = bpAddr + 0x1a0
+				siblingTID   = 2
+			)
+			trap := debugger.ExportedTrapInstruction()
+			retireInternalBreakpoint(fb, d, sentinelAddr)
+			replacement := make([]byte, len(trap))
+			for i := range replacement {
+				replacement[i] = 0x91
+			}
+			fb.seedMem(sentinelAddr, replacement)
+
+			fb.regs[siblingTID] = debugger.Registers{PC: sentinelAddr}
+			runWithWaitLoop(d)
+			before := fb.continueCount()
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: siblingTID, PC: sentinelAddr})
+
+			Eventually(fb.continueCount).Should(BeNumerically(">", before))
+			Expect(fb.regs[siblingTID].PC).To(Equal(sentinelAddr+uint64(len(trap))),
+				"memory that no longer matches the successful restore must not be rewound")
+			Expect(fb.setRegisterCalls).NotTo(BeEmpty())
+			last := fb.setRegisterCalls[len(fb.setRegisterCalls)-1]
+			Expect(last.tid).To(Equal(siblingTID))
+			Expect(last.reg.PC).To(Equal(sentinelAddr + uint64(len(trap))))
+		})
+
+		It("does not mistake the second byte of x86 CD 03 for a delayed sentinel hit", func() {
+			trap := debugger.ExportedTrapInstruction()
+			if len(trap) != 1 {
+				Skip("x86 variable-length trap boundary regression")
+			}
+			const (
+				sentinelAddr = bpAddr + 0x1c0
+				siblingTID   = 2
+			)
+			fb.seedMem(sentinelAddr-1, []byte{0xCD, 0x03, 0x90})
+			debugger.ExportedForceSuspended(d)
+			debugger.ExportedSetStepOverBreakpointAt(d, sentinelAddr)
+			runWithWaitLoop(d)
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: 1, PC: sentinelAddr})
+			Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventStepped))
+
+			fb.regs[siblingTID] = debugger.Registers{PC: sentinelAddr + 1}
+			runWithWaitLoop(d)
+			before := fb.continueCount()
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: siblingTID, PC: sentinelAddr})
+
+			Eventually(fb.continueCount).Should(BeNumerically(">", before))
+			Expect(fb.regs[siblingTID].PC).To(Equal(sentinelAddr+1),
+				"CD 03 must resume after both bytes rather than at its second byte")
 		})
 	})
 

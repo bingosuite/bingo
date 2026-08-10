@@ -5,6 +5,9 @@ package integration
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -46,6 +49,7 @@ var _ = Describe("Linux amd64 debugger backend (ptrace) E2E", Label("linux"), fu
 	declareStepOverlapPauseSpec()
 	declareStepOverlapPauseDeliverySpec()
 	declareStepOverlapKillSpec()
+	declareStepOwnerExitSpec()
 })
 
 // overlapTargetSrc pounds two breakpoint-able lines from several
@@ -106,6 +110,73 @@ func main() {
 	}
 }
 `
+
+const stepOwnerExitTargetSrc = `#include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
+#include <unistd.h>
+
+extern void die_now(void);
+
+static _Atomic uint64_t sink;
+
+static void *spin(void *unused) {
+	(void)unused;
+	for (;;) {
+		atomic_fetch_add_explicit(&sink, 1, memory_order_relaxed); // STEP_EXIT_SIBLING
+	}
+}
+
+static void *die(void *unused) {
+	(void)unused;
+	usleep(200000);
+	die_now();
+	return NULL;
+}
+
+int main(void) {
+	pthread_t workers[8];
+	pthread_t doomed;
+	alarm(180);
+	for (int i = 0; i < 8; i++) {
+		pthread_create(&workers[i], NULL, spin, NULL);
+	}
+	pthread_create(&doomed, NULL, die, NULL);
+	for (;;) {
+		pause();
+	}
+}
+`
+
+const stepOwnerExitTargetAsm = `.file 1 "step_owner_exit_target.S"
+.text
+.globl die_now
+.type die_now,@function
+die_now:
+	movq $60, %rax
+	xorq %rdi, %rdi
+.loc 1 9 0
+	syscall # STEP_OWNER_EXIT
+	ud2
+.size die_now, .-die_now
+.section .note.GNU-stack,"",@progbits
+`
+
+func buildStepOwnerExitTarget() string {
+	GinkgoHelper()
+	dir := GinkgoT().TempDir()
+	cPath := filepath.Join(dir, "step_owner_exit_target.c")
+	asmPath := filepath.Join(dir, "step_owner_exit_target.S")
+	Expect(os.WriteFile(cPath, []byte(stepOwnerExitTargetSrc), 0o600)).To(Succeed())
+	Expect(os.WriteFile(asmPath, []byte(stepOwnerExitTargetAsm), 0o600)).To(Succeed())
+
+	binPath := filepath.Join(dir, "step_owner_exit_target")
+	cmd := exec.Command("gcc", "-g", "-O0", "-fno-omit-frame-pointer", "-no-pie",
+		"-pthread", "-std=gnu11", "-o", binPath, cPath, asmPath)
+	out, err := cmd.CombinedOutput()
+	Expect(err).NotTo(HaveOccurred(), "build stepped-thread-exit target:\n%s", out)
+	return binPath
+}
 
 // declareStepOverlapSpec is the permanent regression gate for issue #199: a
 // foreign thread's breakpoint stop surfacing while another thread single-steps
@@ -241,17 +312,13 @@ func declareStepOverlapSpec() {
 		Expect(parked).To(BeNumerically(">", 0),
 			"no foreign stop was ever parked across %d cycles: this run never "+
 				"exercised the rule under test", iters)
-		// Evidence for the adjacent delayed-sibling-hit rule: a sibling
-		// executed a one-shot sentinel's trap and its stop was already queued
-		// in the kernel when the engine cleared that sentinel. Reported rather
-		// than asserted. Unlike `parked` above — the rule this spec exists to
-		// gate, which the cycle count is sized for — this needs a strictly
-		// narrower coincidence, and nothing here sizes the run for it. Hard
-		// asserting an unsized race buys no protection that the rule's own
-		// unit tests do not already give, and costs a spec that fails while
-		// production is correct.
+		// A sibling must also reach an auto-cleared sentinel before its delayed
+		// stop is handled; otherwise the retired-byte correction is not exercised
+		// against the native backend at all.
 		retired, ok := debugger.LinuxRetiredInternalBreakpointCount(h.d)
 		Expect(ok).To(BeTrue(), "retired internal-breakpoint hook unavailable")
+		Expect(retired).To(BeNumerically(">", 0),
+			"no delayed retired-sentinel hit was recovered across %d cycles", iters)
 
 		AddReportEntry("overlap-iterations", iters)
 		AddReportEntry("overlap-hits-A", hits[bpA.ID])
@@ -933,5 +1000,64 @@ func declareStepOverlapKillSpec() {
 				"all hits came from one goroutine — no cross-thread overlap was exercised before the kill")
 			AddReportEntry("overlap-kill-warmup", warmup)
 			AddReportEntry("overlap-kill-goroutines", len(p.goroutines))
+		})
+}
+
+// declareStepOwnerExitSpec drives the abnormal end of the step-off transaction:
+// the breakpoint instruction is a raw SYS_exit, so the exact thread executing
+// the restored instruction dies instead of producing StopSingleStep. Hot sibling
+// threads trap while that transaction is open. Their stop must remain queued
+// until the engine has reinstalled the original logical breakpoint.
+func declareStepOwnerExitSpec() {
+	It("reconciles the removed breakpoint before surfacing a stop held behind a dead step owner",
+		Label("overlap"), func() {
+			deathLine := markerLine(stepOwnerExitTargetAsm, "# STEP_OWNER_EXIT")
+			siblingLine := markerLine(stepOwnerExitTargetSrc, "// STEP_EXIT_SIBLING")
+			h := newE2EHarness(buildStepOwnerExitTarget())
+			h.waitFor(20*time.Second, protocol.EventStepped)
+
+			deathBP, err := h.d.SetBreakpoint("step_owner_exit_target.S", deathLine)
+			Expect(err).NotTo(HaveOccurred(), "set raw thread-exit breakpoint")
+			Expect(h.d.Continue()).To(Succeed())
+			evt := awaitFrom(h, 30*time.Second,
+				protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+			Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit),
+				"raw thread-exit breakpoint did not stop: %s", evt.Payload)
+			var hit protocol.BreakpointHitPayload
+			Expect(json.Unmarshal(evt.Payload, &hit)).To(Succeed())
+			Expect(hit.Breakpoint.ID).To(Equal(deathBP.ID))
+
+			siblingBP, err := h.d.SetBreakpoint("step_owner_exit_target.c", siblingLine)
+			Expect(err).NotTo(HaveOccurred(), "set sibling breakpoint")
+			Expect(h.d.Continue()).To(Succeed(),
+				"single-step the raw SYS_exit instruction")
+			evt = awaitFrom(h, 30*time.Second,
+				protocol.EventBreakpointHit, protocol.EventStepped,
+				protocol.EventProcessExited, protocol.EventError)
+			Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit),
+				"held sibling stop did not surface after reconciliation: %s", evt.Payload)
+			Expect(json.Unmarshal(evt.Payload, &hit)).To(Succeed())
+			Expect(hit.Breakpoint.ID).To(Equal(siblingBP.ID),
+				"the stop following thread death must retain the sibling breakpoint identity")
+
+			_, err = h.d.SetBreakpoint("step_owner_exit_target.S", deathLine)
+			Expect(err).To(MatchError(ContainSubstring("already installed")),
+				"the dead owner must not orphan the original logical breakpoint")
+
+			exits, ok := debugger.LinuxStepThreadExitCount(h.d)
+			Expect(ok).To(BeTrue(), "stepped-thread-exit hook unavailable")
+			Expect(exits).To(BeNumerically(">", 0),
+				"the target never killed the exact thread under single-step")
+			parked, ok := debugger.LinuxParkedStopCount(h.d)
+			Expect(ok).To(BeTrue(), "parked-stop hook unavailable")
+			Expect(parked).To(BeNumerically(">", 0),
+				"no sibling stop was held behind the dead step owner")
+
+			Expect(h.d.ClearBreakpoint(deathBP.ID)).To(Succeed(),
+				"clear reconciled thread-exit breakpoint")
+			Expect(h.d.ClearBreakpoint(siblingBP.ID)).To(Succeed(),
+				"clear sibling breakpoint")
+			AddReportEntry("overlap-step-owner-exits", exits)
+			AddReportEntry("overlap-step-owner-exit-parked-stops", parked)
 		})
 }

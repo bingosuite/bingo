@@ -67,6 +67,22 @@ func LinuxStepRearmCount(d Debugger) (int, bool) {
 	return b.stepRearmCount(), true
 }
 
+// LinuxStepThreadExitCount reports how many single-steps lost their owning
+// thread before completion. The dedicated native overlap spec uses it to prove
+// that its breakpoint-ownership assertions crossed the reconciliation boundary
+// rather than passing without a thread death.
+func LinuxStepThreadExitCount(d Debugger) (int, bool) {
+	e, ok := d.(*engine)
+	if !ok {
+		return 0, false
+	}
+	b, ok := e.backend.(*linuxBackend)
+	if !ok {
+		return 0, false
+	}
+	return b.stepExitCount(), true
+}
+
 // LinuxRetiredInternalBreakpointCount reports how many delayed sibling hits
 // were recovered after another thread auto-cleared the one-shot sentinel.
 //
