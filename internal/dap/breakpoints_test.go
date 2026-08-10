@@ -632,6 +632,20 @@ func (hh *harness) staleClearIsStillQueued() bool {
 	return len(hh.handler.clearQ) == 1
 }
 
+// setQIsOnlyPendingFor reports whether the set FIFO holds exactly one operation
+// and it is the one the line is currently waiting on — the shape that proves an
+// abandoned operation's answer neither reissued a command nor left a phantom
+// slot the next confirmation would correlate to.
+func (hh *harness) setQIsOnlyPendingFor(file string, line int) bool {
+	hh.handler.mu.Lock()
+	defer hh.handler.mu.Unlock()
+	st := hh.handler.bpByFile[file][line]
+	if st == nil || st.pending == nil || len(hh.handler.setQ) != 1 {
+		return false
+	}
+	return hh.handler.setQ[0] == st.pending
+}
+
 // After a discard abandons its clear, a later request that wants the line back
 // must converge immediately, and the stale clear's rejection must not touch it.
 func TestDiscardedLineAcceptsLaterSetAndIgnoresStaleClearError(t *testing.T) {
@@ -652,6 +666,15 @@ func TestDiscardedLineAcceptsLaterSetAndIgnoresStaleClearError(t *testing.T) {
 	// The stale rejection belongs to nobody: it must not fail or resolve the
 	// request now waiting on this line.
 	hh.expectNoResponse()
+	// Nor may it act on the line it no longer speaks for. Reissuing here would
+	// arm a second trap for one requested breakpoint and put a second operation
+	// in the FIFO, so every later confirmation would correlate to the wrong one.
+	if n := hh.countCommands(protocol.CmdSetBreakpoint); n != 2 {
+		t.Fatalf("SetBreakpoint commands = %d, want 2 — the stale rejection must not reissue the line", n)
+	}
+	if !hh.setQIsOnlyPendingFor(bpSource.Path, 10) {
+		t.Fatal("set FIFO must hold exactly the live re-add operation")
+	}
 
 	hh.confirmSet(bpSource, 10, 7)
 	resp := recvType[*godap.SetBreakpointsResponse](hh)
@@ -761,19 +784,35 @@ func TestFailedClearWithNothingArmedCompletesAndResumes(t *testing.T) {
 	}
 }
 
-// Confirmations the adapter did not ask for must never produce a second
-// response for an already-answered request.
+// A request must be answered exactly once even when its own settlement is
+// re-offered. A line that is already installed and still wanted converges inside
+// onSetBreakpoints itself, so the request is settled by the line AND then
+// re-tested by the final readiness check that exists for requests which settle
+// on nobody's behalf: only the claim in ready() keeps that from being two
+// responses to one request. Confirmations the adapter did not ask for must not
+// produce a second response either.
 func TestSetBreakpointsRespondsExactlyOnce(t *testing.T) {
 	hh := suspendedHarness(t)
 	hh.installBreakpoint(bpSource, []int{10}, []int{101})
+
+	resetSeq := hh.sendReq("setBreakpoints", setBreakpointsFor(bpSource, 10))
+	resp := recvType[*godap.SetBreakpointsResponse](hh)
+	if resp.RequestSeq != resetSeq {
+		t.Fatalf("re-set response seq = %d, want %d", resp.RequestSeq, resetSeq)
+	}
+	requireBreakpointIDs(t, resp, 101)
+	hh.expectNoResponse()
+	if n := hh.countCommands(protocol.CmdSetBreakpoint); n != 1 {
+		t.Fatalf("SetBreakpoint commands = %d, want the already-converged line left alone", n)
+	}
 
 	removeSeq := hh.sendReq("setBreakpoints", setBreakpointsFor(bpSource))
 	hh.clearIDs(1)
 	hh.inject(protocol.EventBreakpointCleared, protocol.BreakpointClearedPayload{ID: 101})
 
-	resp := recvType[*godap.SetBreakpointsResponse](hh)
-	if resp.RequestSeq != removeSeq || len(resp.Body.Breakpoints) != 0 {
-		t.Fatalf("remove response = %+v (seq %d), want empty for %d", resp.Body, resp.RequestSeq, removeSeq)
+	removed := recvType[*godap.SetBreakpointsResponse](hh)
+	if removed.RequestSeq != removeSeq || len(removed.Body.Breakpoints) != 0 {
+		t.Fatalf("remove response = %+v (seq %d), want empty for %d", removed.Body, removed.RequestSeq, removeSeq)
 	}
 
 	// Duplicate and out-of-band confirmations for the same work.
