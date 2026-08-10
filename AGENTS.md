@@ -542,11 +542,11 @@ note below):
    deliberately **no engine-callable purge**: the queue is not part of the
    engine's state model.
 7. **Absorbing a stop on the stepped thread must re-arm its step.** Every site
-   that handles a stop inline and resumes the thread goes through
-   `resumeAbsorbed`, which asks `stepQueue.resumeFor`: the stepped thread gets
-   `PTRACE_SINGLESTEP`, everything else `PTRACE_CONT`. The kernel delivers one
-   stop per resume, so an absorbed event on the stepped thread has **consumed**
-   the pending step. A plain continue there cancels it while `stepping`/`stepTID`
+   that handles a stop inline and resumes the thread names its branch to
+   `stepQueue.planAbsorb` (via `absorbStop`/`applyAbsorb`) instead of reaching
+   for a ptrace primitive: the stepped thread gets `PTRACE_SINGLESTEP`,
+   everything else `PTRACE_CONT`. The kernel delivers one stop per resume, so an
+   absorbed event on the stepped thread has **consumed** the pending step. A plain continue there cancels it while `stepping`/`stepTID`
    stay latched — no completion can ever arrive, so rule 3 holds the gate shut
    forever, every later foreign stop parks, `Wait` never returns and the tracee
    freezes. This generalises what the `SIGURG` branch always did; do not add an
@@ -559,7 +559,7 @@ note below):
    `EventStepped` PC one instruction beyond single-step semantics. That is a
    real, very narrow inaccuracy rather than a purely cosmetic one — accepted
    because the alternative it replaces is a hard freeze. And the absorbed
-   signal is swallowed on that thread: `stepQueue.planResume` chooses the
+   signal is swallowed on that thread: `stepQueue.planAbsorb` chooses the
    primitive and the delivered signal together, forwarding the signal on the
    continue path and zeroing it on the re-arm. `PTRACE_SINGLESTEP` with a signal
    makes the kernel build the signal frame first, so the instruction that
@@ -571,6 +571,19 @@ note below):
    before signalling, so a dropped delivery costs preemption latency and nothing
    else. Forwarding a signal *through* a re-armed step is a per-TID
    signal-forwarding question, not a park-queue one, and is out of scope here.
+
+   The decision is pure and table-tested, but a branch choosing to consult it is
+   not, and that gap was real rather than theoretical: with a live tracee as the
+   only way into the wait loop, rewriting the `CLONE`, `SIGURG` or `SIGCONT`
+   branch back into a bare `continueIfTraceeExists` — the exact freeze above —
+   passed the entire unit suite, as did dropping the thread-exit gate release and
+   both `abortStep` guards. `Wait` therefore takes its three kernel calls through
+   the nil-able `waitFn`/`contFn`/`stepFn` seams so tests can script wait statuses
+   and record the primitive each branch used
+   (`TestLinuxWaitResumesTheSteppedThreadWithASingleStep` and its converse). Keep
+   every new branch reachable that way. One residual: swapping an `absorbKind`
+   *label* between two branches that share a `planAbsorb` row is behaviour-
+   preserving and not detected — the decisions are pinned, the names are not.
 8. **Two absorb cases cannot re-arm and must fail the wait instead.** On
    `PTRACE_EVENT_EXEC` the image the stepped-over breakpoint lived in is gone, so
    neither completing nor restoring it is meaningful; on an unrecognised
@@ -667,11 +680,12 @@ but `Wait`.
 Regression gates: the classifier table, the queue-mechanics tests **and** the
 resume-decision tests covering rules 7–8 in
 [waitpark_test.go](internal/debugger/waitpark_test.go) — all host-agnostic, so
-they run and can be mutation-checked on macOS — plus the three backend-specific
-tests in
-[backend_linux_amd64_test.go](internal/debugger/backend_linux_amd64_test.go)
+they run and can be mutation-checked on macOS — plus the backend-specific tests
+in [backend_linux_amd64_test.go](internal/debugger/backend_linux_amd64_test.go)
 that pin *when `lastStopTID` moves* (not on park, only on delivery, and `Wait`
-drains before blocking), plus the linux-only `overlap` E2E label in
+drains before blocking) and drive `Wait` itself over scripted wait statuses so
+every branch's effect on the step is executed rather than merely decided, plus
+the linux-only `overlap` E2E label in
 [debugger_e2e_linux_amd64_test.go](test/integration/debugger_e2e_linux_amd64_test.go):
 step-over overlap, machine-step (`StepInto`) overlap, a foreign ordinary-signal
 storm, `Pause` racing an in-flight step, and kill with stops held. Those assert
