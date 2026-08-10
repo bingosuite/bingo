@@ -67,7 +67,7 @@ type dapCLI struct {
 	// stateMu guards the fields below.
 	stateMu    sync.Mutex
 	configured bool // handshake past `initialized`: breakpoints go on the wire now
-	curThread  int  // most recent stopped threadId (DAP requires one on control ops)
+	curThread  int  // most recent stopped threadId; zero preserves unknown identity
 	bpsByFile  map[string][]breakpoint
 	sessionID  string
 
@@ -91,7 +91,6 @@ func main() {
 		reader:    bufio.NewReader(conn),
 		pending:   make(map[int]chan godap.Message),
 		bpsByFile: make(map[string][]breakpoint),
-		curThread: 1,
 	}
 	go h.readLoop()
 
@@ -626,9 +625,6 @@ func (h *dapCLI) thread() int {
 }
 
 func (h *dapCLI) setThread(tid int) {
-	if tid == 0 {
-		return
-	}
 	h.stateMu.Lock()
 	h.curThread = tid
 	h.stateMu.Unlock()
