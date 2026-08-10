@@ -610,6 +610,14 @@ func TestLinuxWaitResumesTheSteppedThreadWithASingleStep(t *testing.T) {
 		{"clone", stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_CLONE)},
 		{"async preemption SIGURG", stoppedAt(syscall.SIGURG, 0)},
 		{"SIGCONT", stoppedAt(syscall.SIGCONT, 0)},
+		// The non-main SIGSTOP branch reads as a brand-new thread's initial
+		// group-stop, and a brand-new thread is never the one being stepped.
+		// That is an argument about how the branch is normally reached, not a
+		// guard: it keys off `tid != pid`, so any non-main SIGSTOP lands here,
+		// including one on the thread under an active step. The branch is
+		// deliberately routed through the shared helper for that reason, and
+		// this case is what keeps it there.
+		{"non-main SIGSTOP", stoppedAt(syscall.SIGSTOP, 0)},
 	}
 
 	for _, tc := range cases {
@@ -638,6 +646,58 @@ func TestLinuxWaitResumesTheSteppedThreadWithASingleStep(t *testing.T) {
 					"gate stays latched and Wait hangs", op)
 			}
 		})
+	}
+}
+
+// TestLinuxWaitPreservesTheSignalOfAHeldStop executes the park site's signal
+// capture rather than seeding a queue entry that already carries one.
+//
+// A held stop is replayed to the engine verbatim once the step completes, so the
+// signal number has to survive being held. Every other test of this reaches the
+// queue through park() with a StopEvent it built itself, which cannot tell
+// whether production copied the signal off the wait status or dropped it: the
+// value under test is supplied by the test. Driving Wait means the number comes
+// from the scripted wait status through the real `Signal: int(sig)` copy, so
+// zeroing that field fails here.
+//
+// The exact value is asserted, not merely "nonzero": a stop reported with the
+// wrong signal is as wrong as one reported with none.
+func TestLinuxWaitPreservesTheSignalOfAHeldStop(t *testing.T) {
+	const (
+		pid     = 9501
+		stepped = 9502
+		foreign = 9503
+	)
+
+	b := &linuxBackend{pid: pid}
+	script := &scriptedWait{stops: []scriptedStop{
+		{tid: foreign, status: stoppedAt(syscall.SIGUSR1, 0)},
+		{tid: stepped, status: stoppedAt(syscall.SIGTRAP, 0)},
+	}}
+	script.install(b)
+	b.recordStop(pid)
+	b.beginStep(stepped)
+
+	ev, err := b.Wait()
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if ev.Reason != StopSingleStep || ev.TID != stepped {
+		t.Fatalf("Wait() = %+v, want the step completing on tid %d", ev, stepped)
+	}
+
+	ev, err = b.Wait()
+	if err != nil {
+		t.Fatalf("second Wait() error = %v", err)
+	}
+	if ev.TID != foreign {
+		t.Fatalf("second Wait() = %+v, want the held stop on tid %d", ev, foreign)
+	}
+	if ev.Signal != int(syscall.SIGUSR1) {
+		t.Fatalf("held stop replayed with signal %d, want %d (SIGUSR1): the "+
+			"signal a thread stopped with must survive being held, or the "+
+			"engine decides what to do about a signal it can no longer see",
+			ev.Signal, int(syscall.SIGUSR1))
 	}
 }
 

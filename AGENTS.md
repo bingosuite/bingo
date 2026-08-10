@@ -574,14 +574,29 @@ note below):
 
    The decision is pure and table-tested, but a branch choosing to consult it is
    not, and that gap was real rather than theoretical: with a live tracee as the
-   only way into the wait loop, rewriting the `CLONE`, `SIGURG` or `SIGCONT`
-   branch back into a bare `continueIfTraceeExists` — the exact freeze above —
+   only way into the wait loop, rewriting the `CLONE`, `SIGURG`, `SIGCONT` or
+   non-main `SIGSTOP` branch back into a bare `continueIfTraceeExists` — the exact
+   freeze above —
    passed the entire unit suite, as did dropping the thread-exit gate release and
    both `abortStep` guards. `Wait` therefore takes its three kernel calls through
    the nil-able `waitFn`/`contFn`/`stepFn` seams so tests can script wait statuses
    and record the primitive each branch used
    (`TestLinuxWaitResumesTheSteppedThreadWithASingleStep` and its converse). Keep
-   every new branch reachable that way. One residual: swapping an `absorbKind`
+   every new branch reachable that way. The non-main `SIGSTOP` branch needs a
+   stepped-thread case even though it reads as a brand-new thread's initial
+   group-stop: it keys off `tid != pid`, not on the thread being new, so any
+   non-main `SIGSTOP` reaches it, including one on the thread under an active
+   step. Its `absorbNewThread` routing is what makes that harmless, and only a
+   stepped-thread case holds it there.
+
+   The same rule covers the signal a held stop carries. `Wait` copies it at the
+   park site (`Signal: int(sig)`) and the engine only ever sees the replayed
+   copy, so a dropped signal is invisible until a real tracee misroutes one.
+   Seeding the queue with a `StopEvent` the test built cannot catch that — the
+   value under test comes from the test. `TestLinuxWaitPreservesTheSignalOfAHeldStop`
+   drives `Wait` so the number comes off a scripted wait status through the
+   production copy, and asserts the exact signal rather than merely a nonzero
+   one. One residual: swapping an `absorbKind`
    *label* between two branches that share a `planAbsorb` row is behaviour-
    preserving and not detected — the decisions are pinned, the names are not.
 8. **Two absorb cases cannot re-arm and must fail the wait instead.** On
