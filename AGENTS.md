@@ -1483,10 +1483,22 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   malformed document fails closed; path matching stays inside JSON (Git permits
   newlines in filenames). The selector is deliberately conservative: repo-wide
   implicit `_darwin*`/`_arm64*` source suffixes, every changed native source
-  (`c`/C++/headers/Obj-C/assembly/syso), control-character paths, and any changed
+  that `go/build` compiles (C, C++, Obj-C, Fortran, assembly incl. `.sx`, SWIG,
+  `.syso`), control-character paths, and any changed
   Go blob containing an explicit build-constraint line all require verification.
   This deliberately over-gates Linux/cross-platform constraints rather than
-  guessing an incomplete tag universe. `edited` base-retarget events invalidate
+  guessing an incomplete tag universe.
+
+  **Only `.go` blobs are content-scanned, so everything else must be caught by
+  name.** The native-source extension list is exactly what `go/build` compiles —
+  `c cc cpp cxx m mm h hh hpp hxx f F for f90 s S sx swig swigcxx syso` — and a
+  contract test asserts it stays complete. Shrinking it reopens a real bypass:
+  an untagged cgo wrapper plus a darwin-only `shim_darwin.sx` ships machine code
+  the gate never looked at. Plain `.go` is deliberately **absent** from that
+  bare-extension list (every Go change would gate and the constraint scan would
+  become dead code) but **present** in the `_darwin`/`_arm64` suffix
+  alternation, where the filename itself is the constraint.
+  `edited` base-retarget events invalidate
   verification; unrelated PR edits preserve the current SHA-bound status.
 
   **Non-regular tree entries are always gated.** A changed `.go` *symlink*
