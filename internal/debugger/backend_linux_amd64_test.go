@@ -3,6 +3,7 @@
 package debugger
 
 import (
+	"errors"
 	"os/exec"
 	"strings"
 	"sync"
@@ -567,6 +568,12 @@ type scriptedWait struct {
 	stops []scriptedStop
 	next  int
 	ops   []resumeOp
+
+	// eventMsg is what PTRACE_GETEVENTMSG reports: the wait(2)-encoded status
+	// at EVENT_EXIT, the execing thread's former tid at EVENT_EXEC. Scripting it
+	// is what lets the leader-exit and exec branches run without a tracer.
+	eventMsg    uint
+	eventMsgErr error
 }
 
 type scriptedStop struct {
@@ -592,6 +599,7 @@ func (s *scriptedWait) install(b *linuxBackend) {
 		s.ops = append(s.ops, resumeOp{step: true, tid: tid})
 		return nil
 	}
+	b.eventMsgFn = func(int) (uint, error) { return s.eventMsg, s.eventMsgErr }
 }
 
 // stoppedAt builds the wait status the kernel reports for a ptrace-stop.
@@ -820,6 +828,338 @@ func TestLinuxWaitContinuesThreadsThatAreNotBeingStepped(t *testing.T) {
 			if op.tid != other || op.signal != tc.signal {
 				t.Fatalf("resumed %+v, want a continue of tid %d with signal %d",
 					op, other, tc.signal)
+			}
+		})
+	}
+}
+
+// TestLinuxWaitDefersTheTerminalUntilTheGroupIsActuallyGone pins item 2: a stop
+// under the LEADER's id is evidence of a terminal, not proof of one.
+//
+// de_thread() retires the old leader when a NON-leader calls execve(): the
+// execing thread takes over the leader's pid and the retired task's exit is
+// reported as PTRACE_EVENT_EXIT under tid == pid while the process runs on. A
+// leader that merely pthread_exit()s produces the same shape. Verified against
+// Linux 6.10, where the retired leader's GETEVENTMSG decodes to an ordinary
+// "exited, code 0" — indistinguishable from a real exit, so nothing but a later
+// event can tell them apart.
+//
+// Returning a terminal at that stop declares a live process dead. Every case
+// here drives Wait over the exact status sequence the kernel produces, and the
+// exit code travels through production's own GETEVENTMSG copy rather than being
+// seeded, so dropping that read fails the test instead of passing vacuously.
+func TestLinuxWaitDefersTheTerminalUntilTheGroupIsActuallyGone(t *testing.T) {
+	const (
+		pid    = 9701
+		worker = 9702
+	)
+
+	leaderExit := stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_EXIT)
+
+	t.Run("a leader exit alone is not a terminal", func(t *testing.T) {
+		b := &linuxBackend{pid: pid}
+		script := &scriptedWait{
+			stops: []scriptedStop{
+				{tid: pid, status: leaderExit},
+				{tid: worker, status: stoppedAt(syscall.SIGTRAP, 0)},
+			},
+			eventMsg: uint(exitedWith(0)),
+		}
+		script.install(b)
+
+		ev, err := b.Wait()
+		if err != nil {
+			t.Fatalf("Wait() error = %v", err)
+		}
+		if ev.Reason == StopExited || ev.Reason == StopKilled {
+			t.Fatalf("Wait() = %+v: a leader-id EVENT_EXIT was reported as a terminal, "+
+				"but de_thread retirement and pthread_exit produce that exact stop "+
+				"while the process is alive", ev)
+		}
+		if ev.Reason != StopBreakpoint || ev.TID != worker {
+			t.Fatalf("Wait() = %+v, want the surviving worker's stop", ev)
+		}
+		if !b.leaderExitPendingForTest() {
+			t.Fatal("the leader's status was discarded; a later real death would " +
+				"report exit code 0 instead of the authoritative one")
+		}
+		if len(script.ops) != 1 || script.ops[0].tid != pid {
+			t.Fatalf("resume ops = %+v, want the leader continued so it can finish dying",
+				script.ops)
+		}
+	})
+
+	// The GROUP exit code, not the leader task's, is what the process exited
+	// with. They diverge exactly when the leader dies separately: a leader that
+	// pthread_exit()s with 0 while a surviving worker later calls exit_group(7)
+	// must be reported as 7. The stash is the task's do_exit value, so an
+	// observed wait status always wins over it.
+	t.Run("a real group status beats the stashed leader status", func(t *testing.T) {
+		b := &linuxBackend{pid: pid}
+		script := &scriptedWait{
+			stops: []scriptedStop{
+				{tid: pid, status: leaderExit},
+				{tid: pid, status: exitedWith(7)},
+			},
+			eventMsg: uint(exitedWith(0)),
+		}
+		script.install(b)
+
+		ev, err := b.Wait()
+		if err != nil {
+			t.Fatalf("Wait() error = %v", err)
+		}
+		if ev.Reason != StopExited || ev.ExitCode != 7 {
+			t.Fatalf("Wait() = %+v, want the group's exit code 7; the stashed "+
+				"leader status is that task's do_exit value and must not override "+
+				"how the process actually terminated", ev)
+		}
+		if b.leaderExitPendingForTest() {
+			t.Fatal("the stashed status survived the commit and could be reported twice")
+		}
+	})
+
+	// ECHILD is the one commit point with no observed status at all, so the
+	// stash is the only record of how the process ended — which is the whole
+	// reason it must still be read at the EVENT_EXIT stop (#94).
+	t.Run("the terminal commits on ECHILD from the stashed status", func(t *testing.T) {
+		b := &linuxBackend{pid: pid}
+		script := &scriptedWait{
+			stops:    []scriptedStop{{tid: pid, status: leaderExit}},
+			eventMsg: uint(exitedWith(3)),
+		}
+		script.install(b)
+
+		ev, err := b.Wait()
+		if err != nil {
+			t.Fatalf("Wait() error = %v", err)
+		}
+		if ev.Reason != StopExited || ev.ExitCode != 3 {
+			t.Fatalf("Wait() = %+v, want exit code 3 committed once the group is reaped", ev)
+		}
+	})
+
+	t.Run("a signal death is committed as killed", func(t *testing.T) {
+		b := &linuxBackend{pid: pid}
+		script := &scriptedWait{
+			stops:    []scriptedStop{{tid: pid, status: leaderExit}},
+			eventMsg: uint(syscall.WaitStatus(syscall.SIGKILL)),
+		}
+		script.install(b)
+
+		ev, err := b.Wait()
+		if err != nil {
+			t.Fatalf("Wait() error = %v", err)
+		}
+		if ev.Reason != StopKilled {
+			t.Fatalf("Wait() = %+v, want StopKilled from the stashed signal death", ev)
+		}
+	})
+}
+
+// TestLinuxWaitRetractsTheLeaderExitWhenAnExecProvesRetirement is the other half
+// of item 2, and the point where it meets item 1.
+//
+// The exact kernel sequence for a non-leader execve is: EVENT_EXIT under the
+// leader's id, the other threads dying, then EVENT_EXEC under that same id
+// carrying the execing thread's former tid. The exec is positive proof that the
+// earlier exit was a retirement, so the pending terminal must be dropped rather
+// than committed — otherwise the session ends with a fabricated exit code for a
+// process that is alive.
+func TestLinuxWaitRetractsTheLeaderExitWhenAnExecProvesRetirement(t *testing.T) {
+	const (
+		pid       = 9711
+		formerTID = 9713
+	)
+
+	b := &linuxBackend{pid: pid}
+	script := &scriptedWait{
+		stops: []scriptedStop{
+			{tid: pid, status: stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_EXIT)},
+			{tid: pid, status: stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_EXEC)},
+		},
+		eventMsg: formerTID,
+	}
+	script.install(b)
+
+	ev, err := b.Wait()
+	if err == nil {
+		t.Fatalf("Wait() = %+v, nil: an exec must fail the wait, not report the "+
+			"retired leader's exit as the process terminating", ev)
+	}
+	if !errors.Is(err, ErrSessionInvalidated) {
+		t.Fatalf("Wait() error = %v, want it marked ErrSessionInvalidated so the "+
+			"engine discharges the stops it still owns", err)
+	}
+	if b.leaderExitPendingForTest() {
+		t.Fatal("the exec did not retract the stashed leader exit; a later ECHILD " +
+			"would still commit a terminal for a process that had already exec'd")
+	}
+	if !strings.Contains(err.Error(), "9713") {
+		t.Fatalf("Wait() error = %q, want the execing thread's former tid from "+
+			"GETEVENTMSG — the reported pid is the leader's and identifies nothing", err)
+	}
+	if len(script.ops) != 1 || script.ops[0].tid != pid {
+		t.Fatalf("resume ops = %+v, want only the leader's exit continued and the "+
+			"exec stop left for the engine to discharge", script.ops)
+	}
+}
+
+// TestLinuxWaitReleasesTheStepGateWhenTheLeaderIsTheSteppedThread closes the
+// freeze the deferral could otherwise introduce.
+//
+// The leader can be the thread being single-stepped — it hits a breakpoint like
+// any other. Its PTRACE_EVENT_EXIT consumes that pending step, so resuming it
+// with a bare continue leaves stepping/stepTID latched with no completion ever
+// coming: every later foreign stop parks, and Wait never returns again. That is
+// park-queue rule 7, and it applies to the leader exactly as it does to any
+// other thread, which is why this branch routes through absorbThreadExit rather
+// than reaching for a resume primitive.
+func TestLinuxWaitReleasesTheStepGateWhenTheLeaderIsTheSteppedThread(t *testing.T) {
+	const (
+		pid     = 9741
+		foreign = 9742
+	)
+
+	b := &linuxBackend{pid: pid}
+	script := &scriptedWait{
+		stops: []scriptedStop{
+			{tid: pid, status: stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_EXIT)},
+			{tid: foreign, status: stoppedAt(syscall.SIGTRAP, 0)},
+		},
+		eventMsg: uint(exitedWith(0)),
+	}
+	script.install(b)
+	// The leader itself is under the step.
+	b.beginStep(pid)
+
+	ev, err := b.Wait()
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if b.stepping {
+		t.Fatal("the step stayed latched after its owning thread — the leader — " +
+			"reached its exit stop; every later foreign stop would park forever " +
+			"and Wait would never return")
+	}
+	// With nothing parked the dying owner is held as the reconciliation anchor,
+	// so the boundary is what surfaces and the leader is NOT resumed yet.
+	if ev.Reason != StopStepThreadExited || ev.TID != pid {
+		t.Fatalf("Wait() = %+v, want the reconciliation boundary anchored on the "+
+			"dying leader", ev)
+	}
+	if len(script.ops) != 0 {
+		t.Fatalf("resume ops = %+v, want the held anchor left stopped until the "+
+			"engine has reinstalled through it", script.ops)
+	}
+	if !b.leaderExitPendingForTest() {
+		t.Fatal("the leader's status was not stashed, so the terminal is lost")
+	}
+}
+
+// TestLinuxWaitStillCommitsTheTerminalWithStopsHeld is the liveness gate for
+// deferring the terminal.
+//
+// Withholding the terminal is only safe if it can never be LOST. The worrying
+// ordering is a group death that arrives while the park queue is holding a
+// stop: the leader's zombie is not reapable until every thread is reaped, and a
+// parked thread stays ptrace-stopped until something resumes it, so a naive
+// deferral could wait forever for a reap that cannot happen.
+//
+// It does not, and this pins why. The existing machinery drains the queue on its
+// own schedule — the dying step owner closes the step, the reconciliation
+// boundary is reported, the engine acknowledges, the held stop is delivered —
+// and the stashed terminal survives all of it, to be committed when the group is
+// finally gone. Trading a false terminal for a lost one would be strictly worse
+// than the bug being fixed, so this ordering is asserted end to end.
+func TestLinuxWaitStillCommitsTheTerminalWithStopsHeld(t *testing.T) {
+	const (
+		pid     = 9731
+		stepped = 9732
+		sibling = 9733
+	)
+
+	b := &linuxBackend{pid: pid}
+	script := &scriptedWait{
+		stops: []scriptedStop{
+			{tid: pid, status: stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_EXIT)},
+			{tid: stepped, status: stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_EXIT)},
+			// then ECHILD: the group is gone
+		},
+		eventMsg: uint(exitedWith(5)),
+	}
+	script.install(b)
+	b.beginStep(stepped)
+	b.park(StopEvent{Reason: StopBreakpoint, TID: sibling})
+
+	ev, err := b.Wait()
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if ev.Reason != StopStepThreadExited {
+		t.Fatalf("Wait() = %+v, want the reconciliation boundary; the leader's exit "+
+			"must not short-circuit the step-off transaction", ev)
+	}
+	if !b.leaderExitPendingForTest() {
+		t.Fatal("the stashed terminal was dropped while reconciling the dead step owner")
+	}
+
+	if err := b.completeStepThreadExit(); err != nil {
+		t.Fatalf("completeStepThreadExit() = %v", err)
+	}
+
+	ev, err = b.Wait()
+	if err != nil {
+		t.Fatalf("second Wait() error = %v", err)
+	}
+	if ev.TID != sibling || ev.Reason != StopBreakpoint {
+		t.Fatalf("second Wait() = %+v, want the held sibling stop delivered", ev)
+	}
+
+	ev, err = b.Wait()
+	if err != nil {
+		t.Fatalf("third Wait() error = %v", err)
+	}
+	if ev.Reason != StopExited || ev.ExitCode != 5 {
+		t.Fatalf("third Wait() = %+v, want the deferred terminal committed with the "+
+			"authoritative exit code once the group is reaped — a withheld terminal "+
+			"that is never committed is worse than the false one this replaced", ev)
+	}
+}
+
+// TestLinuxWaitMarksFatalStopsSessionInvalidating covers item 4's contract at
+// the backend edge: both branches that give up must say so in a way the engine
+// can act on.
+//
+// Without the marker the engine merely reports the error and exits its loop,
+// which closes the tracer thread — and the kernel then detaches every tracee and
+// RESUMES it, straight into software breakpoints still written in its text.
+func TestLinuxWaitMarksFatalStopsSessionInvalidating(t *testing.T) {
+	const (
+		pid     = 9721
+		stepped = 9722
+	)
+
+	cases := []struct {
+		name  string
+		event int
+	}{
+		{"exec", syscall.PTRACE_EVENT_EXEC},
+		{"an event we never enabled", syscall.PTRACE_EVENT_VFORK},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			b := &linuxBackend{pid: pid}
+			script := &scriptedWait{stops: []scriptedStop{
+				{tid: stepped, status: stoppedAt(syscall.SIGTRAP, tc.event)},
+			}}
+			script.install(b)
+			b.beginStep(stepped)
+
+			_, err := b.Wait()
+			if !errors.Is(err, ErrSessionInvalidated) {
+				t.Fatalf("Wait() error = %v, want ErrSessionInvalidated", err)
 			}
 		})
 	}
