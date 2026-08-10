@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { resolve } from "node:path";
-import { after, describe, it } from "node:test";
+import { after, afterEach, describe, it } from "node:test";
 
 import type WebSocket from "ws";
 import { WebSocketServer } from "ws";
@@ -1161,6 +1161,30 @@ describe("truthful omission surfacing", () => {
 
 describe("real WebSocket transport", () => {
   const servers: { close(): void }[] = [];
+  // Teardown must not depend on a test reaching its last line. These tests run
+  // a real reconnect ladder against a real socket, so an observer left alive by
+  // a failed assertion keeps timers and connections running and the runner
+  // hangs instead of reporting the failure. Everything created is tracked here
+  // and released unconditionally, so a broken expectation — or a mutation being
+  // checked — terminates red rather than wedging.
+  const observers: TelemetryObserver[] = [];
+  const openSockets: { terminate(): void }[] = [];
+
+  afterEach(() => {
+    for (const observer of observers) {
+      observer.dispose();
+    }
+    observers.length = 0;
+    for (const socket of openSockets) {
+      socket.terminate();
+    }
+    openSockets.length = 0;
+    for (const server of servers) {
+      server.close();
+    }
+    servers.length = 0;
+  });
+
   after(() => {
     for (const server of servers) {
       server.close();
@@ -1182,6 +1206,7 @@ describe("real WebSocket transport", () => {
     let connections = 0;
     wss.on("connection", (socket) => {
       connections += 1;
+      openSockets.push(socket);
       onConnection(socket, connections);
     });
     await new Promise<void>((resolve) => {
@@ -1217,6 +1242,7 @@ describe("real WebSocket transport", () => {
           }),
       },
     );
+    observers.push(observer);
     return {
       observer,
       connections: () => connections,
@@ -1225,6 +1251,20 @@ describe("real WebSocket transport", () => {
       },
     };
   }
+
+  it("releases every observer even when a test fails before disposing", async () => {
+    // Pins the teardown itself. The ladder below never completes on its own, so
+    // if afterEach did not dispose it the runner would hang here rather than
+    // move on — which is exactly how a failed assertion used to wedge instead
+    // of reporting red.
+    const live = await liveObserver((socket) => {
+      socket.close();
+    });
+    live.observer.start();
+    await live.settled();
+    assert.ok(live.connections() >= 1, "the observer must have connected");
+    // Deliberately no dispose() — afterEach owns it.
+  });
 
   it("survives repeated large snapshots without reconnecting", async () => {
     const stops = 8;

@@ -275,6 +275,11 @@ function renderGraph(
         "The target may be exiting or runtime inspection degraded.",
       ),
     );
+    // What the SERVER left out still has to be stated here. An empty graph is
+    // exactly when it matters most: a fully degraded snapshot, or a filter that
+    // matched nothing, otherwise reads as "the runtime has no goroutines" while
+    // the totals say thousands were omitted or the count is only a floor.
+    appendServerOmissionNote(document, panel, session.serverTotals);
     return panel;
   }
 
@@ -338,13 +343,7 @@ function renderGraph(
     note.textContent = `${String(session.tree.omitted)} additional goroutines omitted by the filter or visual cap`;
     panel.append(note);
   }
-  const serverNote = serverOmissionText(session.serverTotals);
-  if (serverNote !== undefined) {
-    const note = document.createElement("p");
-    note.className = "server-omitted";
-    note.textContent = serverNote;
-    panel.append(note);
-  }
+  appendServerOmissionNote(document, panel, session.serverTotals);
   viewport.append(svg);
   panel.append(viewport);
 
@@ -625,6 +624,24 @@ function renderThreads(
     panel.append(note);
   }
   return panel;
+}
+
+// appendServerOmissionNote renders what the DEBUGGER left out, if anything. It
+// is called on every graph path including the empty one, because an empty graph
+// is precisely where a silent omission reads as an authoritative "nothing here".
+function appendServerOmissionNote(
+  document: Document,
+  panel: HTMLElement,
+  totals: ServerTotals | undefined,
+): void {
+  const text = serverOmissionText(totals);
+  if (text === undefined) {
+    return;
+  }
+  const note = document.createElement("p");
+  note.className = "server-omitted";
+  note.textContent = text;
+  panel.append(note);
 }
 
 // serverOmissionText states what the DEBUGGER left out, in its own words —

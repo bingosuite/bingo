@@ -389,17 +389,31 @@ func TestPackAllowancesCoverTheRealWorstCase(t *testing.T) {
 		Goroutines: math.MaxInt64, Threads: math.MaxInt64,
 		GoroutinesClipped: true, ThreadsClipped: true,
 	}
+	// The delta arrays carry omitempty, so a skeleton with EMPTY ones omits
+	// their keys and brackets entirely and never charges that framing. Measuring
+	// that way overstates the slack: it made an envelope allowance of 260 look
+	// sound when the framing alone costs 25 bytes more than it leaves spare.
+	// Measure with the arrays present and charge back only the per-element
+	// allowance, so whatever remains is genuinely fixed envelope cost.
+	widestDelta := []int{math.MinInt64}
 	skeleton := protocol.GoroutineSnapshotPayload{
 		Goroutines: []protocol.Goroutine{}, Threads: []protocol.Thread{},
-		Current: math.MaxInt64, Created: []int{}, Exited: []int{}, Totals: &totals,
+		Current: math.MaxInt64, Created: widestDelta, Exited: widestDelta,
+		Totals: &totals,
 	}
-	if size := eventBytesPlain(t, protocol.EventGoroutineSnapshot, skeleton); size > envelope {
-		t.Fatalf("envelope allowance %d is below the real worst case %d", envelope, size)
+	framed := eventBytesPlain(t, protocol.EventGoroutineSnapshot, skeleton)
+	if fixed := framed - len(widestDelta)*2*delta; fixed > envelope {
+		t.Fatalf("envelope allowance %d is below the real worst case %d", envelope, fixed)
 	}
 
-	// A goid is at most 19 digits plus its separator.
-	if delta < 20 {
-		t.Fatalf("delta allowance %d cannot hold a max-width goid", delta)
+	// A goid can be MinInt64 — 20 characters — plus its separator. Nineteen
+	// digits is the positive case only, and the deltas are plain ints.
+	raw, err = json.Marshal(math.MinInt64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := len(raw) + 1; delta < want {
+		t.Fatalf("delta allowance %d cannot hold a max-width goid (%d)", delta, want)
 	}
 }
 
