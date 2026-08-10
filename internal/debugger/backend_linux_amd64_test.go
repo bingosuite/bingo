@@ -3,8 +3,8 @@
 package debugger
 
 import (
-	"os"
 	"os/exec"
+	"sync"
 	"testing"
 )
 
@@ -46,26 +46,36 @@ type stopTIDRaceBackend struct {
 	*linuxBackend
 	waitStarted chan struct{}
 	stopWriter  chan struct{}
+	stopOnce    sync.Once
 }
 
 func newStopTIDRaceBackend(t *testing.T) *stopTIDRaceBackend {
 	t.Helper()
 	b := &stopTIDRaceBackend{
 		linuxBackend: &linuxBackend{
-			pid:    1_000_001,
+			// Negative IDs cannot name a process, and also force ReadMemory
+			// through the ptrace fallback without attempting process_vm_readv.
+			pid:    -1,
 			tracer: newTracerThread(),
 		},
 		waitStarted: make(chan struct{}),
 		stopWriter:  make(chan struct{}),
 	}
 	b.recordStop(b.pid)
-	t.Cleanup(b.closeTracer)
+	t.Cleanup(func() {
+		b.stop()
+		b.closeTracer()
+	})
 	return b
+}
+
+func (b *stopTIDRaceBackend) stop() {
+	b.stopOnce.Do(func() { close(b.stopWriter) })
 }
 
 func (b *stopTIDRaceBackend) Wait() (StopEvent, error) {
 	close(b.waitStarted)
-	for tid := b.pid + 1; ; tid++ {
+	for tid := b.pid - 1; ; tid-- {
 		select {
 		case <-b.stopWriter:
 			return StopEvent{Reason: StopExited, TID: b.pid}, nil
@@ -90,7 +100,13 @@ func seedBreakpointEntries(e *engine, count int) {
 	}
 }
 
-// TestLinuxBackendRunningKillStopTIDConcurrentAccess is a production-path race
+func TestLinuxBackendStopTIDRaceRegressions(t *testing.T) {
+	t.Run("running-kill", testLinuxBackendRunningKillStopTIDConcurrentAccess)
+	t.Run("running-memory", testLinuxBackendRunningMemoryStopTIDConcurrentAccess)
+	t.Run("stopped-memory-ordered", testLinuxBackendStoppedMemoryStopTIDOrdered)
+}
+
+// testLinuxBackendRunningKillStopTIDConcurrentAccess is a production-path race
 // regression:
 // waitLoop publishes stops through recordStop while the engine actor executes
 // running Kill -> breakpointTable.clearAll -> WriteMemory -> traceTID.
@@ -98,17 +114,23 @@ func seedBreakpointEntries(e *engine, count int) {
 // Keep this test focused on the ownership boundary. It deliberately uses fake
 // TIDs so ptrace writes fail quickly after reading traceTID; clearAll's
 // best-effort contract leaves every entry present, giving the race detector
-// many reads against the live wait-loop writer.
-func TestLinuxBackendRunningKillStopTIDConcurrentAccess(t *testing.T) {
+// many reads against the live wait-loop writer. The launched marker remains
+// non-nil for #204's stacked ownership split, but pid zero makes process.kill
+// stop before any OS signal.
+func testLinuxBackendRunningKillStopTIDConcurrentAccess(t *testing.T) {
 	b := newStopTIDRaceBackend(t)
 	e := newEngine(b, nil)
+	t.Cleanup(func() {
+		b.stop()
+		<-e.done
+	})
 
 	if err := e.dispatch(func() error {
 		// Keep this on launched teardown when attached Kill gains its own
 		// quiesce-before-clear transaction.
 		e.proc = process{
-			pid:  b.pid,
-			cmd:  &exec.Cmd{Process: &os.Process{Pid: b.pid}},
+			pid:  0,
+			cmd:  &exec.Cmd{},
 			live: true,
 		}
 		e.setState(stateRunning)
@@ -123,15 +145,15 @@ func TestLinuxBackendRunningKillStopTIDConcurrentAccess(t *testing.T) {
 	if err := e.Kill(); err != nil {
 		t.Fatalf("Kill() error = %v", err)
 	}
-	close(b.stopWriter)
+	b.stop()
 	<-e.done
 }
 
-// TestLinuxBackendRunningMemoryStopTIDConcurrentAccess covers the other two
+// testLinuxBackendRunningMemoryStopTIDConcurrentAccess covers the other two
 // traceTID readers. WriteMemory is reachable from running SetBreakpoint/
 // ClearBreakpoint; ReadMemory's ptrace fallback is reachable from running
 // SetBreakpoint when process_vm_readv is unavailable or short-reads.
-func TestLinuxBackendRunningMemoryStopTIDConcurrentAccess(t *testing.T) {
+func testLinuxBackendRunningMemoryStopTIDConcurrentAccess(t *testing.T) {
 	tests := []struct {
 		name string
 		read func(*linuxBackend) error
@@ -159,21 +181,25 @@ func TestLinuxBackendRunningMemoryStopTIDConcurrentAccess(t *testing.T) {
 				defer close(done)
 				_, _ = b.Wait()
 			}()
+			t.Cleanup(func() {
+				b.stop()
+				<-done
+			})
 			<-b.waitStarted
 
 			for i := 0; i < 16; i++ {
 				_ = tt.read(b.linuxBackend)
 			}
-			close(b.stopWriter)
+			b.stop()
 			<-done
 		})
 	}
 }
 
-// TestLinuxBackendStoppedMemoryStopTIDOrdered is the stopped-state control.
+// testLinuxBackendStoppedMemoryStopTIDOrdered is the stopped-state control.
 // Receiving Wait's result orders recordStop before every engine-side memory
 // operation, matching the real waitLoop -> stopCh -> engine-loop handoff.
-func TestLinuxBackendStoppedMemoryStopTIDOrdered(t *testing.T) {
+func testLinuxBackendStoppedMemoryStopTIDOrdered(t *testing.T) {
 	tests := []struct {
 		name string
 		read func(*linuxBackend) error
