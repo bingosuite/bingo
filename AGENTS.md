@@ -1113,7 +1113,10 @@ stopped TID and the signal argument to the next ptrace resume:
 5. Pause's main-thread `SIGSTOP` is deliberately excluded from current state,
    preserving manual Pause and leftover-interrupt suppression even when the same
    TID has delayed SIGURG. Clone `SIGSTOP`, `SIGCONT`, ptrace events and spurious
-   breakpoint traps remain internal Wait-loop cases with signal zero.
+   breakpoint traps remain internal Wait-loop cases with signal zero. A raw
+   non-main `SIGSTOP` is not proof that its TID is a new clone: when it belongs
+   to the active `stepTID`, Wait preserves that owner's pending state while
+   re-arming `PTRACE_SINGLESTEP(..., 0)`.
 6. Resume takes a per-TID batch transactionally. Successfully requeued backlog
    entries are not restored if a later requeue fails; the unsent suffix and
    current signal are. A failed public exact-TID `PTRACE_CONT` restores the
@@ -1124,10 +1127,12 @@ stopped TID and the signal argument to the next ptrace resume:
    retry and matching standard signals coalesce; if `ESRCH` meant the TID escaped
    that stop, its fresh delivery goes through `set`, which coalesces it against
    the restored backlog. Internal single-steps leave every pending collection
-   intact. Only a path that has conclusively observed thread/image death clears
-   first. Non-main `Exited`, `Signaled`, and `PTRACE_EVENT_EXIT` branches,
-   held-owner release, and clone initial-stop handling clear their TID **before**
-   any resume, while exec, process exit, Kill/detach, and tracer shutdown purge
+   intact. Conclusive retirement paths — non-main `Exited`, `Signaled`, and
+   `PTRACE_EVENT_EXIT` branches plus held-owner release — clear their TID
+   **before** any resume. The branch treating a non-main `SIGSTOP` as a clone
+   initial stop also clears stale reused-TID state unless that TID is the active
+   step owner; the ambiguous owner case must retain its signal across the
+   signal-zero re-arm. Exec, process exit, Kill/detach, and tracer shutdown purge
    all state to prevent TID reuse. The maps are mutex-protected because `Wait`
    publishes from its goroutine while the engine consumes them; unlike
    `stepQueue`, this state crosses goroutines.
@@ -1145,8 +1150,10 @@ parked-stop count increase; signal outputs plus generic parked traps are not
 proof that a signal was held during a step. Backend mutation gates additionally
 pin failed-continue → signal-zero step → distinct same-TID signal, requiring the
 older signal to be requeued to that TID and the fresh signal to be the exact
-`PTRACE_CONT` argument, plus direct cleanup coverage for all three non-leader
-death branches.
+`PTRACE_CONT` argument; an ambiguous non-main `SIGSTOP` on the active step owner
+must likewise preserve the retained signal through its signal-zero re-arm and
+inject it on the next exact-TID continue. Direct cleanup coverage pins all three
+non-leader death branches.
 
 Deferred-signal transactions necessarily recreate delivery with `tgkill`.
 They preserve every distinct signal number, its target TID, and the backlog's

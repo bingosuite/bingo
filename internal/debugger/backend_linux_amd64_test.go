@@ -1938,6 +1938,56 @@ func TestLinuxWaitCloneAbsorbPreservesPendingSignalOnSteppedThread(t *testing.T)
 	}
 }
 
+func TestLinuxWaitPreservesAPendingSignalWhenAbsorbingSIGSTOPOnTheSteppedThread(t *testing.T) {
+	const (
+		pid     = 9171
+		stepped = 9172
+	)
+	b, calls := newRecordingLinuxBackend(t, pid)
+	b.recordDeliveredStop(StopEvent{
+		Reason: StopSignal,
+		TID:    stepped,
+		Signal: int(syscall.SIGUSR1),
+	})
+	b.ptraceSyscall6Fn = recordingPtraceSyscall(calls, syscall.EIO)
+	if err := b.ContinueProcess(); !errors.Is(err, syscall.EIO) {
+		t.Fatalf("ContinueProcess() error = %v, want %v", err, syscall.EIO)
+	}
+
+	b.ptraceSyscall6Fn = recordingPtraceSyscall(calls, 0)
+	if err := b.SingleStep(stepped); err != nil {
+		t.Fatalf("SingleStep() error = %v", err)
+	}
+	script := &scriptedWait{stops: []scriptedStop{
+		{tid: stepped, status: stoppedAt(syscall.SIGSTOP, 0)},
+		{tid: stepped, status: stoppedAt(syscall.SIGTRAP, 0)},
+	}}
+	script.install(b)
+	// Keep wait4 scripted while the re-arm goes through the raw ptrace recorder.
+	b.stepFn = nil
+
+	ev, err := b.Wait()
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if ev.Reason != StopSingleStep || ev.TID != stepped {
+		t.Fatalf("Wait() = %+v, want the re-armed step completion on tid %d", ev, stepped)
+	}
+
+	if err := b.ContinueProcess(); err != nil {
+		t.Fatalf("ContinueProcess() after absorbed SIGSTOP error = %v", err)
+	}
+	wantCalls := []linuxResumeCall{
+		wantLinuxResume(syscall.PTRACE_CONT, stepped, int(syscall.SIGUSR1)),
+		wantLinuxResume(syscall.PTRACE_SINGLESTEP, stepped, 0),
+		wantLinuxResume(syscall.PTRACE_SINGLESTEP, stepped, 0),
+		wantLinuxResume(syscall.PTRACE_CONT, stepped, int(syscall.SIGUSR1)),
+	}
+	if !reflect.DeepEqual(*calls, wantCalls) {
+		t.Fatalf("ptrace calls = %+v, want retained exact-TID signal tuples %+v", *calls, wantCalls)
+	}
+}
+
 func TestLinuxWaitClearsReusedTIDStateBeforeNewThreadResume(t *testing.T) {
 	const (
 		pid       = 9201
