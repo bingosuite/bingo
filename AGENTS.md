@@ -416,11 +416,11 @@ engine destroys the step-over state machine two ways: a **distinct** sibling
 breakpoint overwrites `lastBP` and the next resume overwrites the one-slot
 `steppingOverBP`, permanently losing the original entry with its trap disarmed
 (so its `ClearBreakpoint` id fails); a **same-address** sibling finds no entry,
-takes the spurious-SIGTRAP path, advances PC and calls `ContinueProcess`, which
-clears `stepping`/`stepTID` so the real step completion is misclassified. Darwin
-is immune by construction — its receive loop already loops until the trap belongs
-to the stepping thread — which is why this is a linux-backend fix and darwin has
-no counterpart.
+takes the spurious-SIGTRAP path, skips the live-register rewind and calls
+`ContinueProcess`, which clears `stepping`/`stepTID` so the real step completion
+is misclassified. Darwin is immune by construction — its receive loop already
+loops until the trap belongs to the stepping thread — which is why this is a
+linux-backend fix and darwin has no counterpart.
 
 **Why it must be in the backend and not the engine.** The `Backend` interface has
 exactly one TID-explicit resume, `SingleStep(tid)`. `ContinueProcess`,
@@ -482,17 +482,27 @@ that their stops are *reported later*, after the trap is back:
   Callers already tolerate this; the `churn` spec always has.
 - Queue depth is bounded by the live thread count — a ptrace-stopped thread
   cannot stop again until it is resumed (G7) — so no cap is needed.
-- Out of scope: a user `ClearBreakpoint` of an address a parked stop refers to
-  still surfaces that stop as a spurious trap when it is finally delivered. The
-  same is true of the engine's auto-cleared `<stepover-next>` sentinel if a
-  parked stop names it. Both land in the engine's pre-existing spurious-SIGTRAP
-  path, which advances PC by one trap length from an already-rewound PC and so
-  resumes mid-instruction on amd64. That path is *far* more often reached
-  inline, by a kernel-queued trap the queue never sees (measured: dozens of
-  spurious-trap warnings per overlap run against **zero** parked stops whose
-  trap had gone), so it is an engine-level hazard, not a queue-level one, and
-  guarding only the parked variant would be unexercised code. Fixing it needs
-  engine changes and is tracked separately.
+- A user `ClearBreakpoint` or the auto-clear of `<stepover-next>` can restore an
+  instruction while sibling trap stops for that address remain parked or queued
+  in the kernel. When one later surfaces, there is no breakpoint-table entry,
+  but on amd64 RIP still points one byte past an instruction that never ran.
+  Linux marks only confirmed instruction traps on the `StopEvent`, using
+  `PTRACE_GETSIGINFO` (`TRAP_BRKPT` or x86's `SI_KERNEL`); Darwin's Mach
+  breakpoint exception is confirmed by construction. For those events the
+  engine also requires provenance from the breakpoint table's successful-clear
+  history before rewinding. At a restored address it decodes only an instruction
+  that starts exactly there: if no live trap remains it resumes from that address
+  so the restored instruction executes; if the restored instruction is itself a
+  trap, it skips it with the same semantics the unowned-trap path would apply on
+  the next stop. Everywhere else it uses the stop's architecture-specific live
+  trap decoding (x86 INT3/ICEBP/two-byte `INT $3`, or any arm64 `BRK #imm`) and
+  advances using that encoding's actual PC semantics. Keeping restored-address
+  provenance is necessary on amd64 because searching backward for `CD 03` can
+  cross an instruction boundary and cannot prove that those bytes form one
+  instruction. An unreadable address or unclassified SIGTRAP keeps the old
+  advance behavior rather than guessing that a live trap was removed. The engine
+  tests pin all outcomes; this is engine-wide because inline kernel-queued traps
+  reach the same path as parked ones.
 - **A stepped thread that dies with stops still held releases them, and that
   delivery deliberately precedes an already-queued main-thread exit.** Because
   the drain runs at the top of the `Wait` loop, before blocking in `wait4`, a
@@ -672,11 +682,15 @@ dance — would otherwise start mid-instruction and corrupt the tracee (this
 manifested as a hung `StepOver`). No-op on arm64/Darwin, whose rewind is
 identity.
 
-Be careful: spurious SIGTRAPs (Go runtime internal traps, libc assertions)
-arrive as `StopBreakpoint` with no entry in our table. On ARM64, calling
-`ContinueProcess` with PC unchanged re-executes the BRK — infinite loop. The
-engine advances PC by `len(archTrapInstruction())` and resumes. See the
-`bp == nil` branch in `handleStop`.
+Be careful: an unowned SIGTRAP can be either a Go runtime/libc trap that remains
+in memory or a debugger trap whose bytes were restored before its queued stop
+surfaced. The former must advance by `len(archTrapInstruction())` (otherwise
+ARM64 re-executes BRK forever); the latter must resume from the rewound address
+(otherwise amd64 starts after the removed INT3, in the middle of the restored
+instruction). The backend first confirms an instruction trap (Linux:
+`PTRACE_GETSIGINFO`; Darwin: Mach breakpoint exception), then the `bp == nil`
+branch in `handleStop` distinguishes the two by decoding every supported live
+trap encoding, not merely comparing against bingo's canonical INT3/`BRK #0`.
 
 ## Backend quirks
 

@@ -79,6 +79,34 @@ func TestLinuxBackendSetPIDSeedsLastStoppedTID(t *testing.T) {
 	}
 }
 
+func TestLinuxBackendSoftwareBreakpointTrapClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		code int32
+		err  error
+		want bool
+	}{
+		{name: "TRAP_BRKPT", code: linuxTrapBreakpoint, want: true},
+		{name: "SI_KERNEL", code: linuxSIKernel, want: true},
+		{name: "TRAP_TRACE", code: 2},
+		{name: "SI_TKILL", code: -6},
+		{name: "unreadable", err: syscall.ESRCH},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &linuxBackend{
+				ptraceSiginfoFn: func(int) (int32, error) {
+					return tt.code, tt.err
+				},
+			}
+			if got := b.isSoftwareBreakpointTrap(1001); got != tt.want {
+				t.Fatalf("isSoftwareBreakpointTrap() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestLinuxBackendContinueForwardsDeliveredSignalOnce(t *testing.T) {
 	const tid = 1002
 	b, calls := newRecordingLinuxBackend(t, 1001)

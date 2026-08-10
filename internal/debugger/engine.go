@@ -612,14 +612,40 @@ func (e *engine) handleStop(stop StopEvent) {
 			"found", bp != nil,
 			"steppingOverBP", e.steppingOverBP != nil)
 		if bp == nil {
-			// Spurious SIGTRAP — a BRK we did not install (Go runtime
-			// internal trap or libc assertion). On ARM64 PC points AT the
-			// BRK; ContinueProcess with signal=0 leaves PC unchanged and
-			// re-executes the trap forever. Advance PC past the 4-byte BRK.
-			e.log.Warn("spurious SIGTRAP — advancing PC past BRK and resuming",
-				"pc", fmt.Sprintf("0x%x", stop.PC))
+			trap := archTrapInstruction()
+			resumePC := stop.PC + uint64(len(trap))
+			staleBreakpoint := false
+			if stop.SoftwareBreakpoint {
+				restored := e.bps.wasRestoredAt(stop.PC)
+				var trapResumePC uint64
+				var live bool
+				var err error
+				if restored {
+					trapResumePC, live, err = archTrapStartingAt(e.backend, stop.PC)
+				} else {
+					trapResumePC, live, err = archLiveTrapResumePC(e.backend, stop.PC)
+				}
+				if err == nil {
+					if live {
+						resumePC = trapResumePC
+					} else if restored {
+						// A trap stop can outlive an auto-cleared sentinel or user
+						// breakpoint. Its instruction bytes are restored, but amd64 RIP
+						// still sits one byte past code that never executed.
+						resumePC = stop.PC
+						staleBreakpoint = true
+					}
+				}
+			}
+			if staleBreakpoint {
+				e.log.Warn("stale breakpoint trap — resuming restored instruction",
+					"pc", fmt.Sprintf("0x%x", stop.PC))
+			} else {
+				e.log.Warn("spurious SIGTRAP — advancing PC past unowned trap and resuming",
+					"pc", fmt.Sprintf("0x%x", stop.PC))
+			}
 			if regs, err := e.backend.GetRegisters(stop.TID); err == nil {
-				regs.PC = stop.PC + uint64(len(archTrapInstruction()))
+				regs.PC = resumePC
 				_ = e.backend.SetRegisters(stop.TID, regs)
 			}
 			_ = e.backend.ContinueProcess()

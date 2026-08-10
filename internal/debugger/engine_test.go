@@ -510,6 +510,157 @@ var _ = Describe("Engine", func() {
 				Expect(evt.Kind).NotTo(Equal(protocol.EventBreakpointHit))
 			}
 		})
+
+		It("rewinds a stale trap after its breakpoint bytes were restored", func() {
+			const trapAddr = uint64(0x9999)
+			trap := debugger.ExportedTrapInstruction()
+			original := make([]byte, len(trap))
+			original[0] = 0x48
+			fb.seedMem(trapAddr, original)
+			id := debugger.ExportedSetBreakpointAt(d, trapAddr)
+			Expect(d.ClearBreakpoint(id)).To(Succeed())
+
+			livePC := trapAddr
+			if len(trap) == 1 {
+				livePC++
+			}
+			fb.seedRegs(debugger.Registers{PC: livePC})
+
+			continueAndConsumeContinued(d)
+			fb.pushStop(debugger.StopEvent{
+				Reason:             debugger.StopBreakpoint,
+				TID:                1,
+				SoftwareBreakpoint: true,
+			})
+
+			Eventually(fb.continueCount).Should(Equal(2))
+			Expect(fb.regs[1].PC).To(Equal(trapAddr),
+				"restored instruction must execute from its first byte")
+		})
+
+		It("skips an unowned trap instruction that is still present", func() {
+			const trapAddr = uint64(0x9999)
+			trap := debugger.ExportedTrapInstruction()
+			fb.seedMem(trapAddr, trap)
+
+			livePC := trapAddr
+			if len(trap) == 1 {
+				livePC++
+			}
+			fb.seedRegs(debugger.Registers{PC: livePC})
+
+			continueAndConsumeContinued(d)
+			fb.pushStop(debugger.StopEvent{
+				Reason:             debugger.StopBreakpoint,
+				TID:                1,
+				SoftwareBreakpoint: true,
+			})
+
+			Eventually(fb.continueCount).Should(Equal(2))
+			Expect(fb.regs[1].PC).To(Equal(trapAddr+uint64(len(trap))),
+				"unowned trap must not be re-executed")
+		})
+
+		It("skips a live alternate one-instruction trap encoding", func() {
+			const trapAddr = uint64(0x9999)
+			canonical := debugger.ExportedTrapInstruction()
+
+			var alternate []byte
+			livePC := trapAddr
+			if len(canonical) == 1 {
+				alternate = []byte{0xF1}
+				livePC++
+			} else {
+				alternate = []byte{0x20, 0x00, 0x20, 0xD4}
+			}
+			fb.seedMem(trapAddr, alternate)
+			fb.seedRegs(debugger.Registers{PC: livePC})
+
+			continueAndConsumeContinued(d)
+			fb.pushStop(debugger.StopEvent{
+				Reason:             debugger.StopBreakpoint,
+				TID:                1,
+				SoftwareBreakpoint: true,
+			})
+
+			Eventually(fb.continueCount).Should(Equal(2))
+			Expect(fb.regs[1].PC).To(Equal(trapAddr+uint64(len(alternate))),
+				"live alternate trap must be skipped rather than re-executed")
+		})
+
+		It("uses the live PC semantics of a multi-byte alternate trap", func() {
+			const trapAddr = uint64(0x9999)
+			canonical := debugger.ExportedTrapInstruction()
+
+			var alternate []byte
+			livePC := trapAddr
+			if len(canonical) == 1 {
+				alternate = []byte{0xCD, 0x03}
+				livePC += 2
+			} else {
+				alternate = []byte{0x40, 0x00, 0x20, 0xD4}
+			}
+			fb.seedMem(trapAddr, alternate)
+			fb.seedRegs(debugger.Registers{PC: livePC})
+
+			continueAndConsumeContinued(d)
+			fb.pushStop(debugger.StopEvent{
+				Reason:             debugger.StopBreakpoint,
+				TID:                1,
+				SoftwareBreakpoint: true,
+			})
+
+			Eventually(fb.continueCount).Should(Equal(2))
+			Expect(fb.regs[1].PC).To(Equal(trapAddr+uint64(len(alternate))),
+				"alternate trap length must not inherit bingo's canonical rewind")
+		})
+
+		It("does not decode a two-byte trap across a restored instruction boundary", func() {
+			canonical := debugger.ExportedTrapInstruction()
+			if len(canonical) != 1 {
+				Skip("x86 variable-length instruction boundary regression")
+			}
+
+			const trapAddr = uint64(0x9999)
+			fb.seedMem(trapAddr-1, []byte{0xCD, 0x03, 0x00})
+			id := debugger.ExportedSetBreakpointAt(d, trapAddr)
+			Expect(d.ClearBreakpoint(id)).To(Succeed())
+			fb.seedRegs(debugger.Registers{PC: trapAddr + 1})
+
+			continueAndConsumeContinued(d)
+			fb.pushStop(debugger.StopEvent{
+				Reason:             debugger.StopBreakpoint,
+				TID:                1,
+				SoftwareBreakpoint: true,
+			})
+
+			Eventually(fb.continueCount).Should(Equal(2))
+			Expect(fb.regs[1].PC).To(Equal(trapAddr),
+				"preceding bytes cannot change the restored breakpoint address")
+		})
+
+		It("does not rewind an unclassified SIGTRAP", func() {
+			const trapAddr = uint64(0x9999)
+			trap := debugger.ExportedTrapInstruction()
+			original := make([]byte, len(trap))
+			original[0] = 0x48
+			fb.seedMem(trapAddr, original)
+			id := debugger.ExportedSetBreakpointAt(d, trapAddr)
+			Expect(d.ClearBreakpoint(id)).To(Succeed())
+
+			livePC := trapAddr
+			if len(trap) == 1 {
+				livePC++
+			}
+			fb.seedRegs(debugger.Registers{PC: livePC})
+
+			continueAndConsumeContinued(d)
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: 1})
+
+			Eventually(fb.continueCount).Should(Equal(2))
+			Expect(fb.regs[1].PC).To(Equal(trapAddr+uint64(len(trap))),
+				"unknown trap origins retain the conservative skip behavior")
+		})
 	})
 
 	Describe("process exit", func() {

@@ -883,7 +883,11 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 				b.clearStepOver()
 				return b.reap()
 			}
-			return StopEvent{Reason: StopBreakpoint, TID: tid}, nil
+			return StopEvent{
+				Reason:             StopBreakpoint,
+				TID:                tid,
+				SoftwareBreakpoint: true,
+			}, nil
 
 		default:
 			return StopEvent{}, fmt.Errorf("mach_msg recv: unknown class %d", int(cls))

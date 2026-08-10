@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -115,6 +116,7 @@ type linuxBackend struct {
 	// Nil in production; tests inject this at the raw syscall seam to pin the
 	// exact ptrace request, TID, and signal without launching a tracee.
 	ptraceSyscall6Fn func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno)
+	ptraceSiginfoFn  func(tid int) (int32, error)
 	tgkillFn         func(tgid, tid int, signal syscall.Signal) error
 }
 
@@ -632,15 +634,24 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 			case 0:
 				reason, disp := classifyUserStop(true, b.stepping, b.stepTID, tid)
+				softwareBreakpoint := reason == StopBreakpoint && b.isSoftwareBreakpointTrap(tid)
 				if disp == parkStop {
 					// A sibling hit a software breakpoint while another thread
 					// is mid-step. It stays ptrace-stopped where it is; the
 					// engine sees it only once the step has completed and the
 					// trap being stepped over is back in place.
-					b.park(StopEvent{Reason: reason, TID: tid})
+					b.park(StopEvent{
+						Reason:             reason,
+						TID:                tid,
+						SoftwareBreakpoint: softwareBreakpoint,
+					})
 					continue
 				}
-				ev := StopEvent{Reason: reason, TID: tid}
+				ev := StopEvent{
+					Reason:             reason,
+					TID:                tid,
+					SoftwareBreakpoint: softwareBreakpoint,
+				}
 				b.recordDeliveredStop(ev)
 				if reason == StopSingleStep {
 					b.endStep()
@@ -815,4 +826,40 @@ func (b *linuxBackend) ptraceResume(request, tid, signal int) error {
 		return errno
 	}
 	return nil
+}
+
+const (
+	linuxTrapBreakpoint = int32(1)
+	linuxSIKernel       = int32(0x80)
+)
+
+func (b *linuxBackend) isSoftwareBreakpointTrap(tid int) bool {
+	code, err := b.ptraceSiginfoCode(tid)
+	return err == nil && (code == linuxTrapBreakpoint || code == linuxSIKernel)
+}
+
+func (b *linuxBackend) ptraceSiginfoCode(tid int) (int32, error) {
+	if b.ptraceSiginfoFn != nil {
+		return b.ptraceSiginfoFn(tid)
+	}
+
+	var (
+		info  unix.Siginfo
+		errno syscall.Errno
+	)
+	b.execPtrace(func() {
+		_, _, errno = syscall.Syscall6(
+			syscall.SYS_PTRACE,
+			uintptr(syscall.PTRACE_GETSIGINFO),
+			uintptr(tid),
+			0,
+			uintptr(unsafe.Pointer(&info)),
+			0,
+			0,
+		)
+	})
+	if errno != 0 {
+		return 0, errno
+	}
+	return info.Code, nil
 }

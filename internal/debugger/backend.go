@@ -56,9 +56,10 @@ const (
 // StopEvent is what Backend.Wait returns. PC may be zero; the engine resolves
 // missing stop PCs on its serialized event loop before emitting user events.
 type StopEvent struct {
-	Reason   StopReason
-	TID      int
-	PC       uint64
-	ExitCode int // StopExited only
-	Signal   int // StopSignal only
+	Reason             StopReason
+	TID                int
+	PC                 uint64
+	ExitCode           int  // StopExited only
+	Signal             int  // StopSignal only
+	SoftwareBreakpoint bool // StopBreakpoint only; false when trap origin is unknown
 }

@@ -33,15 +33,17 @@ func (b *breakpointEntry) toProtocol() protocol.Breakpoint {
 // breakpointTable owns installed breakpoints for one debug session.
 // Not concurrency-safe: the engine's event loop serialises all access.
 type breakpointTable struct {
-	byID   map[int]*breakpointEntry
-	byAddr map[uint64]*breakpointEntry
-	nextID atomic.Int64
+	byID          map[int]*breakpointEntry
+	byAddr        map[uint64]*breakpointEntry
+	restoredAddrs map[uint64]struct{}
+	nextID        atomic.Int64
 }
 
 func newBreakpointTable() *breakpointTable {
 	return &breakpointTable{
-		byID:   make(map[int]*breakpointEntry),
-		byAddr: make(map[uint64]*breakpointEntry),
+		byID:          make(map[int]*breakpointEntry),
+		byAddr:        make(map[uint64]*breakpointEntry),
+		restoredAddrs: make(map[uint64]struct{}),
 	}
 }
 
@@ -86,11 +88,17 @@ func (t *breakpointTable) clear(b Backend, id int) error {
 	}
 	delete(t.byID, id)
 	delete(t.byAddr, entry.addr)
+	t.restoredAddrs[entry.addr] = struct{}{}
 	return nil
 }
 
 func (t *breakpointTable) atAddr(addr uint64) *breakpointEntry {
 	return t.byAddr[addr]
+}
+
+func (t *breakpointTable) wasRestoredAt(addr uint64) bool {
+	_, ok := t.restoredAddrs[addr]
+	return ok
 }
 
 // removeFromTable / addToTable / reinstall: used by the step-over sequence to
