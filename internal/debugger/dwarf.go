@@ -745,6 +745,86 @@ func (r *dwarfReader) runtimeVarAddr(name string) (uint64, bool) {
 	return addr, addr != 0
 }
 
+// runtimeVarAddrs resolves several package-level variable addresses in a SINGLE
+// DWARF pass, caching each result exactly as runtimeVarAddr does. A name absent
+// from the returned map has no usable DW_OP_addr location.
+//
+// resolveVarAddr walks every DIE in the image, so looking names up one at a time
+// costs one full traversal of a Go binary's tens of thousands of entries per
+// name — on the serialized engine loop, at the first stop, where it is already
+// competing with the rest of the snapshot. Resolving a related set together
+// keeps that to one traversal that stops as soon as every requested name is
+// found. Same reasoning as funcIndex: DWARF scans on the engine loop are
+// expensive enough to notice, especially under -race.
+func (r *dwarfReader) runtimeVarAddrs(names ...string) map[string]uint64 {
+	out := make(map[string]uint64, len(names))
+	r.cacheMu.Lock()
+	defer r.cacheMu.Unlock()
+	if r.varAddrs == nil {
+		r.varAddrs = make(map[string]uint64)
+	}
+
+	missing := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		if addr, cached := r.varAddrs[name]; cached {
+			if addr != 0 {
+				out[name] = addr
+			}
+			continue
+		}
+		missing[name] = struct{}{}
+	}
+	if len(missing) == 0 {
+		return out
+	}
+
+	found := r.scanVarAddrs(missing)
+	for name := range missing {
+		addr := found[name]
+		r.varAddrs[name] = addr
+		if addr != 0 {
+			out[name] = addr
+		}
+	}
+	return out
+}
+
+// scanVarAddrs performs the one-pass traversal behind runtimeVarAddrs. It keeps
+// the first match for a name, mirroring resolveVarAddr's single-name semantics,
+// and stops early once every requested name has been decided.
+func (r *dwarfReader) scanVarAddrs(want map[string]struct{}) map[string]uint64 {
+	found := make(map[string]uint64, len(want))
+	rd := r.data.Reader()
+	for len(found) < len(want) {
+		entry, err := rd.Next()
+		if err != nil || entry == nil {
+			break
+		}
+		if entry.Tag != dwarf.TagVariable {
+			// Variables live at CU top level in Go DWARF; don't descend into
+			// subprograms (their locals share the tag and would shadow globals).
+			if entry.Tag == dwarf.TagSubprogram {
+				rd.SkipChildren()
+			}
+			continue
+		}
+		name, _ := entry.Val(dwarf.AttrName).(string)
+		if _, wanted := want[name]; !wanted {
+			continue
+		}
+		if _, decided := found[name]; decided {
+			continue
+		}
+		loc, ok := entry.Val(dwarf.AttrLocation).([]byte)
+		if !ok || len(loc) < 9 || loc[0] != 0x03 { // DW_OP_addr
+			found[name] = 0
+			continue
+		}
+		found[name] = uint64(int64(binary.LittleEndian.Uint64(loc[1:9])) + r.slide)
+	}
+	return found
+}
+
 func (r *dwarfReader) resolveVarAddr(name string) uint64 {
 	rd := r.data.Reader()
 	for {
