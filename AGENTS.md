@@ -1082,12 +1082,16 @@ terminate (issue #206). The backend owns the fix because only it knows both the
 stopped TID and the signal argument to the next ptrace resume:
 
 1. A surfaced `StopSignal` is recorded in `currentByTID[tid]` **before**
-   `lastStopTID` publishes that TID. A pending signal is never process-wide or a
-   single-slot value: another stop may move `lastStopTID`, but cannot transfer or
-   clear a different TID's signal. Resume removes state transactionally and
-   restores it when requeue or ptrace fails.
+   `lastStopTID` publishes that TID. If a distinct signal for that TID arrives
+   while an older current signal is retained across a failed continue or a
+   signal-zero step, the older signal moves to `backlogByTID[tid]` instead of
+   being overwritten; matching standard signals coalesce. The newest delivered
+   stop stays current because it is the signal the exact next `PTRACE_CONT` must
+   inject, while the displaced signals are requeued to that TID in capture order.
+   Pending state is never process-wide: another stop may move `lastStopTID`, but
+   cannot transfer or clear a different TID's signals.
 2. Only `PTRACE_CONT` injects a pending signal. `PTRACE_SINGLESTEP` always uses
-   signal zero and leaves both pending slots intact: injecting any signal while
+   signal zero and leaves all pending state intact: injecting any signal while
    stepping enters its signal frame and reports a trace trap before the
    instruction the engine promised to step has executed. This state is normally
    consumed by the automatic continue from `StopSignal`; it remains observable
@@ -1100,8 +1104,9 @@ stopped TID and the signal argument to the next ptrace resume:
    further steps. The next continue uses exact-TID `tgkill(SIGURG)` followed by
    `PTRACE_CONT(..., 0)`; only the resulting fresh signal-delivery stop resumes
    with `PTRACE_CONT(..., SIGURG)`. A simultaneous current signal has priority
-   while the delayed SIGURG is requeued, matching SIGURG instances coalesce, and
-   the first delayed signal wins until it has been requeued.
+   while the displaced-signal backlog and delayed SIGURG are requeued, matching
+   instances coalesce, and the first delayed signal wins until it has been
+   requeued.
 4. The parked-stop FIFO from #202 retains the signal inside the `StopEvent`.
    Parking never touches pending state. `drainParked` performs the same
    signal-before-TID delivery handoff as a live `Wait` result.
@@ -1109,15 +1114,23 @@ stopped TID and the signal argument to the next ptrace resume:
    preserving manual Pause and leftover-interrupt suppression even when the same
    TID has delayed SIGURG. Clone `SIGSTOP`, `SIGCONT`, ptrace events and spurious
    breakpoint traps remain internal Wait-loop cases with signal zero.
-6. Internal continues clear current state only for their own TID and preserve or
-   requeue delayed state; internal single-steps leave both slots intact. A failed
-   exact-TID continue restores the captured current signal even for `ESRCH`;
-   only a path that has conclusively observed thread/image death clears first.
-   Non-main thread exit, held-owner release and clone initial-stop handling clear
-   their TID **before** any resume, while exec, process exit, Kill/detach and
-   tracer shutdown purge all state to prevent TID reuse. The maps are
-   mutex-protected because `Wait` publishes from its goroutine while the engine
-   consumes them; unlike `stepQueue`, this state crosses goroutines.
+6. Resume takes a per-TID batch transactionally. Successfully requeued backlog
+   entries are not restored if a later requeue fails; the unsent suffix and
+   current signal are. A failed public exact-TID `PTRACE_CONT` restores the
+   current signal even for `ESRCH`, while already-requeued entries stay owned by
+   the kernel. Internal continue retains the established conservative rollback:
+   on ptrace failure it restores the whole captured batch because retirement has
+   not been established. A stopped TID cannot deliver the first requeue before
+   retry and matching standard signals coalesce; if `ESRCH` meant the TID escaped
+   that stop, its fresh delivery goes through `set`, which coalesces it against
+   the restored backlog. Internal single-steps leave every pending collection
+   intact. Only a path that has conclusively observed thread/image death clears
+   first. Non-main `Exited`, `Signaled`, and `PTRACE_EVENT_EXIT` branches,
+   held-owner release, and clone initial-stop handling clear their TID **before**
+   any resume, while exec, process exit, Kill/detach, and tracer shutdown purge
+   all state to prevent TID reuse. The maps are mutex-protected because `Wait`
+   publishes from its goroutine while the engine consumes them; unlike
+   `stepQueue`, this state crosses goroutines.
 
 The host-agnostic map tests, linux backend raw ptrace-tuple tests, the `signals`
 E2E label (one SIGSEGV/SIGABRT output followed by signal death, one handled
@@ -1129,13 +1142,19 @@ discriminator pins two one-byte instruction advances, exact
 `tgkill → PTRACE_CONT(0) → fresh stop → PTRACE_CONT(SIGURG)` tuples, handler
 return, and post-handler exit. The overlap spec must observe a signal-specific
 parked-stop count increase; signal outputs plus generic parked traps are not
-proof that a signal was held during a step.
+proof that a signal was held during a step. Backend mutation gates additionally
+pin failed-continue → signal-zero step → distinct same-TID signal, requiring the
+older signal to be requeued to that TID and the fresh signal to be the exact
+`PTRACE_CONT` argument, plus direct cleanup coverage for all three non-leader
+death branches.
 
-The delayed-SIGURG transaction necessarily recreates delivery with `tgkill`.
-It preserves the exact signal number and target TID, but not the original
-`siginfo_t` or ordering relative to signals that arrive during the re-step.
-Preserving those details requires the broader wait-ownership work, not a
-process-global pending-signal scalar in this layer.
+Deferred-signal transactions necessarily recreate delivery with `tgkill`.
+They preserve every distinct signal number, its target TID, and the backlog's
+requeue-attempt order, but not the original `siginfo_t`; once multiple standard
+signals are kernel-pending, Linux chooses their delivery order, and signals that
+arrive concurrently during requeue or the re-step may interleave. Preserving
+that provenance and delivery ordering requires the broader wait-ownership work,
+not a process-global pending-signal scalar in this layer.
 
 **Composition constraint for #205:** a future process-wide wait broker may own
 the raw `wait4`, but it must route the complete `(TID, signal)` status to the
