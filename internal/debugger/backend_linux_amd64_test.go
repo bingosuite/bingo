@@ -383,25 +383,10 @@ func TestLinuxBackendHeldSignalSurfacesOnlyWithItsOwnStop(t *testing.T) {
 	}
 }
 
-// TestLinuxBackendSteppedThreadDeathDeliversHeldStopBeforeExit pins the
-// precedence between the two events that can end a step abnormally: the stepped
-// thread dying (which lifts the gate) and the main thread exiting (which purges).
-//
-// Because the drain runs at the top of the Wait loop, *before* blocking in
-// wait4, a stop held behind a step whose thread then died is delivered on the
-// next Wait, even if the main thread's exit is already queued in the kernel
-// behind it. That ordering is deliberate and is the same property that makes a
-// same-address sibling resolve only after the reinstall; inverting it to peek at
-// the wait queue first would defeat the fix. It is safe because a parked thread
-// is still ptrace-stopped when it is delivered. Once the main exit *is*
-// observed, purge wins and nothing is delivered afterwards, so the engine never
-// acts on a dead thread.
-//
-// This test pins the ordering, the traceTID anchor and the post-purge silence.
-// It deliberately does not claim anything about a delivery that races a dying
-// process: that is the engine's existing haltOnError path (see
-// engine_halt_test.go), not a property of this queue.
-func TestLinuxBackendSteppedThreadDeathDeliversHeldStopBeforeExit(t *testing.T) {
+// TestLinuxBackendSteppedThreadDeathReconcilesBeforeDelivery pins the exact-TID
+// boundary: the held thread becomes the memory-write anchor, but its real stop
+// cannot be dequeued until the engine confirms the removed trap was reconciled.
+func TestLinuxBackendSteppedThreadDeathReconcilesBeforeDelivery(t *testing.T) {
 	const (
 		pid     = 1001
 		stepped = 1002
@@ -413,25 +398,31 @@ func TestLinuxBackendSteppedThreadDeathDeliversHeldStopBeforeExit(t *testing.T) 
 	b.beginStep(stepped)
 	b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
 
-	// The stepped thread exits before its step completes. Wait observes that as
-	// a non-main thread exit and clears the step bookkeeping.
-	b.clearStepIfStepped(stepped)
+	b.interruptStepIfStepped(stepped)
 
-	// The held stop must now be delivered rather than stranded or dropped: it is
-	// a real breakpoint on a thread that is still ptrace-stopped.
 	ev, err := b.Wait()
 	if err != nil {
 		t.Fatalf("Wait() error = %v", err)
 	}
-	if ev.TID != foreign || ev.Reason != StopBreakpoint {
-		t.Fatalf("Wait() = %+v, want the held breakpoint on tid %d after the stepped thread died", ev, foreign)
+	if ev.TID != foreign || ev.Reason != StopStepThreadExited {
+		t.Fatalf("Wait() = %+v, want the reconciliation boundary on tid %d", ev, foreign)
 	}
 	if got := b.traceTID(); got != foreign {
-		t.Fatalf("traceTID() = %d, want the delivered thread %d", got, foreign)
+		t.Fatalf("traceTID() = %d, want reconciliation anchored to held tid %d", got, foreign)
+	}
+	if b.parkedDepthForTest() != 1 {
+		t.Fatal("the reconciliation boundary dequeued the held stop")
 	}
 
-	// The main thread exiting afterwards purges anything still held, so no
-	// delivery can follow the exit and target a dead thread.
+	b.completeStepThreadExit()
+	ev, err = b.Wait()
+	if err != nil {
+		t.Fatalf("Wait() after reconciliation error = %v", err)
+	}
+	if ev.TID != foreign || ev.Reason != StopBreakpoint {
+		t.Fatalf("Wait() after reconciliation = %+v, want held breakpoint on tid %d", ev, foreign)
+	}
+
 	b.park(StopEvent{Reason: StopBreakpoint, TID: foreign})
 	b.purge()
 	if ev, ok := b.drainParked(); ok {
@@ -801,10 +792,9 @@ func TestLinuxWaitAbortsTheStepItCannotResume(t *testing.T) {
 	}
 }
 
-// TestLinuxWaitReleasesTheGateWhenTheSteppedThreadDies pins G1 at the call site:
-// a step completion can never arrive for a thread that is gone, so the gate must
-// open and the stops held behind it must drain.
-func TestLinuxWaitReleasesTheGateWhenTheSteppedThreadDies(t *testing.T) {
+// TestLinuxWaitReportsReconciliationWhenTheSteppedThreadDies executes both
+// kernel death shapes and requires the internal boundary before held delivery.
+func TestLinuxWaitReportsReconciliationWhenTheSteppedThreadDies(t *testing.T) {
 	const (
 		pid     = 9301
 		stepped = 9302
@@ -833,11 +823,55 @@ func TestLinuxWaitReleasesTheGateWhenTheSteppedThreadDies(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Wait() error = %v", err)
 			}
+			if ev.TID != foreign || ev.Reason != StopStepThreadExited {
+				t.Fatalf("Wait() = %+v, want a reconciliation boundary anchored to tid %d", ev, foreign)
+			}
+			if b.parkedDepthForTest() != 1 {
+				t.Fatal("held stop drained before engine reconciliation")
+			}
+			if b.stepExitCount() != 1 {
+				t.Fatalf("stepExitCount() = %d, want 1", b.stepExitCount())
+			}
+
+			b.completeStepThreadExit()
+			ev, err = b.Wait()
+			if err != nil {
+				t.Fatalf("Wait() after reconciliation error = %v", err)
+			}
 			if ev.TID != foreign || ev.Reason != StopBreakpoint {
-				t.Fatalf("Wait() = %+v, want the held stop on tid %d; the gate did "+
-					"not open when the stepped thread died", ev, foreign)
+				t.Fatalf("Wait() after reconciliation = %+v, want held stop on tid %d", ev, foreign)
 			}
 		})
+	}
+}
+
+// TestLinuxWaitHoldsTheFirstStopAfterTheStepOwnerDies covers the no-queue-yet
+// ordering: a later user stop must become the reconciliation anchor rather than
+// slipping through because hardware stepping was already cleared.
+func TestLinuxWaitHoldsTheFirstStopAfterTheStepOwnerDies(t *testing.T) {
+	const (
+		pid     = 9401
+		stepped = 9402
+		foreign = 9403
+	)
+
+	b := &linuxBackend{pid: pid}
+	script := &scriptedWait{stops: []scriptedStop{
+		{tid: stepped, status: stoppedAt(syscall.SIGTRAP, syscall.PTRACE_EVENT_EXIT)},
+		{tid: foreign, status: stoppedAt(syscall.SIGTRAP, 0)},
+	}}
+	script.install(b)
+	b.beginStep(stepped)
+
+	ev, err := b.Wait()
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if ev.Reason != StopStepThreadExited || ev.TID != foreign {
+		t.Fatalf("Wait() = %+v, want reconciliation anchored to first later stop on tid %d", ev, foreign)
+	}
+	if b.parkedDepthForTest() != 1 {
+		t.Fatal("first post-death user stop was not retained behind reconciliation")
 	}
 }
 

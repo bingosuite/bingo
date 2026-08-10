@@ -348,15 +348,18 @@ See `engine.resumeFromBreakpoint` and the `StopSingleStep` branch of
 
 Internal sentinel BP files: `<stepover-next>`, `<stepout-return>`,
 `<direct-addr>` (test helper). These get auto-cleared when hit and emit
-`EventStepped`, not `EventBreakpointHit`. The engine remembers the addresses of
-auto-cleared stepping sentinels: Linux can deliver a sibling's already-queued hit
-after the trap has been restored, when amd64 RIP is still one byte past the old
-INT3. A later stop at a remembered address is rewound and resumed silently
-instead of entering the generic spurious-SIGTRAP path mid-instruction. The
-precise retired-address set avoids broadly reclassifying unrelated
-tracee-generated `raise(SIGTRAP)` stops. Retired addresses live for the engine's
-lifetime: per-thread wait statuses provide no safe point at which every
-already-queued sibling hit is known to have drained.
+`EventStepped`, not `EventBreakpointHit`. Linux can deliver a sibling's
+already-queued hit after the trap has been restored, when amd64 RIP is still one
+byte past the old INT3. The engine therefore retains each successfully restored
+sentinel address **and its restored instruction bytes** for the session lifetime:
+per-thread wait statuses expose no point at which every queued sibling hit has
+drained. A later unmatched stop is rewound only when current memory matches one
+of those restored histories and the architecture decoder proves no live trap
+instruction starts at, or spans into, that address. A genuine `INT3`/`ICEBP`/
+`CD 03` or ARM `BRK` is advanced instead; address history alone would re-execute
+that trap forever, and on amd64 a `CD 03` whose second byte is the remembered
+address would otherwise resume mid-instruction. Read/register/continue failures
+on the stale-recovery path use `haltOnError` (`Error` then `Paused`).
 
 Clearing a breakpoint is final even when the tracee is parked on it or already
 single-stepping off it. A successful parked clear restores the bytes and
@@ -445,7 +448,8 @@ liveness loss from the other direction. None has a confirmed backend
 reachability, so none is fixed or filed yet; **do not treat this class as
 globally closed.**
 
-The sites are `populateBreakpointStop` failure (`StopBreakpoint`),
+The sites are `populateBreakpointStop` and retired-sentinel verification/
+recovery failure (`StopBreakpoint`),
 `populateStopPC` failure and `bps.reinstall` failure (`StopSingleStep`), the
 `bpResumeStepOut` return-breakpoint `set` failure (which is also the one site
 that must add the otherwise-missing `setState(stateSuspended)` — it is reached
@@ -458,16 +462,19 @@ already safe: it emits a suspending `EventStepped`.
 Source: the platform-neutral `classifyUserStop` + `stepQueue` in
 [waitpark.go](internal/debugger/waitpark.go), embedded in `linuxBackend` and
 driven from `Wait` in
-[backend_linux_amd64.go](internal/debugger/backend_linux_amd64.go) (which adds
-only `drainParked`, the one helper that must also move `lastStopTID`). **The
-whole fix lives in `Wait`; there is no engine-side component.**
+[backend_linux_amd64.go](internal/debugger/backend_linux_amd64.go). Normal stop
+parking and delivery live entirely in `Wait`. The sole engine handshake is the
+abnormal stepped-thread-death boundary: the backend cannot reinstall the
+breakpoint entry the engine owns, so it returns an internal
+`StopStepThreadExited` before releasing the real held stop.
 
 `stepQueue` owns the step bookkeeping (`stepping`/`stepTID`, via
 `beginStep`/`endStep`) *and* the held stops, because the two are one state
-machine: the release gate is literally "no step outstanding". It is embedded, so
-every pre-existing `b.stepping` / `b.stepTID` use site is unchanged. It carries
-no build tag and no backend dependency so the ordering/gating rules are
-unit-testable — and mutation-checkable — on any host.
+machine: the release gate requires both "no hardware step outstanding" and "no
+dead-owner reconciliation pending". It is embedded, so every pre-existing
+`b.stepping` / `b.stepTID` use site is unchanged. It carries no build tag and no
+backend dependency so the ordering/gating rules are unit-testable — and
+mutation-checkable — on any host.
 
 **The invariant: while a single-step is outstanding, `Wait` does not return a
 user-visible stop belonging to any other thread.** The sibling stays
@@ -501,10 +508,12 @@ is backend-private, and by the time a deferred event were replayed the exact
 step completion would already have overwritten `lastStopTID`. Parking inside
 `Wait` preserves the invariant instead of trying to reconstruct it — a parked
 event is simply not a stop yet, and `recordStop` runs at **delivery**, never at
-park time. That is why the engine needs no production change at all.
+park time. The death boundary also stays backend-owned: it borrows the oldest
+held stop's still-stopped TID as the write anchor without dequeuing that stop,
+then the engine acknowledges only after reinstalling its breakpoint.
 
-Rules, all enforced inside `Wait` (the queue is `Wait`-owned; see the locking
-note below):
+Rules are enforced by `Wait`, except for the one serialized engine
+acknowledgement in rule 5 (see the locking note below):
 
 1. **Park only foreign user-visible stops.** `classifyUserStop` parks a
    `StopBreakpoint`/`StopSignal` only when a step is in flight (`stepping` **and**
@@ -531,12 +540,17 @@ note below):
    (the ordering hazard issue #204 raises for pending signals). Do not hoist the
    signal — or any other per-stop datum — into `linuxBackend`; that would
    reintroduce exactly that ordering obligation.
-5. **A dead stepped thread lifts the gate.** `clearStepIfStepped` clears
-   `stepping`/`stepTID` when the stepped TID exits or dies by signal, otherwise
-   its completion never arrives and the queue is stranded. It deliberately does
-   **not** reinstall the trap that step was stepping off: the thread that owned
-   the step is gone, there is no PC to resume, and the engine learns about the
-   death through the stop that follows. An accepted limit, not an oversight.
+5. **A dead stepped thread closes through an internal reconciliation boundary.**
+   `interruptStepIfStepped` clears hardware ownership (`stepping`/`stepTID`) when
+   the exact stepped TID exits, because its completion can never arrive, but it
+   keeps the parked-stop gate closed. Once a held stop exists, `Wait` returns
+   `StopStepThreadExited` anchored to that stop's TID **without dequeuing it**.
+   The engine reinstalls `steppingOverBP`, then calls
+   `completeStepThreadExit`; only the following `Wait` may deliver the real stop.
+   If reinstall fails, the original entry remains owned by `steppingOverBP`,
+   `Error → Paused` is emitted, and Continue/Step are rejected; Kill/Restart is
+   the safe recovery. This prevents a sibling from replacing `lastBP` while the
+   original logical breakpoint is still out of the table.
 6. **Teardown purges inside `Wait`.** `stepQueue.purge` runs on the main thread's
    `PTRACE_EVENT_EXIT`, its real exit, its signal death, and `ECHILD`. There is
    deliberately **no engine-callable purge**: the queue is not part of the
@@ -626,31 +640,21 @@ that their stops are *reported later*, after the trap is back:
   cannot stop again until it is resumed (G7) — so no cap is needed.
 - A user `ClearBreakpoint` of an address a parked stop refers to still surfaces
   that stop as a generic SIGTRAP. One-shot engine sentinels are different: their
-  retired addresses are remembered, so delayed sibling hits are rewound and
-  resumed safely even when they were queued in the kernel and never entered this
-  FIFO. The focused engine test pins the exact `SetRegisters(tid, rewoundPC)`
-  operation, and the plain native overlap spec requires
+  restored-byte histories are remembered, so a delayed sibling hit is rewound
+  only when current bytes match the engine's successful restore and no live
+  architecture trap spans the address. The focused engine tests pin the exact
+  `SetRegisters(tid, rewoundPC)` operation, a genuine live trap at the same
+  address, and x86's cross-boundary `CD 03`; the plain native overlap spec requires
   `LinuxRetiredInternalBreakpointCount > 0`; an armed-ness probe alone cannot
   distinguish safe recovery from the mid-instruction path.
-- **A stepped thread that dies with stops still held releases them, and that
-  delivery deliberately precedes an already-queued main-thread exit.** Because
-  the drain runs at the top of the `Wait` loop, before blocking in `wait4`, a
-  stop held behind an abandoned step is delivered on the next `Wait` even if the
-  process is on its way out. This is accepted, not overlooked: the parked thread
-  is still ptrace-stopped at delivery, so it is a real stop; the alternative —
-  peeking at the wait queue before draining — would invert the drain-before-block
-  rule that makes a same-address sibling resolve only after the reinstall, i.e.
-  it would defeat the fix. Once the main exit *is* observed, `purge` wins and
-  nothing is delivered afterwards, so the engine never acts on a dead thread.
-  `TestLinuxBackendSteppedThreadDeathDeliversHeldStopBeforeExit` pins exactly
-  three things: the delivery happens, `traceTID` names the delivered thread, and
-  a post-purge drain releases nothing. What it does **not** pin is the behaviour
-  if a delivery races a dying process: the engine's ptrace reads would then fail
-  and take the base's existing `haltOnError` path (`EventError` plus a suspending
-  `EventPaused`, pinned by `engine_halt_test.go`), and the exit surfaces on the
-  following `Wait`. That is inherited engine behaviour this queue neither adds
-  nor changes — do not cite this backend test as evidence for it, and do not
-  treat the degradation as a substitute for the ordering guarantees above.
+- **A stepped thread that dies never releases a held stop directly.** The
+  internal boundary is returned first and records the held TID as `traceTID`, so
+  the engine's reinstall writes through a genuinely stopped thread while the
+  actual `StopEvent` remains FIFO-owned by `Wait`. After acknowledgement, the
+  top-of-loop drain delivers it before blocking in `wait4`; main-process exit
+  still purges anything not yet delivered. The queue, scripted-`Wait`, engine,
+  and native raw-`SYS_exit` tests separately pin the gate, exact-TID anchor,
+  breakpoint ownership, and real-kernel path.
 - **Kill ownership is unchanged, and no second reaper is added.** Killing a
   *suspended* tracee still reaps through `reapAfterKill`, which loops
   `Wait4(-1, WALL)` and resumes whatever it finds ptrace-stopped: a parked thread
@@ -688,9 +692,10 @@ Successive `Wait` calls run on different one-shot `waitLoop` goroutines that the
 engine starts with `go e.waitLoop()` **after** consuming the previous `Wait`'s
 result from `stopCh`, so no two ever overlap; that channel-and-goroutine-start
 chain is also what orders the `stepping`/`stepTID` writes the engine makes in
-between (`SingleStep` sets them, `ContinueProcess` clears them) against the next
-`Wait`'s reads. Do not add a mutex, and do not call these helpers from anywhere
-but `Wait`.
+between (`SingleStep` sets them, `ContinueProcess` clears them) and the
+`completeStepThreadExit` acknowledgement against the next `Wait`'s reads.
+Only the cumulative diagnostic counters are atomic because native tests read
+them concurrently; do not add a queue mutex.
 
 Regression gates: the classifier table, the queue-mechanics tests **and** the
 resume-decision tests covering rules 7–8 in
@@ -703,7 +708,8 @@ every branch's effect on the step is executed rather than merely decided, plus
 the linux-only `overlap` E2E label in
 [debugger_e2e_linux_amd64_test.go](test/integration/debugger_e2e_linux_amd64_test.go):
 step-over overlap, machine-step (`StepInto`) overlap, a foreign ordinary-signal
-storm, `Pause` racing an in-flight step, and kill with stops held. Those assert
+storm, `Pause` racing an in-flight step, kill with stops held, and a raw
+`SYS_exit` that kills the exact stepped thread. Those assert
 only invariants the fix guarantees — both logical breakpoints remain tracked at
 every observable stop, every hit belongs to a known id, no error or unexpected
 exit, both ids still clearable, threads still making progress at the end of the
@@ -753,6 +759,13 @@ proves the rule fired against a real kernel. The foreign-signal target storms
 specifically to make that landing happen; the spec reports the count rather than
 asserting a threshold, because which thread a process-directed signal lands on is
 racy per cycle.
+
+**`LinuxStepThreadExitCount` is the native evidence for rule 5.** The dedicated
+C/assembly target places a breakpoint directly on `SYS_exit`, installs a hot
+sibling breakpoint while that thread is suspended, then resumes the removed
+instruction. The count proves the exact step owner died; a positive parked count
+proves a sibling stop crossed the gate; and re-setting/clearing the original ID
+proves reconciliation restored logical ownership before that sibling surfaced.
 
 **A held interrupt is usually surfaced, not suppressed — but only usually.** It
 surfaces when it drains while `manualStopPending` is still set, which is the
