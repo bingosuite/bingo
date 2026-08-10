@@ -825,7 +825,11 @@ func (e *engine) handleStop(stop StopEvent) {
 			e.endThreadStep()
 			switch e.bpResume {
 			case bpResumeContinue:
-				_ = e.backend.ContinueProcess()
+				if err := e.backend.ContinueProcess(); err != nil {
+					e.setState(stateSuspended)
+					e.haltOnError(protocol.CmdContinue, fmt.Errorf("continue after breakpoint step: %w", err), stop)
+					return
+				}
 				e.setState(stateRunning)
 				go e.waitLoop()
 			case bpResumeStep:
@@ -848,10 +852,15 @@ func (e *engine) handleStop(stop StopEvent) {
 								e.setState(stateRunning)
 								go e.waitLoop()
 								return
-							} else if entry != nil {
-								_ = e.bps.clear(e.backend, entry.id)
+							} else {
+								if entry != nil {
+									_ = e.bps.clear(e.backend, entry.id)
+								}
 								e.stepOverFile = ""
 								e.stepOverLine = 0
+								e.setState(stateSuspended)
+								e.haltOnError(protocol.CmdStepOver, fmt.Errorf("continue after source step breakpoint: %w", cerr), stop)
+								return
 							}
 						} else {
 							e.log.Warn("sourceStepOver: set "+stepOverNextFile+" failed",
@@ -882,7 +891,11 @@ func (e *engine) handleStop(stop StopEvent) {
 						fmt.Errorf("StepOut: set return breakpoint: %w", setErr), stop)
 					return
 				}
-				_ = e.backend.ContinueProcess()
+				if err := e.backend.ContinueProcess(); err != nil {
+					e.setState(stateSuspended)
+					e.haltOnError(protocol.CmdStepOut, fmt.Errorf("continue after StepOut breakpoint: %w", err), stop)
+					return
+				}
 				e.setState(stateRunning)
 				go e.waitLoop()
 			}
@@ -967,13 +980,21 @@ func (e *engine) handleStop(stop StopEvent) {
 			// silently — surfacing it as output or EventPaused would be bogus.
 			// The linux backend excludes PauseSignal from pending delivery, so
 			// ContinueProcess resumes with signal 0.
-			_ = e.backend.ContinueProcess()
+			if err := e.backend.ContinueProcess(); err != nil {
+				e.setState(stateSuspended)
+				e.haltOnError(protocol.CmdNone, fmt.Errorf("continue after stale pause signal: %w", err), stop)
+				return
+			}
 			e.setState(stateRunning)
 			go e.waitLoop()
 			return
 		}
 		e.emitOutput("stderr", fmt.Sprintf("signal %d", stop.Signal))
-		_ = e.backend.ContinueProcess()
+		if err := e.backend.ContinueProcess(); err != nil {
+			e.setState(stateSuspended)
+			e.haltOnError(protocol.CmdNone, fmt.Errorf("continue after signal %d on thread %d: %w", stop.Signal, stop.TID, err), stop)
+			return
+		}
 		e.setState(stateRunning)
 		go e.waitLoop()
 	}
