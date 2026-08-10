@@ -56,6 +56,4 @@ jobs:
         run: go test -v ./...
 
       - name: Linux stop TID race regressions
-        run: >
-          go test -race -count=1 -v ./internal/debugger
-          -run '^TestLinuxBackend(Running(Kill|Memory)StopTIDConcurrentAccess|StoppedMemoryStopTIDOrdered)$'
+        run: go test -race -count=1 -v ./internal/debugger -run '^TestLinuxBackendStopTIDRaceRegressions$'
