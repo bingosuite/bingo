@@ -171,8 +171,9 @@ func TestListSessionsContextCancelsRequest(t *testing.T) {
 }
 
 func TestPeerCloseNormalizesCommandErrors(t *testing.T) {
+	upgrader := websocket.Upgrader{}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		conn, err := websocket.Upgrade(w, r, nil, 0, 0)
+		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
 		}
