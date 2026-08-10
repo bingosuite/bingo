@@ -89,8 +89,16 @@ func buildSteppingSIGURGTarget(t *testing.T) (string, uint64) {
 	return "", 0
 }
 
-func TestLinuxSteppingThreadSIGURGIsForwardedAfterInstructionStep(t *testing.T) {
-	binary, stepPC := buildSteppingSIGURGTarget(t)
+type steppingSIGURGTracee struct {
+	t        *testing.T
+	backend  *linuxBackend
+	pid      int
+	cmd      *exec.Cmd
+	finished bool
+}
+
+func startSteppingSIGURGTracee(t *testing.T, binary string) *steppingSIGURGTracee {
+	t.Helper()
 	b := newBackend().(*linuxBackend)
 	pid, cmd, err := startTracedProcess(b, binary, nil, nil)
 	if err != nil {
@@ -98,98 +106,109 @@ func TestLinuxSteppingThreadSIGURGIsForwardedAfterInstructionStep(t *testing.T) 
 		t.Fatalf("start target: %v", err)
 	}
 	b.setPID(pid)
-	finished := false
-	defer func() {
-		if !finished {
-			_ = cmd.Process.Kill()
-			b.reapAfterKill()
-		}
-		b.closeTracer()
-	}()
+	tracee := &steppingSIGURGTracee{t: t, backend: b, pid: pid, cmd: cmd}
+	t.Cleanup(tracee.cleanup)
+	return tracee
+}
 
-	if err := b.ContinueProcess(); err != nil {
-		t.Fatalf("continue to ready stop: %v", err)
+func (p *steppingSIGURGTracee) cleanup() {
+	if !p.finished {
+		_ = p.cmd.Process.Kill()
+		p.backend.reapAfterKill()
 	}
-	ready, err := b.Wait()
+	p.backend.closeTracer()
+}
+
+func (p *steppingSIGURGTracee) prepare(stepPC uint64) {
+	p.t.Helper()
+	if err := p.backend.ContinueProcess(); err != nil {
+		p.t.Fatalf("continue to ready stop: %v", err)
+	}
+	ready, err := p.backend.Wait()
 	if err != nil {
-		t.Fatalf("wait for ready stop: %v", err)
+		p.t.Fatalf("wait for ready stop: %v", err)
 	}
-	if ready.Reason != StopSignal || ready.TID != pid || ready.Signal != int(syscall.SIGSTOP) {
-		t.Fatalf("ready stop = %+v, want main-thread SIGSTOP", ready)
+	if ready.Reason != StopSignal || ready.TID != p.pid || ready.Signal != int(syscall.SIGSTOP) {
+		p.t.Fatalf("ready stop = %+v, want main-thread SIGSTOP", ready)
 	}
 
-	regs, err := b.GetRegisters(pid)
+	regs, err := p.backend.GetRegisters(p.pid)
 	if err != nil {
-		t.Fatalf("read ready registers: %v", err)
+		p.t.Fatalf("read ready registers: %v", err)
 	}
 	regs.PC = stepPC
-	if err := b.SetRegisters(pid, regs); err != nil {
-		t.Fatalf("set step target PC: %v", err)
+	if err := p.backend.SetRegisters(p.pid, regs); err != nil {
+		p.t.Fatalf("set step target PC: %v", err)
 	}
+}
 
-	var resumeCalls []linuxResumeCall
-	b.ptraceSyscall6Fn = func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
-		resumeCalls = append(resumeCalls, linuxResumeCall{
+func (p *steppingSIGURGTracee) recordCalls(resumeCalls *[]linuxResumeCall, tgkillCalls *[]linuxTgkillCall) {
+	p.backend.ptraceSyscall6Fn = func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
+		*resumeCalls = append(*resumeCalls, linuxResumeCall{
 			trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
 		})
 		return syscall.Syscall6(trap, a1, a2, a3, a4, a5, a6)
 	}
-	var tgkillCalls []linuxTgkillCall
-	b.tgkillFn = func(tgid, targetTID int, signal syscall.Signal) error {
-		tgkillCalls = append(tgkillCalls, linuxTgkillCall{tgid: tgid, tid: targetTID, signal: int(signal)})
+	p.backend.tgkillFn = func(tgid, targetTID int, signal syscall.Signal) error {
+		*tgkillCalls = append(*tgkillCalls, linuxTgkillCall{tgid: tgid, tid: targetTID, signal: int(signal)})
 		return syscall.Tgkill(tgid, targetTID, signal)
 	}
+}
 
-	if err := syscall.Tgkill(pid, pid, syscall.SIGURG); err != nil {
-		t.Fatalf("queue initial SIGURG: %v", err)
+func (p *steppingSIGURGTracee) queueSIGURG() {
+	p.t.Helper()
+	if err := syscall.Tgkill(p.pid, p.pid, syscall.SIGURG); err != nil {
+		p.t.Fatalf("queue initial SIGURG: %v", err)
 	}
-	if err := b.SingleStep(pid); err != nil {
-		t.Fatalf("first SingleStep: %v", err)
-	}
-	first, err := b.Wait()
-	if err != nil {
-		t.Fatalf("wait for first step: %v", err)
-	}
-	if first.Reason != StopSingleStep || first.TID != pid {
-		t.Fatalf("first stop = %+v, want StopSingleStep on tid %d", first, pid)
-	}
-	regs, err = b.GetRegisters(pid)
-	if err != nil {
-		t.Fatalf("read first-step registers: %v", err)
-	}
-	if regs.PC != stepPC+1 {
-		t.Fatalf("first-step PC = 0x%x, want 0x%x", regs.PC, stepPC+1)
-	}
+}
 
-	if err := b.SingleStep(pid); err != nil {
-		t.Fatalf("second SingleStep: %v", err)
+func (p *steppingSIGURGTracee) requireStep(name string, wantPC uint64) {
+	p.t.Helper()
+	if err := p.backend.SingleStep(p.pid); err != nil {
+		p.t.Fatalf("%s SingleStep: %v", name, err)
 	}
-	second, err := b.Wait()
+	stop, err := p.backend.Wait()
 	if err != nil {
-		t.Fatalf("wait for second step: %v", err)
+		p.t.Fatalf("wait for %s step: %v", name, err)
 	}
-	if second.Reason != StopSingleStep || second.TID != pid {
-		t.Fatalf("second stop = %+v, want StopSingleStep on tid %d", second, pid)
+	if stop.Reason != StopSingleStep || stop.TID != p.pid {
+		p.t.Fatalf("%s stop = %+v, want StopSingleStep on tid %d", name, stop, p.pid)
 	}
-	regs, err = b.GetRegisters(pid)
+	regs, err := p.backend.GetRegisters(p.pid)
 	if err != nil {
-		t.Fatalf("read second-step registers: %v", err)
+		p.t.Fatalf("read %s-step registers: %v", name, err)
 	}
-	if regs.PC != stepPC+2 {
-		t.Fatalf("second-step PC = 0x%x, want 0x%x", regs.PC, stepPC+2)
+	if regs.PC != wantPC {
+		p.t.Fatalf("%s-step PC = 0x%x, want 0x%x", name, regs.PC, wantPC)
 	}
+}
 
-	if err := b.ContinueProcess(); err != nil {
-		t.Fatalf("continue with delayed SIGURG: %v", err)
+func (p *steppingSIGURGTracee) continueToHandlerExit() {
+	p.t.Helper()
+	if err := p.backend.ContinueProcess(); err != nil {
+		p.t.Fatalf("continue with delayed SIGURG: %v", err)
 	}
-	terminal, err := b.Wait()
+	terminal, err := p.backend.Wait()
 	if err != nil {
-		t.Fatalf("wait for terminal stop: %v", err)
+		p.t.Fatalf("wait for terminal stop: %v", err)
 	}
 	if terminal.Reason != StopExited || terminal.ExitCode != 42 {
-		t.Fatalf("terminal stop = %+v, want handler-returning exit 42", terminal)
+		p.t.Fatalf("terminal stop = %+v, want handler-returning exit 42", terminal)
 	}
+}
 
+func (p *steppingSIGURGTracee) finish() {
+	_ = p.cmd.Wait()
+	p.finished = true
+}
+
+func requireSteppingSIGURGCalls(
+	t *testing.T,
+	pid int,
+	resumeCalls []linuxResumeCall,
+	tgkillCalls []linuxTgkillCall,
+) {
+	t.Helper()
 	wantResumes := []linuxResumeCall{
 		wantLinuxResume(syscall.PTRACE_SINGLESTEP, pid, 0),
 		wantLinuxResume(syscall.PTRACE_SINGLESTEP, pid, 0),
@@ -205,7 +224,20 @@ func TestLinuxSteppingThreadSIGURGIsForwardedAfterInstructionStep(t *testing.T) 
 	if !reflect.DeepEqual(tgkillCalls, wantTgkills) {
 		t.Fatalf("tgkill calls = %+v, want exact-TID requeue %+v", tgkillCalls, wantTgkills)
 	}
+}
 
-	_ = cmd.Wait()
-	finished = true
+func TestLinuxSteppingThreadSIGURGIsForwardedAfterInstructionStep(t *testing.T) {
+	binary, stepPC := buildSteppingSIGURGTarget(t)
+	tracee := startSteppingSIGURGTracee(t, binary)
+	tracee.prepare(stepPC)
+
+	var resumeCalls []linuxResumeCall
+	var tgkillCalls []linuxTgkillCall
+	tracee.recordCalls(&resumeCalls, &tgkillCalls)
+	tracee.queueSIGURG()
+	tracee.requireStep("first", stepPC+1)
+	tracee.requireStep("second", stepPC+2)
+	tracee.continueToHandlerExit()
+	requireSteppingSIGURGCalls(t, tracee.pid, resumeCalls, tgkillCalls)
+	tracee.finish()
 }

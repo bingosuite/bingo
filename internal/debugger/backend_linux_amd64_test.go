@@ -38,18 +38,24 @@ func wantLinuxResume(request, tid, signal int) linuxResumeCall {
 	}
 }
 
+func recordingPtraceSyscall(calls *[]linuxResumeCall, errno syscall.Errno) func(
+	trap, a1, a2, a3, a4, a5, a6 uintptr,
+) (uintptr, uintptr, syscall.Errno) {
+	return func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
+		*calls = append(*calls, linuxResumeCall{
+			trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
+		})
+		return 0, 0, errno
+	}
+}
+
 func newRecordingLinuxBackend(t *testing.T, pid int) (*linuxBackend, *[]linuxResumeCall) {
 	t.Helper()
 	calls := &[]linuxResumeCall{}
 	b := &linuxBackend{
-		pid:    pid,
-		tracer: newTracerThread(),
-		ptraceSyscall6Fn: func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
-			*calls = append(*calls, linuxResumeCall{
-				trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
-			})
-			return 0, 0, 0
-		},
+		pid:              pid,
+		tracer:           newTracerThread(),
+		ptraceSyscall6Fn: recordingPtraceSyscall(calls, 0),
 	}
 	t.Cleanup(b.closeTracer)
 	return b, calls
@@ -390,22 +396,12 @@ func TestLinuxBackendFailedSingleStepRetainsPendingSignal(t *testing.T) {
 	const tid = 4501
 	b, calls := newRecordingLinuxBackend(t, tid)
 	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGSEGV)})
-	b.ptraceSyscall6Fn = func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
-		*calls = append(*calls, linuxResumeCall{
-			trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
-		})
-		return 0, 0, syscall.EIO
-	}
+	b.ptraceSyscall6Fn = recordingPtraceSyscall(calls, syscall.EIO)
 
 	if err := b.SingleStep(tid); !errors.Is(err, syscall.EIO) {
 		t.Fatalf("SingleStep() error = %v, want %v", err, syscall.EIO)
 	}
-	b.ptraceSyscall6Fn = func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
-		*calls = append(*calls, linuxResumeCall{
-			trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
-		})
-		return 0, 0, 0
-	}
+	b.ptraceSyscall6Fn = recordingPtraceSyscall(calls, 0)
 	if err := b.ContinueProcess(); err != nil {
 		t.Fatalf("ContinueProcess() error = %v", err)
 	}
@@ -424,22 +420,12 @@ func TestLinuxBackendFailedResumeRetainsPendingSignal(t *testing.T) {
 	errInjected := syscall.EIO
 	b, calls := newRecordingLinuxBackend(t, tid)
 	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGSEGV)})
-	b.ptraceSyscall6Fn = func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
-		*calls = append(*calls, linuxResumeCall{
-			trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
-		})
-		return 0, 0, errInjected
-	}
+	b.ptraceSyscall6Fn = recordingPtraceSyscall(calls, errInjected)
 
 	if err := b.ContinueProcess(); !errors.Is(err, errInjected) {
 		t.Fatalf("ContinueProcess() error = %v, want %v", err, errInjected)
 	}
-	b.ptraceSyscall6Fn = func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
-		*calls = append(*calls, linuxResumeCall{
-			trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
-		})
-		return 0, 0, 0
-	}
+	b.ptraceSyscall6Fn = recordingPtraceSyscall(calls, 0)
 	if err := b.ContinueProcess(); err != nil {
 		t.Fatalf("retry ContinueProcess() error = %v", err)
 	}
@@ -457,22 +443,12 @@ func TestLinuxBackendFailedResumeESRCHRetainsPendingSignal(t *testing.T) {
 	const tid = 5501
 	b, calls := newRecordingLinuxBackend(t, tid)
 	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGSEGV)})
-	b.ptraceSyscall6Fn = func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
-		*calls = append(*calls, linuxResumeCall{
-			trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
-		})
-		return 0, 0, syscall.ESRCH
-	}
+	b.ptraceSyscall6Fn = recordingPtraceSyscall(calls, syscall.ESRCH)
 
 	if err := b.ContinueProcess(); !errors.Is(err, syscall.ESRCH) {
 		t.Fatalf("ContinueProcess() error = %v, want %v", err, syscall.ESRCH)
 	}
-	b.ptraceSyscall6Fn = func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
-		*calls = append(*calls, linuxResumeCall{
-			trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
-		})
-		return 0, 0, 0
-	}
+	b.ptraceSyscall6Fn = recordingPtraceSyscall(calls, 0)
 	if err := b.ContinueProcess(); err != nil {
 		t.Fatalf("retry ContinueProcess() error = %v", err)
 	}
@@ -490,22 +466,12 @@ func TestLinuxBackendInternalResumeESRCHRetainsPendingSignal(t *testing.T) {
 	const tid = 5751
 	b, calls := newRecordingLinuxBackend(t, tid)
 	b.recordDeliveredStop(StopEvent{Reason: StopSignal, TID: tid, Signal: int(syscall.SIGABRT)})
-	b.ptraceSyscall6Fn = func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
-		*calls = append(*calls, linuxResumeCall{
-			trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
-		})
-		return 0, 0, syscall.ESRCH
-	}
+	b.ptraceSyscall6Fn = recordingPtraceSyscall(calls, syscall.ESRCH)
 
 	if err := b.continueIfTraceeExists(tid, 0); err != nil {
 		t.Fatalf("continueIfTraceeExists() error = %v", err)
 	}
-	b.ptraceSyscall6Fn = func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
-		*calls = append(*calls, linuxResumeCall{
-			trap: trap, request: a1, tid: a2, addr: a3, signal: a4, a5: a5, a6: a6,
-		})
-		return 0, 0, 0
-	}
+	b.ptraceSyscall6Fn = recordingPtraceSyscall(calls, 0)
 	if err := b.ContinueProcess(); err != nil {
 		t.Fatalf("ContinueProcess() after ESRCH error = %v", err)
 	}
@@ -720,7 +686,7 @@ func TestLinuxBackendExitingThreadDropsCurrentAndDelayedSignals(t *testing.T) {
 	b.pendingSignals.set(tid, int(syscall.SIGUSR1))
 	b.pendingSignals.delay(tid, int(syscall.SIGURG))
 	b.pendingSignals.set(otherTID, unrelatedSignal)
-	b.contFn = func(targetTID int, signal int) error {
+	b.contFn = func(targetTID, signal int) error {
 		calls = append(calls, wantLinuxResume(syscall.PTRACE_CONT, targetTID, signal))
 		if got := b.pendingSignals.take(targetTID); got != 0 {
 			return fmt.Errorf("pending signal %d remained when exiting tid %d resumed", got, targetTID)
@@ -1746,7 +1712,7 @@ func TestLinuxWaitClearsReusedTIDStateBeforeNewThreadResume(t *testing.T) {
 	script.install(b)
 	b.pendingSignals.set(newThread, int(syscall.SIGUSR1))
 	b.pendingSignals.delay(newThread, int(syscall.SIGURG))
-	b.contFn = func(tid int, signal int) error {
+	b.contFn = func(tid, signal int) error {
 		if got := b.pendingSignals.take(tid); got != 0 {
 			return fmt.Errorf("stale signal %d remained on reused tid %d", got, tid)
 		}
