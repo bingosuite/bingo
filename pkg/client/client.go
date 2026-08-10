@@ -6,6 +6,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -14,6 +15,9 @@ import (
 )
 
 const listSessionsTimeout = 5 * time.Second
+
+// ErrClosed reports that a client operation was interrupted by connection teardown.
+var ErrClosed = errors.New("client closed")
 
 // Client interacts with a bingo debug server. All methods are goroutine-safe.
 type Client interface {

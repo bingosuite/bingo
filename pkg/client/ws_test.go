@@ -59,16 +59,47 @@ func TestCreateContextCancelsStalledHandshake(t *testing.T) {
 }
 
 func TestCreateContextCancelsWelcomeWait(t *testing.T) {
-	connected := make(chan struct{})
+	welcomeWaitActive := make(chan error, 1)
 	release := make(chan struct{})
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
+			welcomeWaitActive <- err
 			return
 		}
 		defer func() { _ = conn.Close() }()
-		close(connected)
+
+		pong := make(chan struct{})
+		var pongOnce sync.Once
+		conn.SetPongHandler(func(data string) error {
+			if data == "welcome-ready" {
+				pongOnce.Do(func() { close(pong) })
+			}
+			return nil
+		})
+		go func() {
+			for {
+				if _, _, err := conn.ReadMessage(); err != nil {
+					return
+				}
+			}
+		}()
+		if err := conn.WriteControl(
+			websocket.PingMessage,
+			[]byte("welcome-ready"),
+			time.Now().Add(time.Second),
+		); err != nil {
+			welcomeWaitActive <- err
+			return
+		}
+		select {
+		case <-pong:
+			welcomeWaitActive <- nil
+		case <-time.After(time.Second):
+			welcomeWaitActive <- errors.New("client read pump did not answer ping")
+			return
+		}
 		<-release
 	}))
 	defer server.Close()
@@ -82,15 +113,26 @@ func TestCreateContextCancelsWelcomeWait(t *testing.T) {
 	}()
 
 	select {
-	case <-connected:
+	case err := <-welcomeWaitActive:
+		if err != nil {
+			t.Fatal(err)
+		}
 	case <-time.After(time.Second):
-		t.Fatal("client did not complete the WebSocket handshake")
+		t.Fatal("client did not enter the post-upgrade welcome wait")
 	}
+
+	start := time.Now()
 	cancel()
 	select {
 	case createErr := <-result:
 		if !errors.Is(createErr, context.Canceled) {
 			t.Fatalf("CreateContext error = %v, want context cancellation", createErr)
+		}
+		if !strings.Contains(createErr.Error(), "wait for session state") {
+			t.Fatalf("CreateContext error = %v, want welcome-wait context", createErr)
+		}
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("welcome wait cancellation took %v", elapsed)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("CreateContext did not cancel the welcome wait")
@@ -125,6 +167,57 @@ func TestListSessionsContextCancelsRequest(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("ListSessionsContext did not cancel the request")
+	}
+}
+
+func TestPeerCloseNormalizesCommandErrors(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Upgrade(w, r, nil, 0, 0)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		welcome := protocol.MustEvent(protocol.EventSessionState, 1, protocol.SessionStatePayload{
+			SessionID: "closing-session",
+			State:     protocol.StateIdle,
+			Clients:   1,
+		})
+		data, err := protocol.MarshalEvent(welcome)
+		if err != nil {
+			return
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			return
+		}
+		_ = conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+			time.Now().Add(time.Second),
+		)
+	}))
+	defer server.Close()
+
+	c, err := client.Create(strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Close() }()
+
+	select {
+	case _, ok := <-c.Events():
+		if ok {
+			t.Fatal("unexpected event before peer-close completion")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("client did not observe peer close")
+	}
+
+	if err := c.Continue(); !errors.Is(err, client.ErrClosed) {
+		t.Errorf("Continue error = %v, want client.ErrClosed", err)
+	}
+	if _, err := c.SetBreakpoint("main.go", 42); !errors.Is(err, client.ErrClosed) {
+		t.Errorf("SetBreakpoint error = %v, want client.ErrClosed", err)
 	}
 }
 

@@ -54,11 +54,11 @@ func mainExitCode() int {
 		c, err = client.CreateContext(ctx, *addr)
 	}
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
-			return 0
+		code := exitCode(err)
+		if code != 0 {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		}
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		return 1
+		return code
 	}
 	if ctx.Err() != nil {
 		_ = c.Close()
@@ -598,18 +598,22 @@ func printErrUnlessCanceled(ctx context.Context, err error) {
 }
 
 func commandErrorSuppressed(ctx context.Context, err error) bool {
-	if ctx.Err() != nil ||
+	return ctx.Err() != nil ||
+		errors.Is(err, client.ErrClosed) ||
 		errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, net.ErrClosed) {
-		return true
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.EPIPE)
+}
+
+func exitCode(err error) int {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return 0
 	}
-	message := strings.ToLower(err.Error())
-	return strings.Contains(message, "client closed") ||
-		strings.Contains(message, "closed network connection") ||
-		strings.Contains(message, "connection reset") ||
-		strings.Contains(message, "broken pipe") ||
-		strings.Contains(message, "websocket: close")
+	return 1
 }
 
 func printHelp() {
