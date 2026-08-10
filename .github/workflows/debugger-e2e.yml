@@ -40,7 +40,6 @@ permissions:
 
 jobs:
   linux-amd64:
-    if: github.event_name != 'workflow_dispatch'
     name: Linux amd64 (ptrace)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -89,7 +88,6 @@ jobs:
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=concurrency
 
   darwin-arm64:
-    if: github.event_name != 'workflow_dispatch'
     name: Darwin arm64 (Mach exceptions)
     runs-on: macos-14
     timeout-minutes: 25
@@ -175,7 +173,6 @@ jobs:
           echo "Run the full darwin backend E2E locally on real hardware: just e2e-darwin"
 
   fullstack-linux-amd64:
-    if: github.event_name != 'workflow_dispatch'
     name: Full-stack Linux amd64 (client → WS → hub → ptrace)
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -207,7 +204,6 @@ jobs:
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=dap
 
   fullstack-darwin-arm64:
-    if: github.event_name != 'workflow_dispatch'
     name: Full-stack Darwin arm64 (client → WS → hub → Mach)
     runs-on: macos-14
     timeout-minutes: 25
@@ -248,29 +244,3 @@ jobs:
           echo "SKIPPED: task_for_pid is blocked on GitHub-hosted macOS runners (Apple Sonoma restriction)."
           echo "The darwin backend + E2E binary compiled and codesigned successfully above."
           echo "Run the full-stack darwin E2E locally on real hardware: just e2e-darwin"
-
-  sentinel-clear-proof-linux-amd64:
-    if: github.event_name == 'workflow_dispatch' && github.ref_name == 'xsachax-prove-sentinel-clear-failure'
-    name: Linux amd64 native sentinel clear proof
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.25.5"
-
-      - name: Prove the real ptrace clear path
-        run: |
-          set -o pipefail
-          go test -tags e2e -count=1 -v -timeout 60s ./internal/debugger \
-            -run TestNativeSentinelClearFailureFromLiveRemap 2>&1 | tee native-sentinel-proof.log
-
-      - name: Upload native proof log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: native-sentinel-proof-log
-          path: native-sentinel-proof.log
-          if-no-files-found: error
