@@ -2429,7 +2429,8 @@ collapsed to exactly one entry: the current goroutine if that explicit
 Goroutines query resolves it, otherwise a transport-only
 `stopped goroutine (unknown)`. A resolved query restores normal full responses
 for later requests. `stackTrace` returns the stopped stack only for that current
-handle and empty frames for every other thread id; bingo cannot unwind arbitrary
+handle or a request that preserves the omitted/non-positive stop id, and empty
+frames for every other positive thread id; bingo cannot unwind arbitrary
 goroutines yet.
 
 `EventContinued` → DAP `continued` **only for out-of-band resumes**. The Handler
