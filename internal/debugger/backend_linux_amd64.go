@@ -315,12 +315,10 @@ func (b *linuxBackend) ContinueProcess() error {
 
 func (b *linuxBackend) SingleStep(tid int) error {
 	b.beginStep(tid)
-	signal := b.pendingSignals.takeForStep(tid)
 	var err error
-	b.execPtrace(func() { err = b.ptraceSingleStep(tid, signal) })
+	b.execPtrace(func() { err = b.ptraceSingleStep(tid) })
 	if err != nil {
-		b.pendingSignals.restore(tid, signal, 0)
-		return fmt.Errorf("PTRACE_SINGLESTEP tid %d signal %d: %w", tid, signal, err)
+		return fmt.Errorf("PTRACE_SINGLESTEP tid %d: %w", tid, err)
 	}
 	return nil
 }
@@ -767,9 +765,8 @@ func (b *linuxBackend) singleStepIfTraceeExists(tid int) error {
 	if tid == 0 {
 		return nil
 	}
-	b.pendingSignals.takeForStep(tid)
 	var err error
-	b.execPtrace(func() { err = b.ptraceSingleStep(tid, 0) })
+	b.execPtrace(func() { err = b.ptraceSingleStep(tid) })
 	if err != nil && !isNoSuchProcess(err) {
 		return err
 	}
@@ -818,8 +815,8 @@ func (b *linuxBackend) ptraceCont(tid, signal int) error {
 	return b.ptraceResume(syscall.PTRACE_CONT, tid, signal)
 }
 
-func (b *linuxBackend) ptraceSingleStep(tid, signal int) error {
-	return b.ptraceResume(syscall.PTRACE_SINGLESTEP, tid, signal)
+func (b *linuxBackend) ptraceSingleStep(tid int) error {
+	return b.ptraceResume(syscall.PTRACE_SINGLESTEP, tid, 0)
 }
 
 func (b *linuxBackend) ptraceResume(request, tid, signal int) error {
