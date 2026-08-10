@@ -659,6 +659,32 @@ func (e *engine) handleStop(stop StopEvent) {
 
 	case StopBreakpoint:
 		e.setState(stateSuspended)
+		// A breakpoint stop while a step-over is still in flight means that
+		// step-over will never complete: its own StopSingleStep is the only
+		// other way out of it, and both backends refuse to surface a foreign
+		// breakpoint while the stepped thread can still produce one (linux
+		// parks it, darwin re-faults it). So the stepped thread died, and the
+		// trap this step-over lifted is now removed from the tracee and out of
+		// the table with nothing left to put it back. Reconcile it here, before
+		// the table lookup, so that a sibling stopped at the *same* address
+		// resolves to a real breakpoint instead of taking the spurious-SIGTRAP
+		// path, and so the next resume cannot overwrite the one-slot
+		// steppingOverBP and lose the breakpoint for good.
+		if sob := e.steppingOverBP; sob != nil {
+			e.steppingOverBP = nil
+			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
+				e.endThreadStep()
+				e.log.Error("breakpoint reinstall failed after the stepped thread died",
+					"addr", fmt.Sprintf("0x%x", sob.addr), "err", rerr)
+				e.haltOnError(protocol.CmdNone, fmt.Errorf(
+					"reinstall breakpoint 0x%x after the stepped thread died "+
+						"(it may no longer be armed or tracked): %w", sob.addr, rerr), stop)
+				return
+			}
+			e.endThreadStep()
+			e.log.Debug("breakpoint reinstalled after stepped-thread death",
+				"addr", fmt.Sprintf("0x%x", sob.addr))
+		}
 		var err error
 		stop, err = e.populateBreakpointStop(stop)
 		if err != nil {

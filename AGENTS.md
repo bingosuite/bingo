@@ -376,6 +376,23 @@ If `bps.reinstall` ever fails after a single-step, **suspend instead of
 resuming**. Running without the trap is a runaway process; reporting the
 error lets the operator intervene.
 
+**A `StopBreakpoint` that arrives while `steppingOverBP` is set means the
+step-over will never complete, so `handleStop` reconciles it there.** Only the
+stepped thread's own `StopSingleStep` puts a lifted trap back, and neither
+backend surfaces a foreign breakpoint while that thread can still produce one
+(linux holds it in the wait-side queue, darwin re-faults it). So the only way
+this combination occurs is that the stepped thread died mid-step — at which
+point the trap is out of the tracee, the entry is out of `byID`/`byAddr`, and
+the sole remaining reference to it is the one-slot `steppingOverBP` that the
+next resume overwrites. The reconcile runs **before** `bps.atAddr`, not after,
+so a sibling stopped at the *same* address resolves to the reinstalled
+breakpoint instead of falling through to the spurious-SIGTRAP path. Placement
+is load-bearing and pinned by mutation: moving it below the lookup fails the
+same-address spec, removing it fails both (`engine_test.go` →
+"a breakpoint stop that arrives while a step-over is in flight"). This mirrors
+the reconcile the `StopSignal` branch has always done; before it, the two
+branches disagreed and only the signal half was safe.
+
 **Every asynchronous halt in `handleStop` must be reported with a *suspending*
 event, not a bare `EventError`.** These failures happen after the resume that
 led to them already returned `nil` and emitted `EventContinued`, so the hub has

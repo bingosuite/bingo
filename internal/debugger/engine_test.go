@@ -709,6 +709,86 @@ var _ = Describe("Engine", func() {
 		})
 	})
 
+	// A step-over lifts a breakpoint's trap and hands the only copy of the
+	// entry to steppingOverBP, and StopSingleStep on the stepped thread is the
+	// only path that puts it back. If that thread dies mid-step the step-over
+	// never completes, so whatever stop arrives next has to reconcile it — the
+	// one-slot steppingOverBP is overwritten by the next resume, which would
+	// otherwise leave the breakpoint disarmed in the tracee and absent from
+	// both lookup tables with nothing left holding a reference to it.
+	Describe("a breakpoint stop that arrives while a step-over is in flight", func() {
+		const (
+			addrA      = uint64(0x3000)
+			addrB      = uint64(0x3400)
+			steppedTID = 1
+			siblingTID = 2
+		)
+
+		var idA, idB int
+
+		// Leaves the engine with A's trap lifted and a single-step armed on a
+		// thread that (for the purposes of these tests) never reports back.
+		liftTrapForStepOver := func() {
+			trap := debugger.ExportedTrapInstruction()
+			fb.tids = []int{steppedTID, siblingTID}
+			fb.seedMem(addrA, []byte{0x90})
+			fb.seedMem(addrB, []byte{0x90})
+			debugger.ExportedForceSuspended(d)
+			idA = debugger.ExportedSetBreakpointAt(d, addrA)
+			idB = debugger.ExportedSetBreakpointAt(d, addrB)
+
+			continueAndConsumeContinued(d)
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: steppedTID, PC: addrA})
+			Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventBreakpointHit))
+
+			Expect(d.Continue()).To(Succeed())
+			Expect(fb.singleStepCalls).To(ContainElement(steppedTID))
+			Expect(fb.peekMem(addrA, len(trap))).NotTo(Equal(trap),
+				"the step-over must have lifted A's trap or these tests assert nothing")
+		}
+
+		nextBreakpointHit := func() protocol.Event {
+			for {
+				evt := mustNextEvent(d)
+				if evt.Kind == protocol.EventBreakpointHit {
+					return evt
+				}
+				Expect(evt.Kind).To(Equal(protocol.EventContinued),
+					"only the resume notification may precede the hit")
+			}
+		}
+
+		It("reinstalls the lifted breakpoint before reporting another thread's hit", func() {
+			trap := debugger.ExportedTrapInstruction()
+			liftTrapForStepOver()
+
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: siblingTID, PC: addrB})
+
+			var p protocol.BreakpointHitPayload
+			Expect(protocol.DecodeEventPayload(nextBreakpointHit(), &p)).To(Succeed())
+			Expect(p.Breakpoint.ID).To(Equal(idB))
+
+			Expect(fb.peekMem(addrA, len(trap))).To(Equal(trap),
+				"A's trap must be back in the tracee before the sibling's hit is reported")
+			Expect(d.ClearBreakpoint(idA)).To(Succeed(),
+				"A must still be tracked; the next resume overwrites steppingOverBP")
+		})
+
+		It("resolves a same-address hit to the reinstalled breakpoint, not a spurious trap", func() {
+			liftTrapForStepOver()
+			resumes := fb.continueCount()
+
+			fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: siblingTID, PC: addrA})
+
+			var p protocol.BreakpointHitPayload
+			Expect(protocol.DecodeEventPayload(nextBreakpointHit(), &p)).To(Succeed())
+			Expect(p.Breakpoint.ID).To(Equal(idA),
+				"reinstalling before the lookup is what makes atAddr resolve this")
+			Expect(fb.continueCount()).To(Equal(resumes),
+				"the spurious-SIGTRAP path would have advanced PC and resumed instead of reporting")
+		})
+	})
+
 	Describe("process exit", func() {
 		It("emits EventProcessExited with exit code when StopExited arrives", func() {
 			fb2 := newFakeBackend()
