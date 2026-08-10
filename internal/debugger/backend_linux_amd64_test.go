@@ -2,7 +2,11 @@
 
 package debugger
 
-import "testing"
+import (
+	"os"
+	"os/exec"
+	"testing"
+)
 
 func TestLinuxBackendTraceTIDDefaultsToPID(t *testing.T) {
 	const pid = 1001
@@ -100,7 +104,13 @@ func TestLinuxBackendRunningKillStopTIDConcurrentAccess(t *testing.T) {
 	e := newEngine(b, nil)
 
 	if err := e.dispatch(func() error {
-		e.proc = process{pid: b.pid, live: true}
+		// Keep this on launched teardown when attached Kill gains its own
+		// quiesce-before-clear transaction.
+		e.proc = process{
+			pid:  b.pid,
+			cmd:  &exec.Cmd{Process: &os.Process{Pid: b.pid}},
+			live: true,
+		}
 		e.setState(stateRunning)
 		seedBreakpointEntries(e, 16)
 		go e.waitLoop()
