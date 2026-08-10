@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -242,17 +243,44 @@ func (c *wsClient) send(cmd protocol.Command) error {
 	if err := c.terminalReadError(); err != nil {
 		return err
 	}
+	if c.closed() {
+		return ErrClosed
+	}
 	data, err := json.Marshal(cmd)
 	if err != nil {
 		return fmt.Errorf("marshal command: %w", err)
 	}
 	c.writeMu.Lock()
+	if err := c.terminalReadError(); err != nil {
+		c.writeMu.Unlock()
+		return err
+	}
+	if c.closed() {
+		c.writeMu.Unlock()
+		return ErrClosed
+	}
 	writeErr := c.conn.WriteMessage(websocket.TextMessage, data)
 	c.writeMu.Unlock()
 	if err := c.terminalReadError(); err != nil {
 		return err
 	}
-	return writeErr
+	return c.normalizeSendError(writeErr)
+}
+
+func (c *wsClient) normalizeSendError(err error) error {
+	if errors.Is(err, websocket.ErrCloseSent) || c.closed() {
+		return ErrClosed
+	}
+	return err
+}
+
+func (c *wsClient) closed() bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // sendAndWait sends cmd and blocks for the matching confirmation event or an
@@ -289,7 +317,7 @@ func (c *wsClient) sendAndWait(cmd protocol.Command, wantKind protocol.EventKind
 		if err := c.terminalReadError(); err != nil {
 			return protocol.Event{}, err
 		}
-		return protocol.Event{}, fmt.Errorf("client closed")
+		return protocol.Event{}, ErrClosed
 	}
 }
 

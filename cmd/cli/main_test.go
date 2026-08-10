@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/bingosuite/bingo/pkg/client"
 	"github.com/bingosuite/bingo/pkg/protocol"
 	"github.com/chzyer/readline"
 )
@@ -396,14 +399,60 @@ func TestShowLocalsSuppressesCancellationError(t *testing.T) {
 	}
 }
 
-func TestCommandErrorSuppressionOnlyMatchesShutdown(t *testing.T) {
-	if !commandErrorSuppressed(context.Background(), errors.New("client closed")) {
-		t.Fatal("client closure was not suppressed")
+func TestExitCode(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{name: "clean"},
+		{name: "canceled", err: fmt.Errorf("connect: %w", context.Canceled)},
+		{name: "failure", err: errors.New("dial failed"), want: 1},
 	}
-	if !commandErrorSuppressed(context.Background(), io.ErrUnexpectedEOF) {
-		t.Fatal("transport EOF was not suppressed")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := exitCode(tt.err); got != tt.want {
+				t.Fatalf("exitCode(%v) = %d, want %d", tt.err, got, tt.want)
+			}
+		})
 	}
-	if commandErrorSuppressed(context.Background(), errors.New("server: no active debugger")) {
-		t.Fatal("server command error was incorrectly suppressed")
+}
+
+func TestCommandErrorSuppressionUsesTypedShutdownErrors(t *testing.T) {
+	shutdownErrors := []error{
+		client.ErrClosed,
+		io.EOF,
+		io.ErrUnexpectedEOF,
+		io.ErrClosedPipe,
+		net.ErrClosed,
+		syscall.ECONNRESET,
+		syscall.ECONNABORTED,
+		syscall.EPIPE,
+	}
+	for _, err := range shutdownErrors {
+		if !commandErrorSuppressed(context.Background(), fmt.Errorf("wrapped: %w", err)) {
+			t.Errorf("typed shutdown error %v was not suppressed", err)
+		}
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if !commandErrorSuppressed(canceled, errors.New("server error")) {
+		t.Fatal("context cancellation did not suppress command output")
+	}
+}
+
+func TestCommandErrorSuppressionPreservesServerMessages(t *testing.T) {
+	for _, phrase := range []string{
+		"client closed",
+		"closed network connection",
+		"connection reset",
+		"broken pipe",
+		"websocket: close",
+	} {
+		err := errors.New("server: debuggee reported " + phrase)
+		if commandErrorSuppressed(context.Background(), err) {
+			t.Errorf("server message %q was incorrectly suppressed", phrase)
+		}
 	}
 }
