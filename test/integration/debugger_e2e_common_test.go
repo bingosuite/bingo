@@ -433,6 +433,9 @@ import (
 )
 
 var sink int
+var releases []chan struct{}
+var ready = make(chan struct{})
+var assignment int
 
 //go:noinline
 func breakpointWorker(index int) {
@@ -440,27 +443,28 @@ func breakpointWorker(index int) {
 	select {}
 }
 
-func worker(index int, release <-chan struct{}, ready chan<- struct{}) {
+func worker() {
+	index := assignment
 	ready <- struct{}{}
-	<-release
+	<-releases[index]
 	breakpointWorker(index)
 }
 
+func spawnWorker() { go worker() } // SPAWN_CURRENT
+
 func main() {
 	go func() {
-		time.Sleep(180 * time.Second)
+		time.Sleep(10 * time.Minute)
 		os.Exit(0)
 	}()
 	runtime.GOMAXPROCS(4)
 
 	const goroutines = %d
-	releases := make([]chan struct{}, goroutines)
-	ready := make(chan struct{}, goroutines)
+	releases = make([]chan struct{}, goroutines)
 	for i := range releases {
 		releases[i] = make(chan struct{})
-		go worker(i, releases[i], ready)
-	}
-	for range goroutines {
+		assignment = i
+		spawnWorker()
 		<-ready
 	}
 
@@ -1215,6 +1219,7 @@ func assertCurrentGoroutineScan(count int) {
 	}
 	src := fmt.Sprintf(currentGoroutineTargetTemplate, count, releaseIndex)
 	line := markerLine(src, "// BP_CURRENT")
+	spawnLine := markerLine(src, "// SPAWN_CURRENT")
 	bin := buildTarget(fmt.Sprintf("current_goroutine_%d_target", count), src)
 
 	h := newE2EHarness(bin)
@@ -1241,15 +1246,19 @@ func assertCurrentGoroutineScan(count int) {
 	Expect(json.Unmarshal(evt.Payload, &snap)).To(Succeed(), "decode GoroutineSnapshot")
 
 	currentGoroutines := 0
+	var snapshotCurrent protocol.Goroutine
 	for _, g := range snap.Goroutines {
 		if g.Current {
 			currentGoroutines++
+			snapshotCurrent = g
 		}
 	}
 	currentThreads := 0
+	var snapshotThread protocol.Thread
 	for _, thread := range snap.Threads {
 		if thread.Current {
 			currentThreads++
+			snapshotThread = thread
 		}
 	}
 	GinkgoWriter.Printf(
@@ -1260,12 +1269,30 @@ func assertCurrentGoroutineScan(count int) {
 	)
 
 	Expect(hit.Goroutine.Current).To(BeTrue(), "BreakpointHit must identify the stopped goroutine")
+	Expect(hit.Goroutine.ID).To(BeNumerically(">", 0),
+		"BreakpointHit must carry a real nonzero goroutine id")
 	Expect(hit.Goroutine.CurrentLoc).To(Equal(hit.Frames[0].Location),
 		"BreakpointHit goroutine location must match the real stopped thread's innermost frame")
+	Expect(hit.Goroutine.StartLoc.Function).To(Equal("main.worker"),
+		"current goroutine start location must independently resolve the argumentless worker")
+	Expect(hit.Goroutine.CreatedLoc.Function).To(Equal("main.spawnWorker"),
+		"current goroutine creation location must resolve the spawning function")
+	Expect(hit.Goroutine.CreatedLoc.Line).To(Equal(spawnLine),
+		"current goroutine creation location must resolve the marked go statement")
+	Expect(snap.Current).To(BeNumerically(">", 0),
+		"snapshot Current must never pass vacuously as zero")
 	Expect(snap.Current).To(Equal(hit.Goroutine.ID),
 		"snapshot Current must identify the goroutine embedded in BreakpointHit")
 	Expect(currentGoroutines).To(Equal(1), "exactly one snapshot goroutine is current")
 	Expect(currentThreads).To(Equal(1), "exactly one runtime thread is current")
+	Expect(snapshotCurrent.ID).To(Equal(snap.Current),
+		"the uniquely marked snapshot goroutine must match snapshot Current")
+	Expect(snapshotCurrent.StartLoc.Function).To(Equal("main.worker"),
+		"snapshot current anchor must retain independently decoded start metadata")
+	Expect(snapshotCurrent.CreatedLoc.Line).To(Equal(spawnLine),
+		"snapshot current anchor must retain independently decoded creation metadata")
+	Expect(snapshotThread.GoID).To(Equal(snap.Current),
+		"the uniquely current runtime thread must run snapshot Current")
 	if count > richScanLimit {
 		Expect(snap.Goroutines).To(HaveLen(richScanLimit+1),
 			"heavy proof must append one current anchor beyond the full rich prefix")

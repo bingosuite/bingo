@@ -116,6 +116,9 @@ jobs:
       - name: E2E concurrency (goroutine/thread snapshot foundation)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=concurrency
 
+      - name: E2E current goroutine (bounded scan control)
+        run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=current-goroutine
+
       # linux-only: Wait4(-1, WALL) is what lets a foreign thread's stop arrive
       # mid-single-step (issue #199). The darwin receive loop parks stragglers
       # itself, so the linux park queue has no counterpart to exercise there.
@@ -195,6 +198,10 @@ jobs:
       - name: E2E concurrency (goroutine/thread snapshot foundation)
         if: runner.environment == 'self-hosted'
         run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=concurrency
+
+      - name: E2E current goroutine (bounded scan control)
+        if: runner.environment == 'self-hosted'
+        run: ./e2e.test -test.v -test.timeout 300s -ginkgo.label-filter=current-goroutine
 
       - name: E2E hygiene (Mach port-right leak regression)
         if: runner.environment == 'self-hosted'

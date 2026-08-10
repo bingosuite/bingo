@@ -1631,10 +1631,9 @@ new `Thread`, new `GoroutineSnapshotPayload`, new `EventGoroutineSnapshot` +
 auto-emitted on exactly the suspends that can change the concurrency picture —
 **breakpoint hit, pause, and the launch/attach entry stop** — and on demand via
 `CmdGoroutineSnapshot`. It is **NOT** emitted per step: `emitStepped` stays cheap
-(uses only the bounded register/stopped-M current lookup, never an `allgs` scan)
-to protect the fragile single-step/step-over path from a rich per-step walk while
-still reporting a precise stopped goroutine whenever targeted identity is
-available. `emitBreakpointHit`
+(walks frames for the stopped TID but performs no `runtime.allgs`, `runtime.allm`,
+or current-g metadata reads, and reports synthetic ID 0) to protect the fragile
+single-step/step-over path from per-step runtime inspection. `emitBreakpointHit`
 / `emitPaused` build the snapshot **once**, embed its current goroutine in the
 stop event, then stream the same snapshot — one build, no double scan, no double
 delta pass. Because the event is dual-purpose (push *and* query answer), the
@@ -1703,19 +1702,22 @@ around `snapshotFrom` pin the seam's semantics but cannot catch a rewiring.
 
 **Graceful fallback.** Every read is best-effort. `resolveGoLayout` marks the
 layout invalid if any required `g`/`gobuf`/`stack`/`m` offset is missing, and any
-unreadable `allgs` header/slot, required `g` status/goid/stack bound, or
-required targeted-current/allm link degrades the whole snapshot to one synthetic
-unknown goroutine (`ID:0, Status:"unknown"`, current PC) rather than returning a
-partial live set, changing `prevGoids`, or erroring the stop. Both stack bounds
-are required for every included live goroutine: without them SP containment
-cannot rule that goroutine in or out as the stopped one. Intentional
-nil/dead/freelist entries remain filters, and optional metadata remains
-best-effort. This distinction is load-bearing on Linux: ptrace stops only the
-reporting thread, so sibling runtime mutations can race the walk; only backends
-that stop the world make the reads race-free. If every required read succeeds
-but the bounded current lookup misses, `Current` remains 0 and the stop event
-embeds the same ID-0 unknown — `currentGoroutineFrom` must never borrow the first
-real goroutine. This preserves honest behavior for stripped binaries,
+unreadable `allgs` header/slot, required `g` status/goid/stack bound, stack-only
+tail entry, or rooted exact-M/allm link degrades the whole snapshot to one
+synthetic unknown goroutine (`ID:0, Status:"unknown"`, current PC) rather than
+returning a partial live set, changing `prevGoids`, or erroring the stop. The
+arm64 X28 chain is different: it is a speculative ABI hint, not a runtime root,
+so an unreadable or invalid candidate (`g`, `g.m`, `m.g0`, or `m.gsignal`) is a
+complete miss and the reader falls through without discarding the rich set.
+Both stack bounds are required for every included live goroutine: without them
+SP containment cannot rule that goroutine in or out as the stopped one.
+Intentional nil/dead/freelist entries remain filters, and optional metadata
+remains best-effort. This distinction is load-bearing on Linux: ptrace stops
+only the reporting thread, so sibling runtime mutations can race the walk; only
+backends that stop the world make the reads race-free. If every required read
+succeeds but the bounded current lookup misses, `Current` remains 0 and the stop
+event embeds the same ID-0 unknown — `currentGoroutineFrom` must never borrow the
+first real goroutine. This preserves honest behavior for stripped binaries,
 attach-without-DWARF, pre-runtime-init entry stops, zeroed/unreadable registers,
 and scheduler-stack stops whose `m.curg` cannot be resolved.
 
@@ -1757,22 +1759,31 @@ inside the `maxGoroutineScan=8192` rich `runtime.allgs` prefix. If that misses:
    containment; if X28 names g0/gsignal instead, the reader follows
    `g.m → m.curg`, verifies `curg.m == m`, and marks that live positive-goid
    goroutine current without requiring its stack to contain the scheduler SP.
+   Any unreadable or invalid link in this speculative chain is a miss, not
+   snapshot degradation.
 2. On linux/amd64, `FS_BASE` is not a stable `*g` address under external
    linking. Linux ptrace TIDs and `runtime.m.procid` are the same kernel TID, so
    the reader searches for the exact stopped M, then resolves `m.curg` as above.
    The ordinary `allm` window remains `maxThreadScan=2048`; one additional
    targeted-only 2048-M continuation reads only `procid`/`alllink` until the
-   match. Darwin never compares its Mach thread port to `m.procid` (a pthread).
+   match, for a strict maximum of 4096 inspected M nodes. Darwin never compares
+   its Mach thread port to `m.procid` (a pthread).
 3. A final stack-only pass examines at most one additional
    `maxGoroutineScan` `allgs` range, reading pointer + stack bounds until a
-   match.
+   match. Together with the rich prefix, no more than 16,384 allgs slots are
+   inspected.
 
 A current goroutine already in the rich prefix is replaced in place; a
 beyond-prefix match is fully decoded once and prepended as an anchor excluded
 from lifecycle deltas. `readThreads` likewise keeps its rich prefix capped and
 may append exactly one current-M anchor found by a bounded goid-only
 continuation, so thread/current identity stays coherent without unbounded
-latency. If every bounded path misses, identity is unknown rather than guessed.
+latency. On Linux, a concurrent runtime mutation or M transition can make a
+required exact-M read inconsistent because only the reporting TID is stopped;
+that case deliberately degrades instead of reporting a potentially wrong goid.
+If the exact M lies beyond the 4096-node bound and SP containment cannot identify
+a user stack (for example a g0 stop), identity remains unknown rather than
+guessed.
 A non-current goroutine's `CurrentLoc` uses `gobuf.pc` (where it resumes); the
 current one uses the live PC. Status strings are hardcoded (stable across Go
 versions); wait-reason strings are read dynamically from
@@ -2323,7 +2334,8 @@ otherwise the host can wait forever for an acknowledgement from a dead document.
 Preserve the strict nonce CSP, `dist`-only `localResourceRoots`,
 DOM/textContent rendering, deterministic capped cycle-safe tree, bounded
 lifecycle history, and multi-session selector. Filtering searches the full
-validated snapshot (up to the protocol's 5,000-goroutine bound) before applying
+validated snapshot (up to the scanner's 8,193-entry rich-prefix-plus-anchor
+bound) before applying
 the 500-node rendering cap, re-lays out each match with at most four ancestors,
 and resets fit so a deep or previously capped match cannot remain invisible.
 Empty results keep Fit/zoom callbacks safe even without an SVG scene. SVG
@@ -2847,7 +2859,8 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   control plus an opt-in over-cap proof selected by
   `BINGO_E2E_CURRENT_GOROUTINES`; the 20,000-goroutine proof is deliberately not
   part of every suite because the existing 8,192-entry rich decode is costly
-  under `-race`), and `restart` (hub-level
+  under `-race`; both native workflow jobs permanently run the small control),
+  and `restart` (hub-level
   kill+relaunch reinstalls
   breakpoints and reruns from the top), all driving `debugger.Debugger`
   in-process (except `restart`/`fullstack`/`dap`, which go through the stack); plus
