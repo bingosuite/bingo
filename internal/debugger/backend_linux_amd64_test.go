@@ -458,9 +458,10 @@ func TestLinuxBackendWaitDrainsBeforeBlocking(t *testing.T) {
 // TestLinuxBackendApplyAbsorbCarriesOutThePlan pins the half of the absorb path
 // that planAbsorb cannot: that Wait actually acts on the plan it was given.
 //
-// The two observable consequences are the step gate and the re-arm counter, so
-// this asserts both. Dropping the clearStep handling latches the gate forever —
-// held stops never drain and Wait never returns again — and dropping the
+// The observable consequences are the reconciliation boundary, the step gate,
+// and the re-arm counter, so this asserts all three. Dropping the clearStep
+// handling latches the hardware-step gate forever, while opening the gate at
+// thread death lets a held stop bypass breakpoint reconciliation. Dropping the
 // re-arm leaves a cancelled hardware step behind the same latch.
 //
 // The resumes are issued against thread ids that do not exist, so ptrace fails
@@ -482,17 +483,22 @@ func TestLinuxBackendApplyAbsorbCarriesOutThePlan(t *testing.T) {
 		return b
 	}
 
-	t.Run("a dying stepped thread releases the gate so held stops drain", func(t *testing.T) {
+	t.Run("a dying stepped thread keeps held stops gated until reconciliation", func(t *testing.T) {
 		b := newBackend()
 		if err := b.applyAbsorb(b.planAbsorb(absorbThreadExit, stepped, 0), stepped); err != nil {
 			t.Fatalf("applyAbsorb(absorbThreadExit) error = %v", err)
 		}
-		ev, ok := b.releasable()
-		if !ok {
-			t.Fatal("the held stop is still gated after the stepped thread exited: Wait would block forever")
+		if ev, ok := b.releasable(); ok {
+			t.Fatalf("released %+v before breakpoint reconciliation", ev)
 		}
-		if ev.TID != foreign {
-			t.Fatalf("released %+v, want the held stop on tid %d", ev, foreign)
+		boundary, ok := b.stepExitBoundary()
+		if !ok || boundary.TID != foreign || boundary.Reason != StopStepThreadExited {
+			t.Fatalf("stepExitBoundary() = (%+v, %t), want reconciliation on tid %d", boundary, ok, foreign)
+		}
+		b.completeStepThreadExit()
+		ev, ok := b.releasable()
+		if !ok || ev.TID != foreign {
+			t.Fatalf("released (%+v, %t), want the held stop on tid %d after reconciliation", ev, ok, foreign)
 		}
 	})
 
