@@ -347,13 +347,20 @@ func (m *monitor) render() {
 	}
 
 	fmt.Println()
-	fmt.Println(countsLine(m.snapshot))
+	// Nothing has arrived yet, so there is no count to state. Rendering the
+	// zero value here would announce a complete runtime of zero goroutines.
+	if !m.hasSnapshot {
+		fmt.Println("counts: (waiting for GoroutineSnapshot)")
+	} else {
+		fmt.Println(countsLine(m.snapshot))
+	}
 }
 
-// countsLine states what arrived versus what the debugger actually had. The two
-// ways the picture can be incomplete are reported separately: elements the
-// packer left off the wire, and a runtime scan that stopped early (which makes
-// the totals themselves a floor, not a count).
+// countsLine states what arrived versus what the debugger reported having. The
+// two ways the picture can be incomplete are reported separately: elements the
+// packer left off the wire, and a total that is only a floor. The latter covers
+// both a scan that stopped early and one that could not be read at all, so it
+// is phrased as a lower bound rather than as a specific cause.
 func bound(clipped bool) string {
 	if clipped {
 		return "+"
@@ -380,11 +387,14 @@ func countsLine(snap protocol.GoroutineSnapshotPayload) string {
 	if omitted := snap.Totals.Threads - shownT; omitted > 0 {
 		notes = append(notes, fmt.Sprintf("%d threads omitted from this event", omitted))
 	}
+	// The flag means the total is a floor, NOT that a scan reached its ceiling.
+	// A degraded snapshot sets both without any scan having run, so naming a
+	// ceiling here would invent a cause the debugger never reported.
 	if snap.Totals.GoroutinesClipped {
-		notes = append(notes, "goroutine scan hit its ceiling, so that total is a lower bound")
+		notes = append(notes, "goroutine total is a lower bound, not an exact count")
 	}
 	if snap.Totals.ThreadsClipped {
-		notes = append(notes, "thread scan hit its ceiling, so that total is a lower bound")
+		notes = append(notes, "thread total is a lower bound, not an exact count")
 	}
 	if len(notes) > 0 {
 		line += "\n  ! " + strings.Join(notes, "\n  ! ")

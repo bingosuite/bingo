@@ -476,3 +476,24 @@ func ExportedPrevGoids(d Debugger) []int {
 	}
 	return ids
 }
+
+// ExportedSnapshotWithCurrent exposes the split between what is delivered and
+// what the stop is on, so a test can assert the identity survives a packed
+// payload that degraded.
+func ExportedSnapshotWithCurrent(d Debugger) (protocol.GoroutineSnapshotPayload, protocol.Goroutine) {
+	e := d.(*engine)
+	type result struct {
+		snap    protocol.GoroutineSnapshotPayload
+		current protocol.Goroutine
+	}
+	ch := make(chan result, 1)
+	if err := e.dispatch(func() error {
+		snap, current := e.snapshotWithCurrent()
+		ch <- result{snap, current}
+		return nil
+	}); err != nil {
+		panic("ExportedSnapshotWithCurrent: " + err.Error())
+	}
+	r := <-ch
+	return r.snap, r.current
+}

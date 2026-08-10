@@ -1071,16 +1071,36 @@ func (e *engine) buildSnapshot(trackLifecycle bool) (protocol.GoroutineSnapshotP
 	threads := e.readThreads(current, pc)
 	if !threads.Complete {
 		// An incomplete thread walk degrades the whole snapshot, so the deltas
-		// must not run: diffing against a runtime we only partially read would
-		// adopt a truncated live set as the next baseline.
+		// must not run either: diffing against a runtime we only partially read
+		// would adopt a truncated live set as the next baseline.
 		return e.degradedSnapshot(pc)
 	}
-	return e.finishSnapshot(goroutines, threads, pc, trackLifecycle)
+	if trackLifecycle {
+		return e.finishSnapshot(goroutines, threads, pc)
+	}
+	return e.finishSnapshotWithLifecycle(goroutines, threads, pc, false)
 }
 
-// finishSnapshot resolves identity and lifecycle from complete scans before
-// packing decides which elements may leave the engine.
+// finishSnapshot completes a SUCCESSFUL scan: it resolves the stop's identity,
+// computes the lifecycle deltas, and bounds the result for delivery.
+//
+// The identity is resolved from the walk — the full scan — and returned
+// untouched. It is deliberately never read back out of the packed payload:
+// packing decides only what may be DELIVERED and can degrade to empty
+// collections when the required anchors cannot satisfy the byte, count or
+// string contract, at which point the payload names no goroutine and the stop
+// would lose the very thing it exists to report.
 func (e *engine) finishSnapshot(
+	goroutines goroutineWalkResult,
+	threads threadWalkResult,
+	pc uint64,
+) (protocol.GoroutineSnapshotPayload, protocol.Goroutine) {
+	return e.finishSnapshotWithLifecycle(goroutines, threads, pc, true)
+}
+
+// finishSnapshotWithLifecycle is the single automatic/query split. Only the
+// automatic path may advance prevGoids; both paths pack the same complete scan.
+func (e *engine) finishSnapshotWithLifecycle(
 	goroutines goroutineWalkResult,
 	threads threadWalkResult,
 	pc uint64,
@@ -1089,6 +1109,8 @@ func (e *engine) finishSnapshot(
 	live, current := snapshotGoroutineIDs(goroutines.Items, goroutines.AnchorID)
 	currentG := currentGoroutineOf(goroutines.Items)
 	if !currentG.Current {
+		// The scan attributed no current goroutine, but the stop still has to
+		// name something.
 		currentG = e.syntheticGoroutine(pc)
 	}
 
@@ -1193,17 +1215,29 @@ func currentGoroutineFrom(
 ) protocol.Goroutine {
 	for _, g := range snap.Goroutines {
 		if g.Current {
-			if g.ID == 0 {
-				if fallbackLoc == (protocol.Location{}) {
-					fallbackLoc = g.CurrentLoc
-				}
-				return unknownGoroutine(fallbackLoc)
-			}
-			if fallbackLoc != (protocol.Location{}) {
-				g.CurrentLoc = fallbackLoc
-			}
-			return g
+			return currentGoroutineAt(g, fallbackLoc)
 		}
 	}
 	return unknownGoroutine(fallbackLoc)
+}
+
+// currentGoroutineAt applies the stop's resolved location to the goroutine the
+// stop is on. It takes the goroutine directly rather than a payload because the
+// stop's identity must come from the PRE-PACK scan: packing bounds what may be
+// delivered and can degrade to empty collections, and reading the identity back
+// out of a packed payload would leave the stop naming no goroutine at all.
+//
+// An unresolved identity (goid 0) stays unresolved — substituting a real
+// goroutine would misattribute the stop.
+func currentGoroutineAt(g protocol.Goroutine, fallbackLoc protocol.Location) protocol.Goroutine {
+	if !g.Current || g.ID == 0 {
+		if fallbackLoc == (protocol.Location{}) {
+			fallbackLoc = g.CurrentLoc
+		}
+		return unknownGoroutine(fallbackLoc)
+	}
+	if fallbackLoc != (protocol.Location{}) {
+		g.CurrentLoc = fallbackLoc
+	}
+	return g
 }
