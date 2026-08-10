@@ -408,3 +408,73 @@ func TestStepQueueAbortStepLiftsTheGateAndDropsHeldStops(t *testing.T) {
 		t.Fatalf("resumeFor after abortStep = %v, want resumeContinue", got)
 	}
 }
+
+// TestStepQueuePlanResumeForwardsSignalsExceptOnTheSteppedThread pins the
+// signal half of an absorbed resume.
+//
+// SIGURG is the only signal any absorb site passes here, and it must reach the
+// thread again on the continue path or Go loses a preemption it was told to
+// take. The stepped thread is the deliberate exception: re-arming its step with
+// the signal attached would execute the handler's first instruction instead of
+// the instruction under the step, so the engine would reinstall the trap over an
+// instruction that never ran and report the same breakpoint again on return.
+//
+// A mutation that forwards the signal on the re-arm path, or that drops it on
+// the continue path, fails here.
+func TestStepQueuePlanResumeForwardsSignalsExceptOnTheSteppedThread(t *testing.T) {
+	const (
+		stepped = 4600
+		foreign = 4700
+		sigurg  = 23
+	)
+
+	cases := []struct {
+		name       string
+		stepping   bool
+		stepTID    int
+		tid        int
+		signal     int
+		wantMode   stepResume
+		wantSignal int
+	}{
+		{"foreign thread mid-step keeps its signal", true, stepped, foreign, sigurg, resumeContinue, sigurg},
+		{"stepped thread drops its signal", true, stepped, stepped, sigurg, resumeSingleStep, 0},
+		{"idle queue keeps the signal", false, 0, foreign, sigurg, resumeContinue, sigurg},
+		{"idle queue keeps it even for the last stepped tid", false, stepped, stepped, sigurg, resumeContinue, sigurg},
+		{"a zero signal stays zero on continue", true, stepped, foreign, 0, resumeContinue, 0},
+		{"a zero signal stays zero on re-arm", true, stepped, stepped, 0, resumeSingleStep, 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q := &stepQueue{stepping: tc.stepping, stepTID: tc.stepTID}
+			got := q.planResume(tc.tid, tc.signal)
+			if got.mode != tc.wantMode {
+				t.Fatalf("planResume(%d, %d).mode = %v, want %v", tc.tid, tc.signal, got.mode, tc.wantMode)
+			}
+			if got.signal != tc.wantSignal {
+				t.Fatalf("planResume(%d, %d).signal = %d, want %d", tc.tid, tc.signal, got.signal, tc.wantSignal)
+			}
+		})
+	}
+}
+
+// TestStepQueuePlanResumeAgreesWithResumeFor stops the two decisions drifting
+// apart: planResume owns the signal, but the primitive it picks must remain
+// exactly what resumeFor says, so a future change to one cannot silently
+// contradict the other.
+func TestStepQueuePlanResumeAgreesWithResumeFor(t *testing.T) {
+	const (
+		stepped = 4800
+		foreign = 4900
+	)
+
+	for _, stepping := range []bool{false, true} {
+		for _, tid := range []int{stepped, foreign} {
+			q := &stepQueue{stepping: stepping, stepTID: stepped}
+			if got, want := q.planResume(tid, 7).mode, q.resumeFor(tid); got != want {
+				t.Fatalf("stepping=%v tid=%d: planResume mode %v, resumeFor %v", stepping, tid, got, want)
+			}
+		}
+	}
+}

@@ -202,6 +202,40 @@ func (q *stepQueue) resumeFor(tid int) stepResume {
 	return resumeContinue
 }
 
+// resumePlan is how an absorbed stop's thread is resumed: the primitive to use
+// and the signal that primitive actually delivers.
+type resumePlan struct {
+	mode   stepResume
+	signal int
+}
+
+// planResume decides both halves of an absorbed resume at once, so the signal a
+// thread is resumed with is chosen in the same place as the primitive.
+//
+// The stepped thread is re-armed WITHOUT its signal, and that asymmetry is
+// deliberate. PTRACE_SINGLESTEP with a signal makes the kernel build the signal
+// frame first, so the one instruction that then executes is the handler's, not
+// the instruction the engine asked to step over. The engine would take that stop
+// as the step completing, reinstall the trap at the breakpoint address and
+// continue — but the original instruction never ran, so returning from the
+// handler lands back on the re-armed trap and reports the same breakpoint again.
+// Dropping the signal instead costs one delivery; SIGURG is the only signal that
+// can reach here, it is Go's async-preemption hint, and the runtime has already
+// set the goroutine's preempt flag before sending it, so the preemption still
+// happens at the next stack check and sysmon retries regardless.
+//
+// This preserves the pre-existing linux behaviour exactly: before the park queue
+// the SIGURG branch chose between a bare singleStep on the stepped thread and a
+// signal-carrying continue on any other, and SIGURG remains the only caller that
+// passes a non-zero signal. Forwarding it on the step path is out of scope here
+// and belongs with the per-TID signal-forwarding work.
+func (q *stepQueue) planResume(tid int, signal int) resumePlan {
+	if q.resumeFor(tid) == resumeSingleStep {
+		return resumePlan{mode: resumeSingleStep, signal: 0}
+	}
+	return resumePlan{mode: resumeContinue, signal: signal}
+}
+
 // abortStep resolves a step that can no longer complete, for the cases where
 // re-arming it would be wrong rather than merely late.
 //
