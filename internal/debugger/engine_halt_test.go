@@ -129,6 +129,21 @@ var _ = Describe("asynchronous halts in handleStop", func() {
 			"the retry must actually reach the backend")
 	})
 
+	It("reports a halt when Continue cannot resume after the breakpoint step", func() {
+		const bpAddr = uint64(0x4150)
+		arriveAtBreakpoint(fb, d, bpAddr)
+
+		continueAndConsumeContinued(d)
+
+		fb.failContinue(errInjected)
+		fb.pushStop(debugger.StopEvent{Reason: debugger.StopSingleStep, TID: 1, PC: bpAddr + 4})
+
+		expectHaltReported(d, "continue after breakpoint step")
+
+		fb.clearFaults()
+		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
+	})
+
 	// Site D — StopSingleStep/bpResumeStepOut: the temporary return breakpoint
 	// cannot be set. Uniquely, this site left the engine in stateRunning while
 	// the tracee was halted, so it also has to correct the state.
@@ -155,6 +170,24 @@ var _ = Describe("asynchronous halts in handleStop", func() {
 		Expect(fb.continueCount()).To(BeNumerically(">", before))
 	})
 
+	It("reports a halt when StepOut cannot continue after setting its return breakpoint", func() {
+		const bpAddr = uint64(0x4250)
+		const retAddr = uint64(0x9950)
+		arriveAtBreakpoint(fb, d, bpAddr)
+		seedFrameChain(fb, bpAddr, 0x7200, 0x7300, retAddr)
+		fb.seedMem(retAddr, []byte{0x90, 0x90, 0x90, 0x90, 0x90})
+
+		Expect(d.StepOut()).To(Succeed())
+
+		fb.failContinue(errInjected)
+		fb.pushStop(debugger.StopEvent{Reason: debugger.StopSingleStep, TID: 1, PC: bpAddr + 4})
+
+		expectHaltReported(d, "continue after StepOut breakpoint")
+
+		fb.clearFaults()
+		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
+	})
+
 	// Site E — StopSignal: in-flight step-over reinstall failure.
 	It("reports a halt when a signal interrupts an unreinstallable step-over", func() {
 		const bpAddr = uint64(0x4300)
@@ -171,6 +204,31 @@ var _ = Describe("asynchronous halts in handleStop", func() {
 		before := fb.continueCount()
 		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
 		Expect(fb.continueCount()).To(BeNumerically(">", before))
+	})
+
+	It("reports a halt when an ordinary signal cannot be resumed", func() {
+		runWithWaitLoop(d)
+
+		fb.failContinue(errInjected)
+		fb.pushStop(debugger.StopEvent{Reason: debugger.StopSignal, TID: 1, Signal: 10})
+
+		Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventOutput))
+		expectHaltReported(d, "continue after signal 10 on thread 1")
+
+		fb.clearFaults()
+		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
+	})
+
+	It("reports a halt when a stale Pause signal cannot be suppressed", func() {
+		runWithWaitLoop(d)
+
+		fb.failContinue(errInjected)
+		fb.pushStop(debugger.StopEvent{Reason: debugger.StopSignal, TID: 1, Signal: fb.PauseSignal()})
+
+		expectHaltReported(d, "continue after stale pause signal")
+
+		fb.clearFaults()
+		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
 	})
 
 	// The suspending event is the load-bearing half: emit drops events when the

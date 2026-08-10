@@ -111,6 +111,7 @@ type linuxBackend struct {
 	// Nil in production; tests inject this at the raw syscall seam to pin the
 	// exact ptrace request, TID, and signal without launching a tracee.
 	ptraceSyscall6Fn func(trap, a1, a2, a3, a4, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno)
+	tgkillFn         func(tgid, tid int, signal syscall.Signal) error
 }
 
 // drainParked returns the next held stop if one may be surfaced now, installing
@@ -298,10 +299,15 @@ func isAlreadyExited(err error) bool {
 func (b *linuxBackend) ContinueProcess() error {
 	b.endStep()
 	tid := b.traceTID()
-	signal := b.pendingSignals.take(tid)
+	signal, delayed := b.pendingSignals.takeForContinue(tid)
+	if err := b.requeueSignal(tid, delayed); err != nil {
+		b.pendingSignals.restore(tid, signal, delayed)
+		return err
+	}
 	var err error
 	b.execPtrace(func() { err = b.ptraceCont(tid, signal) })
 	if err != nil {
+		b.pendingSignals.restore(tid, signal, 0)
 		return fmt.Errorf("PTRACE_CONT tid %d signal %d: %w", tid, signal, err)
 	}
 	return nil
@@ -309,10 +315,11 @@ func (b *linuxBackend) ContinueProcess() error {
 
 func (b *linuxBackend) SingleStep(tid int) error {
 	b.beginStep(tid)
-	signal := b.pendingSignals.take(tid)
+	signal := b.pendingSignals.takeForStep(tid)
 	var err error
 	b.execPtrace(func() { err = b.ptraceSingleStep(tid, signal) })
 	if err != nil {
+		b.pendingSignals.restore(tid, signal, 0)
 		return fmt.Errorf("PTRACE_SINGLESTEP tid %d signal %d: %w", tid, signal, err)
 	}
 	return nil
@@ -520,12 +527,14 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				b.recordStop(tid)
 				return StopEvent{Reason: StopExited, TID: tid, ExitCode: ws.ExitStatus()}, nil
 			}
+			b.pendingSignals.clear(tid)
 			b.clearStepIfStepped(tid)
 			continue
 		}
 
 		if ws.Signaled() {
 			if tid != b.pid {
+				b.pendingSignals.clear(tid)
 				b.clearStepIfStepped(tid)
 				continue
 			}
@@ -553,10 +562,10 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 			case syscall.PTRACE_EVENT_EXIT:
 				if tid != b.pid {
-					if err := b.continueIfTraceeExists(tid, 0); err != nil {
+					b.clearStepIfStepped(tid)
+					if err := b.continueWithoutPendingSignals(tid); err != nil {
 						return StopEvent{}, fmt.Errorf("PTRACE_CONT exiting thread tid %d: %w", tid, err)
 					}
-					b.clearStepIfStepped(tid)
 					continue
 				}
 				// Main thread is about to exit: nothing parked can ever be
@@ -590,6 +599,7 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				return StopEvent{Reason: StopExited, TID: tid, ExitCode: 0}, nil
 
 			case syscall.PTRACE_EVENT_EXEC:
+				b.pendingSignals.purge()
 				// execve replaces the image the stepped-over breakpoint and its
 				// saved instruction bytes belong to, so the step can be neither
 				// re-armed nor completed. Nothing can restore the old trap
@@ -732,14 +742,22 @@ func isNoChildProcess(err error) bool {
 	return errors.Is(err, syscall.ECHILD)
 }
 
+// continueIfTraceeExists is the only internal continue path. A SIGURG delayed
+// through a single-step is first requeued to the same TID and resumed with
+// signal zero; only the resulting signal-delivery stop may inject SIGURG.
 func (b *linuxBackend) continueIfTraceeExists(tid int, signal int) error {
 	if tid == 0 {
 		return nil
 	}
-	b.pendingSignals.clear(tid)
+	resumeSignal, delayed := b.pendingSignals.takeForExplicitResume(tid, signal)
+	if err := b.requeueSignal(tid, delayed); err != nil {
+		b.pendingSignals.restore(tid, 0, delayed)
+		return err
+	}
 	var err error
-	b.execPtrace(func() { err = b.ptraceCont(tid, signal) })
+	b.execPtrace(func() { err = b.ptraceCont(tid, resumeSignal) })
 	if err != nil && !isNoSuchProcess(err) {
+		b.pendingSignals.restore(tid, 0, delayed)
 		return err
 	}
 	return nil
@@ -749,7 +767,7 @@ func (b *linuxBackend) singleStepIfTraceeExists(tid int) error {
 	if tid == 0 {
 		return nil
 	}
-	b.pendingSignals.clear(tid)
+	b.pendingSignals.takeForStep(tid)
 	var err error
 	b.execPtrace(func() { err = b.ptraceSingleStep(tid, 0) })
 	if err != nil && !isNoSuchProcess(err) {
@@ -764,16 +782,36 @@ func (b *linuxBackend) singleStepIfTraceeExists(tid int) error {
 // consumes that step, and a plain continue there would silently cancel it while
 // the step gate stays latched. See stepQueue.resumeFor.
 //
-// The signal is re-delivered only on the continue path. Re-delivering it with
-// PTRACE_SINGLESTEP would run the handler instead of the instruction the engine
-// asked to step, which is why the stepped thread swallows it — the pre-existing
-// SIGURG behaviour this generalises.
+// A signal absorbed on the stepped thread is delayed through the signal-zero
+// re-step. Injecting it with PTRACE_SINGLESTEP would stop in the handler's signal
+// frame before the requested instruction executes. The next continue requeues
+// it to the same TID and forwards it from a fresh signal-delivery stop.
 func (b *linuxBackend) resumeAbsorbed(tid int, signal int) error {
 	if b.resumeFor(tid) == resumeSingleStep {
+		b.pendingSignals.delay(tid, signal)
 		b.countStepRearm()
 		return b.singleStepIfTraceeExists(tid)
 	}
 	return b.continueIfTraceeExists(tid, signal)
+}
+
+func (b *linuxBackend) requeueSignal(tid, signal int) error {
+	if signal == 0 {
+		return nil
+	}
+	tgkill := syscall.Tgkill
+	if b.tgkillFn != nil {
+		tgkill = b.tgkillFn
+	}
+	if err := tgkill(b.pid, tid, syscall.Signal(signal)); err != nil {
+		return fmt.Errorf("requeue signal %d to tid %d: %w", signal, tid, err)
+	}
+	return nil
+}
+
+func (b *linuxBackend) continueWithoutPendingSignals(tid int) error {
+	b.pendingSignals.clear(tid)
+	return b.continueIfTraceeExists(tid, 0)
 }
 
 func (b *linuxBackend) ptraceCont(tid, signal int) error {
