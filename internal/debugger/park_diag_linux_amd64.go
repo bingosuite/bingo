@@ -66,3 +66,27 @@ func LinuxStepRearmCount(d Debugger) (int, bool) {
 	}
 	return b.stepRearmCount(), true
 }
+
+// LinuxRetiredInternalBreakpointCount reports how many delayed sibling hits
+// were recovered after another thread auto-cleared the one-shot sentinel.
+//
+// The hit may already be queued in the kernel before the sentinel is cleared,
+// so it need not pass through the backend's parked-stop FIFO. Reading through
+// dispatch keeps the loop-thread-owned counter race-free.
+func LinuxRetiredInternalBreakpointCount(d Debugger) (int, bool) {
+	e, ok := d.(*engine)
+	if !ok {
+		return 0, false
+	}
+	if _, ok := e.backend.(*linuxBackend); !ok {
+		return 0, false
+	}
+	var count int
+	if err := e.dispatch(func() error {
+		count = e.retiredInternalBreakpointHits
+		return nil
+	}); err != nil {
+		return 0, false
+	}
+	return count, true
+}

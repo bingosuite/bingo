@@ -61,6 +61,16 @@ func arriveAtBreakpoint(fb *fakeBackend, d debugger.Debugger, addr uint64) {
 	ExpectWithOffset(1, mustNextEvent(d).Kind).To(Equal(protocol.EventBreakpointHit))
 }
 
+func retireInternalBreakpoint(fb *fakeBackend, d debugger.Debugger, addr uint64) {
+	fb.seedMem(addr, []byte{0x90, 0x90, 0x90, 0x90})
+	fb.regs[1] = debugger.Registers{PC: addr}
+	debugger.ExportedForceSuspended(d)
+	debugger.ExportedSetStepOverBreakpointAt(d, addr)
+	runWithWaitLoop(d)
+	fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: 1, PC: addr})
+	ExpectWithOffset(1, mustNextEvent(d).Kind).To(Equal(protocol.EventStepped))
+}
+
 var _ = Describe("asynchronous halts in handleStop", func() {
 	var (
 		fb *fakeBackend
@@ -127,6 +137,66 @@ var _ = Describe("asynchronous halts in handleStop", func() {
 		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
 		Expect(fb.continueCount()).To(BeNumerically(">", before),
 			"the retry must actually reach the backend")
+	})
+
+	It("reports a halt when an internal breakpoint cannot be auto-cleared", func() {
+		const addr = uint64(0x4180)
+		fb.seedMem(addr, []byte{0x90, 0x90, 0x90, 0x90})
+		fb.regs[1] = debugger.Registers{PC: addr}
+		debugger.ExportedForceSuspended(d)
+		debugger.ExportedSetStepOverBreakpointAt(d, addr)
+		runWithWaitLoop(d)
+
+		fb.failWriteAt(addr, errInjected)
+		fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: 1, PC: addr})
+
+		expectHaltReported(d, "clear internal breakpoint")
+		fb.clearFaults()
+		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
+	})
+
+	It("reports a halt when a delayed internal-breakpoint hit cannot read its thread", func() {
+		const addr = uint64(0x4190)
+		retireInternalBreakpoint(fb, d, addr)
+		runWithWaitLoop(d)
+
+		fb.failRegisters(errInjected)
+		fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: 2, PC: addr})
+
+		expectHaltReported(d, "read registers for retired internal breakpoint on thread 2")
+		fb.clearFaults()
+		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
+	})
+
+	It("reports a halt when a delayed internal-breakpoint hit cannot rewind its thread", func() {
+		if len(debugger.ExportedTrapInstruction()) != 1 {
+			Skip("the delayed-PC rewind failure requires an architecture that advances past its trap")
+		}
+		const addr = uint64(0x41a0)
+		retireInternalBreakpoint(fb, d, addr)
+		fb.regs[2] = debugger.Registers{PC: addr + 1}
+		runWithWaitLoop(d)
+
+		fb.failSetRegisters(errInjected)
+		fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: 2, PC: addr})
+
+		expectHaltReported(d, "rewind retired internal breakpoint on thread 2")
+		fb.clearFaults()
+		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
+	})
+
+	It("reports a halt when a delayed internal-breakpoint hit cannot resume", func() {
+		const addr = uint64(0x41b0)
+		retireInternalBreakpoint(fb, d, addr)
+		fb.regs[2] = debugger.Registers{PC: addr}
+		runWithWaitLoop(d)
+
+		fb.failContinue(errInjected)
+		fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: 2, PC: addr})
+
+		expectHaltReported(d, "continue after retired internal breakpoint on thread 2")
+		fb.clearFaults()
+		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
 	})
 
 	// Site D — StopSingleStep/bpResumeStepOut: the temporary return breakpoint
