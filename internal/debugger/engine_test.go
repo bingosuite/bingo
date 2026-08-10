@@ -37,6 +37,7 @@ type fakeBackend struct {
 	continueCalls    int
 	singleStepCalls  []int
 	stopProcessCalls int
+	getRegisterCalls int
 	readCalls        []uint64
 	writeCalls       []uint64
 	writtenAt        map[uint64][]byte
@@ -277,6 +278,7 @@ func (f *fakeBackend) writeCountFor(addr uint64) int {
 }
 
 func (f *fakeBackend) GetRegisters(tid int) (debugger.Registers, error) {
+	f.getRegisterCalls++
 	if f.getRegistersErr != nil {
 		err := f.getRegistersErr
 		f.getRegistersErr = nil
