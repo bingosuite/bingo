@@ -4,9 +4,11 @@ package debugger
 
 import (
 	"bytes"
+	"debug/elf"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"syscall"
 	"testing"
@@ -20,6 +22,15 @@ const steppingSIGURGHelperSource = `
 #include <unistd.h>
 
 static int marker_fd;
+
+__asm__(
+".global step_target\n"
+".type step_target,@function\n"
+"step_target:\n"
+"nop\n"
+"ret\n"
+".size step_target, .-step_target\n"
+);
 
 static void handle_sigurg(int signal) {
 	(void)signal;
@@ -64,9 +75,10 @@ func TestLinuxBackendSteppingThreadSIGURGIsRedelivered(t *testing.T) {
 	if err := os.WriteFile(sourcePath, []byte(steppingSIGURGHelperSource), 0o600); err != nil {
 		t.Fatalf("write helper source: %v", err)
 	}
-	if output, err := exec.Command("cc", "-O0", "-g", "-o", binaryPath, sourcePath).CombinedOutput(); err != nil {
+	if output, err := exec.Command("cc", "-O0", "-g", "-fno-pie", "-no-pie", "-o", binaryPath, sourcePath).CombinedOutput(); err != nil {
 		t.Fatalf("compile helper: %v\n%s", err, output)
 	}
+	stepPC := findELFSymbol(t, binaryPath, "step_target")
 
 	b := newBackend().(*linuxBackend)
 	pid, _, err := startTracedProcess(b, binaryPath, []string{markerPath}, nil)
@@ -115,6 +127,14 @@ func TestLinuxBackendSteppingThreadSIGURGIsRedelivered(t *testing.T) {
 	if stop.Reason != StopSignal || stop.TID != pid || stop.Signal != int(syscall.SIGSTOP) {
 		t.Fatalf("pause stop = %+v, want SIGSTOP on exact tid %d", stop, pid)
 	}
+	regs, err := b.GetRegisters(pid)
+	if err != nil {
+		t.Fatalf("read registers before step: %v", err)
+	}
+	regs.PC = stepPC
+	if err := b.SetRegisters(pid, regs); err != nil {
+		t.Fatalf("set controlled step PC: %v", err)
+	}
 
 	if err := syscall.Tgkill(pid, pid, syscall.SIGURG); err != nil {
 		t.Fatalf("queue SIGURG on tid %d: %v", pid, err)
@@ -130,35 +150,55 @@ func TestLinuxBackendSteppingThreadSIGURGIsRedelivered(t *testing.T) {
 	if step.Reason != StopSingleStep || step.TID != pid {
 		t.Fatalf("step stop = %+v, want StopSingleStep on exact tid %d", step, pid)
 	}
-
-	resumeMu.Lock()
-	var stepCalls []linuxResumeCall
-	for _, call := range resumes {
-		if call.request == syscall.PTRACE_SINGLESTEP {
-			stepCalls = append(stepCalls, call)
-		}
+	regs, err = b.GetRegisters(pid)
+	if err != nil {
+		t.Fatalf("read registers after step: %v", err)
 	}
-	resumeMu.Unlock()
-
-	wantSteps := []linuxResumeCall{
-		wantLinuxResume(syscall.PTRACE_SINGLESTEP, pid, 0),
-		wantLinuxResume(syscall.PTRACE_SINGLESTEP, pid, int(syscall.SIGURG)),
+	if regs.PC != stepPC+1 {
+		t.Fatalf("PC after step = 0x%x, want controlled instruction completed at 0x%x", regs.PC, stepPC+1)
 	}
-	if len(stepCalls) != len(wantSteps) {
-		t.Errorf("PTRACE_SINGLESTEP calls = %+v, want initial step plus SIGURG retry %+v", stepCalls, wantSteps)
-	} else {
-		for i := range wantSteps {
-			if stepCalls[i] != wantSteps[i] {
-				t.Errorf("PTRACE_SINGLESTEP call %d = %+v, want %+v", i, stepCalls[i], wantSteps[i])
-			}
-		}
+
+	regs.PC = stepPC
+	if err := b.SetRegisters(pid, regs); err != nil {
+		t.Fatalf("reset controlled step PC: %v", err)
+	}
+	if err := b.SingleStep(pid); err != nil {
+		t.Fatalf("start second single-step on tid %d: %v", pid, err)
+	}
+	step, err = b.Wait()
+	if err != nil {
+		t.Fatalf("wait for second single-step completion: %v", err)
+	}
+	if step.Reason != StopSingleStep || step.TID != pid {
+		t.Fatalf("second step stop = %+v, want StopSingleStep on exact tid %d", step, pid)
+	}
+	regs, err = b.GetRegisters(pid)
+	if err != nil {
+		t.Fatalf("read registers after second step: %v", err)
+	}
+	if regs.PC != stepPC+1 {
+		t.Fatalf("PC after second step = 0x%x, want delayed SIGURG retained and instruction completed at 0x%x", regs.PC, stepPC+1)
 	}
 
 	if err := b.ContinueProcess(); err != nil {
 		t.Fatalf("continue from single-step completion: %v", err)
 	}
+
+	resumeMu.Lock()
+	gotResumes := append([]linuxResumeCall(nil), resumes...)
+	resumeMu.Unlock()
+	wantResumes := []linuxResumeCall{
+		wantLinuxResume(syscall.PTRACE_CONT, pid, 0),
+		wantLinuxResume(syscall.PTRACE_SINGLESTEP, pid, 0),
+		wantLinuxResume(syscall.PTRACE_SINGLESTEP, pid, 0),
+		wantLinuxResume(syscall.PTRACE_SINGLESTEP, pid, 0),
+		wantLinuxResume(syscall.PTRACE_CONT, pid, int(syscall.SIGURG)),
+	}
+	if !reflect.DeepEqual(gotResumes, wantResumes) {
+		t.Errorf("ptrace resume calls = %+v, want original step completion before exact signal delivery %+v", gotResumes, wantResumes)
+	}
 	if !waitForFileMarker(markerPath, 'H', 2*time.Second) {
-		t.Errorf("SIGURG handler did not run: retry suppressed the signal on tid %d", pid)
+		t.Errorf("SIGURG handler did not run on tid %d", pid)
 		return
 	}
 
@@ -170,6 +210,26 @@ func TestLinuxBackendSteppingThreadSIGURGIsRedelivered(t *testing.T) {
 		t.Fatalf("terminal stop = %+v, want exit 42 on tid %d", exited, pid)
 	}
 	reaped = true
+}
+
+func findELFSymbol(t *testing.T, path, name string) uint64 {
+	t.Helper()
+	f, err := elf.Open(path)
+	if err != nil {
+		t.Fatalf("open helper ELF: %v", err)
+	}
+	defer f.Close()
+	symbols, err := f.Symbols()
+	if err != nil {
+		t.Fatalf("read helper symbols: %v", err)
+	}
+	for _, symbol := range symbols {
+		if symbol.Name == name {
+			return symbol.Value
+		}
+	}
+	t.Fatalf("helper symbol %q not found", name)
+	return 0
 }
 
 func waitForFileMarker(path string, marker byte, timeout time.Duration) bool {

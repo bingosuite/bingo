@@ -40,11 +40,12 @@ type fakeBackend struct {
 	// faulting code, so the arming is already ordered before the engine's
 	// read; faultMu makes that explicit rather than leaning on the channel's
 	// happens-before edge, and keeps -race quiet if a waitLoop is in flight.
-	faultMu    sync.Mutex
-	threadsErr error
-	regsErr    error
-	writeErrAt map[uint64]error
-	readErrAt  map[uint64]error
+	faultMu     sync.Mutex
+	threadsErr  error
+	regsErr     error
+	continueErr error
+	writeErrAt  map[uint64]error
+	readErrAt   map[uint64]error
 }
 
 func newFakeBackend() *fakeBackend {
@@ -73,6 +74,12 @@ func (f *fakeBackend) failRegisters(err error) {
 	f.regsErr = err
 }
 
+func (f *fakeBackend) failContinue(err error) {
+	f.faultMu.Lock()
+	defer f.faultMu.Unlock()
+	f.continueErr = err
+}
+
 func (f *fakeBackend) failWriteAt(addr uint64, err error) {
 	f.faultMu.Lock()
 	defer f.faultMu.Unlock()
@@ -90,6 +97,7 @@ func (f *fakeBackend) clearFaults() {
 	defer f.faultMu.Unlock()
 	f.threadsErr = nil
 	f.regsErr = nil
+	f.continueErr = nil
 	f.writeErrAt = make(map[uint64]error)
 	f.readErrAt = make(map[uint64]error)
 }
@@ -139,9 +147,9 @@ func (f *fakeBackend) peekMem(addr uint64, n int) []byte {
 
 func (f *fakeBackend) ContinueProcess() error {
 	f.faultMu.Lock()
+	defer f.faultMu.Unlock()
 	f.continueCalls++
-	f.faultMu.Unlock()
-	return nil
+	return f.continueErr
 }
 
 // continueCount reads the resume counter under the lock. Assertions that poll
@@ -683,6 +691,27 @@ var _ = Describe("Engine", func() {
 		It("emits EventContinued when it resumes", func() {
 			Expect(d.Continue()).To(Succeed())
 			Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventContinued))
+		})
+	})
+
+	Describe("signal forwarding", func() {
+		It("suspends instead of starting a wait loop when resume fails", func() {
+			debugger.ExportedForceSuspended(d)
+			continueAndConsumeContinued(d)
+			fb.failContinue(errInjected)
+
+			fb.pushStop(debugger.StopEvent{
+				Reason: debugger.StopSignal,
+				TID:    1,
+				Signal: int(syscall.SIGUSR1),
+			})
+
+			Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventOutput))
+			Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventError))
+			Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventPaused))
+
+			fb.clearFaults()
+			Expect(d.Continue()).To(Succeed())
 		})
 	})
 

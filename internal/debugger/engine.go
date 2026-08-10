@@ -796,7 +796,11 @@ func (e *engine) handleStop(stop StopEvent) {
 			return
 		}
 		e.emitOutput("stderr", fmt.Sprintf("signal %d", stop.Signal))
-		_ = e.backend.ContinueProcess()
+		if err := e.backend.ContinueProcess(); err != nil {
+			e.setState(stateSuspended)
+			e.haltOnError(protocol.CmdNone, fmt.Errorf("continue after signal %d: %w", stop.Signal, err), stop)
+			return
+		}
 		e.setState(stateRunning)
 		go e.waitLoop()
 	}

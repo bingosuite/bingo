@@ -367,14 +367,16 @@ state after such a write is a separate problem — do not add disabled-breakpoin
 protocol/state here.
 
 Note also that this rule covers the *reporting* of halts, not every internal
-resume: five `handleStop` paths still ignore `ContinueProcess`'s error (the
+resume: four `handleStop` paths still ignore `ContinueProcess`'s error (the
 spurious-trap advance, `bpResumeContinue`, the successful `StepOut`
-continuation, the leftover-pause-signal suppression, and the ordinary-signal
-auto-resume). If one of those ever fails, the engine records `stateRunning` for
-a tracee that never resumed and no event is emitted at all — the same class of
-liveness loss from the other direction. None has a confirmed backend
-reachability, so none is fixed or filed yet; **do not treat this class as
-globally closed.**
+continuation, and leftover-pause-signal suppression). If one of those ever
+fails, the engine records `stateRunning` for a tracee that never resumed and no
+event is emitted at all — the same class of liveness loss from the other
+direction. Ordinary-signal auto-resume is checked because delayed-SIGURG
+requeue can fail before ptrace runs; it halts with `EventError` + `EventPaused`
+instead of starting a wait loop against a stopped tracee. None of the remaining
+four has a confirmed backend reachability, so none is fixed or filed yet; **do
+not treat this class as globally closed.**
 
 The sites are `populateBreakpointStop` failure (`StopBreakpoint`),
 `populateStopPC` failure and `bps.reinstall` failure (`StopSingleStep`), the
@@ -615,6 +617,13 @@ stopped TID and the signal argument to the next ptrace resume:
 2. `ContinueProcess` and `SingleStep(tid)` atomically take only that exact TID's
    signal and pass it as ptrace's data argument. Taking is one-shot even when the
    ptrace call fails, so a stale signal cannot be injected by a later retry.
+   The store keeps a current signal-delivery stop separate from a SIGURG delayed
+   by an interrupted single-step, so a later stop on the same TID is delivered
+   first without overwriting the delayed signal. `SingleStep` consumes only the
+   current signal and leaves delayed SIGURG pending until a non-step resume. If
+   `ContinueProcess` finds both, it re-queues SIGURG to the exact TID with
+   `tgkill` before injecting the current signal; the resulting signal-delivery
+   stop then runs through the ordinary exact-TID `PTRACE_CONT` path.
 3. The parked-stop FIFO from #202 retains the signal inside the `StopEvent`.
    Parking never touches pending state. `drainParked` performs the same
    signal-before-TID delivery handoff as a live `Wait` result.
@@ -622,10 +631,14 @@ stopped TID and the signal argument to the next ptrace resume:
    preserving manual Pause and leftover-interrupt suppression. Clone `SIGSTOP`,
    `SIGURG`, `SIGCONT`, ptrace events and spurious breakpoint traps remain
    internal Wait-loop cases with their existing explicit resume signal.
-5. Every internal continue/single-step clears pending state only for its own TID;
-   process exit, Kill/detach and tracer shutdown purge all of it. The map is
-   mutex-protected because `Wait` publishes from its goroutine while the engine
-   consumes it; unlike `stepQueue`, this state crosses goroutines.
+5. Any internal `PTRACE_CONT` consumes a delayed SIGURG rather than stranding it:
+   signal `0` becomes SIGURG, a matching explicit SIGURG coalesces with it, and
+   a different explicit signal re-queues SIGURG with exact-TID `tgkill`. The
+   stepping-thread `PTRACE_SINGLESTEP` retry is the only internal resume that
+   preserves it. Per-thread exit/exec and process exit, Kill/detach, and tracer
+   shutdown purge it. The map is mutex-protected because `Wait` publishes from
+   its goroutine while the engine consumes it; unlike `stepQueue`, this state
+   crosses goroutines.
 
 The host-agnostic map tests, linux backend raw ptrace-tuple tests, the `signals`
 E2E label (one SIGSEGV/SIGABRT output followed by signal death, one handled
@@ -848,9 +861,14 @@ are detected by a `mach_msg` receive loop.
   on a Mach port, not `wait4`, so its `killProcess` `Wait4(pid)` is always the
   sole reaper and ignores `running`.) Regression guard: the `kill` e2e loops the
   launch→run→Kill cycle (`BINGO_E2E_KILL_ITERS`).
-- `SIGURG` re-delivery is mandatory here too — but only the `stepTID` thread is
-  re-single-stepped on SIGURG; a SIGURG on any other thread is re-delivered and
-  that thread continued.
+- `SIGURG` re-delivery is mandatory here too, but injecting it directly into
+  `PTRACE_SINGLESTEP` makes Linux report signal-frame setup as a trace trap
+  before the interrupted instruction executes. For `stepTID`, `Wait` therefore
+  saves SIGURG in the per-TID pending map, retries `PTRACE_SINGLESTEP` with
+  signal `0`, and lets the exact TID's next `PTRACE_CONT` deliver it after the
+  real step completion. Further `SingleStep` calls leave that delayed SIGURG
+  pending rather than manufacturing a false completion. A SIGURG on any other
+  thread is re-delivered immediately through `PTRACE_CONT`.
 
 ## DWARF reader notes
 
