@@ -70,8 +70,8 @@ type engine struct {
 
 	// Software-breakpoint step-over state. lastBP is the BP the process
 	// stopped at; on next resume we restore bytes, single-step, reinstall
-	// the trap, then perform bpResumeAction. steppingOverBP is non-nil
-	// during the in-flight single-step.
+	// the trap, then perform bpResumeAction. While steppingOverBP is non-nil,
+	// its temporarily table-less address remains reserved for that operation.
 	lastBP         *breakpointEntry
 	lastBPTID      int // thread that hit lastBP (Mach port on Darwin)
 	steppingOverBP *breakpointEntry
@@ -298,7 +298,7 @@ func (e *engine) SetBreakpoint(file string, line int) (protocol.Breakpoint, erro
 		if err != nil {
 			return err
 		}
-		entry, err := e.bps.set(e.backend, file, line, addr)
+		entry, err := e.setBreakpoint(file, line, addr)
 		if err != nil {
 			return err
 		}
@@ -306,6 +306,13 @@ func (e *engine) SetBreakpoint(file string, line int) (protocol.Breakpoint, erro
 		return nil
 	})
 	return bp, err
+}
+
+func (e *engine) setBreakpoint(file string, line int, addr uint64) (*breakpointEntry, error) {
+	if e.steppingOverBP != nil && e.steppingOverBP.addr == addr {
+		return nil, breakpointExists(addr, file, line)
+	}
+	return e.bps.set(e.backend, file, line, addr)
 }
 
 func (e *engine) ClearBreakpoint(id int) error {
