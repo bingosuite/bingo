@@ -17,9 +17,16 @@ import (
 //
 // The engine serializes the walk while the reporting thread is suspended.
 // Darwin also stops sibling threads, but Linux ptrace stops are per-thread, so
-// runtime mutations can race the walk there. Any incomplete required read
-// therefore degrades gracefully to the legacy single-synthetic goroutine rather
-// than being mistaken for a lifecycle change or erroring the stop.
+// runtime mutations can race the walk there. That race has two distinct shapes
+// and they need two distinct defences:
+//
+//   - A required read FAILS or an entry is retired mid-walk. Handled by
+//     degrading: an incomplete walk falls back to the legacy single-synthetic
+//     goroutine rather than being mistaken for a lifecycle change.
+//   - Every read SUCCEEDS but the values are mutually inconsistent, because
+//     they were taken from different generations of a table that was
+//     republished underneath us. Degradation cannot see this — nothing failed —
+//     so it is prevented instead, by the read ordering in allgsMetadata.
 
 const (
 	// maxGoroutineScan bounds the runtime.allgs walk so a corrupt slice header
@@ -321,6 +328,76 @@ func (e *engine) readI64(addr uint64) (int64, bool) {
 	return int64(v), ok
 }
 
+// allgsMetadata reads the goroutine table's array pointer and length as a
+// coherent pair.
+//
+// The read ORDER is load-bearing, and it is the opposite of the obvious one.
+// Only the trapping thread halts at a Linux ptrace stop, so sibling threads
+// keep running while this walk reads tracee memory and runtime.allgadd can
+// republish the table between our two reads. allgadd publishes the array
+// pointer BEFORE the length, so reading the pointer first can pair a stale
+// array with a length belonging to its larger successor and walk past the end
+// of the old allocation. That overrun is not detectable downstream: the word
+// after a heap object is mapped, so the read SUCCEEDS and the walk reports
+// itself Complete while carrying a goroutine that never existed.
+//
+// Reading the length FIRST is what makes the pair safe, and it is safe only
+// because runtime.allgs is append-only and never shrinks: a length observed
+// before a pointer therefore always fits inside whichever array that pointer
+// names. The worst case degrades to missing a goroutine created during the
+// read, which the runtime documents as acceptable for lock-free readers.
+//
+// runtime.allglen/runtime.allgptr are the runtime's own atomics, published for
+// exactly this purpose and carrying the documented contract ("allgptr is
+// updated before allglen. Readers should read allglen before allgptr"), so they
+// are preferred. The raw runtime.allgs header is a fallback for images without
+// those symbols; it applies the same length-before-pointer ordering, but the
+// slice header's three words are ordinary compiler-scheduled stores rather than
+// a documented contract, so the fallback is best-effort where the mirror is
+// guaranteed.
+//
+// ok is false whenever a required read fails, so callers degrade exactly as
+// they do for any other unreadable runtime data.
+func (e *engine) allgsMetadata() (ptr, length uint64, ok bool) {
+	// One DWARF pass for all three names: resolving them separately costs a
+	// full DIE traversal each, on the engine loop, at the first stop.
+	addrs := e.dw.runtimeVarAddrs("runtime.allglen", "runtime.allgptr", "runtime.allgs")
+
+	lenAddr, haveLen := addrs["runtime.allglen"]
+	ptrAddr, havePtr := addrs["runtime.allgptr"]
+	if haveLen && havePtr {
+		mlen, lenOK := e.readU64(lenAddr)
+		if !lenOK {
+			return 0, 0, false
+		}
+		mptr, ptrOK := e.readU64(ptrAddr)
+		if !ptrOK {
+			return 0, 0, false
+		}
+		// A zero pair means the runtime has not published the table through
+		// these atomics yet — they are written by the first allgadd, so a
+		// pre-init stop sees nothing here. Fall through rather than reporting
+		// an empty table, since the header is the older and more widely
+		// populated source; when it is empty too the caller degrades exactly
+		// as it always has.
+		if mptr != 0 && mlen != 0 {
+			return mptr, mlen, true
+		}
+	}
+
+	base, haveBase := addrs["runtime.allgs"]
+	if !haveBase {
+		return 0, 0, false
+	}
+	if length, ok = e.readU64(base + 8); !ok { // slice header: len @ +8, FIRST
+		return 0, 0, false
+	}
+	if ptr, ok = e.readU64(base); !ok { // slice header: array pointer @ +0
+		return 0, 0, false
+	}
+	return ptr, length, true
+}
+
 // buildGoroutineList enumerates runtime.allgs. Complete is false when the
 // runtime can't be read (no DWARF, bad layout, unreadable membership data, or
 // no live goroutines yet). Clipped is independent: the walk reached its safety
@@ -330,16 +407,8 @@ func (e *engine) buildGoroutineList(liveSP, livePC uint64) goroutineWalkResult {
 	if !ok {
 		return goroutineWalkResult{}
 	}
-	base, ok := e.dw.runtimeVarAddr("runtime.allgs")
-	if !ok {
-		return goroutineWalkResult{}
-	}
-	ptr, ok := e.readU64(base) // slice header: array pointer @ +0
-	if !ok || ptr == 0 {
-		return goroutineWalkResult{}
-	}
-	length, ok := e.readU64(base + 8) // slice header: len @ +8
-	if !ok || length == 0 {
+	ptr, length, ok := e.allgsMetadata()
+	if !ok || ptr == 0 || length == 0 {
 		return goroutineWalkResult{}
 	}
 	clipped := length > maxGoroutineScan
