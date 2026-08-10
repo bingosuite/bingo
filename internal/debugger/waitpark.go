@@ -202,15 +202,65 @@ func (q *stepQueue) resumeFor(tid int) stepResume {
 	return resumeContinue
 }
 
-// resumePlan is how an absorbed stop's thread is resumed: the primitive to use
-// and the signal that primitive actually delivers.
-type resumePlan struct {
-	mode   stepResume
+// absorbKind names the wait-loop branch that absorbed a stop. Every branch that
+// resumes a thread inline names itself here rather than reaching for a ptrace
+// primitive directly, so what a branch does to an in-flight step is decided in
+// one pure, table-tested place instead of seven hand-written call sites. A
+// mutation to any of those decisions changes a planAbsorb row and fails a test;
+// before this seam existed, silently turning a step re-arm back into a plain
+// continue — the exact freeze rule 7 exists to prevent — passed every unit test.
+type absorbKind int
+
+const (
+	// absorbClone is the parent's PTRACE_EVENT_CLONE stop.
+	absorbClone absorbKind = iota
+	// absorbNewThread is a freshly cloned thread's initial group-stop SIGSTOP.
+	absorbNewThread
+	// absorbPreempt is SIGURG, Go's async-preemption signal.
+	absorbPreempt
+	// absorbContinued is SIGCONT.
+	absorbContinued
+	// absorbThreadExit is a non-main thread's PTRACE_EVENT_EXIT.
+	absorbThreadExit
+	// absorbExec is PTRACE_EVENT_EXEC, which replaces the image the stepped-over
+	// breakpoint lived in.
+	absorbExec
+	// absorbUnknownEvent is a PTRACE_EVENT we never enabled.
+	absorbUnknownEvent
+)
+
+// absorbPlan is what a wait-loop branch must do with the thread it absorbed:
+// whether the stop can be absorbed at all, the primitive to resume with, the
+// signal that primitive delivers, and whether the step gate has to be released.
+type absorbPlan struct {
+	// fail marks a stop that cannot be absorbed because the step it consumed can
+	// neither be completed nor re-armed. The caller aborts the step and errors.
+	fail bool
+	// mode is the ptrace primitive to resume the thread with.
+	mode stepResume
+	// signal is the signal that primitive delivers.
 	signal int
+	// clearStep releases the gate because the stepped thread is going away and
+	// no step completion can ever arrive for it.
+	clearStep bool
 }
 
-// planResume decides both halves of an absorbed resume at once, so the signal a
-// thread is resumed with is chosen in the same place as the primitive.
+// planAbsorb decides, for one absorbed stop, every effect that stop has on the
+// step gate — so no branch can cancel a hardware single step while leaving
+// stepping/stepTID latched, which would park every later foreign stop forever
+// and freeze the tracee inside Wait.
+//
+// Three shapes fall out of that:
+//
+//   - A dying thread (absorbThreadExit) is never re-armed — there is nothing
+//     left to step — and releases the gate instead, so held stops can drain.
+//   - absorbExec and absorbUnknownEvent cannot be absorbed on the stepped thread
+//     at all: exec throws away the memory the saved instruction bytes and the
+//     trap live in, and an event we never enabled has no understood stop shape.
+//     Re-arming would assume that shape and continuing would resume a tracee
+//     whose software breakpoint is still out of memory, so the caller aborts the
+//     step and surfaces an error rather than guessing.
+//   - Everything else re-arms the step it consumed.
 //
 // The stepped thread is re-armed WITHOUT its signal, and that asymmetry is
 // deliberate. PTRACE_SINGLESTEP with a signal makes the kernel build the signal
@@ -229,11 +279,21 @@ type resumePlan struct {
 // signal-carrying continue on any other, and SIGURG remains the only caller that
 // passes a non-zero signal. Forwarding it on the step path is out of scope here
 // and belongs with the per-TID signal-forwarding work.
-func (q *stepQueue) planResume(tid int, signal int) resumePlan {
-	if q.resumeFor(tid) == resumeSingleStep {
-		return resumePlan{mode: resumeSingleStep, signal: 0}
+func (q *stepQueue) planAbsorb(kind absorbKind, tid int, signal int) absorbPlan {
+	switch kind {
+	case absorbThreadExit:
+		return absorbPlan{mode: resumeContinue, signal: 0, clearStep: true}
+	case absorbExec, absorbUnknownEvent:
+		if q.resumeFor(tid) == resumeSingleStep {
+			return absorbPlan{fail: true}
+		}
+		return absorbPlan{mode: resumeContinue, signal: 0}
+	default:
+		if q.resumeFor(tid) == resumeSingleStep {
+			return absorbPlan{mode: resumeSingleStep, signal: 0}
+		}
+		return absorbPlan{mode: resumeContinue, signal: signal}
 	}
-	return resumePlan{mode: resumeContinue, signal: signal}
 }
 
 // abortStep resolves a step that can no longer complete, for the cases where
@@ -248,3 +308,7 @@ func (q *stepQueue) abortStep() {
 	q.endStep()
 	q.purge()
 }
+
+// parkedDepthForTest reports how many stops are held right now. parkedCount is
+// cumulative and cannot distinguish "still held" from "already delivered".
+func (q *stepQueue) parkedDepthForTest() int { return len(q.parked) }
