@@ -588,3 +588,31 @@ func TestStepQueuePlanAbsorbAgreesWithResumeFor(t *testing.T) {
 		}
 	}
 }
+
+// The gate contract is stated independently of Wait's call order: once a step
+// owner has died, no held stop may be released until the engine acknowledges
+// the reconciliation boundary. Wait happens to consult the boundary first, so
+// this is defence in depth — pinning it here keeps the queue correct if that
+// ordering is ever changed.
+func TestStepQueueHoldsReleaseUntilReconciliationIsAcknowledged(t *testing.T) {
+	var q stepQueue
+	q.beginStep(7)
+	q.park(StopEvent{Reason: StopBreakpoint, TID: 9})
+	q.interruptStepIfStepped(7)
+
+	if _, ok := q.releasable(); ok {
+		t.Fatal("held stop released before the reconciliation boundary was reported")
+	}
+	if _, ok := q.stepExitBoundary(); !ok {
+		t.Fatal("reconciliation boundary was not reported")
+	}
+	if _, ok := q.releasable(); ok {
+		t.Fatal("held stop released after the boundary but before the engine acknowledged it")
+	}
+
+	q.completeStepThreadExit()
+	ev, ok := q.releasable()
+	if !ok || ev.TID != 9 {
+		t.Fatalf("held stop not released after acknowledgement: %+v ok=%v", ev, ok)
+	}
+}
