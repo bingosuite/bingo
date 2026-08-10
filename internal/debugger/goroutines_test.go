@@ -2,6 +2,7 @@ package debugger_test
 
 import (
 	"encoding/binary"
+	"runtime"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -377,11 +378,13 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 		Expect(currentThreads).To(Equal(1))
 
 		seedU32(fb, fixture.g[2]+fixture.layout.GAtomicstatus, 6)
-		// The first failure rejects the speculative register hint; the second
-		// proves the same required stack bound still degrades when the rooted
-		// allgs tail walk reaches it.
+		// arm64 first rejects X28 as a speculative hint, then reaches the rooted
+		// allgs tail. Linux has no register candidate: its exact stopped-M lookup
+		// is already rooted, so one unreadable bound must degrade immediately.
 		fb.failNextReadAt(tailCurrent + fixture.layout.GStack + fixture.layout.StackLo)
-		fb.failNextReadAt(tailCurrent + fixture.layout.GStack + fixture.layout.StackLo)
+		if runtime.GOARCH == "arm64" {
+			fb.failNextReadAt(tailCurrent + fixture.layout.GStack + fixture.layout.StackLo)
+		}
 
 		degraded := debugger.ExportedGoroutineSnapshot(d)
 		recovered := debugger.ExportedGoroutineSnapshot(d)

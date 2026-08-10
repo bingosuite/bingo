@@ -2,7 +2,7 @@ import { TextDecoder } from "node:util";
 
 export const wireProtocolVersion = "1.3";
 export const snapshotCommandKind = "GoroutineSnapshot";
-export const maximumEnvelopeBytes = 2 * 1024 * 1024;
+export const maximumEnvelopeBytes = 8 * 1024 * 1024;
 export const maximumGoroutines = 8193;
 export const maximumThreads = 2049;
 export const maximumStringLength = 4096;
@@ -166,7 +166,7 @@ export function decodeEvent(data: TelemetryData): DecodedEvent {
 function decodeText(data: TelemetryData): string {
   const bytes = dataBytes(data);
   if (bytes > maximumEnvelopeBytes) {
-    throw new Error("telemetry event exceeds 2 MiB");
+    throw new Error("telemetry event exceeds 8 MiB");
   }
   if (typeof data === "string") {
     return data;
