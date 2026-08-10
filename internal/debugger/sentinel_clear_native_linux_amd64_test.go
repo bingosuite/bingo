@@ -188,13 +188,14 @@ func runNativeSentinelControl(t *testing.T, binary, source string, breakpointLin
 	d := newEngine(backend, nil)
 	defer func() { _ = d.Kill() }()
 
-	sentinelAddr := launchAndArmNativeSentinel(t, d, backend, binary, source, breakpointLine, nil)
+	sentinelAddr := launchAndArmNativeSentinel(t, d, backend, binary, source, breakpointLine, nil, nil)
 	if event := waitNativeEvent(t, d, protocol.EventStepped); event.Kind != protocol.EventStepped {
 		t.Fatalf("normal sentinel hit emitted %s", event.Kind)
 	}
 	if clears := backend.writesAt(sentinelAddr); !hasNativeClear(clears, false, archTrapInstruction()) {
 		t.Fatalf("normal sentinel clear at 0x%x did not reach the real backend", sentinelAddr)
 	}
+	assertNativeSentinelState(t, d, sentinelAddr, false)
 	continueNative(t, d)
 	waitNativeEvent(t, d, protocol.EventProcessExited)
 	t.Logf("CONTROL: normal native sentinel clear at 0x%x succeeded and produced one Stepped event", sentinelAddr)
@@ -212,8 +213,10 @@ func runNativeSentinelRemapExperiment(t *testing.T, binary, source string, break
 	defer func() { _ = d.Kill() }()
 
 	sentinelAddr := launchAndArmNativeSentinel(t, d, backend, binary, source, breakpointLine,
-		[]string{beforeFile, unmappedFile, releaseFile, mappedFile})
-	backend.configureSentinelClear(sentinelAddr, archTrapInstruction(), beforeFile, unmappedFile)
+		[]string{beforeFile, unmappedFile, releaseFile, mappedFile},
+		func(addr uint64) {
+			backend.configureSentinelClear(addr, archTrapInstruction(), beforeFile, unmappedFile)
+		})
 
 	first := waitNativeEvent(t, d, protocol.EventStepped)
 	if first.Kind != protocol.EventStepped {
@@ -228,6 +231,7 @@ func runNativeSentinelRemapExperiment(t *testing.T, binary, source string, break
 	if clears := backend.writesAt(sentinelAddr); !hasNativeClear(clears, true, archTrapInstruction()) {
 		t.Fatalf("expected real WriteMemory failure restoring sentinel at 0x%x; writes=%+v", sentinelAddr, clears)
 	}
+	assertNativeSentinelState(t, d, sentinelAddr, true)
 
 	if err := os.WriteFile(releaseFile, []byte("restore\n"), 0o600); err != nil {
 		t.Fatalf("release remapper: %v", err)
@@ -235,6 +239,7 @@ func runNativeSentinelRemapExperiment(t *testing.T, binary, source string, break
 	if err := waitForNativePath(mappedFile, 5*time.Second); err != nil {
 		t.Fatalf("tracee did not restore the sentinel page: %v", err)
 	}
+	assertNativeSentinelTrap(t, d, sentinelAddr)
 
 	continueNative(t, d)
 	second := waitNativeEvent(t, d, protocol.EventStepped)
@@ -244,6 +249,7 @@ func runNativeSentinelRemapExperiment(t *testing.T, binary, source string, break
 	if clears := backend.writesAt(sentinelAddr); !hasNativeClear(clears, false, archTrapInstruction()) {
 		t.Fatalf("re-hit did not successfully clear sentinel at 0x%x; writes=%+v", sentinelAddr, clears)
 	}
+	assertNativeSentinelState(t, d, sentinelAddr, false)
 
 	continueNative(t, d)
 	waitNativeEvent(t, d, protocol.EventProcessExited)
@@ -257,6 +263,7 @@ func launchAndArmNativeSentinel(
 	binary, source string,
 	breakpointLine int,
 	args []string,
+	beforeStep func(uint64),
 ) uint64 {
 	t.Helper()
 	if err := d.Launch(binary, args, nil); err != nil {
@@ -283,10 +290,50 @@ func launchAndArmNativeSentinel(
 	}
 	continueNative(t, d)
 	waitNativeEvent(t, d, protocol.EventBreakpointHit)
+	if beforeStep != nil {
+		beforeStep(sentinelAddr)
+	}
 	if err := d.StepOver(); err != nil {
 		t.Fatalf("StepOver to native sentinel: %v", err)
 	}
 	return sentinelAddr
+}
+
+func assertNativeSentinelState(t *testing.T, d *engine, addr uint64, present bool) {
+	t.Helper()
+	if err := d.dispatch(func() error {
+		entry := d.bps.atAddr(addr)
+		if present != (entry != nil) {
+			return fmt.Errorf("sentinel table entry at 0x%x present=%t, want %t", addr, entry != nil, present)
+		}
+		regs, err := d.backend.GetRegisters(d.curTID)
+		if err != nil {
+			return fmt.Errorf("read sentinel stop registers: %w", err)
+		}
+		if regs.PC != addr {
+			return fmt.Errorf("sentinel stop PC 0x%x, want 0x%x", regs.PC, addr)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertNativeSentinelTrap(t *testing.T, d *engine, addr uint64) {
+	t.Helper()
+	want := archTrapInstruction()
+	if err := d.dispatch(func() error {
+		got := make([]byte, len(want))
+		if err := d.backend.ReadMemory(addr, got); err != nil {
+			return fmt.Errorf("read restored sentinel trap: %w", err)
+		}
+		if !bytes.Equal(got, want) {
+			return fmt.Errorf("restored sentinel bytes %x, want trap %x", got, want)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func continueNative(t *testing.T, d *engine) {
