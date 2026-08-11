@@ -829,6 +829,64 @@ describe("protocol violations do not consume reconnect attempts", () => {
       TelemetryProtocolError,
       "an unknown session state is a bad enum and must stay terminal",
     );
+
+    // An enormous state is unknown BECAUSE it is enormous, and the enum is
+    // closed, so the proof outranks the size cap: retrying it could never help.
+    assert.throws(
+      () =>
+        decodeEvent(
+          frame(1, "SessionState", {
+            sessionID: "s",
+            state: "x".repeat(4097),
+            clients: 0,
+          }),
+        ),
+      TelemetryProtocolError,
+      "an over-long session state is still a bad enum, not a size overrun",
+    );
+  });
+
+  it("keeps size-derived object limits transient for an unbounded kind", () => {
+    const wide: Record<string, unknown> = { message: "boom" };
+    for (let index = 0; index < 200; index += 1) {
+      wide[`field${String(index)}`] = index;
+    }
+    assert.throws(
+      () => decodeEvent(frame(1, "Error", wide)),
+      (error: unknown) =>
+        error instanceof Error && !(error instanceof TelemetryProtocolError),
+      "an over-wide object is a size limit, not a proven violation",
+    );
+
+    assert.throws(
+      () =>
+        decodeEvent(
+          frame(1, "Error", { message: "boom", ["k".repeat(4097)]: 1 }),
+        ),
+      (error: unknown) =>
+        error instanceof Error && !(error instanceof TelemetryProtocolError),
+      "an over-long field name is a size limit, not a proven violation",
+    );
+  });
+
+  it("accepts any finite number in a consumed unbounded kind", () => {
+    // Demanding a SAFE INTEGER here latched the view dead on a stray float the
+    // server was entitled to send — the exact regression this split exists to
+    // stop. Only a magnitude overflow (`1e400` -> Infinity) is rejected, and
+    // then as a size overrun, so it keeps the ladder.
+    for (const value of [1.5, -0.25, 1e21, Number.MAX_SAFE_INTEGER + 2]) {
+      assert.doesNotThrow(
+        () => decodeEvent(frame(1, "Error", { message: "boom", extra: value })),
+        `a finite number (${String(value)}) must not terminate an unbounded kind`,
+      );
+    }
+
+    assert.throws(
+      () => decodeEvent(`{"v":"1.3","kind":"Error","seq":1,"payload":{"message":"boom","extra":1e400}}`),
+      (error: unknown) =>
+        error instanceof Error && !(error instanceof TelemetryProtocolError),
+      "an out-of-range number is size-derived and must stay transient",
+    );
   });
 
   it("still terminates on the same overrun inside a BOUNDED kind", () => {
