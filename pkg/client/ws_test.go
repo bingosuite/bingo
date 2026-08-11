@@ -445,6 +445,12 @@ func TestMidstreamVersionMismatchFailsPendingRequest(t *testing.T) {
 	if time.Since(start) > time.Second {
 		t.Fatal("later request waited instead of reusing the terminal version error")
 	}
+	closeErr := c.Close()
+	if closeErr == nil ||
+		!strings.Contains(closeErr.Error(), `expected "`+protocol.Version+`"`) ||
+		!strings.Contains(closeErr.Error(), `received "999.0"`) {
+		t.Fatalf("Close did not preserve the terminal version error: %v", closeErr)
+	}
 
 	select {
 	case <-handlerDone:
