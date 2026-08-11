@@ -80,10 +80,14 @@ func mainExitCode() int {
 	}
 
 	printHelp()
-	runInteractive(ctx, rl, c.Events(), c.Close, func(ctx context.Context, args []string) bool {
+	err = runInteractive(ctx, rl, c.Events(), c.Close, func(ctx context.Context, args []string) bool {
 		return dispatch(ctx, c, *addr, args)
 	})
-	return 0
+	code := exitCode(err)
+	if code != 0 {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	}
+	return code
 }
 
 type lineEditor interface {
@@ -97,7 +101,7 @@ func runInteractive(
 	events <-chan protocol.Event,
 	closeTransport func() error,
 	dispatchCommand func(context.Context, []string) bool,
-) {
+) error {
 	runCtx, cancel := context.WithCancel(ctx)
 
 	var closeEditorOnce sync.Once
@@ -105,8 +109,9 @@ func runInteractive(
 		closeEditorOnce.Do(func() { _ = editor.Close() })
 	}
 	var closeTransportOnce sync.Once
+	var closeTransportErr error
 	closeClient := func() {
-		closeTransportOnce.Do(func() { _ = closeTransport() })
+		closeTransportOnce.Do(func() { closeTransportErr = closeTransport() })
 	}
 	shutdown := func() {
 		closeClient()
@@ -133,6 +138,14 @@ func runInteractive(
 	shutdown()
 	stopShutdown()
 	<-eventDone
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if closeTransportErr == nil || transportErrorSuppressed(closeTransportErr) {
+		return nil
+	}
+	return closeTransportErr
 }
 
 //nolint:gocognit,gocyclo // The CLI keeps command routing in one switch while commands are still small.
@@ -598,8 +611,14 @@ func printErrUnlessCanceled(ctx context.Context, err error) {
 }
 
 func commandErrorSuppressed(ctx context.Context, err error) bool {
-	return ctx.Err() != nil ||
-		errors.Is(err, client.ErrClosed) ||
+	var versionErr *protocol.VersionError
+	return errors.As(err, &versionErr) ||
+		ctx.Err() != nil ||
+		transportErrorSuppressed(err)
+}
+
+func transportErrorSuppressed(err error) bool {
+	return errors.Is(err, client.ErrClosed) ||
 		errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, io.ErrClosedPipe) ||
