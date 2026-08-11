@@ -2515,16 +2515,25 @@ so it stays transient. An unreadable prefix also falls back to transient — nev
 latch on a guess.
 
 The same scoping binds the PAYLOAD walk, not just the byte check. `validatePayload`
-applies the bounded family's caps (string length, array length, node budget,
-depth) to every consumed kind as this process's own defence, but those kinds are
-mostly ones the contract does not bound — so a size overrun there is not a broken
-promise and must not latch. `walkLimits`/`tooLarge` in
+applies the bounded family's caps (string length, array length, object width,
+field-name length, node budget, depth) to every consumed kind as this process's
+own defence, but those kinds are mostly ones the contract does not bound — so a
+size overrun there is not a broken promise and must not latch. `walkLimits`/`tooLarge` in
 [telemetry.ts](editors/vscode/src/telemetry.ts) return a plain `Error` for an
-unbounded kind and a `TelemetryProtocolError` for a bounded one; the structural
-failures the walk itself detects (a non-JSON-scalar value, an over-wide object,
-a bad `SessionState` enum, a wrong-typed `SessionState` field) stay fatal for
-every kind. `SessionState` bypasses the walk and so re-applies the same split by
-hand via `sizedString`. Note the limit this draws: the walk validates JSON
+unbounded kind and a `TelemetryProtocolError` for a bounded one. What stays fatal
+for every kind is only the checks that are not size-derived at all: a value
+`JSON.parse` cannot have produced, and a wrong-TYPED string. A plain JSON number
+is accepted whatever its magnitude or fractional part — demanding a *safe
+integer* there made a stray `1.5` in an `Error` body latch the view dead, which
+is the precise regression this split exists to stop; integer-ness is a rule for
+the bounded family's ids only, enforced by the typed decoders. `SessionState`
+bypasses the walk and re-applies that split by hand via `sizedString` for its
+opaque `sessionID`, but its `state` is deliberately NOT sized: the enum is
+closed, so any value outside it — including one that is outside it only because
+it is enormous — is a proven violation and is terminal. Gating that on length
+first would report a proof as a transient overrun and retry a frame that can
+never become valid.
+Note the limit this draws: the walk validates JSON
 *shape*, not per-kind schemas, so a consumed unbounded kind carrying a
 well-formed-but-wrong body (`Error.message` as an object, an unknown
 `Continued` field) is accepted and degrades to that kind's fallback rather than
