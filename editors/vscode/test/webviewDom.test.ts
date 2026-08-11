@@ -256,6 +256,29 @@ describe("concurrency webview DOM", () => {
     assert.doesNotMatch(document.body.textContent, /Connecting to telemetry/);
   });
 
+  // `connection === "error"` is reached by a protocol latch AND by an exhausted
+  // reconnect ladder, which an ordinary stopped server also produces. The old
+  // copy diagnosed only incompatibility, so the far more common "the server went
+  // away" case sent people auditing versions instead of restarting bingo.
+  it("does not blame incompatibility for an exhausted reconnect with no snapshot", () => {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    const render = mountConcurrencyView(document, { postMessage() {} });
+
+    render(
+      model({
+        connection: "error",
+        snapshot: undefined,
+        error: "reconnect attempts exhausted",
+      }),
+    );
+
+    const text = document.body.textContent;
+    assert.match(text, /Telemetry disconnected/);
+    assert.match(text, /Refresh retries the connection/);
+    assert.match(text, /server is still running and compatible/);
+    assert.doesNotMatch(text, /probably not compatible/);
+  });
+
   // An empty tree has two very different causes, and the totals settle which.
   // Blaming the target or a failed runtime read when the debugger reported
   // thousands of live goroutines is exactly the dishonesty this work removes.

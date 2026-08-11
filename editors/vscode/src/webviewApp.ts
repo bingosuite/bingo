@@ -139,7 +139,7 @@ function renderSession(
         document,
         waitingHeadline(session.connection),
         session.connection === "error"
-          ? "Refresh retries the connection. If the error above repeats, the server and this extension are probably not compatible."
+          ? recoveryHint
           : "Snapshots arrive at entry, breakpoints, pauses, and explicit refreshes.",
       ),
     );
@@ -725,6 +725,16 @@ function renderTimeline(
   }
   return panel;
 }
+
+// recoveryHint is deliberately generic. `connection === "error"` covers two very
+// different causes — a protocol latch and an exhausted reconnect ladder (which a
+// simply-unavailable server also produces) — and the view cannot tell them apart
+// here without matching on error-message text, which would break the moment that
+// text is reworded. Naming only incompatibility sent people auditing versions
+// when the real answer was usually "the server went away", so state the action
+// that always applies and let the error text above supply the specifics.
+const recoveryHint =
+  "Refresh retries the connection. If it keeps failing, check that the bingo server is still running and compatible.";
 
 // waitingHeadline names the state the view is ACTUALLY in while no snapshot has
 // arrived. Saying "Connecting" once the observer has stopped trying is the worst
