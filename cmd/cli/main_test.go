@@ -199,21 +199,23 @@ func TestRunInteractiveStopsOnEventStreamClosure(t *testing.T) {
 	editor := newTestEditor()
 	events := make(chan protocol.Event)
 	var transportCloses atomic.Int32
-	done := make(chan struct{})
+	result := make(chan error, 1)
 	go func() {
-		runInteractive(context.Background(), editor, events, func() error {
+		result <- runInteractive(context.Background(), editor, events, func() error {
 			transportCloses.Add(1)
 			return nil
 		}, func(context.Context, []string) bool {
 			t.Error("dispatch called after disconnect")
 			return false
 		})
-		close(done)
 	}()
 
 	close(events)
 	select {
-	case <-done:
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("runInteractive error = %v, want graceful disconnect", err)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("interactive session stayed blocked after event stream closure")
 	}
@@ -233,21 +235,23 @@ func TestRunInteractiveCancellationIsSilentAndClosesResources(t *testing.T) {
 	events := make(chan protocol.Event)
 	var transportCloses atomic.Int32
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	result := make(chan error, 1)
 	go func() {
-		runInteractive(ctx, editor, events, func() error {
+		result <- runInteractive(ctx, editor, events, func() error {
 			transportCloses.Add(1)
 			return nil
 		}, func(context.Context, []string) bool {
 			t.Error("dispatch called after cancellation")
 			return false
 		})
-		close(done)
 	}()
 
 	cancel()
 	select {
-	case <-done:
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runInteractive error = %v, want context cancellation", err)
+		}
 	case <-time.After(time.Second):
 		t.Fatal("interactive session stayed blocked after cancellation")
 	}
