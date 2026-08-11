@@ -22,4 +22,12 @@ func TestNormalizeSendError(t *testing.T) {
 	if err := c.normalizeSendError(failure); !errors.Is(err, ErrClosed) {
 		t.Fatalf("closed-client error = %v, want ErrClosed", err)
 	}
+
+	terminal := errors.New("terminal protocol error")
+	c.readErrMu.Lock()
+	c.readErr = terminal
+	c.readErrMu.Unlock()
+	if err := c.normalizeSendError(failure); !errors.Is(err, terminal) {
+		t.Fatalf("terminal client error = %v, want %v", err, terminal)
+	}
 }
