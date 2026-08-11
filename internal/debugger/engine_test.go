@@ -62,6 +62,14 @@ type fakeBackend struct {
 	continueErr error
 	writeErrAt  map[uint64]error
 	readErrAt   map[uint64]error
+
+	// failReadFrom/failReadTo make ReadMemory fail for any read overlapping a
+	// half-open address range, so a test can reach the reader's "the walk
+	// stopped early" branches. The range is bounded rather than open-ended
+	// because a real image's runtime globals live above any synthetic region.
+	// Disabled while failReadTo is zero.
+	failReadFrom uint64
+	failReadTo   uint64
 }
 
 type setRegistersCall struct {
@@ -235,6 +243,10 @@ func (f *fakeBackend) ReadMemory(addr uint64, dst []byte) error {
 		return err
 	}
 	f.faultMu.Lock()
+	if f.failReadTo != 0 && addr < f.failReadTo && addr+uint64(len(dst)) > f.failReadFrom {
+		f.faultMu.Unlock()
+		return fmt.Errorf("fakeBackend: unmapped address 0x%x", addr)
+	}
 	if f.readFailures[addr] > 0 {
 		f.readFailures[addr]--
 		f.faultMu.Unlock()
