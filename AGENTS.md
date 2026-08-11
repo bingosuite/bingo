@@ -2531,8 +2531,8 @@ otherwise the host can wait forever for an acknowledgement from a dead document.
 Preserve the strict nonce CSP, `dist`-only `localResourceRoots`,
 DOM/textContent rendering, deterministic capped cycle-safe tree, bounded
 lifecycle history, and multi-session selector. Filtering searches the full
-validated snapshot (up to the scanner's 8,193-entry rich-prefix-plus-anchor
-bound) before applying
+validated snapshot (up to the protocol's 5,000-goroutine delivery bound — a
+larger scan is reported through `totals`, never delivered) before applying
 the 500-node rendering cap, re-lays out each match with at most four ancestors,
 and resets fit so a deep or previously capped match cannot remain invisible.
 Empty results keep Fit/zoom callbacks safe even without an SVG scene. SVG
