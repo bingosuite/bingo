@@ -125,7 +125,10 @@ describe("telemetry codec", () => {
             clients: 1,
           }),
         ),
-      /characters/,
+      // An enormous `state` is rejected for being outside the closed enum, not
+      // for its length: the proof outranks the size cap, so the message names
+      // the enum. See `validatePayload`'s SessionState branch.
+      /unknown session state/,
     );
     assert.throws(
       () =>

@@ -534,11 +534,17 @@ function validatePayload(
     // promise the server broke, and it must not latch the view dead.
     const limits: walkLimits = { remaining: maximumPayloadNodes, bounded: boundedKinds.has(kind) };
     sizedString(payload.sessionID, "sessionID", limits);
-    const state = sizedString(payload.state, "session state", limits);
-    if (!["idle", "running", "suspended", "exited"].includes(state)) {
+    // `state` is a closed four-value enum, so it is NOT sized like sessionID:
+    // any string past the length cap is necessarily outside the enum, i.e. a
+    // proven violation. Gating it on length first would report that proof as a
+    // transient size overrun and retry a frame that can never become valid.
+    if (typeof payload.state !== "string") {
+      throw new TelemetryProtocolError("session state must be a string");
+    }
+    if (!["idle", "running", "suspended", "exited"].includes(payload.state)) {
       throw new TelemetryProtocolError(
-      `unknown session state ${JSON.stringify(state)}`,
-    );
+        `unknown session state ${JSON.stringify(payload.state.slice(0, 64))}`,
+      );
     }
     integer(payload.clients, "session clients", 0);
     return;
@@ -550,20 +556,25 @@ function validatePayload(
 // walkLimits carries the generic walk's node budget plus whether the kind being
 // walked is one the CONTRACT bounds.
 //
-// The size checks below (string length, array length, node budget, depth) are
-// the bounded family's limits. Applying them to a consumed-but-unbounded kind is
-// legitimate defence for this process, but a failure there is NOT a proven
-// contract violation — the server is explicitly allowed to emit a long
-// `Error` message or a deep `Frames` list — so it must not latch the observer
-// dead. It stays an ordinary Error, which keeps the reconnect ladder, and the
-// view recovers on the next snapshot. Only a violation of something the server
-// actually promised is terminal; that is the same line `oversizedError` draws.
+// The size checks below (string length, array length, object width, field-name
+// length, node budget, depth) are the bounded family's limits. Applying them to
+// a consumed-but-unbounded kind is legitimate defence for this process, but a
+// failure there is NOT a proven contract violation — the server is explicitly
+// allowed to emit a long `Error` message or a wide/deep `Frames` list — so it
+// must not latch the observer dead. It stays an ordinary Error, which keeps the
+// reconnect ladder, and the view recovers on the next snapshot. Only a violation
+// of something the server actually promised is terminal; that is the same line
+// `oversizedError` draws.
 //
-// Structural failures the walk itself detects (a value that is not a JSON
-// scalar/array/object, an over-wide object, a wrong-typed string) stay
-// TelemetryProtocolError for every kind: no server may produce those. The walk
-// checks JSON SHAPE, not per-kind schemas, so a well-formed-but-wrong body in a
+// What stays TelemetryProtocolError for every kind is the checks that are not
+// size-derived at all: a value `JSON.parse` cannot have produced (`undefined`,
+// a function — reachable only via a hand-built object, never off the wire) and a
+// wrong-TYPED string. No server may produce those at any size. The walk checks
+// JSON SHAPE, not per-kind schemas, so a well-formed-but-wrong body in a
 // consumed unbounded kind is accepted and degrades to that kind's fallback.
+// `SessionState` is validated by hand above and adds the one per-kind rule that
+// IS a proof: its `state` enum is closed, so an unknown value — including one
+// that is unknown only because it is enormous — is terminal, not a size overrun.
 //
 // `bounded` is LATENT today and that is deliberate, not an oversight: the two
 // bounded kinds never reach this walk — `GoroutineSnapshot` is handled by the
@@ -610,11 +621,20 @@ function validatePayloadValue(
   if (depth > 12) {
     throw tooLarge(limits, `${label} payload nesting is too deep`);
   }
-  if (
-    value === null ||
-    typeof value === "boolean" ||
-    (typeof value === "number" && Number.isSafeInteger(value))
-  ) {
+  if (value === null || typeof value === "boolean") {
+    return;
+  }
+  // Any finite JSON number is legal here. Requiring a SAFE INTEGER made a plain
+  // `1.5` — or any value past 2^53 — terminate a consumed UNBOUNDED kind, which
+  // is the exact "latch the view dead over something the server was entitled to
+  // send" failure this split exists to stop. Integer-ness is only a rule for the
+  // bounded family's ids, and the typed decoders enforce it there. A non-finite
+  // number can only arrive by magnitude overflow (`1e400` parses to `Infinity`),
+  // so it is size-derived and follows `tooLarge`.
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw tooLarge(limits, `${label} payload contains an out-of-range number`);
+    }
     return;
   }
   if (typeof value === "string") {
