@@ -432,11 +432,18 @@ func (r *dwarfReader) LocalsForFrame(b Backend, pc, frameBase uint64) ([]protoco
 	if err != nil {
 		return nil, err
 	}
+	return r.formatLocalEntries(b, entries, frameBase), nil
+}
+
+// formatLocalEntries owns the production roots-to-formatEntry path separately
+// from DWARF discovery so its request-wide accounting can be tested without
+// manufacturing a complete .debug_info section.
+func (r *dwarfReader) formatLocalEntries(b Backend, entries []*dwarf.Entry, frameBase uint64) []protocol.Variable {
 	ctx := newFormatCtx(b)
 	return formatRequestRoots(ctx, len(entries), func(i int) protocol.Variable {
 		name, _ := entries[i].Val(dwarf.AttrName).(string)
 		return r.formatEntry(ctx, entries[i], name, frameBase)
-	}), nil
+	})
 }
 
 // EvaluateName resolves a single variable name — no dotted paths, indexing, or
@@ -470,6 +477,9 @@ func (r *dwarfReader) formatEntry(ctx *formatCtx, entry *dwarf.Entry, name strin
 	typ := r.varType(entry)
 	addr, ok := r.varAddress(entry, frameBase)
 	if !ok {
+		if !ctx.takeNode() {
+			return truncatedNode()
+		}
 		return protocol.Variable{Name: name, Type: typeDisplayName(typ), Value: optimizedOut}
 	}
 	return r.formatRoot(ctx, name, typ, addr)

@@ -2,6 +2,7 @@ package debugger
 
 import (
 	"debug/dwarf"
+	"encoding/binary"
 	"testing"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
@@ -43,6 +44,98 @@ func countAllNodes(vars []protocol.Variable) int {
 		total += countNodes(vars[i])
 	}
 	return total
+}
+
+func localEntry(name string, addr *uint64) *dwarf.Entry {
+	entry := &dwarf.Entry{
+		Tag: dwarf.TagVariable,
+		Field: []dwarf.Field{
+			{Attr: dwarf.AttrName, Val: name},
+		},
+	}
+	if addr != nil {
+		expr := make([]byte, 9)
+		expr[0] = 0x03
+		binary.LittleEndian.PutUint64(expr[1:], *addr)
+		entry.Field = append(entry.Field, dwarf.Field{Attr: dwarf.AttrLocation, Val: expr})
+	}
+	return entry
+}
+
+// TestLocalsProductionPathChargesOptimizedOutRoots drives the exact
+// LocalsForFrame entries-to-formatEntry path. Optimized-out variables never
+// reach formatNode, but each emitted root must still spend one request node.
+func TestLocalsProductionPathChargesOptimizedOutRoots(t *testing.T) {
+	const roots = maxTotalNodes + 100
+	entries := make([]*dwarf.Entry, roots)
+	for i := range entries {
+		entries[i] = localEntry("optimized", nil)
+	}
+	backend := &countingBackend{}
+
+	vars := (&dwarfReader{}).formatLocalEntries(backend, entries, 0)
+
+	if got, want := len(vars), maxTotalNodes+1; got != want {
+		t.Fatalf("roots = %d, want %d budgeted roots plus one marker", got, want)
+	}
+	if last := vars[len(vars)-1]; last.Name != "…" || last.Value != truncatedValue {
+		t.Fatalf("last root = %#v, want one truncation marker", last)
+	}
+	if backend.reads != 0 {
+		t.Fatalf("optimized-out roots performed %d backend reads, want 0", backend.reads)
+	}
+}
+
+func TestFormatEntryChargesBestEffortRoots(t *testing.T) {
+	const (
+		missingAddr  = uint64(0x2000)
+		readableAddr = uint64(0x3000)
+	)
+	backend := newValueMemoryBackend()
+	backend.seedUint64(readableAddr, 7)
+	ctx := newFormatCtx(backend)
+	r := &dwarfReader{}
+
+	optimized := r.formatEntry(ctx, localEntry("optimized", nil), "optimized", 0)
+	unreadable := r.formatEntry(ctx, localEntry("unreadable", ptrTo(missingAddr)), "unreadable", 0)
+	unknown := r.formatEntry(ctx, localEntry("unknown", ptrTo(readableAddr)), "unknown", 0)
+
+	if optimized.Value != optimizedOut {
+		t.Fatalf("optimized root = %q, want %q", optimized.Value, optimizedOut)
+	}
+	if got, want := unreadable.Value, "<unreadable: unreadable memory>"; got != want {
+		t.Fatalf("unreadable root = %q, want %q", got, want)
+	}
+	if unknown.Value != "0x7" {
+		t.Fatalf("unknown root = %q, want 0x7", unknown.Value)
+	}
+	if got, want := ctx.nodesLeft, maxTotalNodes-3; got != want {
+		t.Fatalf("nodesLeft = %d, want %d after three best-effort roots", got, want)
+	}
+}
+
+func ptrTo(v uint64) *uint64 { return &v }
+
+// TestFormatEntryReservesBytesBeforeBackendRead mutation-locks the production
+// formatEntry path: a read that cannot fit must truncate without any backend I/O.
+func TestFormatEntryReservesBytesBeforeBackendRead(t *testing.T) {
+	const addr = uint64(0x3000)
+	backend := &countingBackend{}
+	ctx := newFormatCtx(backend)
+	ctx.bytesLeft = 1
+
+	got := (&dwarfReader{}).formatEntry(ctx, localEntry("value", ptrTo(addr)), "value", 0)
+
+	if got.Value != truncatedValue {
+		t.Fatalf("value = %q, want %q", got.Value, truncatedValue)
+	}
+	if backend.reads != 0 || backend.bytes != 0 {
+		t.Fatalf("backend reads=%d bytes=%d, want no I/O beyond the remaining byte budget",
+			backend.reads, backend.bytes)
+	}
+	if ctx.bytesLeft != 0 {
+		t.Fatalf("bytesLeft = %d, want exhausted after a refused read", ctx.bytesLeft)
+	}
 }
 
 // TestLocalsRequestSharesBudgetAcrossRoots is the #186 regression gate: before
@@ -257,8 +350,8 @@ func TestLocalsByteCeilingStopsRequest(t *testing.T) {
 	if ctx.bytesLeft > 0 {
 		t.Fatalf("bytesLeft = %d, want the byte ceiling to be the limiter", ctx.bytesLeft)
 	}
-	if backend.bytes > maxTotalBytes+maxScalarBytes {
-		t.Fatalf("bytes read %d exceed the shared byte ceiling %d(+one read)",
+	if backend.bytes > maxTotalBytes {
+		t.Fatalf("bytes read %d exceed the hard shared byte ceiling %d",
 			backend.bytes, maxTotalBytes)
 	}
 	if len(vars) >= roots {

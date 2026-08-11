@@ -3,6 +3,7 @@ package debugger
 import (
 	"debug/dwarf"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -44,6 +45,8 @@ const (
 // truncatedValue marks a node the eager walk refused to expand because the
 // shared per-request node/byte budget (formatCtx) was exhausted.
 const truncatedValue = "<truncated: inspection budget exhausted>"
+
+var errInspectionBudgetExhausted = errors.New("inspection budget exhausted")
 
 // Variable.Kind classifier strings.
 const (
@@ -97,12 +100,27 @@ func newFormatCtx(b Backend) *formatCtx {
 	}
 }
 
-// read fetches n bytes at addr like readMem, additionally debiting the shared
-// byte budget so the whole eager walk can't over-read across many small nodes.
+// read reserves n bytes before touching the backend so maxTotalBytes is a hard
+// I/O ceiling. A read that does not fit exhausts the request: allowing later
+// smaller reads would make truncation depend on target layout after the first
+// value was already refused.
 func (ctx *formatCtx) read(addr uint64, n int) ([]byte, error) {
-	buf, err := readMem(ctx.b, addr, n)
-	ctx.bytesLeft -= len(buf)
-	return buf, err
+	if n <= 0 {
+		return nil, nil
+	}
+	if n > maxScalarBytes {
+		n = maxScalarBytes
+	}
+	if n > ctx.bytesLeft {
+		ctx.bytesLeft = 0
+		return nil, errInspectionBudgetExhausted
+	}
+	ctx.bytesLeft -= n
+	buf := make([]byte, n)
+	if err := ctx.b.ReadMemory(addr, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 // budgetExhausted reports whether the shared node or byte ceiling for one
@@ -111,6 +129,14 @@ func (ctx *formatCtx) read(addr uint64, n int) ([]byte, error) {
 // erroring the stop.
 func (ctx *formatCtx) budgetExhausted() bool {
 	return ctx.nodesLeft <= 0 || ctx.bytesLeft <= 0
+}
+
+func (ctx *formatCtx) takeNode() bool {
+	if ctx.budgetExhausted() {
+		return false
+	}
+	ctx.nodesLeft--
+	return true
 }
 
 // enterPointer claims addr for the current recursion path. A rejected claim
@@ -159,10 +185,9 @@ func formatRequestRoots(ctx *formatCtx, roots int, render func(i int) protocol.V
 func (r *dwarfReader) formatNode(name string, typ dwarf.Type, addr uint64, depth, ptrDepth int, ctx *formatCtx) protocol.Variable {
 	// Global budget guard: every node in the tree passes through here, so this
 	// single check bounds the total node count regardless of nesting shape.
-	if ctx.budgetExhausted() {
+	if !ctx.takeNode() {
 		return protocol.Variable{Name: name, Address: addr, Value: truncatedValue}
 	}
-	ctx.nodesLeft--
 	out := protocol.Variable{Name: name, Address: addr}
 	if typ == nil {
 		out.Value = r.hexFallback(ctx, addr, 8)
@@ -266,7 +291,7 @@ func (r *dwarfReader) formatPointer(out *protocol.Variable, t *dwarf.PtrType, ad
 	out.Kind = kindPtr
 	buf, err := ctx.read(addr, 8)
 	if err != nil {
-		out.Value = unreadable(err)
+		out.Value = readErrorValue(err)
 		return
 	}
 	p := binary.LittleEndian.Uint64(buf)
@@ -333,7 +358,7 @@ func (r *dwarfReader) formatSlice(out *protocol.Variable, t *dwarf.StructType, a
 	out.Kind = kindSlice
 	hdr, err := ctx.read(addr, 24) // {array *elem, len int, cap int}
 	if err != nil {
-		out.Value = unreadable(err)
+		out.Value = readErrorValue(err)
 		return
 	}
 	ptr := binary.LittleEndian.Uint64(hdr[0:8])
@@ -387,7 +412,7 @@ func (r *dwarfReader) formatElements(out *protocol.Variable, elemType dwarf.Type
 func (r *dwarfReader) readGoString(ctx *formatCtx, addr uint64) string {
 	hdr, err := ctx.read(addr, 16)
 	if err != nil {
-		return unreadable(err)
+		return readErrorValue(err)
 	}
 	ptr := binary.LittleEndian.Uint64(hdr[0:8])
 	length := int64(binary.LittleEndian.Uint64(hdr[8:16]))
@@ -401,7 +426,7 @@ func (r *dwarfReader) readGoString(ctx *formatCtx, addr uint64) string {
 	}
 	data, err := ctx.read(ptr, int(length))
 	if err != nil {
-		return unreadable(err)
+		return readErrorValue(err)
 	}
 	s := strconv.Quote(string(data))
 	if truncated {
@@ -415,7 +440,7 @@ func (r *dwarfReader) readGoString(ctx *formatCtx, addr uint64) string {
 func (r *dwarfReader) summaryPointer(ctx *formatCtx, addr uint64, display string) string {
 	buf, err := ctx.read(addr, 8)
 	if err != nil {
-		return unreadable(err)
+		return readErrorValue(err)
 	}
 	p := binary.LittleEndian.Uint64(buf)
 	if p == 0 {
@@ -429,7 +454,7 @@ func (r *dwarfReader) summaryPointer(ctx *formatCtx, addr uint64, display string
 func (r *dwarfReader) summaryInterface(ctx *formatCtx, addr uint64, display string) string {
 	buf, err := ctx.read(addr, 16)
 	if err != nil {
-		return unreadable(err)
+		return readErrorValue(err)
 	}
 	typ := binary.LittleEndian.Uint64(buf[0:8])
 	data := binary.LittleEndian.Uint64(buf[8:16])
@@ -448,7 +473,7 @@ func (r *dwarfReader) hexFallback(ctx *formatCtx, addr uint64, n int) string {
 	}
 	buf, err := ctx.read(addr, n)
 	if err != nil {
-		return unreadable(err)
+		return readErrorValue(err)
 	}
 	var u uint64
 	for i := len(buf) - 1; i >= 0; i-- {
@@ -466,7 +491,7 @@ func (r *dwarfReader) setScalar(out *protocol.Variable, ctx *formatCtx, addr uin
 	}
 	buf, err := ctx.read(addr, size)
 	if err != nil {
-		out.Value = unreadable(err)
+		out.Value = readErrorValue(err)
 		return
 	}
 	out.Value = fn(buf)
@@ -559,20 +584,11 @@ func truncatedNode() protocol.Variable {
 
 func unreadable(err error) string { return fmt.Sprintf("<unreadable: %v>", err) }
 
-// readMem reads exactly n bytes at addr, capping n defensively so a bogus DWARF
-// size can't trigger a huge allocation.
-func readMem(b Backend, addr uint64, n int) ([]byte, error) {
-	if n <= 0 {
-		return nil, nil
+func readErrorValue(err error) string {
+	if errors.Is(err, errInspectionBudgetExhausted) {
+		return truncatedValue
 	}
-	if n > maxScalarBytes {
-		n = maxScalarBytes
-	}
-	buf := make([]byte, n)
-	if err := b.ReadMemory(addr, buf); err != nil {
-		return nil, err
-	}
-	return buf, nil
+	return unreadable(err)
 }
 
 // sizeOf returns a type's byte size, or 8 as a safe default when unknown.
