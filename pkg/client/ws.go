@@ -240,47 +240,42 @@ func (c *wsClient) retirePending(req *pendingReq) {
 }
 
 func (c *wsClient) send(cmd protocol.Command) error {
-	if err := c.terminalReadError(); err != nil {
+	if err := c.operationError(nil); err != nil {
 		return err
-	}
-	if c.closed() {
-		return ErrClosed
 	}
 	data, err := json.Marshal(cmd)
 	if err != nil {
 		return fmt.Errorf("marshal command: %w", err)
 	}
 	c.writeMu.Lock()
-	if err := c.terminalReadError(); err != nil {
+	if err := c.operationError(nil); err != nil {
 		c.writeMu.Unlock()
 		return err
-	}
-	if c.closed() {
-		c.writeMu.Unlock()
-		return ErrClosed
 	}
 	writeErr := c.conn.WriteMessage(websocket.TextMessage, data)
 	c.writeMu.Unlock()
-	if err := c.terminalReadError(); err != nil {
-		return err
-	}
 	return c.normalizeSendError(writeErr)
 }
 
 func (c *wsClient) normalizeSendError(err error) error {
-	if errors.Is(err, websocket.ErrCloseSent) || c.closed() {
-		return ErrClosed
-	}
-	return err
+	return c.operationError(err)
 }
 
-func (c *wsClient) closed() bool {
+func (c *wsClient) operationError(fallback error) error {
+	c.readErrMu.RLock()
+	defer c.readErrMu.RUnlock()
+	if c.readErr != nil {
+		return c.readErr
+	}
 	select {
 	case <-c.done:
-		return true
+		return ErrClosed
 	default:
-		return false
 	}
+	if errors.Is(fallback, websocket.ErrCloseSent) {
+		return ErrClosed
+	}
+	return fallback
 }
 
 // sendAndWait sends cmd and blocks for the matching confirmation event or an
@@ -314,10 +309,7 @@ func (c *wsClient) sendAndWait(cmd protocol.Command, wantKind protocol.EventKind
 		return protocol.Event{}, fmt.Errorf("timeout waiting for %s response", wantKind)
 	case <-c.done:
 		c.discardPending(req)
-		if err := c.terminalReadError(); err != nil {
-			return protocol.Event{}, err
-		}
-		return protocol.Event{}, ErrClosed
+		return protocol.Event{}, c.operationError(nil)
 	}
 }
 
