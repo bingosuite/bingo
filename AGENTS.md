@@ -1710,6 +1710,16 @@ byte- or rune-counting would disagree exactly at the boundary. Invalid UTF-8
 bytes count as one unit each, matching both Go's range loop and `encoding/json`'s
 one-U+FFFD-per-bad-byte substitution.
 
+Both sides testing that rule *in their own terms* is how they would drift, so the
+boundary cases live in ONE fixture both languages read:
+[goroutine_string_boundary.json](pkg/protocol/testdata/goroutine_string_boundary.json).
+A Go spec generates it from the packer and diff-gates it (regenerate with
+`BINGO_UPDATE_FIXTURES=1`); the VS Code suite reads the same file and asserts its
+decoder reaches the identical verdict on the identical wire strings — including
+that Node's replacement-mode UTF-8 decoding of the raw bytes matches what
+`encoding/json` produced. Moving the limit means regenerating the fixture and
+re-running the VS Code suite in the same change; neither side can move it alone.
+
 `MaxLifecycleDeltaIDs` (8192) is the same idea applied to `Created`/`Exited`.
 Those are NEVER trimmed, so they carry no packing limit — what bounds them is the
 producer's own walk (both are set differences over the live goroutine set, capped
@@ -2441,6 +2451,16 @@ reuses the normalized management endpoint, validates protocol 1.4 envelopes,
 payload/string/count limits and seq gaps, and reconnects only while the DAP
 session lives. It sends `CmdGoroutineSnapshot` once after every successful
 WebSocket join and thereafter only for explicit Refresh—never run control.
+`refresh()` is the manual recovery for EVERY terminal state — a fatal latch or an
+exhausted reconnect ladder — and redials whenever no socket is left, because
+re-sending a snapshot request over a socket that is gone silently strands the
+panel. While no snapshot has arrived the view names the connection state it is
+actually in; claiming "Connecting" after the observer stopped makes the panel
+look busy, so nobody presses the one control that would recover it. An empty tree
+is attributed to the cause the evidence supports — a filter that matched nothing,
+elements the event omitted (when `Totals` proves the debugger had them), or an
+unreadable runtime — never guessed, and each collection's shortfall is reported
+once, beside its own data.
 
 **Two limits, deliberately different (issue #194).** `maximumEnvelopeBytes`
 (2 MiB) is the decoder contract and mirrors `protocol.MaxGoroutineEventBytes`;
@@ -2493,6 +2513,20 @@ debugger's `maxTotalNodes`, so a big variable expansion in the Variables pane ca
 legitimately exceed 2 MiB. Latching the view dead on that would be a regression,
 so it stays transient. An unreadable prefix also falls back to transient — never
 latch on a guess.
+
+The same scoping binds the PAYLOAD walk, not just the byte check. `validatePayload`
+applies the bounded family's caps (string length, array length, node budget,
+depth) to every consumed kind as this process's own defence, but those kinds are
+mostly ones the contract does not bound — so a size overrun there is not a broken
+promise and must not latch. `walkLimits`/`tooLarge` in
+[telemetry.ts](editors/vscode/src/telemetry.ts) return a plain `Error` for an
+unbounded kind and a `TelemetryProtocolError` for a bounded one; structural
+failures (wrong type, unknown key, bad enum) stay fatal for every kind. The
+reachable case this closes: a >4080-character Watch expression comes back as an
+`EventError` echoing it, which killed the Concurrency view for the session over
+output the server was entitled to send. `bounded` is latent today — the two
+bounded kinds never reach this walk — and exists so that adding either to
+`consumedKinds` cannot silently downgrade a real violation to a retry.
 
 **Lifecycle deltas are not packed elements.** `created`/`exited` are never
 trimmed by the packer, and the debugger's scan reaches `maxGoroutineScan` (8192),

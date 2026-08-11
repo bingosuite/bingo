@@ -123,8 +123,15 @@ than a failure:
   stops instead of reconnecting into the identical failure. Ordinary connection
   drops still reconnect as before, and an oversized event that the contract does
   not cover — a very large `Locals`/`Frames`/`Evaluate` broadcast, for
-  instance — stays recoverable rather than ending the view. If the view does stop
-  on a protocol error, **Refresh** clears it and reconnects.
+  instance — stays recoverable rather than ending the view; so is a payload that
+  merely exceeds those caps on an event the contract does not bound, such as an
+  `Error` echoing a long Watch expression. **Refresh** is the manual recovery for
+  every terminal state — a protocol error or an exhausted reconnect ladder — and
+  redials rather than asking a socket that is gone.
+- An empty tree or thread list is attributed to the cause the evidence supports:
+  a filter that matched nothing, elements the event omitted, or a runtime the
+  debugger could not read. Each collection's shortfall is reported once, beside
+  its own data.
 - Events the view does not consume (`Output`, `Locals`, `Frames`, `Goroutines`,
   `Evaluate`, breakpoint confirmations, `Restarted`) have their envelope
   validated but their body skipped, so another client's large data request can

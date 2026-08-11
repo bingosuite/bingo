@@ -538,22 +538,53 @@ function validatePayload(
     integer(payload.clients, "session clients", 0);
     return;
   }
-  const budget = { remaining: maximumPayloadNodes };
+  const budget = { remaining: maximumPayloadNodes, bounded: boundedKinds.has(kind) };
   validatePayloadValue(payload, kind, 0, budget);
+}
+
+// walkLimits carries the generic walk's node budget plus whether the kind being
+// walked is one the CONTRACT bounds.
+//
+// The size checks below (string length, array length, node budget, depth) are
+// the bounded family's limits. Applying them to a consumed-but-unbounded kind is
+// legitimate defence for this process, but a failure there is NOT a proven
+// contract violation — the server is explicitly allowed to emit a long
+// `Error` message or a deep `Frames` list — so it must not latch the observer
+// dead. It stays an ordinary Error, which keeps the reconnect ladder, and the
+// view recovers on the next snapshot. Only a violation of something the server
+// actually promised is terminal; that is the same line `oversizedError` draws.
+//
+// Structural failures (wrong type, unknown key, bad enum) stay
+// TelemetryProtocolError for every kind: no server may produce those.
+//
+// `bounded` is LATENT today and that is deliberate, not an oversight: the two
+// bounded kinds never reach this walk — `GoroutineSnapshot` is handled by the
+// typed decoders above and `Goroutines` is shallow-ignored — so the bounded
+// family's fatality comes from those decoders, NOT from here. Do not read this
+// flag as that protection. It exists so that adding either kind to
+// `consumedKinds` cannot silently downgrade a real violation to a retry.
+interface walkLimits {
+  remaining: number;
+  readonly bounded: boolean;
+}
+
+// tooLarge classifies a size-derived rejection by whether the kind is bounded.
+function tooLarge(limits: walkLimits, message: string): Error {
+  return limits.bounded ? new TelemetryProtocolError(message) : new Error(message);
 }
 
 function validatePayloadValue(
   value: unknown,
   label: string,
   depth: number,
-  budget: { remaining: number },
+  limits: walkLimits,
 ): void {
-  budget.remaining -= 1;
-  if (budget.remaining < 0) {
-    throw new TelemetryProtocolError(`${label} payload is too large`);
+  limits.remaining -= 1;
+  if (limits.remaining < 0) {
+    throw tooLarge(limits, `${label} payload is too large`);
   }
   if (depth > 12) {
-    throw new TelemetryProtocolError(`${label} payload nesting is too deep`);
+    throw tooLarge(limits, `${label} payload nesting is too deep`);
   }
   if (
     value === null ||
@@ -563,15 +594,20 @@ function validatePayloadValue(
     return;
   }
   if (typeof value === "string") {
-    boundedString(value, label);
+    if (value.length > maximumStringLength) {
+      throw tooLarge(
+        limits,
+        `${label} exceeds ${String(maximumStringLength)} characters`,
+      );
+    }
     return;
   }
   if (Array.isArray(value)) {
-    validatePayloadArray(value, label, depth, budget);
+    validatePayloadArray(value, label, depth, limits);
     return;
   }
   if (value !== null && typeof value === "object") {
-    validatePayloadObject(value, label, depth, budget);
+    validatePayloadObject(value, label, depth, limits);
     return;
   }
   throw new TelemetryProtocolError(`${label} payload contains an unsupported value`);
@@ -581,13 +617,13 @@ function validatePayloadArray(
   value: readonly unknown[],
   label: string,
   depth: number,
-  budget: { remaining: number },
+  limits: walkLimits,
 ): void {
   if (value.length > maximumGoroutines) {
-    throw new TelemetryProtocolError(`${label} payload array is too large`);
+    throw tooLarge(limits, `${label} payload array is too large`);
   }
   for (const item of value) {
-    validatePayloadValue(item, label, depth + 1, budget);
+    validatePayloadValue(item, label, depth + 1, limits);
   }
 }
 
@@ -595,15 +631,17 @@ function validatePayloadObject(
   value: object,
   label: string,
   depth: number,
-  budget: { remaining: number },
+  limits: walkLimits,
 ): void {
   const entries = Object.entries(value);
   if (entries.length > 128) {
-    throw new TelemetryProtocolError(`${label} payload object has too many fields`);
+    throw tooLarge(limits, `${label} payload object has too many fields`);
   }
   for (const [key, item] of entries) {
-    boundedString(key, `${label} field name`);
-    validatePayloadValue(item, label, depth + 1, budget);
+    if (key.length > maximumStringLength) {
+      throw tooLarge(limits, `${label} field name is too long`);
+    }
+    validatePayloadValue(item, label, depth + 1, limits);
   }
 }
 
