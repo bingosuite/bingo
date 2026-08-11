@@ -249,22 +249,38 @@ describe("shallow parsing of unconsumed kinds", () => {
   });
 
   it("still deep-validates every consumed kind", () => {
+    // Structural violations are terminal for any kind — no server may emit them.
     assert.throws(
       () => decodeEvent(frame(1, "SessionState", { sessionID: "a", state: "nope", clients: 0 })),
-      TelemetryProtocolError,
-    );
-    assert.throws(
-      () => decodeEvent(frame(1, "Error", { message: "x".repeat(5000) })),
       TelemetryProtocolError,
     );
     assert.throws(
       () => decodeEvent(frame(1, "GoroutineSnapshot", { goroutines: [], threads: [], nope: 1 })),
       TelemetryProtocolError,
     );
-    assert.throws(
-      () => decodeEvent(frame(1, "BreakpointHit", { frames: richGoroutines(3000) })),
-      TelemetryProtocolError,
-    );
+  });
+
+  it("rejects an oversized consumed payload without calling it a violation", () => {
+    // The walk still runs — this process will not build a model from an
+    // unbounded stranger's payload — but the contract bounds only the goroutine
+    // family, so exceeding those caps elsewhere is this decoder's own defence,
+    // not a promise the server broke. Classifying it as a violation latches the
+    // view dead over output the server was entitled to send.
+    const oversized: readonly string[] = [
+      frame(1, "Error", { message: "x".repeat(5000) }),
+      frame(1, "BreakpointHit", { frames: richGoroutines(3000) }),
+    ];
+    for (const payload of oversized) {
+      assert.throws(() => decodeEvent(payload), (error: unknown) => {
+        assert.ok(error instanceof Error, "it is still rejected");
+        assert.equal(
+          error instanceof TelemetryProtocolError,
+          false,
+          "but stays recoverable, so the reconnect ladder still applies",
+        );
+        return true;
+      });
+    }
   });
 });
 
@@ -650,14 +666,6 @@ describe("protocol violations do not consume reconnect attempts", () => {
       }),
     ],
     [
-      "deep consumed payload beyond the node budget",
-      frame(1, "BreakpointHit", { frames: richGoroutines(3000) }),
-    ],
-    [
-      "over-long string in a consumed payload",
-      frame(1, "Error", { message: "x".repeat(maximumStringLength + 1) }),
-    ],
-    [
       "invalid sequence in a consumed payload",
       frame(0, "GoroutineSnapshot", { goroutines: [], threads: [] }),
     ],
@@ -684,6 +692,99 @@ describe("protocol violations do not consume reconnect attempts", () => {
       observer.dispose();
     });
   }
+
+  // The contract bounds TWO events. Everything else on the wire is explicitly
+  // allowed to be large, so applying the bounded family's caps to a consumed-but-
+  // unbounded kind must never be treated as a proven violation. A user pasting a
+  // long Watch expression produces exactly this: the failed evaluate is broadcast
+  // as an EventError whose message carries the whole expression back. Latching on
+  // it would kill the Concurrency view for the rest of the session over something
+  // the server was entitled to send. See issue #194.
+  const legalButLarge: readonly (readonly [string, string])[] = [
+    [
+      "an Error message longer than the bounded-family string cap",
+      frame(1, "Error", {
+        command: "Evaluate",
+        message: "x".repeat(maximumStringLength + 1),
+      }),
+    ],
+    [
+      "a stop event whose function name exceeds the string cap",
+      frame(1, "BreakpointHit", {
+        breakpoint: { id: 1 },
+        goroutine: {
+          id: 1,
+          currentLoc: { file: "a.go", line: 1, function: "f".repeat(maximumStringLength + 1) },
+        },
+        frames: [],
+      }),
+    ],
+    [
+      "a stack deeper than the bounded-family element cap",
+      frame(1, "Stepped", {
+        goroutine: { id: 1 },
+        location: { file: "a.go", line: 1 },
+        frames: Array.from({ length: maximumGoroutines + 1 }, (_, index) => ({
+          index,
+          location: { file: "a.go", line: 1 },
+        })),
+      }),
+    ],
+  ];
+
+  for (const [label, payload] of legalButLarge) {
+    it(`stays recoverable on ${label}`, () => {
+      const { observer, sockets, delays } = ladder();
+      observer.start();
+      const socket = sockets[0]!;
+      socket.open();
+      socket.emit("message", Buffer.from(payload, "utf8"));
+      socket.emit("close");
+
+      assert.equal(
+        delays.length,
+        1,
+        "an event the contract does not bound must keep the reconnect ladder",
+      );
+      assert.notEqual(
+        observer.model.connection,
+        "error",
+        "and must not latch the view dead",
+      );
+      observer.dispose();
+    });
+  }
+
+  it("still terminates on the same overrun inside a BOUNDED kind", () => {
+    // The mirror image: the identical string cap IS a proven violation here,
+    // because the producer packs this kind against exactly that limit.
+    const { observer, sockets, delays } = ladder();
+    observer.start();
+    const socket = sockets[0]!;
+    socket.open();
+    socket.emit(
+      "message",
+      Buffer.from(
+        frame(1, "GoroutineSnapshot", {
+          goroutines: [
+            {
+              id: 1,
+              status: "x".repeat(maximumStringLength + 1),
+              current: true,
+              currentLoc: { file: "a.go", line: 1 },
+            },
+          ],
+          threads: [],
+          current: 1,
+        }),
+        "utf8",
+      ),
+    );
+
+    assert.equal(observer.model.connection, "error");
+    assert.equal(delays.length, 0, "retrying would replay the identical frame");
+    observer.dispose();
+  });
 
   it("still reconnects after a genuine transport close", () => {
     const { observer, sockets, delays } = ladder();
@@ -1114,7 +1215,11 @@ describe("truthful omission surfacing", () => {
     });
   }
 
-  it("names each clipped scan separately in the omission note", () => {
+  // The tree's note speaks only for goroutines; the thread list carries its own,
+  // beside the data it describes. Reporting threads in both places made one
+  // shortfall read as two. The rendered-DOM specs in webviewDom.test.ts cover
+  // that each collection's flag reaches its own panel and no other.
+  it("keeps the tree's omission note scoped to goroutines", () => {
     const note = (goroutinesClipped: boolean, threadsClipped: boolean): string =>
       serverOmissionText({
         goroutines: 8192,
@@ -1126,12 +1231,15 @@ describe("truthful omission surfacing", () => {
       }) ?? "";
 
     assert.equal(note(false, false), "", "nothing to report");
-    assert.match(note(true, false), /8192 goroutines/u);
-    assert.doesNotMatch(note(true, false), /threads, so that total/u);
-    assert.match(note(false, true), /2048 threads/u);
-    assert.doesNotMatch(note(false, true), /goroutines, so that total/u);
+    assert.match(note(true, false), /stopped after finding 8192 goroutines/u);
+    assert.doesNotMatch(note(true, false), /threads/u);
+    assert.equal(
+      note(false, true),
+      "",
+      "a clipped THREAD scan is the thread list's business, not the tree's",
+    );
     assert.match(note(true, true), /8192 goroutines/u);
-    assert.match(note(true, true), /2048 threads/u);
+    assert.doesNotMatch(note(true, true), /threads/u);
   });
 
   it("keeps a goroutine whose parent was omitted as a root", () => {

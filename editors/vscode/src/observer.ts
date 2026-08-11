@@ -107,10 +107,17 @@ export class TelemetryObserver {
   }
 
   public refresh(): void {
-    // Refresh doubles as the manual recovery path. A fatal latch stops the
+    // Refresh doubles as the manual recovery path, and it must work from EVERY
+    // terminal state, not just the fatal latch. A fatal latch stops the
     // AUTOMATIC reconnect ladder (which would replay the same bad frame), but an
     // explicit user action is not a loop, so it clears the latch and redials.
-    if (this.#fatal && !this.#disposed) {
+    // Exhausting the ladder is just as terminal even though it never latches:
+    // it leaves no socket behind, so asking for a snapshot would silently do
+    // nothing and strand the view. Redial whenever there is nothing to ask.
+    if (this.#disposed) {
+      return;
+    }
+    if (this.#fatal || this.#socket === undefined) {
       this.#fatal = false;
       this.#connect(0);
       return;
