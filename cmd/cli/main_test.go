@@ -262,6 +262,31 @@ func TestRunInteractiveCancellationIsSilentAndClosesResources(t *testing.T) {
 	}
 }
 
+func TestRunInteractiveReturnsTerminalDisconnectError(t *testing.T) {
+	editor := newTestEditor()
+	events := make(chan protocol.Event)
+	close(events)
+	versionErr := &protocol.VersionError{Expected: protocol.Version, Received: "999.0"}
+
+	err := runInteractive(context.Background(), editor, events, func() error {
+		return fmt.Errorf("server event: %w", versionErr)
+	}, func(context.Context, []string) bool {
+		t.Error("dispatch called after terminal disconnect")
+		return false
+	})
+
+	var gotVersionErr *protocol.VersionError
+	if !errors.As(err, &gotVersionErr) {
+		t.Fatalf("runInteractive error = %v, want VersionError", err)
+	}
+	if got := editor.out.String(); got != "  disconnected\n" {
+		t.Fatalf("output = %q, want one disconnect notice", got)
+	}
+	if !commandErrorSuppressed(context.Background(), err) {
+		t.Fatal("terminal error should be owned by runInteractive, not a racing command")
+	}
+}
+
 func TestPrintEventSurfacesOutputWithoutHandwrittenPrompt(t *testing.T) {
 	event, err := protocol.NewEvent(protocol.EventOutput, 1, protocol.OutputPayload{
 		Stream:  "stderr",

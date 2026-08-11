@@ -552,10 +552,15 @@ func (c *wsClient) RequestGoroutineSnapshot() error {
 	return c.send(cmd)
 }
 
-// Close disconnects from the server. Safe to call multiple times.
+// Close disconnects from the server. A terminal read failure takes precedence
+// over the socket close result so the connection owner can report its cause.
 func (c *wsClient) Close() error {
 	c.signalDone()
-	return c.conn.Close()
+	closeErr := c.conn.Close()
+	if err := c.terminalReadError(); err != nil {
+		return err
+	}
+	return closeErr
 }
 
 func (c *wsClient) signalDone() {

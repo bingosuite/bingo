@@ -147,7 +147,10 @@ names the expected and received versions; do not broadcast `EventError` or
 increment the shared hub sequence for a peer-local compatibility failure.
 `/api/health` remains a discovery preflight, not a substitute for per-envelope
 validation. Exact enforcement of the existing contract does not itself require
-a `Version` bump.
+a `Version` bump. The Go client retains a midstream mismatch as its terminal
+error: pending and later requests plus `Close` return that `VersionError`, and
+`cmd/cli` reports it once as an abnormal session exit. Normal transport EOF
+still ends the interactive session gracefully.
 
 ### Suspend/resume protocol
 
