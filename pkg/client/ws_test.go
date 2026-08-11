@@ -365,6 +365,17 @@ func TestCreateRejectsIncompatibleWelcomeVersion(t *testing.T) {
 	}
 }
 
+func requireVersionError(t *testing.T, context string, err error) {
+	t.Helper()
+	var versionErr *protocol.VersionError
+	if !errors.As(err, &versionErr) {
+		t.Fatalf("%s = %v, want VersionError", context, err)
+	}
+	if versionErr.Expected != protocol.Version || versionErr.Received != "999.0" {
+		t.Fatalf("%s = %v, want expected %q and received %q", context, err, protocol.Version, "999.0")
+	}
+}
+
 func TestMidstreamVersionMismatchFailsPendingRequest(t *testing.T) {
 	ts, handlerDone := newScriptedServer(t, func(conn *websocket.Conn) {
 		writeServerEvent(t, conn, protocol.MustEvent(
@@ -417,11 +428,7 @@ func TestMidstreamVersionMismatchFailsPendingRequest(t *testing.T) {
 
 	select {
 	case err := <-errCh:
-		if err == nil ||
-			!strings.Contains(err.Error(), `expected "`+protocol.Version+`"`) ||
-			!strings.Contains(err.Error(), `received "999.0"`) {
-			t.Fatalf("SetBreakpoint error does not preserve the terminal version error: %v", err)
-		}
+		requireVersionError(t, "SetBreakpoint error", err)
 	case <-time.After(2 * time.Second):
 		t.Fatal("SetBreakpoint waited instead of failing on the terminal version error")
 	}
@@ -437,20 +444,12 @@ func TestMidstreamVersionMismatchFailsPendingRequest(t *testing.T) {
 
 	start := time.Now()
 	_, err = c.SetBreakpoint("main.go", 43)
-	if err == nil ||
-		!strings.Contains(err.Error(), `expected "`+protocol.Version+`"`) ||
-		!strings.Contains(err.Error(), `received "999.0"`) {
-		t.Fatalf("later request did not preserve the terminal version error: %v", err)
-	}
+	requireVersionError(t, "later SetBreakpoint error", err)
 	if time.Since(start) > time.Second {
 		t.Fatal("later request waited instead of reusing the terminal version error")
 	}
 	closeErr := c.Close()
-	if closeErr == nil ||
-		!strings.Contains(closeErr.Error(), `expected "`+protocol.Version+`"`) ||
-		!strings.Contains(closeErr.Error(), `received "999.0"`) {
-		t.Fatalf("Close did not preserve the terminal version error: %v", closeErr)
-	}
+	requireVersionError(t, "Close error", closeErr)
 
 	select {
 	case <-handlerDone:
