@@ -53,19 +53,19 @@ class FakeSocket extends EventEmitter implements Socket {
 function setup(): {
   readonly observer: TelemetryObserver;
   readonly sockets: FakeSocket[];
-  readonly delays: { resolve: () => void }[];
+  readonly delays: { resolve: () => void; milliseconds: number }[];
 } {
   const sockets: FakeSocket[] = [];
-  const delays: { resolve: () => void }[] = [];
+  const delays: { resolve: () => void; milliseconds: number }[] = [];
   const dependencies: ObserverDependencies = {
     createSocket() {
       const socket = new FakeSocket();
       sockets.push(socket);
       return socket;
     },
-    delay(_milliseconds, signal) {
+    delay(milliseconds, signal) {
       return new Promise((resolve, reject) => {
-        const delay = { resolve };
+        const delay = { resolve, milliseconds };
         delays.push(delay);
         signal.addEventListener("abort", () => {
           reject(new Error("cancelled"));
@@ -173,6 +173,83 @@ describe("telemetry observer", () => {
     sockets[6]!.close();
     assert.equal(observer.model.connection, "error");
     assert.match(observer.model.error, /reconnect limit/);
+    observer.dispose();
+  });
+
+  // Exhausting the ladder is terminal but never latches `fatal`, so a Refresh
+  // that only re-sent a snapshot command would silently do nothing — there is no
+  // socket left to send it on — and the panel would stay dead for the rest of
+  // the session with no way back. Refresh must redial from EVERY terminal state.
+  it("redials on refresh after the reconnect ladder is exhausted", async () => {
+    const { observer, sockets, delays } = setup();
+    observer.start();
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const socket = sockets[attempt]!;
+      socket.open();
+      socket.close();
+      delays[attempt]!.resolve();
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    sockets[6]!.open();
+    sockets[6]!.close();
+    assert.equal(observer.model.connection, "error");
+    const exhausted = sockets.length;
+
+    observer.refresh();
+    assert.equal(sockets.length, exhausted + 1, "refresh must open a new socket");
+    assert.equal(observer.model.connection, "connecting");
+
+    sockets[exhausted]!.open();
+    assert.equal(observer.model.connection, "connected");
+    assert.equal(
+      sockets[exhausted]!.sent.length,
+      1,
+      "a recovered connection asks for a snapshot so the view repopulates",
+    );
+
+    // Recovery must restore the BUDGET, not merely dial once. Asserting the
+    // label above would pass a regression that redials with the ladder still
+    // spent, making Refresh single-use: the panel comes back and dies on the
+    // next blip, which is the failure this spec exists to prevent.
+    const spent = delays.length;
+    sockets[exhausted]!.close();
+    assert.notEqual(
+      observer.model.connection,
+      "error",
+      "a recovered connection must not be one blip from terminal",
+    );
+    assert.equal(observer.model.connection, "reconnecting");
+    assert.equal(delays.length, spent + 1, "the disconnect must enter the ladder");
+    assert.equal(
+      delays[spent]!.milliseconds,
+      100,
+      "the recovered ladder restarts at its floor rather than resuming where it stopped",
+    );
+    observer.dispose();
+  });
+
+  // Refresh bumps #connectionEpoch, and the sleeping #reconnect re-checks it
+  // after its delay. Without that check a refresh issued during a pending
+  // backoff races a second live socket into #socket and leaks the loser. The
+  // budget spec above cannot see this: it drives a ladder that has already been
+  // exhausted, so no backoff is ever in flight while refresh runs.
+  it("does not double-dial when refresh interrupts a pending backoff", async () => {
+    const { observer, sockets, delays } = setup();
+    observer.start();
+    sockets[0]!.open();
+    sockets[0]!.close();
+    assert.equal(delays.length, 1, "a backoff is pending");
+
+    observer.refresh();
+    assert.equal(sockets.length, 2, "refresh dials once");
+
+    delays[0]!.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(
+      sockets.length,
+      2,
+      "the superseded backoff must abandon its dial rather than open a second socket",
+    );
     observer.dispose();
   });
 
