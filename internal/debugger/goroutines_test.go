@@ -109,6 +109,9 @@ type snapshotObservation struct {
 	Exited     []int
 }
 
+// observeSnapshot reads what a client actually receives. Goroutines therefore
+// appear in the packer's delivery order — current first, then its ancestors,
+// then ascending goid — not in scan order.
 func observeSnapshot(snap protocol.GoroutineSnapshotPayload) snapshotObservation {
 	return snapshotObservation{
 		Goroutines: goroutineIDs(snap.Goroutines),
@@ -356,12 +359,17 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 
 		baseline := debugger.ExportedGoroutineSnapshot(d)
 		Expect(baseline.Current).To(Equal(104))
+		// The rich walk hit its ceiling and the current anchor came from the
+		// rooted tail beyond it, so the scan is clipped AND delivery is bounded:
+		// the wire carries the element cap while totals report the scanned count
+		// as the lower bound it is, and the anchor survives regardless.
 		Expect(baseline.Goroutines).To(HaveLen(protocol.MaxSnapshotGoroutines))
-		Expect(baseline.Goroutines[0].ID).To(Equal(104))
-		Expect(baseline.Goroutines[0].Current).To(BeTrue())
 		Expect(baseline.Totals).NotTo(BeNil())
 		Expect(baseline.Totals.Goroutines).To(Equal(richCount + 1))
-		Expect(baseline.Totals.GoroutinesClipped).To(BeTrue())
+		Expect(baseline.Totals.GoroutinesClipped).To(BeTrue(),
+			"the rich walk stopped at its ceiling, so the count is a lower bound")
+		Expect(baseline.Goroutines[0].ID).To(Equal(104))
+		Expect(baseline.Goroutines[0].Current).To(BeTrue())
 		Expect(baseline.Created).To(BeNil())
 		Expect(baseline.Exited).To(BeNil())
 		currentGoroutines := 0
