@@ -277,7 +277,15 @@ function renderGraph(
   panel.append(controls);
 
   if (session.tree.nodes.length === 0) {
-    panel.append(emptyTreeState(document, session, state.query));
+    const empty = emptyTreeState(document, session, state.query);
+    panel.append(empty.element);
+    // An empty graph must still say what the DEBUGGER left out — otherwise a
+    // filter that matches nothing silently swallows the whole shortfall. Skip it
+    // only when the empty state already stated that shortfall inline, so the
+    // collection is still reported exactly once.
+    if (!empty.statesOmission) {
+      appendServerOmission(document, panel, session.serverTotals);
+    }
     return panel;
   }
 
@@ -341,13 +349,7 @@ function renderGraph(
     note.textContent = `${String(session.tree.omitted)} additional goroutines omitted by the filter or visual cap`;
     panel.append(note);
   }
-  const serverNote = serverOmissionText(session.serverTotals);
-  if (serverNote !== undefined) {
-    const note = document.createElement("p");
-    note.className = "server-omitted";
-    note.textContent = serverNote;
-    panel.append(note);
-  }
+  appendServerOmission(document, panel, session.serverTotals);
   viewport.append(svg);
   panel.append(viewport);
 
@@ -752,27 +754,53 @@ function emptyTreeState(
   document: Document,
   session: SessionViewModel,
   query: string,
-): HTMLElement {
+): { readonly element: HTMLElement; readonly statesOmission: boolean } {
   if (query.trim().length > 0 && (session.snapshot?.goroutines.length ?? 0) > 0) {
-    return emptyState(
-      document,
-      "No goroutines match this filter",
-      "Clear or change the filter to show this snapshot.",
-    );
+    return {
+      element: emptyState(
+        document,
+        "No goroutines match this filter",
+        "Clear or change the filter to show this snapshot.",
+      ),
+      statesOmission: false,
+    };
   }
   const totals = session.serverTotals;
   if (totals !== undefined && totals.goroutines > 0) {
-    return emptyState(
-      document,
-      "Goroutine data was omitted from this snapshot",
-      `The debugger found ${scannedCount(totals.goroutines, totals.goroutinesClipped)} live goroutines, but none fit within the snapshot limits.`,
-    );
+    return {
+      element: emptyState(
+        document,
+        "Goroutine data was omitted from this snapshot",
+        `The debugger found ${scannedCount(totals.goroutines, totals.goroutinesClipped)} live goroutines, but none fit within the snapshot limits.`,
+      ),
+      statesOmission: true,
+    };
   }
-  return emptyState(
-    document,
-    "No goroutines in this snapshot",
-    "The target may be exiting or runtime inspection degraded.",
-  );
+  return {
+    element: emptyState(
+      document,
+      "No goroutines in this snapshot",
+      "The target may be exiting or runtime inspection degraded.",
+    ),
+    statesOmission: false,
+  };
+}
+
+// appendServerOmission states the goroutine collection's own shortfall beside
+// its own data, exactly once.
+function appendServerOmission(
+  document: Document,
+  panel: HTMLElement,
+  totals: ServerTotals | undefined,
+): void {
+  const text = serverOmissionText(totals);
+  if (text === undefined) {
+    return;
+  }
+  const note = document.createElement("p");
+  note.className = "server-omitted";
+  note.textContent = text;
+  panel.append(note);
 }
 
 function emptyState(

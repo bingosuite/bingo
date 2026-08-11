@@ -2520,8 +2520,16 @@ depth) to every consumed kind as this process's own defence, but those kinds are
 mostly ones the contract does not bound — so a size overrun there is not a broken
 promise and must not latch. `walkLimits`/`tooLarge` in
 [telemetry.ts](editors/vscode/src/telemetry.ts) return a plain `Error` for an
-unbounded kind and a `TelemetryProtocolError` for a bounded one; structural
-failures (wrong type, unknown key, bad enum) stay fatal for every kind. The
+unbounded kind and a `TelemetryProtocolError` for a bounded one; the structural
+failures the walk itself detects (a non-JSON-scalar value, an over-wide object,
+a bad `SessionState` enum, a wrong-typed `SessionState` field) stay fatal for
+every kind. `SessionState` bypasses the walk and so re-applies the same split by
+hand via `sizedString`. Note the limit this draws: the walk validates JSON
+*shape*, not per-kind schemas, so a consumed unbounded kind carrying a
+well-formed-but-wrong body (`Error.message` as an object, an unknown
+`Continued` field) is accepted and degrades to that kind's fallback rather than
+terminating. Per-kind schema validators for the consumed unbounded kinds are
+deliberately out of scope here. The
 reachable case this closes: a >4080-character Watch expression comes back as an
 `EventError` echoing it, which killed the Concurrency view for the session over
 output the server was entitled to send. `bounded` is latent today — the two

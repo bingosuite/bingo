@@ -788,6 +788,49 @@ describe("protocol violations do not consume reconnect attempts", () => {
     );
   });
 
+  // SessionState bypasses the generic walk entirely, so the bounded/unbounded
+  // split has to be applied there by hand. It is not a bounded kind: an
+  // over-long sessionID is this process's own cap, not a promise the server
+  // broke, so it must stay transient like every other unbounded overrun. A
+  // wrong TYPE in the same field is structural and stays terminal.
+  it("classifies a SessionState string overrun as transient, not a violation", () => {
+    assert.throws(
+      () =>
+        decodeEvent(
+          frame(1, "SessionState", {
+            sessionID: "x".repeat(4097),
+            state: "idle",
+            clients: 0,
+          }),
+        ),
+      (error: unknown) =>
+        error instanceof Error && !(error instanceof TelemetryProtocolError),
+      "an over-long sessionID must not latch the view dead",
+    );
+
+    assert.throws(
+      () =>
+        decodeEvent(
+          frame(1, "SessionState", { sessionID: 7, state: "idle", clients: 0 }),
+        ),
+      TelemetryProtocolError,
+      "a non-string sessionID is structural and must stay terminal",
+    );
+
+    assert.throws(
+      () =>
+        decodeEvent(
+          frame(1, "SessionState", {
+            sessionID: "s",
+            state: "not-a-state",
+            clients: 0,
+          }),
+        ),
+      TelemetryProtocolError,
+      "an unknown session state is a bad enum and must stay terminal",
+    );
+  });
+
   it("still terminates on the same overrun inside a BOUNDED kind", () => {
     // The mirror image: the identical string cap IS a proven violation here,
     // because the producer packs this kind against exactly that limit.
