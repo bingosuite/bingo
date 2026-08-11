@@ -755,6 +755,39 @@ describe("protocol violations do not consume reconnect attempts", () => {
     });
   }
 
+  // This is the precondition that makes the generic walk's `bounded` flag latent,
+  // asserted rather than asserted-in-a-comment. Neither bounded kind reaches that
+  // walk today: GoroutineSnapshot is answered by the typed decoders (which is what
+  // makes the mirror case below fatal), and Goroutines is shallow-parsed. So the
+  // walk's size checks only ever see kinds the contract does not bound, which is
+  // precisely why a size overrun there must stay transient.
+  //
+  // If a future change consumes Goroutines, or drops the snapshot's typed path,
+  // this fails — and that is the point. The bounded family's fatality would then
+  // depend on `bounded` actually classifying, so it must be re-proven there
+  // rather than silently downgraded to a retry.
+  it("keeps both bounded kinds out of the generic payload walk", () => {
+    const snapshotDecoded = decodeEvent(
+      frame(1, "GoroutineSnapshot", {
+        goroutines: [{ id: 1, status: "running", current: true, currentLoc: { file: "a.go", line: 1 } }],
+        threads: [],
+        current: 1,
+      }),
+    );
+    assert.notEqual(
+      snapshotDecoded.snapshot,
+      undefined,
+      "GoroutineSnapshot must be answered by the typed decoder, not the generic walk",
+    );
+
+    const listDecoded = decodeEvent(frame(1, "Goroutines", { goroutines: richGoroutines(1) }));
+    assert.deepEqual(
+      listDecoded.payload,
+      {},
+      "Goroutines must stay shallow-parsed, never walked",
+    );
+  });
+
   it("still terminates on the same overrun inside a BOUNDED kind", () => {
     // The mirror image: the identical string cap IS a proven violation here,
     // because the producer packs this kind against exactly that limit.
