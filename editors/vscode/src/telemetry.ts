@@ -528,8 +528,13 @@ function validatePayload(
 ): void {
   if (kind === "SessionState") {
     exactKeys(payload, ["sessionID", "state", "clients"], [], "SessionState");
-    boundedString(payload.sessionID, "sessionID");
-    const state = boundedString(payload.state, "session state");
+    // SessionState bypasses the generic walk, so it must apply the same
+    // bounded/unbounded split by hand: it is NOT a bounded kind, so an
+    // over-long string here is this process's own limit being hit, not a
+    // promise the server broke, and it must not latch the view dead.
+    const limits: walkLimits = { remaining: maximumPayloadNodes, bounded: boundedKinds.has(kind) };
+    sizedString(payload.sessionID, "sessionID", limits);
+    const state = sizedString(payload.state, "session state", limits);
     if (!["idle", "running", "suspended", "exited"].includes(state)) {
       throw new TelemetryProtocolError(
       `unknown session state ${JSON.stringify(state)}`,
@@ -554,8 +559,11 @@ function validatePayload(
 // view recovers on the next snapshot. Only a violation of something the server
 // actually promised is terminal; that is the same line `oversizedError` draws.
 //
-// Structural failures (wrong type, unknown key, bad enum) stay
-// TelemetryProtocolError for every kind: no server may produce those.
+// Structural failures the walk itself detects (a value that is not a JSON
+// scalar/array/object, an over-wide object, a wrong-typed string) stay
+// TelemetryProtocolError for every kind: no server may produce those. The walk
+// checks JSON SHAPE, not per-kind schemas, so a well-formed-but-wrong body in a
+// consumed unbounded kind is accepted and degrades to that kind's fallback.
 //
 // `bounded` is LATENT today and that is deliberate, not an oversight: the two
 // bounded kinds never reach this walk — `GoroutineSnapshot` is handled by the
@@ -571,6 +579,22 @@ interface walkLimits {
 // tooLarge classifies a size-derived rejection by whether the kind is bounded.
 function tooLarge(limits: walkLimits, message: string): Error {
   return limits.bounded ? new TelemetryProtocolError(message) : new Error(message);
+}
+
+// sizedString splits the two failures a string can have: a wrong TYPE is
+// structural and always terminal, while exceeding the length cap is size-derived
+// and follows `tooLarge`'s bounded/unbounded rule.
+function sizedString(value: unknown, label: string, limits: walkLimits): string {
+  if (typeof value !== "string") {
+    throw new TelemetryProtocolError(`${label} must be a string`);
+  }
+  if (value.length > maximumStringLength) {
+    throw tooLarge(
+      limits,
+      `${label} exceeds ${String(maximumStringLength)} characters`,
+    );
+  }
+  return value;
 }
 
 function validatePayloadValue(

@@ -441,7 +441,9 @@ describe("server-omission rendering", () => {
           ),
           totals: {
             goroutines: 8192,
-            threads: 2048,
+            // Threads are complete on purpose: a thread note in a different
+            // panel must not be able to stand in for the goroutine one.
+            threads: 1,
             goroutinesClipped: false,
             threadsClipped: false,
           },
@@ -455,15 +457,48 @@ describe("server-omission rendering", () => {
     search.dispatchEvent(new window.Event("input"));
 
     assert.equal(document.querySelectorAll(".tree-node").length, 0);
-    const notes = [...document.querySelectorAll(".server-omitted")]
-      .map((n) => n.textContent ?? "")
-      .join(" | ");
-    assert.notEqual(
-      notes,
-      "",
-      "a filter matching nothing hid what the server left out",
+    const notes = [...document.querySelectorAll(".graph-panel .server-omitted")]
+      .map((n) => n.textContent ?? "");
+    assert.equal(
+      notes.length,
+      1,
+      "a filter matching nothing hid what the server left out of the goroutines",
     );
-    assert.match(notes, /were not sent/u);
+    assert.match(notes[0] ?? "", /8191 goroutines were not sent/u);
+    assert.equal(
+      document.querySelectorAll(".server-omitted").length,
+      1,
+      "the goroutine shortfall must be stated exactly once",
+    );
+  });
+
+  it("does not repeat the shortfall the empty state already stated", () => {
+    const { document } = parseHTML(
+      "<html><body><div id=app></div></body></html>",
+    );
+    mountConcurrencyView(document, { postMessage() {} })(
+      model({
+        snapshot: {
+          ...snapshot([], [thread(10)]),
+          totals: {
+            goroutines: 8192,
+            threads: 1,
+            goroutinesClipped: false,
+            threadsClipped: false,
+          },
+        },
+      }),
+    );
+    assert.match(
+      document.querySelector(".empty-state")?.textContent ?? "",
+      /8192 live goroutines/u,
+      "the empty state must state the shortfall inline",
+    );
+    assert.equal(
+      document.querySelectorAll(".graph-panel .server-omitted").length,
+      0,
+      "the inline shortfall must not be repeated as a second note",
+    );
   });
 
   it("marks neither count when neither scan clipped", () => {
