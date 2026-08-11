@@ -2499,9 +2499,11 @@ an explicit user Refresh is not a loop, so it clears the latch and redials.
 The acceptance invariant, pinned by test, splits by *what was proven*, not by how
 deep the failure was found. **Terminal, no reconnect attempt consumed:** a
 malformed envelope (bad JSON, wrong version, unknown kind, wrong keys, bad seq),
-and any structural/schema proof inside a *consumed* payload — a wrong-typed or
-`JSON.parse`-impossible value, a value outside a closed enum, or a typed bounded
-decoder rejecting its own field schema. Those name a rule the peer broke, so the
+and any structural/schema proof inside a *consumed* payload — a value
+`JSON.parse` could not have produced, or, **for a field a validator owns**, a
+wrong-typed value or one outside a closed enum (`SessionState`'s own checks, or
+a typed bounded decoder rejecting its own field schema). Those name a rule the
+peer broke, so the
 identical frame would be produced again. **Transient — closes, redials, and
 spends a reconnect rung:** a genuine socket close, and every *size-derived*
 failure in a consumed **unbounded** kind (string/array/object-width/field-name/
@@ -2539,14 +2541,12 @@ own defence, but those kinds are mostly ones the contract does not bound — so 
 size overrun there is not a broken promise and must not latch. `walkLimits`/`tooLarge` in
 [telemetry.ts](editors/vscode/src/telemetry.ts) return a plain `Error` for an
 unbounded kind and a `TelemetryProtocolError` for a bounded one. What survives
-that scoping is only the checks that are not size-derived at all: a value
-`JSON.parse` cannot have produced, and a wrong-TYPED value. Those are terminal
-wherever the walk reaches them, but note what "the walk" covers — it validates
-JSON *shape* only. Per-FIELD schemas live with their owners: `SessionState`
-bypasses the walk entirely and checks its own fields, and the bounded family's
-typed decoders enforce theirs. So "a wrong-typed string is terminal" is a
-statement about the generic shape walk plus those hand-written checks, not a
-promise that every kind's fields are schema-validated. A plain JSON number
+that scoping is exactly one non-size terminal case in the generic walk: a value
+`JSON.parse` could not have produced. The walk validates JSON *shape* only, so
+it does NOT reject a field merely for having the wrong type. Field-type and
+schema violations are terminal only where an **owning validator** checks them —
+`SessionState`, which bypasses the walk and checks its own fields, and the
+bounded family's typed decoders, which enforce theirs. A plain JSON number
 is accepted whatever its magnitude or fractional part — demanding a *safe
 integer* there made a stray `1.5` in an `Error` body latch the view dead, which
 is the precise regression this split exists to stop; integer-ness is a rule for
