@@ -2496,12 +2496,30 @@ The full classification, pinned by real-`ws` tests:
 **Refresh is the manual recovery path.** The latch stops the *automatic* ladder;
 an explicit user Refresh is not a loop, so it clears the latch and redials.
 
-The acceptance invariant, pinned by test: a decode/protocol-contract violation —
-malformed JSON, wrong version, unknown kind, a bad envelope, or any deep failure
-in a *consumed* payload — terminates that connection and view **without consuming
-a reconnect attempt**, while a genuine socket close still consumes one and
-redials. Shallow-parsing an unused-but-valid kind is explicitly NOT a violation:
-it leaves the connection open, sets no error, and still advances the sequence.
+The acceptance invariant, pinned by test, splits by *what was proven*, not by how
+deep the failure was found. **Terminal, no reconnect attempt consumed:** a
+malformed envelope (bad JSON, wrong version, unknown kind, wrong keys, bad seq),
+and any structural/schema proof inside a *consumed* payload — a wrong-typed or
+`JSON.parse`-impossible value, a value outside a closed enum, or a typed bounded
+decoder rejecting its own field schema. Those name a rule the peer broke, so the
+identical frame would be produced again. **Transient — closes, redials, and
+spends a reconnect rung:** a genuine socket close, and every *size-derived*
+failure in a consumed **unbounded** kind (string/array/object-width/field-name/
+node-budget/depth), because the contract never bounded that kind and the server
+was entitled to send it. A size violation of a **bounded** kind stays terminal:
+there the cap *is* the contract. Shallow-parsing an unused-but-valid kind is
+explicitly NOT a violation: it leaves the connection open, sets no error, and
+still advances the sequence.
+
+**The retry ladder is incident-cumulative, by design.** The six rungs
+(`100,250,500,1000,2000,4000` ms) are spent across the whole session: an
+automatic reconnect **success does not reset them**, so a burst of legal
+oversized unbounded events each spends a rung and can exhaust the ladder even
+though every frame was lawful. Recovery is the explicit user Refresh, which is
+not a loop and therefore restores a full ladder (and clears a fatal latch).
+That is the intended trade — a lifetime cross-incident reset would let a genuinely
+broken peer retry forever. Do not change this policy without changing the tests
+that pin it.
 
 **Fatality is scoped to the bounded kinds.** The byte check must stay *before*
 the parse, but the kind is only known *after* it — so an over-budget frame gets a
@@ -2520,21 +2538,27 @@ field-name length, node budget, depth) to every consumed kind as this process's
 own defence, but those kinds are mostly ones the contract does not bound — so a
 size overrun there is not a broken promise and must not latch. `walkLimits`/`tooLarge` in
 [telemetry.ts](editors/vscode/src/telemetry.ts) return a plain `Error` for an
-unbounded kind and a `TelemetryProtocolError` for a bounded one. What stays fatal
-for every kind is only the checks that are not size-derived at all: a value
-`JSON.parse` cannot have produced, and a wrong-TYPED string. A plain JSON number
+unbounded kind and a `TelemetryProtocolError` for a bounded one. What survives
+that scoping is only the checks that are not size-derived at all: a value
+`JSON.parse` cannot have produced, and a wrong-TYPED value. Those are terminal
+wherever the walk reaches them, but note what "the walk" covers — it validates
+JSON *shape* only. Per-FIELD schemas live with their owners: `SessionState`
+bypasses the walk entirely and checks its own fields, and the bounded family's
+typed decoders enforce theirs. So "a wrong-typed string is terminal" is a
+statement about the generic shape walk plus those hand-written checks, not a
+promise that every kind's fields are schema-validated. A plain JSON number
 is accepted whatever its magnitude or fractional part — demanding a *safe
 integer* there made a stray `1.5` in an `Error` body latch the view dead, which
 is the precise regression this split exists to stop; integer-ness is a rule for
 the bounded family's ids only, enforced by the typed decoders. `SessionState`
-bypasses the walk and re-applies that split by hand via `sizedString` for its
+re-applies the split by hand: `sizedString` for its
 opaque `sessionID`, but its `state` is deliberately NOT sized: the enum is
 closed, so any value outside it — including one that is outside it only because
 it is enormous — is a proven violation and is terminal. Gating that on length
 first would report a proof as a transient overrun and retry a frame that can
 never become valid.
-Note the limit this draws: the walk validates JSON
-*shape*, not per-kind schemas, so a consumed unbounded kind carrying a
+Note the limit this draws: because the walk validates JSON
+*shape*, not per-kind schemas, a consumed unbounded kind carrying a
 well-formed-but-wrong body (`Error.message` as an object, an unknown
 `Continued` field) is accepted and degrades to that kind's fallback rather than
 terminating. Per-kind schema validators for the consumed unbounded kinds are
