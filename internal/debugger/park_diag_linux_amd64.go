@@ -29,10 +29,9 @@ func LinuxParkedStopCount(d Debugger) (int, bool) {
 //
 // This is the observable that proves an asynchronous interrupt was received by
 // the backend *while a single-step was in flight*. The wait loop absorbs SIGURG,
-// SIGCONT and a new thread's initial SIGSTOP before classification, so the only
-// signal that can reach the park queue in the overlap target is the SIGSTOP that
-// Pause directs at the main thread. Returns (0, false) for a non-engine
-// Debugger.
+// SIGCONT and a new thread's initial SIGSTOP before classification. The native
+// overlap specs use this to gate both Pause's directed SIGSTOP and an ordinary
+// directed SIGUSR1. Returns (0, false) for a non-engine Debugger.
 func LinuxParkedSignalCount(d Debugger) (int, bool) {
 	e, ok := d.(*engine)
 	if !ok {
