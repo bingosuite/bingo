@@ -367,10 +367,13 @@ invalidates matching `lastBP` / `lastBPTID`; the live PC was rewound when the
 trap stop arrived, so the next resume can continue directly from the original
 instruction. During an in-flight step-off the entry is intentionally absent
 from the table and its original bytes are already restored: `ClearBreakpoint`
-matches the retained entry by ID, marks it disabled, and succeeds. Completion
-then skips `reinstall` but still performs the saved `bpResumeAction`. Failed
-restoration leaves the entry enabled and all pending state intact. `clearAll`
-applies the same invalidation/cancellation rules for Kill.
+matches the retained entry by ID, records its restored bytes, marks it disabled,
+and succeeds. Completion then skips `reinstall` but still performs the saved
+`bpResumeAction`. Recording the bytes keeps an already-queued same-address
+sibling hit classifiable after owner death: it is rewound and resumed silently,
+never reported or reinstalled. Failed restoration leaves the entry enabled and
+all pending state intact. `clearAll` applies the same
+invalidation/cancellation rules for Kill.
 
 If `bps.reinstall` ever fails after a single-step, **suspend instead of
 resuming**. Running without the trap is a runaway process; reporting the
@@ -382,16 +385,19 @@ stepped thread's own `StopSingleStep` puts a lifted trap back, and neither
 backend surfaces a foreign breakpoint while that thread can still produce one
 (linux holds it in the wait-side queue, darwin re-faults it). So the only way
 this combination occurs is that the stepped thread died mid-step — at which
-point the trap is out of the tracee, the entry is out of `byID`/`byAddr`, and
-the sole remaining reference to it is the one-slot `steppingOverBP` that the
-next resume overwrites. The reconcile runs **before** `bps.atAddr`, not after,
-so a sibling stopped at the *same* address resolves to the reinstalled
-breakpoint instead of falling through to the spurious-SIGTRAP path. Placement
-is load-bearing and pinned by mutation: moving it below the lookup fails the
-same-address spec, removing it fails both (`engine_test.go` →
-"a breakpoint stop that arrives while a step-over is in flight"). This mirrors
-the reconcile the `StopSignal` branch has always done; before it, the two
-branches disagreed and only the signal half was safe.
+point the entry is out of `byID`/`byAddr`, and the sole remaining reference to
+it is the one-slot `steppingOverBP` that the next resume overwrites. An enabled
+entry is reinstalled **before** `bps.atAddr`, not after, so a sibling stopped at
+the same address resolves to the real breakpoint instead of taking the
+spurious-SIGTRAP path. A concurrently-cleared entry is different: its original
+bytes are already authoritative and `enabled=false`, so the backstop ends the
+step without reinstalling it. Clearing is final on every completion path.
+Placement is load-bearing and pinned by mutation: moving the reconcile below
+the lookup fails the same-address spec, removing it fails both
+(`engine_test.go` → "a breakpoint stop that arrives while a step-over is in
+flight"); `engine_breakpoint_clear_test.go` separately pins the disabled path.
+This mirrors the reconcile the `StopSignal` branch has always done; before it,
+the two branches disagreed and only the signal half was safe.
 
 On **linux** that death is now caught earlier and more precisely, by the
 `StopStepThreadExited` boundary (park-queue rule 5): the backend refuses to
@@ -407,12 +413,15 @@ the boundary is the ordered handoff, the reconcile is the invariant that a
 breakpoint stop never proceeds while a lifted trap is outstanding.
 
 The engine's `StopStepThreadExited` handler therefore has a strict order:
-reinstall through the anchor, *then* acknowledge with `completeStepThreadExit`,
-which is what releases it. Both halves can fail, and both halt suspended rather
-than tearing the session down — a failed reinstall keeps `steppingOverBP` set and
-the anchor held, a failed release keeps the anchor held and the gate closed, and
-in both cases `ContinueProcess`/`SingleStep` refuse while `stepExitPending` so
-Kill/Restart is the only recovery.
+resolve the retained breakpoint entry, *then* acknowledge with
+`completeStepThreadExit`, which is what releases the anchor. Resolution means
+reinstalling an enabled entry through the anchor, or preserving the restored
+bytes of an entry cleared mid-step; the cleared path still acknowledges, because
+it has no write obligation but must open the gate. Both operations can fail and
+halt suspended rather than tearing the session down — a failed reinstall keeps
+`steppingOverBP` set and the anchor held, a failed release keeps the anchor held
+and the gate closed, and in both cases `ContinueProcess`/`SingleStep` refuse
+while `stepExitPending` so Kill/Restart is the only recovery.
 
 **Every asynchronous halt in `handleStop` must be reported with a *suspending*
 event, not a bare `EventError`.** These failures happen after the resume that
@@ -862,15 +871,18 @@ that their stops are *reported later*, after the trap is back:
   Callers already tolerate this; the `churn` spec always has.
 - Queue depth is bounded by the live thread count — a ptrace-stopped thread
   cannot stop again until it is resumed (G7) — so no cap is needed.
-- A user `ClearBreakpoint` of an address a parked stop refers to still surfaces
-  that stop as a generic SIGTRAP. One-shot engine sentinels are different: their
-  restored-byte histories are remembered, so a delayed sibling hit is rewound
-  only when current bytes match the engine's successful restore and no live
-  architecture trap spans the address. The focused engine tests pin the exact
-  `SetRegisters(tid, rewoundPC)` operation, a genuine live trap at the same
-  address, and x86's cross-boundary `CD 03`; the plain native overlap spec requires
-  `LinuxRetiredInternalBreakpointCount > 0`; an armed-ness probe alone cannot
-  distinguish safe recovery from the mid-instruction path.
+- A table-resident user `ClearBreakpoint` of an address a parked stop refers to
+still surfaces that stop as a generic SIGTRAP. An in-flight clear is different:
+its retained entry records the restored bytes before it is disabled, so an
+owner-death boundary can release a same-address sibling without resurrecting
+the breakpoint or resuming mid-instruction. One-shot engine sentinels retain
+the same kind of restored-byte history. In both cases a delayed hit is rewound
+only when current bytes match the engine's successful restore and no live
+architecture trap spans the address. The focused engine tests pin the exact
+`SetRegisters(tid, rewoundPC)` operation, a genuine live trap at the same
+address, and x86's cross-boundary `CD 03`; the plain native overlap spec requires
+`LinuxRetiredInternalBreakpointCount > 0`; an armed-ness probe alone cannot
+distinguish safe recovery from the mid-instruction path.
 - **A stepped thread that dies never releases a held stop directly.** The
   internal boundary is returned first and records the anchor TID as `traceTID`,
   so the engine's reinstall writes through a genuinely stopped thread while every

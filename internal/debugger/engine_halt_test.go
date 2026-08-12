@@ -177,7 +177,7 @@ var _ = Describe("asynchronous halts in handleStop", func() {
 		fb.failRegisters(errInjected)
 		fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: 2, PC: addr})
 
-		expectHaltReported(d, "read registers for retired internal breakpoint on thread 2")
+		expectHaltReported(d, "read registers for retired breakpoint on thread 2")
 		fb.clearFaults()
 		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
 	})
@@ -190,7 +190,7 @@ var _ = Describe("asynchronous halts in handleStop", func() {
 		fb.failReadAt(addr, errInjected)
 		fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: 2, PC: addr})
 
-		expectHaltReported(d, "inspect retired internal breakpoint")
+		expectHaltReported(d, "inspect retired breakpoint")
 		fb.clearFaults()
 		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
 	})
@@ -207,7 +207,7 @@ var _ = Describe("asynchronous halts in handleStop", func() {
 		fb.failSetRegisters(errInjected)
 		fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: 2, PC: addr})
 
-		expectHaltReported(d, "rewind retired internal breakpoint on thread 2")
+		expectHaltReported(d, "rewind retired breakpoint on thread 2")
 		fb.clearFaults()
 		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
 	})
@@ -221,7 +221,7 @@ var _ = Describe("asynchronous halts in handleStop", func() {
 		fb.failContinue(errInjected)
 		fb.pushStop(debugger.StopEvent{Reason: debugger.StopBreakpoint, TID: 2, PC: addr})
 
-		expectHaltReported(d, "continue after retired internal breakpoint on thread 2")
+		expectHaltReported(d, "continue after retired breakpoint on thread 2")
 		fb.clearFaults()
 		Expect(d.Continue()).To(Succeed(), "the session must remain resumable")
 	})
