@@ -195,6 +195,67 @@ var _ = Describe("Breakpoint clear state transitions", func() {
 		Expect(d.ClearBreakpoint(id)).To(MatchError(ContainSubstring("not found")))
 	})
 
+	It("does not resurrect a cleared breakpoint in the stepped-thread death backstop", func() {
+		const (
+			siblingAddr = bpAddr + 0x100
+			siblingTID  = 2
+		)
+		fb.seedMem(siblingAddr, original)
+		siblingID := debugger.ExportedSetBreakpointAt(d, siblingAddr)
+		parkOnBreakpoint(1)
+
+		continueAndConsumeContinued(d)
+		Expect(d.ClearBreakpoint(id)).To(Succeed())
+
+		hitPC := siblingAddr
+		if len(trap) == 1 {
+			hitPC++
+		}
+		fb.tids = []int{1, siblingTID}
+		fb.regs[siblingTID] = debugger.Registers{PC: hitPC}
+		fb.pushStop(debugger.StopEvent{
+			Reason: debugger.StopBreakpoint,
+			TID:    siblingTID,
+			PC:     siblingAddr,
+		})
+
+		evt := mustNextEvent(d)
+		Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit))
+		var payload protocol.BreakpointHitPayload
+		Expect(protocol.DecodeEventPayload(evt, &payload)).To(Succeed())
+		Expect(payload.Breakpoint.ID).To(Equal(siblingID))
+		expectOriginalInstruction()
+		Expect(d.ClearBreakpoint(id)).To(MatchError(ContainSubstring("not found")))
+	})
+
+	It("rewinds a queued same-address hit after the in-flight breakpoint is cleared", func() {
+		const siblingTID = 2
+		parkOnBreakpoint(1)
+
+		continueAndConsumeContinued(d)
+		Expect(d.ClearBreakpoint(id)).To(Succeed())
+
+		hitPC := bpAddr
+		if len(trap) == 1 {
+			hitPC++
+		}
+		fb.tids = []int{1, siblingTID}
+		fb.regs[siblingTID] = debugger.Registers{PC: hitPC}
+		fb.pushStop(debugger.StopEvent{
+			Reason: debugger.StopBreakpoint,
+			TID:    siblingTID,
+			PC:     bpAddr,
+		})
+
+		waitForContinue()
+		Expect(fb.regs[siblingTID].PC).To(Equal(bpAddr),
+			"the delayed hit must execute the restored instruction rather than resume past it")
+		expectOriginalInstruction()
+		Expect(d.ClearBreakpoint(id)).To(MatchError(ContainSubstring("not found")))
+		_, ok := nextEvent(d)
+		Expect(ok).To(BeFalse(), "a delayed hit on a cleared breakpoint must remain silent")
+	})
+
 	It("makes Kill's clearAll path forget a parked breakpoint", func() {
 		parkOnBreakpoint(1)
 
