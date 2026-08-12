@@ -94,12 +94,14 @@ type engine struct {
 	stepOverFile string
 	stepOverLine int
 
-	// Linux can report a sibling's already-queued hit after a one-shot internal
-	// breakpoint has been restored and removed from bps. A stale stop is resumed
-	// only when current memory matches bytes this engine actually restored and
-	// no live architecture trap spans that address. Histories live for the
-	// engine's lifetime because wait statuses expose no safe drain point.
+	// A sibling's already-queued hit can surface after the trap that produced it
+	// has been restored and removed from bps. This includes one-shot internal
+	// sentinels and user entries cleared during an in-flight step-off. A stale
+	// stop is resumed only when current memory matches bytes this engine actually
+	// restored and no live architecture trap spans that address. The histories
+	// stay separate so the Linux internal-sentinel diagnostic remains precise.
 	retiredInternalBreakpointBytes map[uint64][][]byte
+	retiredClearedBreakpointBytes  map[uint64][][]byte
 	retiredInternalBreakpointHits  int
 
 	// manualStopPending records that a Pause request has fired the backend's
@@ -320,6 +322,11 @@ func (e *engine) clearBreakpoint(id int) error {
 		// The step-off path already restored the original instruction and
 		// transiently removed this entry from the table. Keep its metadata for
 		// the pending resume action, but make completion skip the reinstall.
+		// Its restored bytes identify any same-address sibling hit the kernel
+		// had already queued, so that stop can resume at the instruction rather
+		// than being advanced into or past it as an unowned trap.
+		e.retiredClearedBreakpointBytes = recordRetiredBreakpointBytes(
+			e.retiredClearedBreakpointBytes, e.steppingOverBP.addr, e.steppingOverBP.originalBytes)
 		e.steppingOverBP.enabled = false
 		return nil
 	}
@@ -710,26 +717,26 @@ func (e *engine) handleStop(stop StopEvent) {
 		// other way out of it, and both backends refuse to surface a foreign
 		// breakpoint while the stepped thread can still produce one (linux
 		// parks it, darwin re-faults it). So the stepped thread died, and the
-		// trap this step-over lifted is now removed from the tracee and out of
-		// the table with nothing left to put it back. Reconcile it here, before
-		// the table lookup, so that a sibling stopped at the *same* address
-		// resolves to a real breakpoint instead of taking the spurious-SIGTRAP
-		// path, and so the next resume cannot overwrite the one-slot
-		// steppingOverBP and lose the breakpoint for good.
+		// retained entry must be resolved before the table lookup. A live entry
+		// needs its lifted trap put back so a same-address sibling resolves to
+		// the real breakpoint; a cleared entry already owns restored bytes and
+		// must not be resurrected.
 		if sob := e.steppingOverBP; sob != nil {
 			e.steppingOverBP = nil
-			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
-				e.endThreadStep()
-				e.log.Error("breakpoint reinstall failed after the stepped thread died",
-					"addr", fmt.Sprintf("0x%x", sob.addr), "err", rerr)
-				e.haltOnError(protocol.CmdNone, fmt.Errorf(
-					"reinstall breakpoint 0x%x after the stepped thread died "+
-						"(it may no longer be armed or tracked): %w", sob.addr, rerr), stop)
-				return
+			if sob.enabled {
+				if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
+					e.endThreadStep()
+					e.log.Error("breakpoint reinstall failed after the stepped thread died",
+						"addr", fmt.Sprintf("0x%x", sob.addr), "err", rerr)
+					e.haltOnError(protocol.CmdNone, fmt.Errorf(
+						"reinstall breakpoint 0x%x after the stepped thread died "+
+							"(it may no longer be armed or tracked): %w", sob.addr, rerr), stop)
+					return
+				}
+				e.log.Debug("breakpoint reinstalled after stepped-thread death",
+					"addr", fmt.Sprintf("0x%x", sob.addr))
 			}
 			e.endThreadStep()
-			e.log.Debug("breakpoint reinstalled after stepped-thread death",
-				"addr", fmt.Sprintf("0x%x", sob.addr))
 		}
 		var err error
 		stop, err = e.populateBreakpointStop(stop)
@@ -748,7 +755,7 @@ func (e *engine) handleStop(stop StopEvent) {
 			"found", bp != nil,
 			"steppingOverBP", e.steppingOverBP != nil)
 		if bp == nil {
-			if e.resumeRetiredInternalBreakpoint(stop) {
+			if e.resumeRetiredBreakpoint(stop) {
 				return
 			}
 			// Spurious SIGTRAP — a BRK we did not install (Go runtime
@@ -888,27 +895,31 @@ func (e *engine) handleStop(stop StopEvent) {
 	case StopStepThreadExited:
 		// The backend is holding a genuinely ptrace-stopped thread solely as a
 		// memory-write anchor — the dying step owner itself, or a sibling whose
-		// real stop stays queued. Reinstall through it FIRST; only the
-		// acknowledgement below releases that anchor and lets held stops drain.
+		// real stop stays queued. Resolve the breakpoint transaction FIRST:
+		// reinstall a live entry through the anchor, or preserve the restored
+		// bytes of an entry cleared mid-step. Only the acknowledgement below
+		// releases that anchor and lets held stops drain.
 		if sob := e.steppingOverBP; sob != nil {
-			if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
-				// steppingOverBP is deliberately left set: the trap is still out
-				// of the tracee and the engine still owns it, which is also what
-				// keeps the backend's gate closed so Continue/Step are refused.
-				e.setState(stateSuspended)
-				e.haltOnError(protocol.CmdNone, fmt.Errorf(
-					"reinstall breakpoint 0x%x after stepped thread exited; kill or restart to recover safely: %w",
-					sob.addr, rerr), stop)
-				return
+			if sob.enabled {
+				if rerr := e.bps.reinstall(e.backend, sob); rerr != nil {
+					// steppingOverBP is deliberately left set: the trap is still out
+					// of the tracee and the engine still owns it, which is also what
+					// keeps the backend's gate closed so Continue/Step are refused.
+					e.setState(stateSuspended)
+					e.haltOnError(protocol.CmdNone, fmt.Errorf(
+						"reinstall breakpoint 0x%x after stepped thread exited; kill or restart to recover safely: %w",
+						sob.addr, rerr), stop)
+					return
+				}
+				e.log.Debug("breakpoint reinstalled after stepped thread exited",
+					"addr", fmt.Sprintf("0x%x", sob.addr))
 			}
 			e.steppingOverBP = nil
-			e.log.Debug("breakpoint reinstalled after stepped thread exited",
-				"addr", fmt.Sprintf("0x%x", sob.addr))
 		}
 		if cerr := e.completeStepThreadExit(); cerr != nil {
-			// The reinstall succeeded but the anchor could not be released, so
-			// the gate stays closed and no waitLoop is started: resuming would
-			// leave a thread stopped that nothing will ever deliver.
+			// The breakpoint transaction is resolved but the anchor could not be
+			// released, so the gate stays closed and no waitLoop is started:
+			// resuming would leave a thread stopped that nothing will ever deliver.
 			e.setState(stateSuspended)
 			e.haltOnError(protocol.CmdNone, fmt.Errorf(
 				"reconcile the exited step owner; kill or restart to recover safely: %w",
@@ -974,29 +985,45 @@ func (e *engine) retireInternalBreakpoint(bp *breakpointEntry, stop StopEvent) b
 			fmt.Errorf("clear internal breakpoint 0x%x: %w", bp.addr, err), stop)
 		return false
 	}
-	if e.retiredInternalBreakpointBytes == nil {
-		e.retiredInternalBreakpointBytes = make(map[uint64][][]byte)
-	}
-	restored := bytes.Clone(bp.originalBytes)
-	history := e.retiredInternalBreakpointBytes[bp.addr]
-	for _, prior := range history {
-		if bytes.Equal(prior, restored) {
-			return true
-		}
-	}
-	e.retiredInternalBreakpointBytes[bp.addr] = append(history, restored)
+	e.retiredInternalBreakpointBytes = recordRetiredBreakpointBytes(
+		e.retiredInternalBreakpointBytes, bp.addr, bp.originalBytes)
 	return true
 }
 
-// resumeRetiredInternalBreakpoint handles a sibling that executed a one-shot
-// sentinel before another thread cleared it, but whose kernel stop reached the
-// engine only afterwards. On amd64 the live RIP is then one byte into the
-// restored instruction. An address match is insufficient: tracee code may later
-// place a genuine trap there, including an x86 CD 03 spanning the rewind
-// boundary, and rewinding that live trap would re-execute it forever.
-func (e *engine) resumeRetiredInternalBreakpoint(stop StopEvent) bool {
-	history, ok := e.retiredInternalBreakpointBytes[stop.PC]
-	if !ok {
+func recordRetiredBreakpointBytes(history map[uint64][][]byte, addr uint64, original []byte) map[uint64][][]byte {
+	if history == nil {
+		history = make(map[uint64][][]byte)
+	}
+	restored := bytes.Clone(original)
+	priorBytes := history[addr]
+	for _, prior := range priorBytes {
+		if bytes.Equal(prior, restored) {
+			return history
+		}
+	}
+	history[addr] = append(priorBytes, restored)
+	return history
+}
+
+func matchesRetiredBreakpointBytes(current []byte, history [][]byte) bool {
+	for _, prior := range history {
+		if bytes.Equal(current, prior) {
+			return true
+		}
+	}
+	return false
+}
+
+// resumeRetiredBreakpoint handles a sibling whose kernel stop arrives after
+// another thread removed the trap that produced it. On amd64 the live RIP is
+// then one byte into the restored instruction. An address match is insufficient:
+// tracee code may later place a genuine trap there, including an x86 CD 03
+// spanning the rewind boundary, and rewinding that live trap would re-execute it
+// forever.
+func (e *engine) resumeRetiredBreakpoint(stop StopEvent) bool {
+	internalHistory := e.retiredInternalBreakpointBytes[stop.PC]
+	clearedHistory := e.retiredClearedBreakpointBytes[stop.PC]
+	if len(internalHistory) == 0 && len(clearedHistory) == 0 {
 		return false
 	}
 
@@ -1004,7 +1031,7 @@ func (e *engine) resumeRetiredInternalBreakpoint(stop StopEvent) bool {
 	if err != nil {
 		e.setState(stateSuspended)
 		e.haltOnError(protocol.CmdNone,
-			fmt.Errorf("inspect retired internal breakpoint at 0x%x: %w", stop.PC, err), stop)
+			fmt.Errorf("inspect retired breakpoint at 0x%x: %w", stop.PC, err), stop)
 		return true
 	}
 	if liveTrap {
@@ -1014,14 +1041,8 @@ func (e *engine) resumeRetiredInternalBreakpoint(stop StopEvent) bool {
 		return true
 	}
 
-	restored := false
-	for _, prior := range history {
-		if bytes.Equal(current, prior) {
-			restored = true
-			break
-		}
-	}
-	if !restored {
+	internalMatch := matchesRetiredBreakpointBytes(current, internalHistory)
+	if !internalMatch && !matchesRetiredBreakpointBytes(current, clearedHistory) {
 		e.log.Debug("retired address no longer matches restored breakpoint bytes",
 			"tid", stop.TID, "pc", fmt.Sprintf("0x%x", stop.PC))
 		e.resumeUnownedBreakpoint(stop, stop.PC+uint64(len(archTrapInstruction())))
@@ -1032,7 +1053,7 @@ func (e *engine) resumeRetiredInternalBreakpoint(stop StopEvent) bool {
 	if err != nil {
 		e.setState(stateSuspended)
 		e.haltOnError(protocol.CmdNone,
-			fmt.Errorf("read registers for retired internal breakpoint on thread %d: %w", stop.TID, err), stop)
+			fmt.Errorf("read registers for retired breakpoint on thread %d: %w", stop.TID, err), stop)
 		return true
 	}
 	if regs.PC != stop.PC {
@@ -1040,20 +1061,22 @@ func (e *engine) resumeRetiredInternalBreakpoint(stop StopEvent) bool {
 		if err := e.backend.SetRegisters(stop.TID, regs); err != nil {
 			e.setState(stateSuspended)
 			e.haltOnError(protocol.CmdNone,
-				fmt.Errorf("rewind retired internal breakpoint on thread %d: %w", stop.TID, err), stop)
+				fmt.Errorf("rewind retired breakpoint on thread %d: %w", stop.TID, err), stop)
 			return true
 		}
 	}
 
-	e.log.Debug("resuming delayed sibling hit on retired internal breakpoint",
+	e.log.Debug("resuming delayed sibling hit on retired breakpoint",
 		"tid", stop.TID, "pc", fmt.Sprintf("0x%x", stop.PC))
 	if err := e.backend.ContinueProcess(); err != nil {
 		e.setState(stateSuspended)
 		e.haltOnError(protocol.CmdNone,
-			fmt.Errorf("continue after retired internal breakpoint on thread %d: %w", stop.TID, err), stop)
+			fmt.Errorf("continue after retired breakpoint on thread %d: %w", stop.TID, err), stop)
 		return true
 	}
-	e.retiredInternalBreakpointHits++
+	if internalMatch {
+		e.retiredInternalBreakpointHits++
+	}
 	e.setState(stateRunning)
 	go e.waitLoop()
 	return true
