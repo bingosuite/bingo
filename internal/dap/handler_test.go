@@ -987,6 +987,25 @@ func TestRestartPreservesBreakpointCorrelationQueues(t *testing.T) {
 	}
 }
 
+func requireSequentialOpaqueBreakpoints(t *testing.T, got []godap.Breakpoint, count int) map[int]struct{} {
+	t.Helper()
+	if len(got) != count {
+		t.Fatalf("got %d breakpoints, want %d", len(got), count)
+	}
+	ids := make(map[int]struct{}, count+1)
+	for i, bp := range got {
+		wantLine := i + 1
+		if !bp.Verified || bp.Id <= 0 || bp.Line != wantLine {
+			t.Fatalf("breakpoint %d = %+v, want verified line %d with a positive id", i, bp, wantLine)
+		}
+		if _, duplicate := ids[bp.Id]; duplicate {
+			t.Fatalf("breakpoint %d reused id %d", i, bp.Id)
+		}
+		ids[bp.Id] = struct{}{}
+	}
+	return ids
+}
+
 func TestSetBreakpointsBurstThroughHubPreservesFIFO(t *testing.T) {
 	dbg := newGatedBreakpointDebugger()
 	defer dbg.release()
@@ -1044,20 +1063,7 @@ func TestSetBreakpointsBurstThroughHubPreservesFIFO(t *testing.T) {
 	if resp.RequestSeq != setSeq {
 		t.Fatalf("setBreakpoints request seq = %d, want %d", resp.RequestSeq, setSeq)
 	}
-	if len(resp.Body.Breakpoints) != breakpointCount {
-		t.Fatalf("got %d breakpoints, want %d", len(resp.Body.Breakpoints), breakpointCount)
-	}
-	ids := make(map[int]struct{}, breakpointCount+1)
-	for i, bp := range resp.Body.Breakpoints {
-		wantLine := i + 1
-		if !bp.Verified || bp.Id <= 0 || bp.Line != wantLine {
-			t.Fatalf("breakpoint %d = %+v, want verified line %d with a positive id", i, bp, wantLine)
-		}
-		if _, duplicate := ids[bp.Id]; duplicate {
-			t.Fatalf("breakpoint %d reused id %d", i, bp.Id)
-		}
-		ids[bp.Id] = struct{}{}
-	}
+	ids := requireSequentialOpaqueBreakpoints(t, resp.Body.Breakpoints, breakpointCount)
 	if got := dbg.setCount(); got != breakpointCount {
 		t.Fatalf("SetBreakpoint calls = %d, want %d", got, breakpointCount)
 	}
