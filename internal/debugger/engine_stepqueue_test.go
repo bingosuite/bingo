@@ -356,6 +356,46 @@ var _ = Describe("Engine over the production park queue", func() {
 			"the dead step owner's breakpoint must still be tracked by id")
 	})
 
+	It("opens the owner-death gate without reinstalling a breakpoint cleared mid-step", func() {
+		idA := debugger.ExportedSetBreakpointAt(d, bpAddrA)
+
+		continueAndConsumeContinued(d)
+		qb.push(rawStop{tid: steppedTID, trap: true, pc: bpAddrA})
+		Expect(mustNextEvent(d).Kind).To(Equal(protocol.EventBreakpointHit))
+
+		continueAndConsumeContinued(d)
+		Eventually(func() []byte { return fb.peekMem(bpAddrA, len(trap)) }).
+			ShouldNot(Equal(trap), "the step-over transaction must own A's lifted trap")
+		Expect(d.ClearBreakpoint(idA)).To(Succeed())
+
+		hitPC := bpAddrA
+		if len(trap) == 1 {
+			hitPC++
+		}
+		fb.regs[siblingTID] = debugger.Registers{PC: hitPC}
+		qb.push(rawStop{tid: siblingTID, trap: true, pc: bpAddrA})
+		Eventually(qb.q.ParkedDepth).Should(Equal(1),
+			"the same-address sibling must remain held until owner reconciliation")
+
+		qb.resetOrder()
+		continuesBefore := fb.continueCount()
+		qb.push(rawStop{tid: steppedTID, death: true})
+
+		Eventually(qb.events).Should(Equal([]string{"release"}),
+			"a cleared entry needs no reinstall, but its held sibling must still drain")
+		Eventually(qb.q.StepExitPending).Should(BeFalse(),
+			"skipping the write must still open the reconciliation gate")
+		Eventually(fb.continueCount).Should(BeNumerically(">", continuesBefore),
+			"the released same-address hit must be resumed silently")
+		Expect(fb.regs[siblingTID].PC).To(Equal(bpAddrA),
+			"the released hit must execute the restored instruction rather than resume past it")
+		Expect(fb.peekMem(bpAddrA, len(trap))).NotTo(Equal(trap),
+			"the stepped-owner death path must not resurrect a cleared breakpoint")
+		Expect(d.ClearBreakpoint(idA)).To(MatchError(ContainSubstring("not found")))
+		Expect(noUserEventWithin(d, 150*time.Millisecond)).To(BeTrue(),
+			"reconciling a cleared breakpoint must not fabricate a stop")
+	})
+
 	// Reinstall failure on the held-owner path. The trap is still out of the
 	// tracee and the engine still owns it, so the anchor must NOT be released
 	// and the session must halt suspended rather than resume or die.
