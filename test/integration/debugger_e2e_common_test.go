@@ -1098,8 +1098,13 @@ type e2eHarness struct {
 // failure mode instead of wedging the whole suite.
 func newE2EHarness(bin string) *e2eHarness {
 	GinkgoHelper()
+	return newE2EHarnessArgs(bin, nil)
+}
+
+func newE2EHarnessArgs(bin string, args []string) *e2eHarness {
+	GinkgoHelper()
 	d := debugger.New(nil)
-	Expect(d.Launch(bin, nil, nil)).To(Succeed(), "Launch target")
+	Expect(d.Launch(bin, args, nil)).To(Succeed(), "Launch target")
 	DeferCleanup(func() {
 		done := make(chan struct{})
 		go func() { _ = d.Kill(); close(done) }()

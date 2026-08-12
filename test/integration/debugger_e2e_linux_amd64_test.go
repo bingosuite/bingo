@@ -674,11 +674,13 @@ func declareStepOverlapSpec() {
 	})
 }
 
-// overlapSignalTargetSrc adds a process-directed signal storm to the overlap
-// workload. A process-directed signal is delivered to an arbitrary thread that
-// is not blocking it, so it regularly lands on a spinner in the exact window
-// where another spinner is single-stepping off a trap — the foreign StopSignal
-// case, as opposed to the foreign SIGTRAP the plain overlap target produces.
+// overlapSignalTargetSrc adds a dedicated, locked signal thread and a raw
+// nanosleep syscall to the overlap workload. The harness directs SIGUSR1 to the
+// known signal TID after single-stepping the syscall has begun. The step thread
+// blocks runtime preemption's SIGURG, and the SIGCONT storm starts only after
+// this gate, so the syscall keeps the step open until the foreign signal stop is
+// provably parked instead of relying on a process-directed storm to win a
+// microsecond-scale race.
 //
 // SIGUSR1 is handled explicitly so forwarding it changes only an atomic counter.
 // Its exact number is asserted by the spec, so do not swap it for another
@@ -694,15 +696,22 @@ func declareStepOverlapSpec() {
 const overlapSignalTargetSrc = `package main
 
 import (
+	"fmt"
 	"os"
 	"os/signal"
 	"runtime"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
-var sink int64
+var (
+	sink          int64
+	signalHandled int64
+)
+
+func slowStep()
 
 func work(n int64) int64 {
 	s := int64(0)
@@ -723,27 +732,72 @@ func spin(id int64) {
 	}
 }
 
+func signalThread(ready chan<- int) {
+	runtime.LockOSThread()
+	ready <- syscall.Gettid()
+	for atomic.LoadInt64(&signalHandled) == 0 {
+		atomic.AddInt64(&sink, 1)
+	}
+	for {
+		atomic.AddInt64(&sink, 1) // SIGNAL_THREAD_RESUMED
+	}
+}
+
+func stepThread() {
+	runtime.LockOSThread()
+	mask := uint64(1) << (uint(syscall.SIGURG) - 1)
+	_, _, errno := syscall.RawSyscall6(
+		syscall.SYS_RT_SIGPROCMASK,
+		0,
+		uintptr(unsafe.Pointer(&mask)),
+		0,
+		unsafe.Sizeof(mask),
+		0,
+		0,
+	)
+	runtime.KeepAlive(&mask)
+	if errno != 0 {
+		os.Exit(96)
+	}
+	slowStep()
+	for {
+		time.Sleep(time.Second)
+	}
+}
+
 func main() {
 	go func() { time.Sleep(180 * time.Second); os.Exit(0) }()
-	runtime.GOMAXPROCS(4)
-	for i := int64(0); i < 6; i++ {
-		go spin(i)
-	}
+	runtime.GOMAXPROCS(6)
 	signals := make(chan os.Signal, 64)
 	signal.Notify(signals, syscall.SIGUSR1)
 	go func() {
 		for range signals {
+			atomic.StoreInt64(&signalHandled, 1)
 			atomic.AddInt64(&sink, 1)
 		}
 	}()
+	if len(os.Args) != 3 {
+		os.Exit(94)
+	}
+	ready := make(chan int, 1)
+	go signalThread(ready)
+	signalTID := <-ready
+	if err := os.WriteFile(os.Args[1],
+		[]byte(fmt.Sprintf("%d %d\n", os.Getpid(), signalTID)), 0600); err != nil {
+		os.Exit(95)
+	}
+	go stepThread()
 	pid := os.Getpid()
 	go func() {
 		for {
-			_ = syscall.Kill(pid, syscall.SIGUSR1)
-			time.Sleep(2 * time.Millisecond)
+			if _, err := os.Stat(os.Args[2]); err == nil {
+				break
+			}
+			time.Sleep(time.Millisecond)
 		}
-	}()
-	go func() {
+		for i := int64(0); i < 6; i++ {
+			go spin(i)
+		}
 		for {
 			_ = syscall.Kill(pid, syscall.SIGCONT)
 			time.Sleep(1 * time.Millisecond)
@@ -754,6 +808,37 @@ func main() {
 	}
 }
 `
+
+const overlapSignalTargetAsm = `#include "textflag.h"
+
+TEXT ·slowStep(SB), NOSPLIT, $16-0
+	MOVQ $5, 0(SP)
+	MOVQ $0, 8(SP)
+	MOVQ $35, AX
+	LEAQ 0(SP), DI
+	XORQ SI, SI
+	SYSCALL // OVERLAP_SIGNAL_STEP
+	RET
+`
+
+func buildOverlapSignalTarget() string {
+	GinkgoHelper()
+	dir := GinkgoT().TempDir()
+	goPath := filepath.Join(dir, "overlap_signal_target.go")
+	asmPath := filepath.Join(dir, "overlap_signal_target.s")
+	modPath := filepath.Join(dir, "go.mod")
+	Expect(os.WriteFile(goPath, []byte(overlapSignalTargetSrc), 0o600)).To(Succeed())
+	Expect(os.WriteFile(asmPath, []byte(overlapSignalTargetAsm), 0o600)).To(Succeed())
+	Expect(os.WriteFile(modPath, []byte("module overlap_signal_target\n\ngo 1.25\n"), 0o600)).To(Succeed())
+
+	binPath := filepath.Join(dir, "overlap_signal_target")
+	cmd := exec.Command("go", "build", "-gcflags=all=-N -l", "-o", binPath, ".")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0")
+	out, err := cmd.CombinedOutput()
+	Expect(err).NotTo(HaveOccurred(), "build deterministic overlap-signal target:\n%s", out)
+	return binPath
+}
 
 // overlapProbe bundles the per-stop bookkeeping the overlap specs share: the
 // liveness probe that both logical breakpoints are still tracked, and the tally
@@ -896,6 +981,92 @@ func setupOverlap(name, src string) (*overlapProbe, int, int) {
 	return newOverlapProbe(h, name+".go", []int{bpA.ID, bpB.ID}, []int{lineA, lineB}), bpA.ID, bpB.ID
 }
 
+func setupOverlapSignal() (*overlapProbe, int, int, int) {
+	GinkgoHelper()
+	syncDir := GinkgoT().TempDir()
+	syncPath := filepath.Join(syncDir, "signal-thread")
+	stormPath := filepath.Join(syncDir, "start-sigcont-storm")
+	h := newE2EHarnessArgs(buildOverlapSignalTarget(), []string{syncPath, stormPath})
+	h.waitFor(20*time.Second, protocol.EventStepped)
+
+	stepLine := markerLine(overlapSignalTargetAsm, "// OVERLAP_SIGNAL_STEP")
+	stepBP, err := h.d.SetBreakpoint("overlap_signal_target.s", stepLine)
+	Expect(err).NotTo(HaveOccurred(), "set blocking single-step breakpoint")
+	resumedLine := markerLine(overlapSignalTargetSrc, "// SIGNAL_THREAD_RESUMED")
+	resumedBP, err := h.d.SetBreakpoint("overlap_signal_target.go", resumedLine)
+	Expect(err).NotTo(HaveOccurred(), "set signal-thread liveness breakpoint")
+	parkedSignalsBefore, ok := debugger.LinuxParkedSignalCount(h.d)
+	Expect(ok).To(BeTrue(), "parked-signal hook unavailable")
+
+	Expect(h.d.Continue()).To(Succeed(), "continue to blocking single-step breakpoint")
+	evt := awaitFrom(h, 30*time.Second,
+		protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+	Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit),
+		"blocking single-step breakpoint did not stop: %s", evt.Payload)
+	var hit protocol.BreakpointHitPayload
+	Expect(json.Unmarshal(evt.Payload, &hit)).To(Succeed())
+	Expect(hit.Breakpoint.ID).To(Equal(stepBP.ID))
+
+	var pid, signalTID int
+	syncData, err := os.ReadFile(syncPath)
+	Expect(err).NotTo(HaveOccurred(), "read signal-thread identity")
+	_, err = fmt.Sscanf(string(syncData), "%d %d", &pid, &signalTID)
+	Expect(err).NotTo(HaveOccurred(), "decode signal-thread identity %q", syncData)
+	Expect(pid).To(BeNumerically(">", 0))
+	Expect(signalTID).To(BeNumerically(">", 0))
+	Expect(hit.Goroutine.ThreadID).To(BeNumerically(">", 0),
+		"blocking step did not report its OS thread")
+	Expect(hit.Goroutine.Current).To(BeTrue(),
+		"blocking step fell back to a non-current goroutine")
+	Expect(hit.Goroutine.ThreadID).NotTo(Equal(signalTID),
+		"the directed signal thread must be foreign to the single-step owner")
+
+	Expect(h.d.StepInto()).To(Succeed(), "single-step blocking nanosleep syscall")
+	Expect(syscall.Tgkill(pid, signalTID, syscall.SIGUSR1)).To(Succeed(),
+		"direct SIGUSR1 to the known foreign thread")
+	evt = awaitFrom(h, 30*time.Second,
+		protocol.EventStepped, protocol.EventBreakpointHit,
+		protocol.EventProcessExited, protocol.EventError)
+	Expect(evt.Kind).To(Equal(protocol.EventStepped),
+		"the blocking syscall step did not complete after holding the foreign signal: %s", evt.Payload)
+	Expect(h.d.ClearBreakpoint(stepBP.ID)).To(Succeed(),
+		"clear blocking single-step breakpoint")
+
+	lineA := markerLine(overlapSignalTargetSrc, "// OVERLAP_A")
+	lineB := markerLine(overlapSignalTargetSrc, "// OVERLAP_B")
+	bpA, err := h.d.SetBreakpoint("overlap_signal_target.go", lineA)
+	Expect(err).NotTo(HaveOccurred(), "SetBreakpoint A")
+	bpB, err := h.d.SetBreakpoint("overlap_signal_target.go", lineB)
+	Expect(err).NotTo(HaveOccurred(), "SetBreakpoint B")
+	p := newOverlapProbe(h, "overlap_signal_target.go",
+		[]int{bpA.ID, bpB.ID}, []int{lineA, lineB})
+
+	Expect(h.d.Continue()).To(Succeed(), "release the held foreign signal")
+	evt = p.await(30*time.Second,
+		protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+	Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit),
+		"the directed signal thread did not resume after SIGUSR1 forwarding: %s", evt.Payload)
+	Expect(json.Unmarshal(evt.Payload, &hit)).To(Succeed())
+	Expect(hit.Breakpoint.ID).To(Equal(resumedBP.ID),
+		"the first post-signal stop must prove the exact signaled thread resumed")
+	Expect(hit.Goroutine.Current).To(BeTrue(),
+		"signal-thread liveness stop fell back to a non-current goroutine")
+	Expect(hit.Goroutine.ThreadID).To(Equal(signalTID),
+		"the liveness breakpoint ran on TID %d, want directed signal TID %d",
+		hit.Goroutine.ThreadID, signalTID)
+	Expect(h.d.ClearBreakpoint(resumedBP.ID)).To(Succeed(),
+		"clear signal-thread liveness breakpoint")
+	Expect(os.WriteFile(stormPath, nil, 0o600)).To(Succeed(),
+		"start the hot-loop and stepped-thread SIGCONT workloads")
+	Expect(h.d.Continue()).To(Succeed(), "continue into the hot-loop overlap workload")
+	evt = p.await(30*time.Second,
+		protocol.EventBreakpointHit, protocol.EventProcessExited, protocol.EventError)
+	Expect(evt.Kind).To(Equal(protocol.EventBreakpointHit),
+		"hot-loop overlap workload did not stop: %s", evt.Payload)
+	p.record(evt, "after deterministic foreign signal", false)
+	return p, bpA.ID, bpB.ID, parkedSignalsBefore
+}
+
 // declareStepOverlapStepIntoSpec covers the machine-granularity step
 // (bpResumeStep) rather than the source-level step-over: StepInto off an armed
 // trap issues the same restore → single-step → reinstall dance, but suspends on
@@ -959,24 +1130,12 @@ func declareStepOverlapStepIntoSpec() {
 func declareStepOverlapSignalSpec() {
 	It("resumes the thread that stopped when a foreign signal lands mid-step",
 		Label("overlap"), func() {
-			p, bpA, bpB := setupOverlap("overlap_signal_target", overlapSignalTargetSrc)
-			parkedSignalsBefore, ok := debugger.LinuxParkedSignalCount(p.h.d)
-			Expect(ok).To(BeTrue(), "parked-signal hook unavailable")
+			p, bpA, bpB, parkedSignalsBefore := setupOverlapSignal()
 
 			iters := envInt("BINGO_E2E_OVERLAP_SIGNAL_ITERS", 40)
-			// Machine steps per cycle. A foreign signal is only *held* if it
-			// lands while a step is outstanding, and that window is a few tens
-			// of microseconds against a cycle time dominated by the storm
-			// itself — so the way to make the held-signal population reliable
-			// is to spend more of the run inside a step, not to storm harder
-			// (a faster storm costs a ptrace round-trip per signal and would
-			// dominate the runtime). A burst of machine steps multiplies the
-			// exposure for a per-step cost far below one cycle. Measured: 80
-			// cycles x 1 step gave 12 / 2 / 0 held signals across three native
-			// runs — the zero run is what made this necessary. 40 x 13 windows
-			// is ~6.5x the exposure at roughly the same wall time, since the
-			// halved cycle count pays for the steps: sizing is two-sided here,
-			// because every target self-exits on a 180s watchdog.
+			// Keep the machine-step burst and its existing watchdog envelope:
+			// besides the directed SIGUSR1 gate above, SIGCONT still exercises
+			// the stepped-thread re-arm path opportunistically across the run.
 			steps := envInt("BINGO_E2E_OVERLAP_SIGNAL_STEPS", 12)
 			for i := 0; i < iters; i++ {
 				where := fmt.Sprintf("cycle #%d", i)
@@ -1016,8 +1175,8 @@ func declareStepOverlapSignalSpec() {
 			Expect(p.h.d.ClearBreakpoint(bpA)).To(Succeed(), "ClearBreakpoint A after the run")
 			Expect(p.h.d.ClearBreakpoint(bpB)).To(Succeed(), "ClearBreakpoint B after the run")
 
-			// Non-vacuity: the signal storm must have reached the debugger,
-			// otherwise this ran as a plain overlap spec.
+			// Non-vacuity: the directed setup gate must have reached the
+			// debugger, otherwise this ran as a plain overlap spec.
 			Expect(p.signalOutputs).To(BeNumerically(">", 0),
 				"no signal stops were reported — the foreign-signal path was never exercised")
 
@@ -1052,8 +1211,8 @@ func declareStepOverlapSignalSpec() {
 			parkedSignals, ok := debugger.LinuxParkedSignalCount(p.h.d)
 			Expect(ok).To(BeTrue(), "parked-signal hook unavailable")
 			Expect(parkedSignals).To(BeNumerically(">", parkedSignalsBefore),
-				"no signal stop was ever held back across %d cycles x %d steps: "+
-					"the queued signal path was not exercised", iters, steps)
+				"the deterministic setup gate did not hold a signal stop behind "+
+					"its in-flight single-step")
 			// Liveness: threads are still making progress at the end of the
 			// run. A thread resumed while another was left stopped would drop
 			// out permanently, since every spinner is LockOSThread'd.

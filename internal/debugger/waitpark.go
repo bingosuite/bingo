@@ -157,8 +157,8 @@ func (q *stepQueue) parkedCount() int { return int(q.parkedTotal.Load()) }
 // asynchronous interrupt reached the backend while a step was in flight" from
 // "a sibling happened to trap". The linux wait loop absorbs SIGURG, SIGCONT and
 // a new thread's initial SIGSTOP before classification, so a parked signal stop
-// is a genuine externally-directed interrupt — in practice the SIGSTOP that
-// Pause sends at the main thread.
+// is a genuine externally-directed interrupt, either Pause's directed SIGSTOP
+// or the ordinary directed signal used by the native overlap gate.
 func (q *stepQueue) parkedSignalCount() int { return int(q.parkedSignalTotal.Load()) }
 
 // releasable pops the oldest held stop if one may be surfaced now.

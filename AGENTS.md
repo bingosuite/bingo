@@ -984,16 +984,21 @@ those specs. The counter is cumulative and `atomic` because the test reads it
 from its own goroutine; draining and purging describe what is still held, not
 what was ever held, so neither rolls it back.
 
-`LinuxParkedSignalCount` splits out the held **signal** stops, and the `Pause`
-overlap spec's non-vacuity rests on it. The wait loop absorbs SIGURG, SIGCONT
-and a new thread's initial SIGSTOP before `classifyUserStop`, so a signal stop
-that reaches the queue can only be an externally-directed interrupt — in that
-target, the SIGSTOP `Pause` sends at the main thread. Since the main thread
-never traps there, it is never the stepped thread, so a held signal is direct
-evidence that the interrupt arrived *while a single-step was outstanding*. That
-spec asserts three independent things: a `Pause` was accepted (the engine was
-running, so a step really was in flight), an interrupt was held mid-step, and at
-least one `EventPaused` actually surfaced.
+`LinuxParkedSignalCount` splits out the held **signal** stops. The wait loop
+absorbs SIGURG, SIGCONT and a new thread's initial SIGSTOP before
+`classifyUserStop`, so a signal stop that reaches the queue is an
+externally-directed interrupt. The ordinary-signal overlap target exposes one
+locked signal TID and a separate locked thread stopped on a breakpoint at a raw
+`nanosleep` syscall. The harness starts a machine step over that syscall, then
+directs SIGUSR1 to the known foreign TID. The step owner blocks runtime
+preemption's SIGURG, and the target gates its SIGCONT storm until this transaction
+finishes, so the blocking syscall keeps the step open until the foreign signal
+is provably parked. After forwarding, the signaled locked thread must hit its
+own gated breakpoint under the same TID, proving the backend resumed the thread
+that actually stopped rather than merely reporting the signal. The Pause overlap
+spec uses the same counter for its directed main-thread SIGSTOP. In both cases,
+a held signal is direct evidence that the interrupt arrived *while a single-step
+was outstanding*.
 
 **The foreign-signal spec also gates the signal *number*, not just its arrival.**
 A held stop carries its signal in the `StopEvent` the wait loop builds at park
@@ -1002,9 +1007,9 @@ still advance every counter, and merely report `signal 0`. The spec therefore
 records the numbers the engine reported and requires `SIGUSR1` to be among them
 and `0` not to be — with a held **signal** stop asserted separately, since that
 is the population whose number travels through the queue. `SIGUSR1` is chosen
-because ptrace intercepts it and the engine resumes with signal 0, so the storm
-never changes the target's behaviour; its exact value is now asserted, so do not
-swap it.
+because ptrace intercepts and forwards it to the exact stopped TID, whose handler
+changes only an atomic counter in the target; its exact value is asserted, so do
+not swap it.
 
 **`LinuxStepRearmCount` is the native evidence for rule 7.** The failure that
 rule prevents is a freeze, which a test can otherwise only observe as a timeout —
