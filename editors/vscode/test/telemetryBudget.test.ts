@@ -178,7 +178,7 @@ describe("telemetry budget contract", () => {
     const manifest = JSON.parse(
       readFileSync(resolve(process.cwd(), "package.json"), "utf8"),
     ) as { readonly version: string };
-    assert.equal(manifest.version, "0.4.0");
+    assert.equal(manifest.version, "0.4.1");
   });
 });
 
