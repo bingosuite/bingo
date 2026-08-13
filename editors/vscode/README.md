@@ -23,8 +23,10 @@ This builds, verifies, and installs `dist/bingo-<platform>.vsix`. The graphical
 concurrency view debuted in 0.3.0, 0.3.1 added capability-safe managed-server
 reuse, and 0.3.2 added wire 1.3's honest unknown stopped-goroutine rendering;
 **0.4.0** adds wire 1.4's bounded goroutine event contract, which is what keeps
-the concurrency view alive on highly concurrent targets. 0.4.0 is the minimum
-supported version. Rerun the command to update, then run
+the concurrency view alive on highly concurrent targets. **0.4.1** adds
+bounded-family error classification, truthful omission states, and manual
+recovery after reconnect exhaustion. 0.4.0 is the minimum supported version.
+Rerun the command to update, then run
 **Developer: Reload Window** once so the active extension host loads the new
 bundle. Package without installing with `just vscode-package`. Uninstall with:
 
