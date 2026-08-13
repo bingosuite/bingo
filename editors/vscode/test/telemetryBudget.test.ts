@@ -881,8 +881,11 @@ describe("protocol violations do not consume reconnect attempts", () => {
       );
     }
 
+    const overflowFrame =
+      `{"v":${JSON.stringify(wireProtocolVersion)},` +
+      `"kind":"Error","seq":1,"payload":{"message":"boom","extra":1e400}}`;
     assert.throws(
-      () => decodeEvent(`{"v":"1.3","kind":"Error","seq":1,"payload":{"message":"boom","extra":1e400}}`),
+      () => decodeEvent(overflowFrame),
       (error: unknown) =>
         error instanceof Error && !(error instanceof TelemetryProtocolError),
       "an out-of-range number is size-derived and must stay transient",
