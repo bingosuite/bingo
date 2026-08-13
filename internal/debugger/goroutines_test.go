@@ -117,6 +117,22 @@ func observeSnapshot(snap protocol.GoroutineSnapshotPayload) snapshotObservation
 	}
 }
 
+func expectDegradedSnapshotPreservesBaseline(degraded, recovered protocol.GoroutineSnapshotPayload) {
+	Expect([]snapshotObservation{
+		observeSnapshot(degraded),
+		observeSnapshot(recovered),
+	}).To(Equal([]snapshotObservation{
+		{Goroutines: []int{1}, Selected: 1},
+		{
+			Goroutines: []int{101, 102},
+			Threads:    2,
+			Current:    102,
+			Selected:   102,
+			Exited:     []int{103},
+		},
+	}))
+}
+
 var _ = Describe("goroutine snapshot partial reads", func() {
 	var (
 		fb      *fakeBackend
@@ -159,19 +175,7 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 			degraded := debugger.ExportedGoroutineSnapshot(d)
 			recovered := debugger.ExportedGoroutineSnapshot(d)
 
-			Expect([]snapshotObservation{
-				observeSnapshot(degraded),
-				observeSnapshot(recovered),
-			}).To(Equal([]snapshotObservation{
-				{Goroutines: []int{1}, Selected: 1},
-				{
-					Goroutines: []int{101, 102},
-					Threads:    2,
-					Current:    102,
-					Selected:   102,
-					Exited:     []int{103},
-				},
-			}))
+			expectDegradedSnapshotPreservesBaseline(degraded, recovered)
 		},
 		Entry("when an allgs slot pointer is unreadable", func() uint64 {
 			return allgsArrayAddr + 8
@@ -204,19 +208,7 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 			degraded := debugger.ExportedGoroutineSnapshotQuery(d)
 			recovered := debugger.ExportedGoroutineSnapshot(d)
 
-			Expect([]snapshotObservation{
-				observeSnapshot(degraded),
-				observeSnapshot(recovered),
-			}).To(Equal([]snapshotObservation{
-				{Goroutines: []int{1}, Selected: 1},
-				{
-					Goroutines: []int{101, 102},
-					Threads:    2,
-					Current:    102,
-					Selected:   102,
-					Exited:     []int{103},
-				},
-			}))
+			expectDegradedSnapshotPreservesBaseline(degraded, recovered)
 		},
 		Entry("when allgs is incomplete", func() uint64 {
 			return allgsArrayAddr + 8
