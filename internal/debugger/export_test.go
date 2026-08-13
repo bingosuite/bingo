@@ -118,6 +118,18 @@ func ExportedGoroutineSnapshot(d Debugger) protocol.GoroutineSnapshotPayload {
 	return snap
 }
 
+func ExportedGoroutineSnapshotQuery(d Debugger) protocol.GoroutineSnapshotPayload {
+	e := d.(*engine)
+	var snap protocol.GoroutineSnapshotPayload
+	if err := e.dispatch(func() error {
+		snap = e.goroutineSnapshotQuery()
+		return nil
+	}); err != nil {
+		panic("ExportedGoroutineSnapshotQuery: " + err.Error())
+	}
+	return snap
+}
+
 func ExportedCurrentGoroutineFrom(snap protocol.GoroutineSnapshotPayload) protocol.Goroutine {
 	return currentGoroutineFrom(snap)
 }
@@ -428,8 +440,8 @@ func (b *ExportedGateBackend) completeStepThreadExit() error {
 	return nil
 }
 
-// ExportedSnapshotFrom assembles a snapshot payload around a pre-built
-// goroutine list, bypassing the runtime memory scan, so tests can pin the
+// ExportedSnapshotFrom assembles a snapshot payload around pre-built complete
+// walk results, bypassing runtime memory, so tests can pin the
 // lifecycle split: trackLifecycle=true is the automatic stop path (diffs and
 // adopts the baseline), false is the on-demand query path. Runs on the engine
 // loop thread, like the real callers.
@@ -437,7 +449,8 @@ func ExportedSnapshotFrom(d Debugger, gs []protocol.Goroutine, trackLifecycle bo
 	e := d.(*engine)
 	var snap protocol.GoroutineSnapshotPayload
 	if err := e.dispatch(func() error {
-		snap = e.snapshotFrom(gs, 0, trackLifecycle)
+		current, live := snapshotGoroutineState(gs)
+		snap = e.snapshotFrom(gs, nil, current, live, trackLifecycle)
 		return nil
 	}); err != nil {
 		panic("ExportedSnapshotFrom: " + err.Error())
