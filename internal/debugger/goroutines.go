@@ -509,13 +509,37 @@ func (e *engine) buildSnapshot(trackLifecycle bool) protocol.GoroutineSnapshotPa
 		// runtime init) must not look like every goroutine exited.
 		return e.degradedSnapshot(pc)
 	}
-	return e.snapshotFrom(goroutines.Items, pc, trackLifecycle)
+
+	current, live := snapshotGoroutineState(goroutines.Items)
+	threads := e.readThreads(current, pc)
+	if !threads.Complete {
+		return e.degradedSnapshot(pc)
+	}
+	return e.snapshotFrom(goroutines.Items, threads.Items, current, live, trackLifecycle)
 }
 
-// snapshotFrom assembles the payload around an already-built goroutine list.
+// snapshotFrom assembles a payload after both runtime walks have completed.
 // trackLifecycle is the single point where an automatic snapshot's ownership of
 // the lifecycle baseline differs from a query's read-only view.
-func (e *engine) snapshotFrom(gs []protocol.Goroutine, livePC uint64, trackLifecycle bool) protocol.GoroutineSnapshotPayload {
+func (e *engine) snapshotFrom(
+	gs []protocol.Goroutine,
+	threads []protocol.Thread,
+	current int,
+	live map[int]struct{},
+	trackLifecycle bool,
+) protocol.GoroutineSnapshotPayload {
+	snap := protocol.GoroutineSnapshotPayload{
+		Goroutines: gs,
+		Threads:    threads,
+		Current:    current,
+	}
+	if trackLifecycle {
+		snap.Created, snap.Exited = e.diffGoids(live)
+	}
+	return snap
+}
+
+func snapshotGoroutineState(gs []protocol.Goroutine) (int, map[int]struct{}) {
 	var current int
 	live := make(map[int]struct{}, len(gs))
 	for _, g := range gs {
@@ -524,21 +548,7 @@ func (e *engine) snapshotFrom(gs []protocol.Goroutine, livePC uint64, trackLifec
 			current = g.ID
 		}
 	}
-
-	threads := e.readThreads(current, livePC)
-	if !threads.Complete {
-		return e.degradedSnapshot(livePC)
-	}
-
-	snap := protocol.GoroutineSnapshotPayload{
-		Goroutines: gs,
-		Threads:    threads.Items,
-		Current:    current,
-	}
-	if trackLifecycle {
-		snap.Created, snap.Exited = e.diffGoids(live)
-	}
-	return snap
+	return current, live
 }
 
 // diffGoids compares the current live goid set against the previous automatic

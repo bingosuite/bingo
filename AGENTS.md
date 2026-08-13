@@ -1663,7 +1663,9 @@ target — is in [docs/ConcurrencyTelemetry.md](docs/ConcurrencyTelemetry.md).
 created/exited and adopts the new set. First snapshot returns nil deltas (a fresh
 session must not report every goroutine as "created"). A **degraded** snapshot
 (runtime unreadable — e.g. the pre-init entry stop) does **not** touch
-`prevGoids`: an empty read must not look like every goroutine exited.
+`prevGoids`: an empty read must not look like every goroutine exited. This holds
+for both automatic and on-demand snapshots: neither kind may clear or adopt a
+baseline from an incomplete walk.
 
 **Automatic snapshots alone own the baseline.** `prevGoids` is the *only*
 lifecycle memory, so whoever advances it decides what the next automatic

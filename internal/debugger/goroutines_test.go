@@ -196,6 +196,36 @@ var _ = Describe("goroutine snapshot partial reads", func() {
 		}),
 	)
 
+	DescribeTable("keeps degraded on-demand snapshots read-only",
+		func(faultAddr func() uint64) {
+			seedU32(fb, fixture.g[2]+fixture.layout.GAtomicstatus, 6)
+			fb.failNextReadAt(faultAddr())
+
+			degraded := debugger.ExportedGoroutineSnapshotQuery(d)
+			recovered := debugger.ExportedGoroutineSnapshot(d)
+
+			Expect([]snapshotObservation{
+				observeSnapshot(degraded),
+				observeSnapshot(recovered),
+			}).To(Equal([]snapshotObservation{
+				{Goroutines: []int{1}, Selected: 1},
+				{
+					Goroutines: []int{101, 102},
+					Threads:    2,
+					Current:    102,
+					Selected:   102,
+					Exited:     []int{103},
+				},
+			}))
+		},
+		Entry("when allgs is incomplete", func() uint64 {
+			return allgsArrayAddr + 8
+		}),
+		Entry("when allm is incomplete", func() uint64 {
+			return fixture.m[0] + fixture.layout.MAlllink
+		}),
+	)
+
 	It("keeps nil, dead, and zero-goid entries as intentional filters", func() {
 		seedU32(fb, fixture.g[2]+fixture.layout.GAtomicstatus, 6)
 		dead := debugger.ExportedGoroutineSnapshot(d)
