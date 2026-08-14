@@ -42,6 +42,7 @@ func attachToProcess(backend Backend, pid int) (retErr error) {
 	b.attachCleanup = true
 	b.attachGone = false
 	b.attachImageGone = false
+	b.attachStepTID = 0
 	ctx, cancel := context.WithTimeout(context.Background(), linuxAttachTimeout)
 	defer cancel()
 
@@ -247,12 +248,14 @@ func (b *linuxBackend) quiesceAttached(ctx context.Context) (bool, error) {
 			continue
 		}
 		if b.attachGone && len(b.attachedTracees) == 0 {
+			b.attachStepTID = 0
 			return true, nil
 		}
 		if added == 0 && b.allAttachedStopped() {
 			stablePasses++
 			if stablePasses >= 2 {
 				b.collectStepQueueForDetach()
+				b.attachStepTID = 0
 				return false, nil
 			}
 			continue
@@ -265,6 +268,7 @@ func (b *linuxBackend) quiesceAttached(ctx context.Context) (bool, error) {
 			if isNoChildProcess(err) && len(b.attachedTracees) == 0 {
 				if !b.attachedProcessExists() {
 					b.attachGone = true
+					b.attachStepTID = 0
 					return true, nil
 				}
 			}
@@ -324,7 +328,11 @@ func (b *linuxBackend) recordAttachedQuiesceResult(result linuxWaitResult) error
 			b.markAttachedStopped(tid, StopEvent{Reason: stopAttachedInternal, TID: tid}, false, 0, true)
 			return nil
 		case 0:
-			reason, _ := classifyUserStop(true, b.stepping, b.stepTID, tid)
+			reason := StopBreakpoint
+			if tid == b.attachStepTID {
+				reason = StopSingleStep
+				b.attachStepTID = 0
+			}
 			b.markAttachedStopped(tid, StopEvent{Reason: reason, TID: tid}, false, 0, true)
 			return nil
 		default:
@@ -363,6 +371,9 @@ func (b *linuxBackend) recordAttachedRetirement(tid int, generation uint64) erro
 func (b *linuxBackend) collectStepQueueForDetach() {
 	if !b.attached() {
 		return
+	}
+	if b.attachStepTID == 0 && b.stepping {
+		b.attachStepTID = b.stepTID
 	}
 	for _, event := range b.parked {
 		b.markAttachedStopped(event.TID, event, event.Reason == StopSignal, 0, false)

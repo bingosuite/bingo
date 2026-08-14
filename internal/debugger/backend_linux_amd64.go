@@ -122,6 +122,7 @@ type linuxBackend struct {
 	attachCleanup   bool
 	attachGone      bool
 	attachImageGone bool
+	attachStepTID   int
 
 	// Wait writes this from a waitLoop while running engine commands may read it
 	// for TID-less memory operations. Atomicity defines that snapshot; it does

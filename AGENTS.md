@@ -1208,7 +1208,9 @@ The invariants:
    every live owned TID stopped, and an empty owner queue. The whole operation is
    deadline-bounded. A timeout is not called "suspended": the session remains
    running/cleanup-pending and a later `Kill` retries from the durable broker
-   queue.
+   queue. The active `stepTID` is captured before the step queue is folded, so a
+   completion already queued for that owner remains `StopSingleStep`; treating
+   it as a breakpoint would rewind RIP onto an instruction it already executed.
 4. **Repair, then restore, then detach.** Each held bingo breakpoint stop is
    checked against live table entries, an in-flight table-less entry, and
    retired internal/cleared-byte histories. An amd64 RIP is rewound exactly once
