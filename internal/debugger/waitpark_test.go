@@ -564,7 +564,7 @@ const (
 
 // absorbRearmingKinds are the branches that resume the thread and keep going.
 func absorbRearmingKinds() []absorbKind {
-	return []absorbKind{absorbClone, absorbNewThread, absorbPreempt, absorbContinued}
+	return []absorbKind{absorbClone, absorbNewThread, absorbPreempt, absorbContinued, absorbInterrupt}
 }
 
 // absorbFatalKinds are the branches Wait cannot absorb under an in-flight step.
