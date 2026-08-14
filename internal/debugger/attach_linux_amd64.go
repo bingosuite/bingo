@@ -332,7 +332,7 @@ func (b *linuxBackend) recordAttachedQuiesceResult(result linuxWaitResult) error
 		}
 	}
 
-	if ws.TrapCause() == unix.PTRACE_EVENT_STOP {
+	if int(uint32(ws)>>16) == unix.PTRACE_EVENT_STOP {
 		b.markAttachedStopped(tid, StopEvent{Reason: StopSignal, TID: tid, Signal: int(sig)}, false, int(sig), true)
 		return nil
 	}
@@ -591,6 +591,7 @@ func (b *linuxBackend) detachAttachedTID(tid int, state *linuxTracee) error {
 		b.pendingSignals.restore(tid, restore)
 		return err
 	}
+	state.groupStopSignal = 0
 
 	var detachErr error
 	b.execPtrace(func() {
