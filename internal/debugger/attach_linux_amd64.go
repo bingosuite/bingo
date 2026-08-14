@@ -216,7 +216,8 @@ func (b *linuxBackend) quiesceAttached(ctx context.Context) (bool, error) {
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return false, fmt.Errorf("quiesce attached pid %d: %w", b.pid, err)
+			return false, fmt.Errorf("quiesce attached pid %d: %w (%s)",
+				b.pid, err, b.attachedStateSummary())
 		}
 		added, err := b.reconcileAttachedTracees()
 		if err != nil {
@@ -278,6 +279,35 @@ func (b *linuxBackend) quiesceAttached(ctx context.Context) (bool, error) {
 			return false, err
 		}
 	}
+}
+
+func (b *linuxBackend) attachedStateSummary() string {
+	parts := make([]string, 0, len(b.attachedTracees)+1)
+	for _, tid := range b.attachedTIDs() {
+		state := b.attachedTracees[tid]
+		kernelState, tracerPID := "?", 0
+		if raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/status", b.pid, tid)); err == nil {
+			for _, line := range strings.Split(string(raw), "\n") {
+				switch {
+				case strings.HasPrefix(line, "State:"):
+					kernelState = strings.TrimSpace(strings.TrimPrefix(line, "State:"))
+				case strings.HasPrefix(line, "TracerPid:"):
+					tracerPID, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "TracerPid:")))
+				}
+			}
+		}
+		parts = append(parts, fmt.Sprintf(
+			"tid=%d stopped=%t interrupt=%t initial=%t reason=%d kernel=%q tracer=%d",
+			tid, state.stopped, state.interruptPending, state.initialStopPending,
+			state.stop.Reason, kernelState, tracerPID))
+	}
+	if owner, ok := b.waits.(*linuxWaitOwner); ok {
+		owner.mu.Lock()
+		parts = append(parts, fmt.Sprintf("owner_registered=%d owner_queued=%d",
+			len(owner.registered), len(owner.queue)))
+		owner.mu.Unlock()
+	}
+	return strings.Join(parts, "; ")
 }
 
 func (b *linuxBackend) recordAttachedQuiesceResult(result linuxWaitResult) error {
