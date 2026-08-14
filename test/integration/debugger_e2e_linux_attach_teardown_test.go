@@ -86,14 +86,15 @@ func main() {
 `
 
 type attachTeardownProcess struct {
-	cmd     *exec.Cmd
-	stdin   io.WriteCloser
-	lines   chan string
-	wait    chan error
-	stderr  bytes.Buffer
-	waitMu  sync.Mutex
-	waitErr error
-	waited  bool
+	cmd      *exec.Cmd
+	stdin    io.WriteCloser
+	lines    chan string
+	wait     chan error
+	stderr   bytes.Buffer
+	waitMu   sync.Mutex
+	waitOnce sync.Once
+	waitErr  error
+	waited   bool
 }
 
 func startAttachTeardownProcess(bin string) *attachTeardownProcess {
@@ -117,16 +118,23 @@ func startAttachTeardownProcess(bin string) *attachTeardownProcess {
 		}
 		close(p.lines)
 	}()
-	go func() {
-		err := p.cmd.Wait()
-		p.waitMu.Lock()
-		p.waitErr = err
-		p.waited = true
-		p.waitMu.Unlock()
-		p.wait <- err
-		close(p.wait)
-	}()
+	// Cmd.Wait uses wait4 in this process. Starting it before bingo detaches
+	// would compete with linuxWaitOwner and can steal a ptrace stop.
 	return p
+}
+
+func (p *attachTeardownProcess) beginWait() {
+	p.waitOnce.Do(func() {
+		go func() {
+			err := p.cmd.Wait()
+			p.waitMu.Lock()
+			p.waitErr = err
+			p.waited = true
+			p.waitMu.Unlock()
+			p.wait <- err
+			close(p.wait)
+		}()
+	})
 }
 
 func (p *attachTeardownProcess) send(command string) {
@@ -172,6 +180,7 @@ func (p *attachTeardownProcess) cleanup() {
 		return
 	}
 	_ = p.cmd.Process.Kill()
+	p.beginWait()
 	select {
 	case <-p.wait:
 	case <-time.After(5 * time.Second):
@@ -216,6 +225,7 @@ func declareAttachTeardownSpec() {
 		Expect(after).To(BeNumerically(">", before), "target heartbeat before detach")
 
 		Expect(d.Kill()).To(Succeed(), "detach running target")
+		target.beginWait()
 		Eventually(func() int { return tracerPID(target.cmd.Process.Pid) }, 5*time.Second, 10*time.Millisecond).
 			Should(Equal(0), "target must no longer be traced")
 
@@ -261,6 +271,7 @@ func declareAttachTeardownSpec() {
 		Expect(event.Kind).To(Equal(protocol.EventBreakpointHit), "target reached breakpoint")
 
 		Expect(d.Kill()).To(Succeed(), "detach suspended target")
+		target.beginWait()
 		Expect(target.line(5*time.Second)).To(Equal("RAN"),
 			"detach must resume at the restored instruction, not mid-instruction")
 		target.send("check")
@@ -287,6 +298,7 @@ func declareAttachTeardownSpec() {
 		awaitEvent(d.Events(), 10*time.Second, protocol.EventStepped)
 		Expect(d.Continue()).To(Succeed())
 		Expect(d.Kill()).To(Succeed(), "detach running control")
+		target.beginWait()
 		Eventually(func() int { return tracerPID(target.cmd.Process.Pid) }, 5*time.Second, 10*time.Millisecond).
 			Should(Equal(0))
 
