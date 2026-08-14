@@ -18,14 +18,18 @@ import (
 const linuxWaitFallbackInterval = time.Second
 
 type linuxWaitResult struct {
-	tid    int
-	status syscall.WaitStatus
-	err    error
+	tid        int
+	generation uint64
+	status     syscall.WaitStatus
+	retired    bool
+	err        error
 }
 
 type linuxWaitSource interface {
-	register(tid int) error
+	register(tid int) (uint64, error)
+	release(tid int, generation uint64) bool
 	next(context.Context) (linuxWaitResult, error)
+	tryNext() (linuxWaitResult, bool, error)
 	close()
 }
 
@@ -86,9 +90,9 @@ func (b *linuxWaitBroker) newOwner() *linuxWaitOwner {
 	}
 }
 
-func (o *linuxWaitOwner) register(tid int) error {
+func (o *linuxWaitOwner) register(tid int) (uint64, error) {
 	if tid <= 0 {
-		return fmt.Errorf("invalid tid %d", tid)
+		return 0, fmt.Errorf("invalid tid %d", tid)
 	}
 
 	b := o.broker
@@ -97,7 +101,7 @@ func (o *linuxWaitOwner) register(tid int) error {
 
 	if current, ok := b.registrations[tid]; ok {
 		if current.owner == o {
-			return nil
+			return current.generation, nil
 		}
 		current.owner.mu.Lock()
 		stale := current.owner.closed
@@ -107,7 +111,7 @@ func (o *linuxWaitOwner) register(tid int) error {
 		}
 		current.owner.mu.Unlock()
 		if !stale {
-			return fmt.Errorf("tid %d is already owned by another debugger", tid)
+			return 0, fmt.Errorf("tid %d is already owned by another debugger", tid)
 		}
 	}
 
@@ -115,14 +119,15 @@ func (o *linuxWaitOwner) register(tid int) error {
 	o.mu.Lock()
 	if o.closed {
 		o.mu.Unlock()
-		return fmt.Errorf("wait owner is closed")
+		return 0, fmt.Errorf("wait owner is closed")
 	}
+	o.removeQueuedTIDLocked(tid, 0)
 	o.registered[tid] = generation
 	o.signalLocked()
 	o.mu.Unlock()
 	b.registrations[tid] = linuxWaitRegistration{owner: o, generation: generation}
 	b.signal()
-	return nil
+	return generation, nil
 }
 
 func (o *linuxWaitOwner) next(ctx context.Context) (linuxWaitResult, error) {
@@ -130,9 +135,7 @@ func (o *linuxWaitOwner) next(ctx context.Context) (linuxWaitResult, error) {
 		o.mu.Lock()
 		switch {
 		case len(o.queue) > 0:
-			result := o.queue[0]
-			o.queue[0] = linuxWaitResult{}
-			o.queue = o.queue[1:]
+			result := o.popLocked()
 			o.mu.Unlock()
 			if result.err != nil {
 				return linuxWaitResult{}, result.err
@@ -153,6 +156,64 @@ func (o *linuxWaitOwner) next(ctx context.Context) (linuxWaitResult, error) {
 		case <-o.notify:
 		}
 	}
+}
+
+func (o *linuxWaitOwner) tryNext() (linuxWaitResult, bool, error) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	switch {
+	case len(o.queue) > 0:
+		result := o.popLocked()
+		if result.err != nil {
+			return linuxWaitResult{}, false, result.err
+		}
+		return result, true, nil
+	case o.closed, len(o.registered) == 0:
+		return linuxWaitResult{}, false, syscall.ECHILD
+	default:
+		return linuxWaitResult{}, false, nil
+	}
+}
+
+func (o *linuxWaitOwner) release(tid int, generation uint64) bool {
+	b := o.broker
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	current, ok := b.registrations[tid]
+	if !ok || current.owner != o || current.generation != generation {
+		return false
+	}
+	delete(b.registrations, tid)
+
+	o.mu.Lock()
+	if o.registered[tid] == generation {
+		delete(o.registered, tid)
+	}
+	o.removeQueuedTIDLocked(tid, generation)
+	o.signalLocked()
+	o.mu.Unlock()
+	b.signal()
+	return true
+}
+
+func (o *linuxWaitOwner) popLocked() linuxWaitResult {
+	result := o.queue[0]
+	o.queue[0] = linuxWaitResult{}
+	o.queue = o.queue[1:]
+	return result
+}
+
+func (o *linuxWaitOwner) removeQueuedTIDLocked(tid int, generation uint64) {
+	filtered := o.queue[:0]
+	for _, result := range o.queue {
+		if result.tid == tid && (generation == 0 || result.generation == generation) {
+			continue
+		}
+		filtered = append(filtered, result)
+	}
+	clear(o.queue[len(filtered):])
+	o.queue = filtered
 }
 
 func (o *linuxWaitOwner) close() {
@@ -249,7 +310,9 @@ func (b *linuxWaitBroker) scan() bool {
 			continue
 		case err == nil:
 			progressed = true
-			b.deliver(item.tid, item.reg, linuxWaitResult{tid: tid, status: status},
+			b.deliver(item.tid, item.reg, linuxWaitResult{
+				tid: tid, generation: item.reg.generation, status: status,
+			},
 				status.Exited() || status.Signaled())
 		case errors.Is(err, syscall.EINTR):
 			progressed = true
@@ -259,8 +322,9 @@ func (b *linuxWaitBroker) scan() bool {
 		default:
 			progressed = true
 			b.deliver(item.tid, item.reg, linuxWaitResult{
-				tid: item.tid,
-				err: fmt.Errorf("wait4 tid %d: %w", item.tid, err),
+				tid:        item.tid,
+				generation: item.reg.generation,
+				err:        fmt.Errorf("wait4 tid %d: %w", item.tid, err),
 			}, true)
 		}
 	}
@@ -304,6 +368,13 @@ func (b *linuxWaitBroker) retire(tid int, expected linuxWaitRegistration) {
 	owner.mu.Lock()
 	if owner.registered[tid] == current.generation {
 		delete(owner.registered, tid)
+	}
+	if !owner.closed {
+		owner.queue = append(owner.queue, linuxWaitResult{
+			tid:        tid,
+			generation: current.generation,
+			retired:    true,
+		})
 	}
 	owner.signalLocked()
 	owner.mu.Unlock()

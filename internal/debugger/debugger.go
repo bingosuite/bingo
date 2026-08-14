@@ -17,6 +17,13 @@ var (
 	ErrAlreadyRunning = errors.New("debugger: process already running")
 	ErrNoProcess      = errors.New("debugger: no process")
 	ErrNotRunning     = errors.New("debugger: process is not running")
+	// ErrAttachedDetachIncomplete means bingo still owns at least one ptraced
+	// thread or has not restored every instruction it patched. The debugger is
+	// retained so Kill can be retried; callers must not discard it as exited.
+	ErrAttachedDetachIncomplete = errors.New("debugger: attached detach incomplete")
+	// ErrAttachedOwnershipLost means the engine stopped before it could release
+	// a foreign process. Retrying cannot help because the tracer thread is gone.
+	ErrAttachedOwnershipLost = errors.New("debugger: attached ownership lost")
 
 	// ErrSessionInvalidated marks a backend failure after which the tracee can
 	// no longer be described, let alone debugged — the process image was
