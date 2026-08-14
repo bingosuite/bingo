@@ -507,10 +507,6 @@ func formatGoroutineList(list protocol.GoroutinesPayload) string {
 	return b.String()
 }
 
-func printGoroutine(g protocol.Goroutine) {
-	fmt.Println(formatGoroutine(g))
-}
-
 func formatGoroutine(g protocol.Goroutine) string {
 	marker := " "
 	if g.Current {
