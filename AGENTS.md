@@ -1246,7 +1246,9 @@ Regression gates are the deterministic backend/engine tests in
 the broker generation/static-wait tests, and the native `attach-teardown` E2E:
 running armed detach, suspended-at-breakpoint detach, and a no-breakpoint
 control all assert restored bytes, `TracerPid == 0`, heartbeat progress, former
-breakpoint execution, and clean exit.
+breakpoint execution, and clean exit. Its independently-started target does not
+call `exec.Cmd.Wait` until after detach: `Cmd.Wait` is another wait4 consumer in
+the debugger process and would steal the very ptrace stop the broker owns.
 
 ## Linux signal forwarding
 
