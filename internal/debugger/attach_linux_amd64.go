@@ -273,7 +273,8 @@ func (b *linuxBackend) quiesceAttached(ctx context.Context) (bool, error) {
 					return true, nil
 				}
 			}
-			return false, fmt.Errorf("wait for attached quiesce: %w", err)
+			return false, fmt.Errorf("wait for attached quiesce: %w (%s)",
+				err, b.attachedStateSummary())
 		}
 		if err := b.recordAttachedQuiesceResult(result); err != nil {
 			return false, err
