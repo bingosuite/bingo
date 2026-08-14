@@ -203,18 +203,42 @@ func tracerPID(pid int) int {
 	return -1
 }
 
+func newAttachTeardownHarness(name string) (*attachTeardownProcess, debugger.Debugger) {
+	GinkgoHelper()
+	bin := buildTarget(name, attachTeardownTargetSrc)
+	target := startAttachTeardownProcess(bin)
+	DeferCleanup(target.cleanup)
+	Expect(target.line(10 * time.Second)).To(Equal("READY"))
+
+	d := debugger.New(nil)
+	DeferCleanup(func() { _ = d.Kill() })
+	Expect(d.Attach(target.cmd.Process.Pid, bin)).To(Succeed(), "attach to target")
+	awaitEvent(d.Events(), 10*time.Second, protocol.EventStepped)
+	return target, d
+}
+
+func (p *attachTeardownProcess) expectRestored() {
+	GinkgoHelper()
+	p.send("check")
+	Expect(p.line(5 * time.Second)).To(Equal("BYTES_OK"))
+}
+
+func (p *attachTeardownProcess) exitCleanly(context string) {
+	GinkgoHelper()
+	p.send("exit")
+	Expect(p.line(5 * time.Second)).To(Equal("DONE"))
+	select {
+	case err := <-p.wait:
+		Expect(err).NotTo(HaveOccurred(), "%s; stderr=%q", context, p.stderr.String())
+	case <-time.After(5 * time.Second):
+		Fail(context)
+	}
+}
+
 func declareAttachTeardownSpec() {
 	It("restores a running attached target before releasing it", Label("attach", "attach-teardown"), func() {
 		line := markerLine(attachTeardownTargetSrc, "// BP_FUTURE")
-		bin := buildTarget("attach_teardown_target", attachTeardownTargetSrc)
-		target := startAttachTeardownProcess(bin)
-		DeferCleanup(target.cleanup)
-		Expect(target.line(10 * time.Second)).To(Equal("READY"))
-
-		d := debugger.New(nil)
-		DeferCleanup(func() { _ = d.Kill() })
-		Expect(d.Attach(target.cmd.Process.Pid, bin)).To(Succeed(), "attach to target")
-		awaitEvent(d.Events(), 10*time.Second, protocol.EventStepped)
+		target, d := newAttachTeardownHarness("attach_teardown_target")
 		_, err := d.SetBreakpoint("attach_teardown_target.go", line)
 		Expect(err).NotTo(HaveOccurred(), "arm future breakpoint")
 		Expect(d.Continue()).To(Succeed(), "resume gated target")
@@ -229,9 +253,7 @@ func declareAttachTeardownSpec() {
 		Eventually(func() int { return tracerPID(target.cmd.Process.Pid) }, 5*time.Second, 10*time.Millisecond).
 			Should(Equal(0), "target must no longer be traced")
 
-		target.send("check")
-		Expect(target.line(5*time.Second)).To(Equal("BYTES_OK"),
-			"the target text must match its pre-attach bytes")
+		target.expectRestored()
 		detachedBefore := target.heartbeat(5 * time.Second)
 		time.Sleep(25 * time.Millisecond)
 		detachedAfter := target.heartbeat(5 * time.Second)
@@ -240,28 +262,12 @@ func declareAttachTeardownSpec() {
 		target.send("run")
 		Expect(target.line(5*time.Second)).To(Equal("RAN"),
 			"the former breakpoint must execute normally after detach")
-		target.send("exit")
-		Expect(target.line(5 * time.Second)).To(Equal("DONE"))
-		select {
-		case err := <-target.wait:
-			Expect(err).NotTo(HaveOccurred(),
-				"target must exit cleanly after executing the restored instruction; stderr=%q", target.stderr.String())
-		case <-time.After(5 * time.Second):
-			Fail("target did not exit after executing the former breakpoint")
-		}
+		target.exitCleanly("target must exit cleanly after executing the restored instruction")
 	})
 
 	It("rewinds and restores an attached target already stopped at the breakpoint", Label("attach", "attach-teardown"), func() {
 		line := markerLine(attachTeardownTargetSrc, "// BP_FUTURE")
-		bin := buildTarget("attach_teardown_suspended_target", attachTeardownTargetSrc)
-		target := startAttachTeardownProcess(bin)
-		DeferCleanup(target.cleanup)
-		Expect(target.line(10 * time.Second)).To(Equal("READY"))
-
-		d := debugger.New(nil)
-		DeferCleanup(func() { _ = d.Kill() })
-		Expect(d.Attach(target.cmd.Process.Pid, bin)).To(Succeed(), "attach to target")
-		awaitEvent(d.Events(), 10*time.Second, protocol.EventStepped)
+		target, d := newAttachTeardownHarness("attach_teardown_suspended_target")
 		_, err := d.SetBreakpoint("attach_teardown_suspended_target.go", line)
 		Expect(err).NotTo(HaveOccurred(), "arm breakpoint")
 		Expect(d.Continue()).To(Succeed())
@@ -274,45 +280,21 @@ func declareAttachTeardownSpec() {
 		target.beginWait()
 		Expect(target.line(5*time.Second)).To(Equal("RAN"),
 			"detach must resume at the restored instruction, not mid-instruction")
-		target.send("check")
-		Expect(target.line(5 * time.Second)).To(Equal("BYTES_OK"))
-		target.send("exit")
-		Expect(target.line(5 * time.Second)).To(Equal("DONE"))
-		select {
-		case err := <-target.wait:
-			Expect(err).NotTo(HaveOccurred(), "suspended target exit; stderr=%q", target.stderr.String())
-		case <-time.After(5 * time.Second):
-			Fail("suspended target did not exit after detach")
-		}
+		target.expectRestored()
+		target.exitCleanly("suspended target did not exit after detach")
 	})
 
 	It("detaches a running attached target without breakpoints as a control", Label("attach", "attach-teardown"), func() {
-		bin := buildTarget("attach_teardown_control_target", attachTeardownTargetSrc)
-		target := startAttachTeardownProcess(bin)
-		DeferCleanup(target.cleanup)
-		Expect(target.line(10 * time.Second)).To(Equal("READY"))
-
-		d := debugger.New(nil)
-		DeferCleanup(func() { _ = d.Kill() })
-		Expect(d.Attach(target.cmd.Process.Pid, bin)).To(Succeed(), "attach to target")
-		awaitEvent(d.Events(), 10*time.Second, protocol.EventStepped)
+		target, d := newAttachTeardownHarness("attach_teardown_control_target")
 		Expect(d.Continue()).To(Succeed())
 		Expect(d.Kill()).To(Succeed(), "detach running control")
 		target.beginWait()
 		Eventually(func() int { return tracerPID(target.cmd.Process.Pid) }, 5*time.Second, 10*time.Millisecond).
 			Should(Equal(0))
 
-		target.send("check")
-		Expect(target.line(5 * time.Second)).To(Equal("BYTES_OK"))
+		target.expectRestored()
 		target.send("run")
 		Expect(target.line(5 * time.Second)).To(Equal("RAN"))
-		target.send("exit")
-		Expect(target.line(5 * time.Second)).To(Equal("DONE"))
-		select {
-		case err := <-target.wait:
-			Expect(err).NotTo(HaveOccurred(), "control target exit; stderr=%q", target.stderr.String())
-		case <-time.After(5 * time.Second):
-			Fail("control target did not exit after detach")
-		}
+		target.exitCleanly("control target did not exit after detach")
 	})
 }
