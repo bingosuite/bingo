@@ -966,6 +966,32 @@ var _ = Describe("Hub", func() {
 		})
 	})
 
+	Describe("failed startup ownership retention", func() {
+		It("reports the original Attach error without blocking the Run loop on cleanup retries", func() {
+			fd := newFakeDebugger()
+			fd.attachErr = errors.New("attach failed")
+			fd.setKillError(fmt.Errorf("%w: retained partial attach",
+				debugger.ErrAttachedDetachIncomplete))
+			h := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			go h.Run(ctx)
+			defer cancel()
+
+			conn := newFakeWSConn()
+			mustAddClient(h, conn)
+			conn.inject(mustCommand(protocol.CmdAttach,
+				protocol.AttachPayload{PID: 1234}))
+			var payload protocol.ErrorPayload
+			waitForEventKind(conn, protocol.EventError, &payload)
+			Expect(payload.Message).To(ContainSubstring("attach failed"))
+
+			Eventually(func() int {
+				return countCalls(fd.recordedCalls(), "Kill")
+			}, "1s", "10ms").Should(BeNumerically(">=", 2))
+			fd.setKillError(nil)
+		})
+	})
+
 	// A Restart rejected before it touches the debugger, or a Kill the
 	// debugger refuses, leaves the original process suspended. The hub must
 	// stay in the suspend-wait loop — the only loop that drains resumeCh
