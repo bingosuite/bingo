@@ -378,11 +378,15 @@ anything in [internal/debugger/](internal/debugger/).
    there is no ptrace: the Mach calls run on the engine-loop thread itself (Mach
    ports are task-wide). Mirrors Delve's `execPtraceFunc`.
 
-2. **`waitLoop` is a one-shot, locked goroutine.** Every time the process is
-   resumed, a fresh `waitLoop` goroutine is started. It calls `Backend.Wait()`
-   exactly once (also `LockOSThread`'d) and sends the result to `stopCh`.
-   Selects on `e.done` so a stale waitLoop exits cleanly when the engine has
-   already shut down.
+2. **`waitLoop` is a tracked, cancellable, one-shot goroutine.** Every resume
+   starts it through `engine.startWait` — never a raw `go e.waitLoop()` — which
+   records the sole active waiter and its cancel function. It calls
+   `Backend.Wait()` exactly once (also `LockOSThread`'d) and sends the result to
+   `stopCh`; the loop clears ownership when it consumes that result. Linux
+   attached teardown cancels and **joins that exact waiter** before the engine
+   goroutine consumes `linuxWaitOwner` itself. Cancellation does not dequeue a
+   routed status, so the synchronous quiesce pass loses nothing, and joining
+   preserves the step queue's no-concurrent-owner proof.
 
 3. **Shutdown sequence.** When `StopExited` / `StopKilled` / `ErrProcessExited`
    arrives, the loop sets `stateExited`, calls `drainCmds` (answers queued
@@ -393,14 +397,21 @@ anything in [internal/debugger/](internal/debugger/).
    not unregister live TIDs: the process-global broker keeps exact ownership
    until it reaps each final status. This is what lets a running Kill return
    promptly without leaking zombies or leaving a stale waiter able to steal a
-   later session's initial stop.
+   later session's initial stop. An attached process is the exception to
+   "return immediately on a wait error": every wait failure first runs the same
+   checked quiesce/restore/detach transaction as `Kill`. If that transaction
+   fails, the engine stays alive with the tracer thread retained so a later
+   `Kill` can retry; closing the loop there would implicitly detach and resume
+   the foreign target.
 
-4. **`Kill` is idempotent and races-safe.** It checks `done` first (fast
-   path), then dispatches a closure that injects a synthetic `StopExited`
-   into `stopCh`. The main loop sees that, exits cleanly. Multiple concurrent
-   `Kill` callers share one teardown. A backend cleanup error is returned to the
-   caller but does not cancel that exit transition: teardown must still close
-   `done`, `events`, the tracer thread, and the Linux wait consumer.
+4. **`Kill` is idempotent and ownership-aware.** Launched targets retain the
+   existing one-way shutdown: even if SIGKILL/reaping reports an error, the
+   engine injects synthetic `StopExited` and closes. Linux attached targets do
+   not: `Kill` returns `ErrAttachedDetachIncomplete`, keeps `process.live` and
+   the engine/tracer alive, and rejects every command except a retrying `Kill`
+   until all patched bytes are restored and every owned TID is detached.
+   `ErrAttachedOwnershipLost` is terminal and non-retryable: it means the engine
+   already stopped, so retrying cannot recreate the tracer thread.
 
 5. **`dispatch` is the only public-method pattern.** Send `engineCmd{fn,err}`
    on `cmdCh`, wait on `err`. If the loop has exited (`e.done` closed),
@@ -834,14 +845,16 @@ acknowledgement in rule 5 (see the locking note below):
 
    It is also the **retraction point for a stashed leader exit** (rule 10).
 
-   **bingo's own startup is out of reach by construction**, which is what makes
-   an unconditional rule safe. The launch path consumes its own `execve`
-   `SIGTRAP` in `startTracedProcess`'s private `Wait4` *before* calling
-   `PtraceSetOptions`, so the image bingo itself launched never produces an
-   `EVENT_EXEC` and never reaches `Wait`; `Restart` builds a brand-new debugger
-   and repeats that sequence; and the attach path (`attachToProcess`) currently
-   installs **no ptrace options at all**, so it cannot generate the event either.
-   Keep that ordering if you touch either path.
+   **bingo's own launch-time exec is out of reach by construction.** The launch
+   path consumes its own `execve` `SIGTRAP` through the wait broker *before*
+   calling `PtraceSetOptions`, so the image bingo itself launched never produces
+   an `EVENT_EXEC` and never reaches `Wait`; `Restart` builds a new debugger and
+   repeats that sequence. Linux attach deliberately differs: every existing TID
+   is `PTRACE_SEIZE`d with `TRACEEXEC`, so a later exec is reported and
+   invalidates the attached session. Teardown then skips restoration — saved
+   instruction bytes belong to the old image — quiesces the replacement image,
+   and detaches it. Keep the launch ordering and the attach invalidation
+   semantics if you touch either path.
 
    That guarantee is about the execve *bingo performed*, not about "nothing
    execs early". A tracee whose first image immediately execs a second one — a
@@ -915,34 +928,25 @@ acknowledgement in rule 5 (see the locking note below):
     detaches every tracee and **resumes** it, straight into software breakpoints
     still written in its text.
 
-    Both branches therefore wrap `ErrSessionInvalidated`, and the engine's
-    `stopCh` error branch discards the tracee explicitly before returning:
-    `endThreadStep`, `bps.clearAll` (restore the original bytes **first** — that
-    is what makes the release safe), then `proc.kill(backend, running:false)`.
-    For a launched tracee `reapAfterKill` drains only that backend's broker
-    queue and continues every owned thread it finds stopped, which discharges
-    the parked stops and the trigger stop; for an attached one the detach is
-    safe because the traps are already gone. `running` is false because the
-    `waitLoop` that produced the failure has already delivered its result, so
-    `killProcess` is the active consumer of those routed statuses (#111). Only
-    these two branches carry the marker: an ordinary wait failure deliberately
-    keeps its pre-existing detach-and-resume behaviour; fixing that generic
-    tracee-state cleanup class is separate from status ownership.
+    For a launched tracee the engine restores what it can, SIGKILLs it, and
+    `reapAfterKill` drains only that backend's broker queue, continuing every
+    owned stopped thread until final retirement. An attached tracee uses the
+    stronger transaction in [Linux attached teardown](#linux-attached-teardown):
+    this applies to **every** wait error, not only the two session-invalidating
+    markers, because closing the tracer on any error would implicitly detach and
+    resume a foreign process. The waiter has already delivered its result, so the
+    engine loop is the sole owner allowed to consume the routed queue.
 
     The exec case inverts one step. `ErrImageReplaced` (which wraps
     `ErrSessionInvalidated`) suppresses the restore, because writing saved bytes
     back would poke instructions from the OLD image at OLD addresses into the new
     one. Nothing of ours is in that image to remove.
 
-    What this does **not** claim: a fully clean release of an ATTACHED tracee.
-    `killProcess` detaches the leader and the kernel releases the remaining
-    threads when the tracer thread closes, but a thread parked at a software
-    breakpoint still has its PC one trap-width past the trap on amd64 and
-    `abortStep` has already discarded the metadata needed to rewind it, and
-    `bps.clearAll` ignores individual restore failures. A launched tracee is
-    killed so none of that matters; an attached one may resume mid-instruction.
-    Fixing that needs per-TID quiescing, checked restoration and PC repair, which
-    is out of scope here — do not describe attached release as safe.
+    Attached release is considered successful only after every live owned TID
+    is stopped, every delayed bingo breakpoint PC is repaired, every saved byte
+    is restored, and every TID's checked `PTRACE_DETACH` succeeds. A partial
+    failure retains the engine/tracer and is retryable; it is never converted to
+    a clean shutdown.
 
 **Explicit limits — this is NOT an atomic stop-the-world step-over.** Sibling
 threads keep running and keep trapping during a step; the fix only guarantees
@@ -1009,13 +1013,14 @@ distinguish safe recovery from the mid-instruction path.
   process-global consumer: launch, normal Wait, suspended Kill, and post-close
   reaping all use one owner-routed status path.
 
-**No lock on the queue, and none is needed.** `parked` is touched only inside `Wait`.
-Successive `Wait` calls run on different one-shot `waitLoop` goroutines that the
-engine starts with `go e.waitLoop()` **after** consuming the previous `Wait`'s
-result from `stopCh`, so no two ever overlap; that channel-and-goroutine-start
-chain is also what orders the `stepping`/`stepTID` writes the engine makes in
-between (`SingleStep` sets them, `ContinueProcess` clears them) and the
-`completeStepThreadExit` acknowledgement against the next `Wait`'s reads.
+**No lock on the queue, and none is needed.** `parked` is touched by exactly one
+wait owner at a time. Successive `Wait` calls run on tracked one-shot
+`waitLoop` goroutines started only through `engine.startWait` after the previous
+result was consumed. Attached teardown cancels and joins that waiter before the
+engine loop folds the queue into its quiesced TID set; it never overlaps the two
+owners. That result/join chain also orders the `stepping`/`stepTID` writes the
+engine makes in between (`SingleStep` sets them, `ContinueProcess` clears them)
+and the `completeStepThreadExit` acknowledgement against the next owner's reads.
 Only the cumulative diagnostic counters are atomic because native tests read
 them concurrently; do not add a queue mutex. This no-lock rule applies only to
 `stepQueue`: pending signals cross from `Wait` to the engine loop and therefore
@@ -1162,6 +1167,84 @@ so the held-interrupt assertion is the spec's own flake risk — at 40 cycles it
 would fail spuriously ~0.9^40 ≈ 1.5% of the time. 70 takes that to ~0.06% and
 still costs only ~88s at the slowest per-cycle rate yet observed. Lowering it
 re-introduces the flake; raising it much further runs into the watchdog.
+
+## Linux attached teardown
+
+Source: [attach_linux_amd64.go](internal/debugger/attach_linux_amd64.go), the
+engine orchestration in [engine.go](internal/debugger/engine.go), and exact-TID
+ownership in [waitbroker_linux_amd64.go](internal/debugger/waitbroker_linux_amd64.go).
+
+An attached process is foreign: bingo may stop it, but must never kill it or
+release it with an `INT3` still installed. Linux also requires both
+`PTRACE_POKEDATA` and `PTRACE_DETACH` to target a ptrace-stopped TID. The old
+leader-only, best-effort path attempted both while the target was running,
+discarded `ESRCH`, cleared `process.live`, and later let the foreign target die
+on the leaked trap (issue #204).
+
+The invariants:
+
+1. **Attach owns the whole thread group.** `attachToProcess` repeatedly scans
+   `/proc/<pid>/task`, `PTRACE_SEIZE`s every existing TID with
+   `TRACECLONE|TRACEEXEC|TRACEEXIT`, registers each exact TID with the backend's
+   existing `linuxWaitOwner`, and `PTRACE_INTERRUPT`s it. The stop→scan loop
+   converges because once all known TIDs are stopped they cannot create another
+   thread; a final stable scan catches the last pre-option clone. A clone can
+   become visible in `/proc` before its parent event is consumed; `SEIZE` then
+   returns `EPERM`, which is accepted only after `/proc/.../status` proves
+   `TracerPid` equals the dedicated tracer thread's kernel TID, and the
+   auto-attached TID is registered rather
+   than failed forever. `PTRACE_EVENT_STOP` is an internal notification and is
+   always resumed with signal zero during normal debugging — never recorded as
+   an injectable `SIGTRAP`.
+2. **There is one wait consumer.** Running teardown cancels and joins the
+   tracked engine waiter before the engine-loop goroutine calls
+   `linuxWaitOwner.next/tryNext`. No attach/quiesce path calls `wait4` directly,
+   and no second goroutine competes for the owner queue. Cancellation leaves
+   queued results untouched.
+3. **Quiesce is complete only with exact evidence.** The engine folds parked
+   stops and a held step-owner anchor into the per-TID stop set without resuming
+   either, interrupts every remaining running TID, drains all routed results,
+   handles clone/exit/signal/trap provenance, then requires two stable task scans,
+   every live owned TID stopped, and an empty owner queue. The whole operation is
+   deadline-bounded. A timeout is not called "suspended": the session remains
+   running/cleanup-pending and a later `Kill` retries from the durable broker
+   queue.
+4. **Repair, then restore, then detach.** Each held bingo breakpoint stop is
+   checked against live table entries, an in-flight table-less entry, and
+   retired internal/cleared-byte histories. An amd64 RIP is rewound exactly once
+   (an already-rewound suspended stop is detected before applying
+   `archRewindPC`). A verified stopped TID is selected as the write anchor.
+   `breakpointTable.clearAll` writes every saved instruction in deterministic ID
+   order and drops no entry unless the whole restore succeeds. Only then are
+   stop/step metadata cleared and non-leader TIDs detached before the leader.
+   If exec replaced the image, both rewind and restore are skipped and the stale
+   table is discarded.
+5. **Detach preserves real signals, not debugger stops.** The per-TID
+   `pendingSignals` current/backlog/delayed batch remains the source of truth.
+   The current signal is passed to `PTRACE_DETACH` only if that TID is still at
+   the matching signal-delivery stop; otherwise it and every deferred signal are
+   requeued to the exact TID with `tgkill` before a signal-zero detach. A
+   `PTRACE_INTERRUPT`, bingo's Pause `SIGSTOP`, and software-breakpoint
+   `SIGTRAP` are suppressed. A genuine job-control group stop is requeued so
+   detach does not spuriously wake the target. Normal Continue/SingleStep signal
+   forwarding is unchanged.
+6. **Partial detach remains owned and retryable.** Successful per-TID detaches
+   release only their exact wait-registration generation and purge only that
+   generation's queued results. If another detach fails, bingo reports the exact
+   ptrace error, re-seizes/re-registers the released live TIDs and any late
+   clones, and re-quiesces before returning
+   `ErrAttachedDetachIncomplete`. `process.live` stays true and every command
+   except retrying `Kill` is rejected. A closed tracer thread is an explicit
+   detach error, never a no-op success. A delivered terminal status proves
+   natural exit; bare `/proc` disappearance or `ESRCH` does not fabricate one.
+
+Regression gates are the deterministic backend/engine tests in
+[attach_linux_amd64_test.go](internal/debugger/attach_linux_amd64_test.go) and
+[engine_detach_linux_amd64_test.go](internal/debugger/engine_detach_linux_amd64_test.go),
+the broker generation/static-wait tests, and the native `attach-teardown` E2E:
+running armed detach, suspended-at-breakpoint detach, and a no-breakpoint
+control all assert restored bytes, `TracerPid == 0`, heartbeat progress, former
+breakpoint execution, and clean exit.
 
 ## Linux signal forwarding
 
@@ -1397,23 +1480,23 @@ are detected by a `mach_msg` receive loop.
 
 - Pure ptrace, funnelled through one dedicated tracer thread
   (`tracerThread` / `execPtrace`) because ptrace is thread-bound: the initial
-  fork/exec, attach, and every control op (`CONT` / `SINGLESTEP` /
-  `GET`·`SETREGS` / `PEEK`·`POKEDATA` / `SETOPTIONS`) must originate from the
-  one thread that became the tracer. Wait-status collection does not: the
+  fork/exec, `SEIZE` / `INTERRUPT` / `DETACH`, and every control op (`CONT` /
+  `SINGLESTEP` / `GET`·`SETREGS` / `PEEK`·`POKEDATA` / `SETOPTIONS`) must
+  originate from the one thread that became the tracer. Wait-status collection does not: the
   process-global `linuxWaitBroker` owns raw `wait4`, which is process-scoped but
   not thread-bound. Splitting ptrace control across threads was the original
   step-over hang: cross-thread `PTRACE_SINGLESTEP` failed with `ESRCH`; moving
   only status collection is safe because the broker never issues ptrace.
-- `startTracedProcess` enables `PTRACE_O_TRACEEXIT | PTRACE_O_TRACEEXEC |
-  PTRACE_O_TRACECLONE`. Clone tracing is set at the single-threaded execve stop
-  so every later Go-runtime worker thread inherits it; without it a goroutine
-  migrated (e.g. by `time.Sleep`) onto an untraced clone thread would deliver
-  its breakpoint `SIGTRAP` to the Go runtime ("fatal: trace trap") instead of
-  the tracer. Each new thread's initial `SIGSTOP` is resumed **individually** —
-  never a group-continue, which would let a thread parked at a breakpoint run
-  away (the "parking the thread group" hazard). The clone TID from
-  `PTRACE_GETEVENTMSG` is registered with the same wait owner **before** the
-  parent resumes, so its initial status cannot escape routing.
+- Both launch and attach enable `PTRACE_O_TRACEEXIT | PTRACE_O_TRACEEXEC |
+  PTRACE_O_TRACECLONE`. Launch sets them at the single-threaded execve stop;
+  attach passes them in `PTRACE_SEIZE` while claiming every pre-existing TID.
+  Every later Go-runtime worker therefore inherits tracing; without it a
+  goroutine migrated onto an untraced clone thread would deliver its breakpoint
+  `SIGTRAP` to the runtime ("fatal: trace trap") instead of the debugger. Each
+  new thread's initial stop is resumed **individually** — never a
+  group-continue, which would release a sibling parked at a breakpoint. The
+  clone TID from `PTRACE_GETEVENTMSG` is registered with the same wait owner
+  before the parent resumes.
 - **One process-global exact-TID wait broker owns every Linux wait syscall.**
   Each backend creates a wait owner and registers its root PID before consuming
   the launch/attach stop; clone TIDs join that owner before resume. The broker
@@ -1422,7 +1505,10 @@ are detected by a `mach_msg` receive loop.
   coalesced notification. It never calls `Wait4(-1, ...)` and therefore cannot
   steal another debugger's status or reap an unrelated child. One live TID has
   one owner; monotonically increasing registration generations prevent a scan
-  result for a retired TID from reaching a later owner after TID reuse. A closed
+  result for a retired TID from reaching a later owner after TID reuse. A
+  successful attached detach explicitly releases the exact generation and
+  purges only its queued results; exact `ECHILD` retirement is routed as a
+  generation-bearing result so quiesce can distinguish it from a live stop. A closed
   owner discards routed events but keeps registrations until final
   `Exited`/`Signaled` or exact `ECHILD`, which closes the running-Kill and
   natural-exit zombie leaks (#205/#217). Do not add another raw wait site.
@@ -1445,8 +1531,9 @@ are detected by a `mach_msg` receive loop.
   targets `ContinueProcess` / memory writes at that TID, not blindly at the
   process PID. `lastStopTID` is `atomic.Int64`: `Wait` records stops from the
   one-shot `waitLoop` goroutine, while running engine commands can concurrently
-  read it through `traceTID` (`Kill` → breakpoint cleanup, or WebSocket
-  Set/ClearBreakpoint). The atomic is only a defined TID snapshot, not a
+  read it through `traceTID` (for example a WebSocket Set/ClearBreakpoint).
+  Linux attached Kill no longer relies on that running snapshot: it joins the
+  waiter and selects a verified-stopped write anchor before restoration. The atomic is only a defined TID snapshot, not a
   stop-state guarantee; the ptrace call still returns its normal error if that
   TID is not stopped. Ordinary suspended operations remain ordered by the
   `waitLoop` → `stopCh` → engine-loop handoff. Regression coverage is
@@ -2090,6 +2177,24 @@ debugger.
 discarded debugger: a failing `Kill` is logged there (the owning top level, per
 [docs/ErrorHandling.md](docs/ErrorHandling.md)) rather than returned, so cleanup
 never replaces the original launch error the client is told about.
+
+**Shutdown completion is withheld while an attached detach is retryable.**
+`ErrAttachedDetachIncomplete` means the engine and tracer still own the foreign
+target, so `discardDebugger` retains that exact debugger and retries `Kill`
+instead of logging-and-dropping it. This applies to explicit server shutdown,
+idle shutdown, last-client disconnect, DAP disconnect, and failed startup whose
+partial attach still owns TIDs. Registry admission closes first, but
+`shutdownCh`, `Hub.Done`, session removal, and `Server.Done` do not complete
+until cleanup succeeds. A caller waiting on `Server.Shutdown(timeout)` receives
+`ErrShutdownIncomplete` at its deadline while cleanup continues in the
+background. `ErrAttachedOwnershipLost` is different and terminal: the engine
+already stopped, so the hub logs it once and does not livelock by retrying the
+impossible.
+
+The CLI restores default SIGINT/SIGTERM handling after the first graceful
+shutdown signal. If retained ownership cannot converge, a second signal is the
+explicit operator escape hatch; normal frontends still never kill a shared
+server.
 
 ## Restart — hub-level, not engine-level
 
@@ -3078,7 +3183,11 @@ and exits on server cancellation. It may call `Shutdown` itself, so Shutdown
 must not wait for the monitor goroutine. Shutdown is idempotent: mark admission
 closed and cancel the server context; join any in-flight DAP listener startup;
 close DAP and gracefully stop HTTP; wait for every admitted WS/DAP create/join;
-then wait event-driven for the canceled session store to empty. DAP Close
+then wait event-driven for the canceled session store to empty. The caller's
+timeout may return `ErrShutdownIncomplete`, but `Done` remains open and the
+shutdown goroutine keeps waiting while a hub retains retryable attached
+ownership; reporting process completion there would destroy the only tracer
+able to restore the foreign target. DAP Close
 already waits for its handlers, including clients that connected but never
 created a session. This ordering prevents a late client add from escaping
 registry teardown while still allowing every established session to close.
@@ -3249,7 +3358,10 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   the shared Pause-suppression control), `overlap` (linux-only: a foreign thread's breakpoint stop
   surfacing while another thread single-steps off a software breakpoint —
   issue #199), `attach` (attach by PID to an already-running tracee — one the
-  debugger did not launch — then breakpoint it), `concurrency` (the
+  debugger did not launch — then breakpoint it, plus the linux-only
+  `attach-teardown` running/suspended/no-breakpoint controls that prove bytes,
+  `TracerPid`, heartbeat, former-breakpoint execution, and clean exit),
+  `concurrency` (the
   goroutine/thread snapshot data foundation — drives a known spawn-tree target
   and asserts parent linkage, start/created locations, the thread set with a
   single current thread, and created/exited lifecycle deltas across stops),
@@ -3689,14 +3801,12 @@ through the justfile.
   [foreign-thread stop parking](#foreign-thread-stop-parking-during-a-single-step-linux).
 - **`PtraceSetOptions` on either process path**: the unconditional
   `PTRACE_EVENT_EXEC` failure (park-queue rule 9) is safe only because bingo's
-  own `execve` is consumed *before* `TRACEEXEC` is enabled, and because
-  `attachToProcess` enables no options at all. Preserve that ordering in
-  `startTracedProcess`. Enabling `TRACEEXEC` on attach would not retroactively
-  produce an event for an exec that already happened, but it WOULD make any
-  later exec by the attached process fatal — decide that deliberately, and note
-  the converse hazard it fixes: with no options at all, an attached process's
-  exec currently arrives as a plain `SIGTRAP` that `Wait` can misread as a
-  breakpoint.
+  own launch-time `execve` is consumed *before* `TRACEEXEC` is enabled. Preserve
+  that ordering in `startTracedProcess`. Attach deliberately enables the same
+  options in `PTRACE_SEIZE` for every existing TID: a later exec is fatal to the
+  debug session, and attached teardown must skip stale-byte restoration before
+  detaching the replacement image. Do not remove the option or downgrade that
+  stop to a plain breakpoint.
 - **New `EventKind`/`CommandKind`**: if it should reach an IDE, add its
   translation to [internal/dap](internal/dap/) (`translateEvent`/event handlers
   for events, `dispatchRequest` for the reverse). Events with no DAP equivalent

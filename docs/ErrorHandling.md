@@ -265,6 +265,13 @@ pushed unsolicited on every stop: correlating it by kind would let an automatic
 push answer the request, or let a timed-out request's reply debt swallow an
 automatic push (issue #187). It registers no pending entry at all.
 
+`Kill` is fire-and-forget only at the client transport boundary; the hub still
+receives its synchronous debugger result. On Linux attached teardown,
+`ErrAttachedDetachIncomplete` means the engine/tracer deliberately retained the
+foreign process for a checked retry, so hub/server shutdown must keep that
+debugger rather than log-and-drop it. `ErrAttachedOwnershipLost` is terminal:
+the engine is already gone and retrying cannot recover ownership.
+
 ## 8. Propagating errors to clients: typed `EventError`
 
 Errors cross the WebSocket as a typed JSON event, reusing the same protocol and
