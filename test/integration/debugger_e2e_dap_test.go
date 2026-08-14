@@ -641,6 +641,6 @@ func startTestServerWithDAP() (srv *server.Server, wsAddr, dapAddr string) {
 	dap, err := freeLoopbackAddr()
 	Expect(err).NotTo(HaveOccurred(), "allocate DAP port")
 	Expect(s.StartDAP(dap)).To(Succeed(), "start DAP server")
-	DeferCleanup(func() { s.Shutdown(5 * time.Second) })
+	DeferCleanup(func() { _ = s.Shutdown(5 * time.Second) })
 	return s, ws, dap
 }
