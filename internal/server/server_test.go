@@ -33,17 +33,22 @@ func serverOrigin(ts *httptest.Server) string {
 }
 
 func recvState(conn *websocket.Conn) (protocol.SessionStatePayload, error) {
+	_, payload, err := recvStateEvent(conn)
+	return payload, err
+}
+
+func recvStateEvent(conn *websocket.Conn) (protocol.Event, protocol.SessionStatePayload, error) {
 	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 	_, msg, err := conn.ReadMessage()
 	if err != nil {
-		return protocol.SessionStatePayload{}, err
+		return protocol.Event{}, protocol.SessionStatePayload{}, err
 	}
-	var evt protocol.Event
-	if err := json.Unmarshal(msg, &evt); err != nil {
-		return protocol.SessionStatePayload{}, err
+	evt, err := protocol.UnmarshalEvent(msg)
+	if err != nil {
+		return protocol.Event{}, protocol.SessionStatePayload{}, err
 	}
 	var p protocol.SessionStatePayload
-	return p, protocol.DecodeEventPayload(evt, &p)
+	return evt, p, protocol.DecodeEventPayload(evt, &p)
 }
 
 func closeWS(conn *websocket.Conn) {
@@ -190,6 +195,11 @@ var _ = Describe("Server", func() {
 				_, err = recvState(good)
 				Expect(err).NotTo(HaveOccurred())
 
+				// A join broadcasts session state to every client, so the
+				// existing connection has that frame queued ahead of the close.
+				_, err = recvState(bad)
+				Expect(err).NotTo(HaveOccurred())
+
 				cmd := protocol.Command{
 					Version: "999.0",
 					Kind:    protocol.CmdSetBreakpoint,
@@ -232,17 +242,24 @@ var _ = Describe("Server", func() {
 				conn1, _, err := websocket.DefaultDialer.Dial(toWS(ts, "/ws?create"), nil)
 				Expect(err).NotTo(HaveOccurred())
 				defer closeWS(conn1)
-				p1, _ := recvState(conn1)
+				first, p1, err := recvStateEvent(conn1)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(first.Seq).To(BeNumerically(">=", uint64(1)))
 
 				conn2, _, err := websocket.DefaultDialer.Dial(
 					toWS(ts, "/ws?session="+p1.SessionID), nil)
 				Expect(err).NotTo(HaveOccurred())
 				defer closeWS(conn2)
 
-				p2, err := recvState(conn2)
+				existing, pExisting, err := recvStateEvent(conn1)
 				Expect(err).NotTo(HaveOccurred())
+				joining, p2, err := recvStateEvent(conn2)
+				Expect(err).NotTo(HaveOccurred())
+				Expect(pExisting).To(Equal(p2))
 				Expect(p2.SessionID).To(Equal(p1.SessionID))
 				Expect(p2.Clients).To(Equal(2))
+				Expect(existing.Seq).To(Equal(first.Seq + 1))
+				Expect(joining.Seq).To(Equal(existing.Seq))
 			})
 
 			It("closes the connection when the session does not exist", func() {
