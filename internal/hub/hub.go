@@ -260,27 +260,32 @@ func (h *Hub) beginShutdown() debugger.Debugger {
 // failure is logged here (the owning top level, per docs/ErrorHandling.md)
 // rather than returned: every caller is already on a failure path whose
 // original cause must reach the client unchanged.
-func (h *Hub) discardDebugger(dbg debugger.Debugger, reason string) {
+func (h *Hub) discardDebugger(dbg debugger.Debugger, reason string) bool {
 	if dbg == nil {
-		return
+		return true
 	}
+	err := dbg.Kill()
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, debugger.ErrAttachedDetachIncomplete) {
+		h.log.Warn("retaining debugger ownership after incomplete attached detach",
+			"reason", reason, "err", err)
+		return false
+	}
+	h.log.Warn("discarded debugger did not shut down cleanly", "reason", reason, "err", err)
+	return true
+}
+
+func (h *Hub) discardDebuggerUntilSuccess(dbg debugger.Debugger, reason string) {
 	attempts := 0
 	for {
 		attempts++
-		err := dbg.Kill()
-		if err == nil {
+		if h.discardDebugger(dbg, reason) {
 			if attempts > 1 {
 				h.log.Info("retained debugger shutdown completed", "reason", reason, "attempts", attempts)
 			}
 			return
-		}
-		if !errors.Is(err, debugger.ErrAttachedDetachIncomplete) {
-			h.log.Warn("discarded debugger did not shut down cleanly", "reason", reason, "err", err)
-			return
-		}
-		if attempts == 1 {
-			h.log.Warn("retaining debugger ownership until attached detach can be retried",
-				"reason", reason, "err", err)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
@@ -490,7 +495,7 @@ func (h *Hub) prepareCommandDebugger(cmd protocol.Command) (dbg debugger.Debugge
 
 	dbg = h.newDebugger()
 	if h.isClosing() {
-		h.discardDebugger(dbg, "start: hub closed before startup")
+		h.discardDebuggerUntilSuccess(dbg, "start: hub closed before startup")
 		return nil, false, false
 	}
 	// Keep the candidate caller-owned through startup. Installing it first
@@ -501,7 +506,9 @@ func (h *Hub) prepareCommandDebugger(cmd protocol.Command) (dbg debugger.Debugge
 
 func (h *Hub) transferStartedDebugger(dbg debugger.Debugger, cmd protocol.Command, startErr error) bool {
 	if startErr != nil {
-		h.discardDebugger(dbg, "start: startup failed")
+		if !h.discardDebugger(dbg, "start: startup failed") {
+			go h.discardDebuggerUntilSuccess(dbg, "start: startup failed")
+		}
 		if h.isClosing() {
 			return false
 		}
@@ -510,7 +517,7 @@ func (h *Hub) transferStartedDebugger(dbg debugger.Debugger, cmd protocol.Comman
 		return false
 	}
 	if !h.installDebugger(dbg) {
-		h.discardDebugger(dbg, "start: hub closed before install")
+		h.discardDebuggerUntilSuccess(dbg, "start: hub closed before install")
 		return false
 	}
 	return true
@@ -680,7 +687,7 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 	if !open {
 		return
 	}
-	h.discardDebugger(oldDbg, "restart: replaced debugger")
+	h.discardDebuggerUntilSuccess(oldDbg, "restart: replaced debugger")
 
 	if h.isClosing() {
 		return
@@ -695,7 +702,11 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 	// obligation structural, so no later early return can reintroduce the leak;
 	// clearing candidate is the single ownership-transfer point.
 	candidate := newDbg
-	defer func() { h.discardDebugger(candidate, "restart: abandoned replacement") }()
+	defer func() {
+		if !h.discardDebugger(candidate, "restart: abandoned replacement") {
+			go h.discardDebuggerUntilSuccess(candidate, "restart: abandoned replacement")
+		}
+	}()
 
 	if h.isClosing() {
 		return
@@ -907,7 +918,7 @@ func (h *Hub) shutdown() {
 		h.outboundMu.Lock()
 		h.registry.closeAll()
 		h.outboundMu.Unlock()
-		h.discardDebugger(dbg, "hub shutdown")
+		h.discardDebuggerUntilSuccess(dbg, "hub shutdown")
 		close(h.shutdownCh)
 	})
 }
