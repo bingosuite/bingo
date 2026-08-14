@@ -815,69 +815,64 @@ func (e *engine) loop() {
 			cmd.err <- cmd.fn()
 
 		case result := <-e.stopCh:
-			e.finishWait()
-			if result.err != nil {
-				if e.proc.attached() {
-					if err := e.discardTracee(!errors.Is(result.err, ErrImageReplaced)); err != nil {
-						cause := errors.Join(result.err, err)
-						if e.getState() == stateSuspended {
-							e.haltOnError(protocol.CmdNone, cause, StopEvent{})
-						} else {
-							e.emitError(protocol.CmdNone, cause)
-						}
-						continue
-					}
-					if errors.Is(result.err, ErrProcessExited) {
-						e.emitProcessExited(0)
-					} else {
-						e.emitError(protocol.CmdNone, result.err)
-					}
-					e.drainCmds()
-					return
-				}
-				if errors.Is(result.err, ErrProcessExited) {
-					e.detachPending = false
-					e.proc.markExited()
-					e.emitProcessExited(0)
-				} else {
-					e.emitError(protocol.CmdNone, result.err)
-					// A session-invalidating failure leaves threads stopped and
-					// owned by us — the one that triggered it, plus anything the
-					// park queue was holding. Exiting the loop closes the tracer
-					// thread, and the kernel then detaches every tracee and
-					// resumes it straight into breakpoints that are still
-					// written into its text. Discharge them explicitly instead.
-					if errors.Is(result.err, ErrSessionInvalidated) {
-						// Restoring saved bytes into an image that has already
-						// been replaced would poke old instructions at old
-						// addresses into the NEW one. Nothing of ours is in it.
-						if err := e.discardTracee(!errors.Is(result.err, ErrImageReplaced)); err != nil {
-							e.emitError(protocol.CmdNone, errors.Join(result.err, err))
-							continue
-						}
-					}
-				}
-				e.drainCmds()
-				return
-			}
-			// Kill may have already moved us to stateExited while a real
-			// (non-exit) stop was buffered in stopCh — its synthetic StopExited
-			// is dropped when the channel is full. Do NOT let that stale stop
-			// reach handleStop: StopBreakpoint/StopSingleStep/StopSignal call
-			// setState(stateSuspended) unconditionally, which would resurrect
-			// the engine out of stateExited and wedge the loop (done/events
-			// never close, hub never sees the exit). Tear down cleanly instead.
-			if e.getState() == stateExited {
-				e.drainCmds()
-				return
-			}
-			e.handleStop(result.evt)
-			if e.getState() == stateExited {
+			if e.handleWaitResult(result) {
 				e.drainCmds()
 				return
 			}
 		}
 	}
+}
+
+func (e *engine) handleWaitResult(result stopResult) bool {
+	e.finishWait()
+	if result.err != nil {
+		return e.handleWaitError(result.err)
+	}
+	// Kill may have already moved us to stateExited while a real non-exit stop
+	// was buffered in stopCh and its synthetic wake was dropped.
+	if e.getState() == stateExited {
+		return true
+	}
+	e.handleStop(result.evt)
+	return e.getState() == stateExited
+}
+
+func (e *engine) handleWaitError(waitErr error) bool {
+	if e.proc.attached() {
+		if err := e.discardTracee(!errors.Is(waitErr, ErrImageReplaced)); err != nil {
+			cause := errors.Join(waitErr, err)
+			if e.getState() == stateSuspended {
+				e.haltOnError(protocol.CmdNone, cause, StopEvent{})
+			} else {
+				e.emitError(protocol.CmdNone, cause)
+			}
+			return false
+		}
+		if errors.Is(waitErr, ErrProcessExited) {
+			e.emitProcessExited(0)
+		} else {
+			e.emitError(protocol.CmdNone, waitErr)
+		}
+		return true
+	}
+
+	if errors.Is(waitErr, ErrProcessExited) {
+		e.detachPending = false
+		e.proc.markExited()
+		e.emitProcessExited(0)
+		return true
+	}
+
+	e.emitError(protocol.CmdNone, waitErr)
+	if !errors.Is(waitErr, ErrSessionInvalidated) {
+		return true
+	}
+	// Restoring saved bytes after exec would corrupt the replacement image.
+	if err := e.discardTracee(!errors.Is(waitErr, ErrImageReplaced)); err != nil {
+		e.emitError(protocol.CmdNone, errors.Join(waitErr, err))
+		return false
+	}
+	return true
 }
 
 func (e *engine) startWait() {
@@ -951,46 +946,7 @@ func (e *engine) discardTracee(restore bool) error {
 	if e.proc.attached() {
 		detacher, ok := e.backend.(attachedProcessDetacher)
 		if ok {
-			e.detachPending = true
-			ctx, cancel := context.WithTimeout(context.Background(), attachedDetachTimeout)
-			defer cancel()
-			gone, err := detacher.quiesceAttached(ctx)
-			if err != nil {
-				if detacher.attachedQuiesced() {
-					e.setState(stateSuspended)
-				} else {
-					e.setState(stateRunning)
-				}
-				return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, err)
-			}
-			if restore && !gone && !detacher.attachedImageReplaced() {
-				stops := detacher.attachedDetachStops()
-				if _, err := detacher.selectAttachedWriteTID(); err != nil {
-					e.setState(stateSuspended)
-					return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, err)
-				}
-				if err := e.rewindAttachedDetachStops(stops); err != nil {
-					e.setState(stateSuspended)
-					return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, err)
-				}
-				if err := e.clearAllBreakpoints(); err != nil {
-					e.setState(stateSuspended)
-					return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, err)
-				}
-			} else {
-				e.bps.discardAll()
-			}
-			e.clearAttachedDetachStopState()
-			if err := e.proc.kill(e.backend, false); err != nil {
-				if detacher.attachedQuiesced() {
-					e.setState(stateSuspended)
-				} else {
-					e.setState(stateRunning)
-				}
-				return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, err)
-			}
-			e.detachPending = false
-			return nil
+			return e.discardAttachedTracee(detacher, restore)
 		}
 	}
 
@@ -1003,6 +959,49 @@ func (e *engine) discardTracee(restore bool) error {
 			"err", err)
 	}
 	return nil
+}
+
+func (e *engine) discardAttachedTracee(detacher attachedProcessDetacher, restore bool) error {
+	e.detachPending = true
+	ctx, cancel := context.WithTimeout(context.Background(), attachedDetachTimeout)
+	defer cancel()
+	gone, err := detacher.quiesceAttached(ctx)
+	if err != nil {
+		e.setAttachedCleanupState(detacher)
+		return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, err)
+	}
+	if restore && !gone && !detacher.attachedImageReplaced() {
+		stops := detacher.attachedDetachStops()
+		if _, err := detacher.selectAttachedWriteTID(); err != nil {
+			e.setState(stateSuspended)
+			return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, err)
+		}
+		if err := e.rewindAttachedDetachStops(stops); err != nil {
+			e.setState(stateSuspended)
+			return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, err)
+		}
+		if err := e.clearAllBreakpoints(); err != nil {
+			e.setState(stateSuspended)
+			return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, err)
+		}
+	} else {
+		e.bps.discardAll()
+	}
+	e.clearAttachedDetachStopState()
+	if err := e.proc.kill(e.backend, false); err != nil {
+		e.setAttachedCleanupState(detacher)
+		return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, err)
+	}
+	e.detachPending = false
+	return nil
+}
+
+func (e *engine) setAttachedCleanupState(detacher attachedProcessDetacher) {
+	if detacher.attachedQuiesced() {
+		e.setState(stateSuspended)
+	} else {
+		e.setState(stateRunning)
+	}
 }
 
 //nolint:gocognit,gocyclo // Stop handling is a single serialized debugger state machine.

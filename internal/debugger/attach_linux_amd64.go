@@ -204,6 +204,7 @@ func (b *linuxBackend) interruptAttachedTracees() error {
 	return nil
 }
 
+//nolint:gocognit,gocyclo // Quiesce is one ordered per-TID seize/interrupt/drain state machine.
 func (b *linuxBackend) quiesceAttached(ctx context.Context) (bool, error) {
 	if !b.attached() {
 		return b.attachGone, nil

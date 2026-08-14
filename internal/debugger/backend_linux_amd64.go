@@ -104,14 +104,6 @@ func (t *tracerThread) closed() bool {
 	}
 }
 
-// tracerExecer is implemented by backends whose ptrace control ops must all run
-// on one dedicated thread. Only the linux backend implements it; the platform
-// free functions (startTracedProcess/attachToProcess/killProcess) use it to run
-// the fork/attach/detach on that thread. Darwin does not implement it.
-type tracerExecer interface {
-	execPtrace(fn func())
-}
-
 type linuxBackend struct {
 	// stepQueue carries the single-step bookkeeping (stepping/stepTID) and the
 	// queue of stops held back while a step is in flight. Embedded so those
@@ -728,7 +720,7 @@ func (b *linuxBackend) Threads() ([]int, error) {
 //
 // The queue needs no lock. It is touched only here, and successive Wait calls
 // run on different one-shot waitLoop goroutines that the engine starts with a
-// `go` statement after consuming the previous Wait's result — so each Wait
+// through startWait after consuming the previous result — so each Wait
 // happens-after the previous one, along with the step-state writes the engine
 // makes in between.
 //
@@ -741,12 +733,11 @@ func (b *linuxBackend) Threads() ([]int, error) {
 // thread, so the engine can issue control ops concurrently. Every ptrace CONTROL
 // op below is funnelled through b.execPtrace and executes on the one thread the
 // kernel accepts ptrace requests from.
-//
-//nolint:gocognit,gocyclo // The wait loop is one serialized ptrace state machine.
 func (b *linuxBackend) Wait() (StopEvent, error) {
 	return b.wait(context.Background())
 }
 
+//nolint:gocognit,gocyclo // The wait loop is one serialized ptrace state machine.
 func (b *linuxBackend) wait(ctx context.Context) (StopEvent, error) {
 	for {
 		// A stepped thread can die before reporting completion. Reconciling

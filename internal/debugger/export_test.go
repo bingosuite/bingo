@@ -256,8 +256,7 @@ func ExportedSetBreakpointAtErr(d Debugger, addr uint64) error {
 func ExportedClearAllBreakpoints(d Debugger) {
 	e := d.(*engine)
 	if err := e.dispatch(func() error {
-		e.clearAllBreakpoints()
-		return nil
+		return e.clearAllBreakpoints()
 	}); err != nil {
 		panic("ExportedClearAllBreakpoints: " + err.Error())
 	}
