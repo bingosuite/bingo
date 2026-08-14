@@ -221,7 +221,7 @@ func newFullStackHarness(bin string) *fullStackHarness {
 			AddReportEntry("fullstack-kill-timeout", "client.Kill did not return within 5s")
 		}
 		_ = c.Close()
-		srv.Shutdown(5 * time.Second)
+		_ = srv.Shutdown(5 * time.Second)
 	})
 
 	// Launch is fire-and-forget; the initial stop surfaces as Stepped on Events.
@@ -261,7 +261,7 @@ func startTestServer() (*server.Server, string) {
 		if waitServerReady(addr, 3*time.Second) {
 			return srv, addr
 		}
-		srv.Shutdown(time.Second) // lost the port race or bind failed; retry
+		_ = srv.Shutdown(time.Second) // lost the port race or bind failed; retry
 	}
 	Fail("server did not become ready after multiple attempts")
 	return nil, ""

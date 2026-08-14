@@ -64,7 +64,7 @@ func startConstructedServer(t *testing.T, srv *Server) runningServer {
 
 func (r runningServer) stop(t *testing.T) {
 	t.Helper()
-	r.server.Shutdown(time.Second)
+	_ = r.server.Shutdown(time.Second)
 	g := NewWithT(t)
 	g.Eventually(r.errCh, time.Second).Should(Receive(BeNil()))
 }
@@ -147,7 +147,7 @@ func TestHealthReportsResolvedDAPAddress(t *testing.T) {
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(srv.StartDAP("127.0.0.1:0")).To(Succeed())
 	t.Cleanup(func() {
-		srv.Shutdown(time.Second)
+		_ = srv.Shutdown(time.Second)
 	})
 
 	_, health := getHealth(t, srv.httpServer.Handler)
@@ -169,7 +169,7 @@ func TestHealthReportsSessionCount(t *testing.T) {
 	_, health := getHealth(t, srv.httpServer.Handler)
 	g.Expect(health.SessionCount).To(Equal(1))
 
-	srv.Shutdown(time.Second)
+	_ = srv.Shutdown(time.Second)
 	g.Expect(srv.sessions.count()).To(Equal(0))
 }
 
@@ -390,7 +390,7 @@ func TestFailedAdmissionsDoNotExtendExpiredDeadline(t *testing.T) {
 	g.Expect(srv.beginSessionOperation()).To(BeFalse())
 	_, err := (dapProvider{srv: srv}).CreateSession()
 	g.Expect(err).To(MatchError(ErrServerClosed))
-	srv.Shutdown(time.Second)
+	_ = srv.Shutdown(time.Second)
 }
 
 func TestActiveSessionSuppressesIdleShutdown(t *testing.T) {
@@ -483,7 +483,7 @@ func TestShutdownIsConcurrentAndIdempotent(t *testing.T) {
 	for range 8 {
 		go func() {
 			defer callers.Done()
-			running.server.Shutdown(time.Second)
+			_ = running.server.Shutdown(time.Second)
 		}()
 	}
 	done := make(chan struct{})
@@ -495,7 +495,7 @@ func TestShutdownIsConcurrentAndIdempotent(t *testing.T) {
 	g.Eventually(done, 2*time.Second).Should(BeClosed())
 	g.Eventually(running.errCh, time.Second).Should(Receive(BeNil()))
 	g.Expect(running.server.sessions.count()).To(Equal(0))
-	running.server.Shutdown(time.Second)
+	_ = running.server.Shutdown(time.Second)
 	g.Expect(running.server.StartDAP("127.0.0.1:0")).To(MatchError(ErrServerClosed))
 }
 
@@ -555,7 +555,7 @@ func TestStartCancellationDuringListenReturnsCleanly(t *testing.T) {
 		startResult <- srv.Start()
 	}()
 	g.Eventually(listenStarted, time.Second).Should(BeClosed())
-	srv.Shutdown(time.Second)
+	_ = srv.Shutdown(time.Second)
 
 	g.Eventually(startResult, time.Second).Should(Receive(BeNil()))
 	g.Expect(srv.Done()).To(BeClosed())
@@ -577,7 +577,7 @@ func TestStartPreservesBindErrorDuringShutdown(t *testing.T) {
 		startResult <- srv.Start()
 	}()
 	g.Eventually(listenStarted, time.Second).Should(BeClosed())
-	srv.Shutdown(time.Second)
+	_ = srv.Shutdown(time.Second)
 
 	g.Eventually(startResult, time.Second).Should(Receive(MatchError(bindErr)))
 	g.Expect(srv.Done()).To(BeClosed())
@@ -604,7 +604,7 @@ func TestShutdownCancelsAndJoinsDAPStart(t *testing.T) {
 	g.Eventually(listenStarted, time.Second).Should(BeClosed())
 	shutdownResult := make(chan struct{})
 	go func() {
-		srv.Shutdown(time.Second)
+		_ = srv.Shutdown(time.Second)
 		close(shutdownResult)
 	}()
 	g.Eventually(listenCanceled, time.Second).Should(BeClosed())
@@ -623,7 +623,7 @@ func TestShutdownCancelsAndJoinsDAPStart(t *testing.T) {
 func TestShutdownBeforeStartDoesNotResurrectServer(t *testing.T) {
 	g := NewWithT(t)
 	srv := New("127.0.0.1:0", nil)
-	srv.Shutdown(time.Second)
+	_ = srv.Shutdown(time.Second)
 
 	g.Expect(srv.Start()).To(Succeed())
 	g.Expect(srv.StartDAP("127.0.0.1:0")).To(MatchError(ErrServerClosed))
@@ -662,7 +662,7 @@ func TestWebSocketJoinRejectsClosedHub(t *testing.T) {
 	g.Expect(sess.hub.ClientCount()).To(Equal(0))
 
 	srv.sessions.remove(sess.id)
-	srv.Shutdown(time.Second)
+	_ = srv.Shutdown(time.Second)
 }
 
 func TestDAPBindFailureIsRetryable(t *testing.T) {
