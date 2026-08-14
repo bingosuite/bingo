@@ -60,8 +60,12 @@ func main() {
 
 	go func() {
 		<-sigCh
+		signal.Stop(sigCh)
+		signal.Reset(syscall.SIGINT, syscall.SIGTERM)
 		log.Info("received shutdown signal")
-		srv.Shutdown(10 * time.Second)
+		if err := srv.Shutdown(10 * time.Second); err != nil {
+			log.Error("server shutdown incomplete; send a second signal to force exit", "err", err)
+		}
 	}()
 
 	if err := runServer(srv); err != nil {

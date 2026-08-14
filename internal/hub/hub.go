@@ -264,8 +264,25 @@ func (h *Hub) discardDebugger(dbg debugger.Debugger, reason string) {
 	if dbg == nil {
 		return
 	}
-	if err := dbg.Kill(); err != nil {
-		h.log.Warn("discarded debugger did not shut down cleanly", "reason", reason, "err", err)
+	attempts := 0
+	for {
+		attempts++
+		err := dbg.Kill()
+		if err == nil {
+			if attempts > 1 {
+				h.log.Info("retained debugger shutdown completed", "reason", reason, "attempts", attempts)
+			}
+			return
+		}
+		if !errors.Is(err, debugger.ErrAttachedDetachIncomplete) {
+			h.log.Warn("discarded debugger did not shut down cleanly", "reason", reason, "err", err)
+			return
+		}
+		if attempts == 1 {
+			h.log.Warn("retaining debugger ownership until attached detach can be retried",
+				"reason", reason, "err", err)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -887,10 +904,10 @@ func (h *Hub) shutdown() {
 	h.shutdownOnce.Do(func() {
 		h.log.Info("hub shutting down")
 		dbg := h.beginShutdown()
-		close(h.shutdownCh)
 		h.outboundMu.Lock()
 		h.registry.closeAll()
 		h.outboundMu.Unlock()
 		h.discardDebugger(dbg, "hub shutdown")
+		close(h.shutdownCh)
 	})
 }
