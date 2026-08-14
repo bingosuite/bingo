@@ -367,11 +367,12 @@ anything in [internal/debugger/](internal/debugger/).
    ptrace is thread-bound on Linux, so the linux backend goes further: it owns
    a **dedicated tracer thread** (`tracerThread`) and funnels *every* ptrace
    control op through `execPtrace`, because they must issue from the exact
-   thread that forked/attached the tracee. `wait4` is the one exception — legal
-   from any thread of the tracer process, so `Wait` runs it directly off the
-   tracer thread. On Darwin there is no ptrace: the Mach calls run on the
-   engine-loop thread itself (Mach ports are task-wide). Mirrors Delve's
-   `execPtraceFunc`.
+   thread that forked/attached the tracee. Linux wait-status collection is the
+   one exception: `wait4` is not thread-bound, so the process-global
+   `linuxWaitBroker` owns it and routes exact-TID statuses to the backend that
+   registered them. The broker performs no ptrace control operations. On Darwin
+   there is no ptrace: the Mach calls run on the engine-loop thread itself (Mach
+   ports are task-wide). Mirrors Delve's `execPtraceFunc`.
 
 2. **`waitLoop` is a one-shot, locked goroutine.** Every time the process is
    resumed, a fresh `waitLoop` goroutine is started. It calls `Backend.Wait()`
@@ -383,12 +384,19 @@ anything in [internal/debugger/](internal/debugger/).
    arrives, the loop sets `stateExited`, calls `drainCmds` (answers queued
    commands with `ErrProcessExited` so blocked dispatchers unblock), then
    returns. The `defer` closes `done` (signals waitLoop to abandon pending
-   sends) and then `events` (signals hub no more events coming).
+   sends) and then `events` (signals hub no more events coming). On Linux,
+   closing the backend's wait owner drops consumer-facing queued stops but does
+   not unregister live TIDs: the process-global broker keeps exact ownership
+   until it reaps each final status. This is what lets a running Kill return
+   promptly without leaking zombies or leaving a stale waiter able to steal a
+   later session's initial stop.
 
 4. **`Kill` is idempotent and races-safe.** It checks `done` first (fast
    path), then dispatches a closure that injects a synthetic `StopExited`
    into `stopCh`. The main loop sees that, exits cleanly. Multiple concurrent
-   `Kill` callers share one teardown.
+   `Kill` callers share one teardown. A backend cleanup error is returned to the
+   caller but does not cancel that exit transition: teardown must still close
+   `done`, `events`, the tracer thread, and the Linux wait consumer.
 
 5. **`dispatch` is the only public-method pattern.** Send `engineCmd{fn,err}`
    on `cmdCh`, wait on `err`. If the loop has exited (`e.done` closed),
@@ -607,8 +615,9 @@ ptrace-stopped exactly where it is and is delivered from a FIFO queue on a later
 `Wait`, once the step has completed and the engine has reinstalled the trap it
 stepped off.
 
-Why it is needed (issue #199, linux only): `Wait` uses `Wait4(-1, …, WALL)`, so
-a sibling thread's `SIGTRAP` can surface in the middle of the
+Why it is needed (issue #199, linux only): the process-global wait broker can
+deliver any status owned by this debugger, so a sibling thread's `SIGTRAP` can
+surface in the middle of the
 restore→single-step→reinstall sequence, when the stepped-over trap bytes are out
 of the tracee and its entry is out of `bps` (see
 [step-over flow](#software-breakpoint-step-over-flow)). Handing that to the
@@ -697,9 +706,10 @@ acknowledgement in rule 5 (see the locking note below):
    The held owner is preferred when both exist. A **reaped** owner
    (`ws.Exited()`/`ws.Signaled()`) cannot be held — it is already gone — so that
    shape keeps the original lazy fallback: `stepExitPending` stays set, `Wait`
-   keeps blocking in `wait4`, and the first foreign stop to arrive parks (the
-   park condition includes `stepExitPending`) and supplies the anchor. Whole
-   process death still routes through the main thread and tears down as usual.
+   keeps blocking on its broker-owned queue, and the first foreign stop to arrive
+   parks (the park condition includes `stepExitPending`) and supplies the anchor.
+   Whole process death still routes through the main thread and tears down as
+   usual.
 
    `completeStepThreadExit` returns an error because that release is a real
    ptrace op. `ESRCH`/`ENOENT` is benign — the anchor was mid-exit and simply
@@ -905,15 +915,15 @@ acknowledgement in rule 5 (see the locking note below):
     `stopCh` error branch discards the tracee explicitly before returning:
     `endThreadStep`, `bps.clearAll` (restore the original bytes **first** — that
     is what makes the release safe), then `proc.kill(backend, running:false)`.
-    For a launched tracee `reapAfterKill` loops `Wait4(-1, WALL)` and continues
-    every thread it finds stopped, which discharges the parked stops and the
-    trigger stop; for an attached one the detach is safe because the traps are
-    already gone. `running` is false because the `waitLoop` that produced the
-    failure has already delivered its result, so `killProcess` is the sole
-    reaper (#111). Only these two branches carry the marker: ordinary `wait4`
-    failures deliberately keep their pre-existing behaviour, which still leaks a
-    detach-and-resume, and closing that generic class belongs with the
-    wait-ownership work (#205/#217).
+    For a launched tracee `reapAfterKill` drains only that backend's broker
+    queue and continues every owned thread it finds stopped, which discharges
+    the parked stops and the trigger stop; for an attached one the detach is
+    safe because the traps are already gone. `running` is false because the
+    `waitLoop` that produced the failure has already delivered its result, so
+    `killProcess` is the active consumer of those routed statuses (#111). Only
+    these two branches carry the marker: an ordinary wait failure deliberately
+    keeps its pre-existing detach-and-resume behaviour; fixing that generic
+    tracee-state cleanup class is separate from status ownership.
 
     The exec case inverts one step. `ErrImageReplaced` (which wraps
     `ErrSessionInvalidated`) suppresses the restore, because writing saved bytes
@@ -965,38 +975,35 @@ distinguish safe recovery from the mid-instruction path.
   parked sibling is never resumed at all. The queue, scripted-`Wait`, engine,
   and native raw-`SYS_exit` tests separately pin the gate, exact-TID anchor,
   breakpoint ownership, and real-kernel path for both anchor shapes.
-- **Kill ownership is unchanged, and no second reaper is added.** Killing a
-  *suspended* tracee still reaps through `reapAfterKill`, which loops
-  `Wait4(-1, WALL)` and resumes whatever it finds ptrace-stopped: a parked thread
-  — or a held anchor — is ptrace-stopped like any other and is indistinguishable
-  to that loop, so the queue costs it iterations, nothing more. Killing a
-  *running* tracee still
-  leaves reaping to the in-flight `waitLoop` (#111 forbids a second `wait4`
-  reaper here, and #205 is why a process-global one is dangerous in a shared
-  server). The one honest cost: because the drain runs before `wait4`, that
-  final `waitLoop` can return a held stop instead of blocking, so it absorbs
-  fewer thread deaths than it would have, leaving a few more unreaped statuses
-  until the tracer process exits. Bounded by the live thread count, the same P3
-  class as #217's unreaped leader, and it neither hangs nor wedges teardown —
-  `declareStepOverlapKillSpec` kills mid-step with stops held and requires both
-  `Kill` and the event-stream close to complete. Do not "fix" this with a purge
-  on kill: `purge` is `Wait`-owned (rule 6) and draining before blocking is what
-  makes a same-address sibling resolve after the reinstall (rule 3).
+- **Kill status ownership stays with the process-global broker.** Before
+  SIGKILL, the Linux backend registers every TID currently visible in
+  `/proc/<pid>/task`; it repeats the scan after the signal to close the clone
+  race. Killing a *suspended* tracee then runs `reapAfterKill`, which consumes
+  only that backend's routed statuses and resumes owned ptrace stops until the
+  broker retires every registered TID. A parked thread or held anchor costs it
+  iterations, but no other debugger or unrelated child can enter the queue.
+  Killing a *running* tracee leaves the existing engine `waitLoop` as the active
+  consumer while the engine exits; when the wait owner closes, the broker
+  silently continues exact-TID reaping until every registration is terminal.
+  Never add a competing raw waiter or unregister those TIDs at close: either
+  would recreate #205 or #217. `declareStepOverlapKillSpec` still requires both
+  Kill and event-stream close to complete with stops held.
 - **The `kill` label itself never exercises the queue.** `declareKillRunningSpec`
   sets no breakpoints — it launches, `Continue`s, and `Kill`s — so the engine
   never single-steps, `beginStep` is never called, nothing is ever parked, and
   `resumeFor` returns `resumeContinue` for every absorbed stop, which is the
-  pre-change `continueIfTraceeExists` verbatim. A failure in that label is
-  therefore not attributable to the queue. The one seen (native run
+  pre-change `continueIfTraceeExists` verbatim. A failure in that label was
+  therefore not attributable to the step queue. The one seen (native run
   `31344255645`) hung in `startTracedProcess`'s `Wait4(pid)` waiting for a *new*
-  tracee's execve stop, and is the pre-existing #205 hazard: `engine.Kill`
+  tracee's execve stop and confirmed the #205 hazard: `engine.Kill`
   injects a synthetic `StopExited`, so the loop can reach `stateExited` while the
   real `waitLoop` is still blocked in the process-global `Wait4(-1, WALL)`. That
   orphan absorbs the SIGKILLed threads' deaths, loops back, blocks again with no
   statuses left, and can then collect the *next* iteration's child exec stop
   before discovering `done` is closed and exiting — which is why no second
-  `wait4` frame survives in the timeout dump. Fixing it belongs with #205/#217,
-  not here.
+  `wait4` frame survives in the timeout dump. The exact-TID broker removes every
+  process-global consumer: launch, normal Wait, suspended Kill, and post-close
+  reaping all use one owner-routed status path.
 
 **No lock on the queue, and none is needed.** `parked` is touched only inside `Wait`.
 Successive `Wait` calls run on different one-shot `waitLoop` goroutines that the
@@ -1246,11 +1253,15 @@ arrive concurrently during requeue or the re-step may interleave. Preserving
 that provenance and delivery ordering requires the broader wait-ownership work,
 not a process-global pending-signal scalar in this layer.
 
-**Composition constraint for #205:** a future process-wide wait broker may own
-the raw `wait4`, but it must route the complete `(TID, signal)` status to the
-owning session/backend and preserve FIFO order. Pending signal state stays
-per-session and per-TID; it must not move into one process-global broker slot or
-be installed before the owning backend actually delivers the stop.
+**Composition constraint with the process-global wait broker:** the broker owns
+raw Linux `wait4`, but it routes the complete `(TID, WaitStatus)` only to the
+backend that registered that exact TID. Pending signal state stays per-session
+and per-TID; it must not move into one process-global slot or be installed before
+the owning backend actually delivers the stop. Clone ownership must be
+registered from `PTRACE_GETEVENTMSG` before the parent is resumed. Registrations
+survive consumer close until a final status or exact `ECHILD` retires them, so
+TID reuse cannot hand a stale status to a new debugger. The broker's generation
+check pins that last boundary.
 
 ## Architecture-specific traps
 
@@ -1384,9 +1395,11 @@ are detected by a `mach_msg` receive loop.
   (`tracerThread` / `execPtrace`) because ptrace is thread-bound: the initial
   fork/exec, attach, and every control op (`CONT` / `SINGLESTEP` /
   `GET`·`SETREGS` / `PEEK`·`POKEDATA` / `SETOPTIONS`) must originate from the
-  one thread that became the tracer. `wait4` runs off that thread (valid from
-  any tracer thread). Splitting the wait from the control ops was the original
-  step-over hang: cross-thread `PTRACE_SINGLESTEP` failed with `ESRCH`.
+  one thread that became the tracer. Wait-status collection does not: the
+  process-global `linuxWaitBroker` owns raw `wait4`, which is process-scoped but
+  not thread-bound. Splitting ptrace control across threads was the original
+  step-over hang: cross-thread `PTRACE_SINGLESTEP` failed with `ESRCH`; moving
+  only status collection is safe because the broker never issues ptrace.
 - `startTracedProcess` enables `PTRACE_O_TRACEEXIT | PTRACE_O_TRACEEXEC |
   PTRACE_O_TRACECLONE`. Clone tracing is set at the single-threaded execve stop
   so every later Go-runtime worker thread inherits it; without it a goroutine
@@ -1394,8 +1407,22 @@ are detected by a `mach_msg` receive loop.
   its breakpoint `SIGTRAP` to the Go runtime ("fatal: trace trap") instead of
   the tracer. Each new thread's initial `SIGSTOP` is resumed **individually** —
   never a group-continue, which would let a thread parked at a breakpoint run
-  away (the "parking the thread group" hazard).
-- `Wait` uses `Wait4(-1, …, WALL)` to receive events for any thread.
+  away (the "parking the thread group" hazard). The clone TID from
+  `PTRACE_GETEVENTMSG` is registered with the same wait owner **before** the
+  parent resumes, so its initial status cannot escape routing.
+- **One process-global exact-TID wait broker owns every Linux wait syscall.**
+  Each backend creates a wait owner and registers its root PID before consuming
+  the launch/attach stop; clone TIDs join that owner before resume. The broker
+  listens for SIGCHLD, scans only registered TIDs with
+  `Wait4(tid, WNOHANG|WALL)`, and uses a one-second fallback scan for a missed or
+  coalesced notification. It never calls `Wait4(-1, ...)` and therefore cannot
+  steal another debugger's status or reap an unrelated child. One live TID has
+  one owner; monotonically increasing registration generations prevent a scan
+  result for a retired TID from reaching a later owner after TID reuse. A closed
+  owner discards routed events but keeps registrations until final
+  `Exited`/`Signaled` or exact `ECHILD`, which closes the running-Kill and
+  natural-exit zombie leaks (#205/#217). Do not add another raw wait site.
+- `Wait` consumes its owner's routed statuses for any registered tracee thread.
   `PTRACE_EVENT_*` stops are absorbed (resumed and looped) and never surface
   to the engine — with two exceptions. The **main thread's**
   `PTRACE_EVENT_EXIT` is the one exit the engine needs, and
@@ -1444,38 +1471,33 @@ are detected by a `mach_msg` receive loop.
   `stepTID` (the exact TID `SingleStep` was issued against). Only a `cause==0`
   SIGTRAP on `stepTID` is the step's completion; the same stop on any other
   thread is that thread hitting an INT3 and is reported as a breakpoint. This
-  matters because `Wait4(-1, …)` can return a sibling thread's concurrent
+  matters because the owner queue can deliver a sibling thread's concurrent
   breakpoint (or SIGURG) while a step is in flight — keying off `stepping`
   alone would misclassify it and corrupt the engine's step-over state machine.
   Correct classification is necessary but not sufficient: a correctly-labelled
   foreign breakpoint handed to the engine mid-step is still corrupting, so `Wait`
   also **parks** it until the step completes — see
   [foreign-thread stop parking](#foreign-thread-stop-parking-during-a-single-step-linux).
-- **One live tracee per process.** `Wait4(-1, …, WALL)` is scoped to the whole
-  tracer *process*, not to one tracee, so two `Debugger`s running at once in the
-  same binary steal each other's stops — observed as `PTRACE_GETREGS` `ESRCH`
-  for a foreign tid and both backends wedging in `Kill`. Nothing filters by pid,
-  and adding a filter would break the deliberate any-thread wait. Tests must
-  therefore own exactly one tracee for its whole lifetime; an e2e spec that
-  needs a differently-configured target launches it in a spec of its own, after
-  the previous `DeferCleanup` has killed the last one.
+- **Multiple live tracees per process are supported.** Their ptrace controls
+  remain isolated on separate tracer threads and their statuses are isolated by
+  wait owners. A debugger may see only TIDs it registered; an unrelated child is
+  intentionally invisible and remains reapable by its creator. The
+  multisession E2E starts concurrent debuggers and requires both later initial
+  stops and independent natural exit codes, while the Kill E2E keeps an
+  unrelated child live across suspended teardown.
 - `g` pointer for goroutine inspection lives at `FS_BASE` on amd64.
-- `killProcess` never reaps the zombie itself while the engine's `waitLoop` is
-  in flight (a *running* tracee). That waitLoop is blocked in `Wait4(-1, WALL)`
-  and is the **sole** legitimate reaper: it absorbs every thread's SIGKILL death
-  and surfaces `StopKilled`. A second reaper in `killProcess` deadlocks Kill two
-  ways (#111): it races the waitLoop for the same stops, and — because a Go
-  tracee is always multi-threaded — `Wait4(pid)` targets only the thread-group
-  leader, whose zombie stays unreapable until every sibling is reaped, which
-  `killProcess` cannot do. So `killProcess` only reaps when the tracee was
-  **suspended** at a stop (no waitLoop), via `reapAfterKill`, which loops
-  `Wait4(-1, WALL)` (any thread, never the leader's pid), resuming any
-  ptrace-stopped thread so the pending process-wide SIGKILL kills it, until
-  `ECHILD`. The engine passes `running` (state == running) down through
-  `process.kill` to drive this. (Darwin has no such race — its `waitLoop` blocks
-  on a Mach port, not `wait4`, so its `killProcess` `Wait4(pid)` is always the
-  sole reaper and ignores `running`.) Regression guard: the `kill` e2e loops the
-  launch→run→Kill cycle (`BINGO_E2E_KILL_ITERS`).
+- `killProcess` first registers the visible thread group, sends SIGKILL, then
+  registers again to close a concurrent-clone race. For a suspended tracee,
+  `reapAfterKill` drains the same owner queue and continues owned stopped
+  threads until all registrations retire. For a running tracee, the in-flight
+  engine `waitLoop` remains the only active consumer (#111); after engine
+  shutdown closes that consumer, the broker silently reaps all remaining exact
+  TIDs. There is one raw reaper in both cases, so Kill neither races another
+  waiter nor leaves final zombies. (Darwin has no broker; its Mach wait loop and
+  targeted `wait4` reaping are unchanged.) Regression guards: the `kill` E2E
+  repeats launch→run→Kill (`BINGO_E2E_KILL_ITERS`), the suspended-Kill spec keeps
+  an unrelated child alive, and natural-exit specs require `/proc/<pid>` to
+  disappear.
 - `SIGURG` re-delivery is mandatory here too. A sibling SIGURG is re-delivered
   immediately on that sibling's continue. A SIGURG on `stepTID` consumes the
   outstanding step, so `applyAbsorb` reissues the instruction step with zero
@@ -3128,6 +3150,12 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   the state field — it starts no `waitLoop`, so a stop pushed after it is never
   consumed; reach `running` through a real `Continue` when a stop must be
   delivered. Engine tests are tagged-agnostic — they avoid native code paths.
+  On linux/amd64,
+  [waitbroker_linux_amd64_test.go](internal/debugger/waitbroker_linux_amd64_test.go)
+  drives the raw-wait seam deterministically: exact owner routing, unrelated
+  child isolation, a status pending before registration, final retirement,
+  generation-safe TID reuse, closed-owner reaping, cross-session initial stops,
+  and clone registration before parent resume.
 - `internal/hub`: `fakeDebugger` + `fakeWSConn` in [hub_test.go](internal/hub/hub_test.go).
   The fake conn uses a 256-deep `incoming` buffer so `WriteMessage` never
   blocks the hub event loop.
@@ -3148,9 +3176,12 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   (StepInto crosses into a callee, StepOut returns to the caller), `inspect`
   (StackFrames chain + Locals + Goroutines at a breakpoint), `breakpoints`
   (a cleared breakpoint stops firing and an in-flight step-off reserves its
-  temporarily table-less address), `kill` (Kill terminates a
-  freely-running tracee), `exit` (EventProcessExited reports the tracee's real
-  exit code), `signals` (linux-only: fatal and ordinary signal forwarding plus
+  temporarily table-less address), `kill` (Kill terminates a freely-running
+  tracee; linux additionally kills a suspended tracee while an unrelated child
+  stays live and requires the tracee to be reaped), `exit` (EventProcessExited
+  reports the tracee's real exit code; linux additionally runs concurrent
+  sessions, routes each initial/final status to its owner, and requires natural
+  exits to disappear from `/proc`), `signals` (linux-only: fatal and ordinary signal forwarding plus
   the shared Pause-suppression control), `overlap` (linux-only: a foreign thread's breakpoint stop
   surfacing while another thread single-steps off a software breakpoint —
   issue #199), `attach` (attach by PID to an already-running tracee — one the

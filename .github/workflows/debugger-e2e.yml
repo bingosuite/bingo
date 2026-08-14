@@ -119,9 +119,9 @@ jobs:
       - name: E2E current goroutine (bounded scan control)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=current-goroutine
 
-      # linux-only: Wait4(-1, WALL) is what lets a foreign thread's stop arrive
-      # mid-single-step (issue #199). The darwin receive loop parks stragglers
-      # itself, so the linux park queue has no counterpart to exercise there.
+      # linux-only: the routed any-thread status stream can deliver a foreign
+      # thread's stop mid-single-step (issue #199). The darwin receive loop
+      # parks stragglers itself, so the linux park queue has no counterpart.
       - name: E2E overlap (foreign-thread stop during a single-step)
         run: go test -tags e2e -race -count=1 -v -timeout 1800s ./test/integration -ginkgo.label-filter=overlap
 

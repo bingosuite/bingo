@@ -48,8 +48,8 @@ func (p *process) attach(b Backend, pid int) error {
 
 // kill terminates the tracee. The Backend argument lets platform kill paths run
 // PTRACE_DETACH on the tracer thread; the engine's Kill path also runs
-// bps.clearAll. running reports whether a waitLoop is in flight (a running
-// tracee), which the linux backend needs to decide who reaps the zombie.
+// bps.clearAll. running reports whether a waitLoop is already consuming the
+// Linux backend's routed status queue.
 func (p *process) kill(b Backend, running bool) error {
 	if !p.live {
 		return nil

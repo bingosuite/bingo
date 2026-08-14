@@ -935,11 +935,10 @@ func declareKillRunningSpec() {
 	It("kills a running process", Label("kill"), func() {
 		bin := buildTarget("kill_target", basicTargetSrc)
 
-		// Repeat the launch→run→Kill cycle. Killing a running tracee reaps it
-		// from the engine loop while a waitLoop concurrently reaps via
-		// Wait4(-1); the losing reaper must return promptly (ECHILD) rather than
-		// wedge Kill. That is a timing race, so a single kill only catches a
-		// regression intermittently — loop to make the reap path deterministic.
+		// Repeat the launch→run→Kill cycle. A running Kill closes the engine
+		// before every terminal status necessarily arrives; the process-global
+		// broker must keep reaping that owner's exact TIDs without letting the
+		// closed session consume the next launch's initial stop.
 		iters := envInt("BINGO_E2E_KILL_ITERS", 20)
 		for i := 0; i < iters; i++ {
 			h := newE2EHarness(bin)
@@ -952,8 +951,8 @@ func declareKillRunningSpec() {
 
 			Expect(h.d.Kill()).To(Succeed(), "Kill running process (iter %d)", i)
 			// Kill tears the engine down; which signal surfaces depends on which
-			// stop wins the race inside the loop. On linux the real wait4 exit
-			// typically arrives as ErrProcessExited and the loop emits
+			// stop wins the race inside the loop. On linux the routed terminal
+			// status typically arrives as ErrProcessExited and the loop emits
 			// EventProcessExited before closing; on darwin the synthetic
 			// StopExited injected by Kill wins and the loop returns straight to
 			// its deferred close(events) with no explicit exit event (see
