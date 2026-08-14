@@ -19,9 +19,10 @@ import (
 const idleShutdownGrace = 10 * time.Second
 
 var (
-	ErrServerClosed      = errors.New("server is shutting down")
-	ErrServerStarted     = errors.New("server already started")
-	ErrDAPAlreadyStarted = errors.New("DAP server already started")
+	ErrServerClosed       = errors.New("server is shutting down")
+	ErrServerStarted      = errors.New("server already started")
+	ErrDAPAlreadyStarted  = errors.New("DAP server already started")
+	ErrShutdownIncomplete = errors.New("server shutdown is retaining debugger ownership")
 )
 
 // Server owns the HTTP listener, the session store, and the lifecycle of all
@@ -173,14 +174,24 @@ func (s *Server) Start() error {
 	return err
 }
 
-// Shutdown closes the HTTP listener, drains in-flight requests, and cancels
-// all session contexts.
-func (s *Server) Shutdown(timeout time.Duration) {
+// Shutdown closes listeners and cancels every session. The caller's timeout
+// bounds its wait, but ownership cleanup continues until every retained
+// debugger has detached or terminated; Done never reports a false completion.
+func (s *Server) Shutdown(timeout time.Duration) error {
 	s.shutdownOnce.Do(func() {
-		s.shutdown(timeout)
-		close(s.shutdownDone)
+		go func() {
+			s.shutdown(timeout)
+			close(s.shutdownDone)
+		}()
 	})
-	<-s.shutdownDone
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-s.shutdownDone:
+		return nil
+	case <-timer.C:
+		return ErrShutdownIncomplete
+	}
 }
 
 // Done closes after the server has finished closing listeners and draining all
@@ -219,6 +230,7 @@ func (s *Server) shutdown(timeout time.Duration) {
 	s.sessionOps.Wait()
 	if !s.sessions.waitEmpty(ctx) {
 		s.log.Error("session shutdown timed out", "remaining", s.sessions.count())
+		s.sessions.waitEmpty(context.Background())
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/bingosuite/bingo/internal/dap"
+	"github.com/bingosuite/bingo/internal/hub"
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
@@ -679,4 +680,34 @@ func TestDurationMillisecondsIsExact(t *testing.T) {
 	g.Expect(durationMilliseconds(0)).To(Equal(int64(0)))
 	g.Expect(durationMilliseconds(time.Millisecond)).To(Equal(int64(1)))
 	g.Expect(durationMilliseconds(150 * time.Millisecond)).To(Equal(int64(150)))
+}
+
+func TestShutdownTimeoutRetainsSessionsUntilCleanupCompletes(t *testing.T) {
+	srv := New("127.0.0.1:0", nil)
+	const id = "retained-cleanup"
+	srv.sessions.mu.Lock()
+	srv.sessions.sessions[id] = &session{
+		id:        id,
+		hub:       hub.New(nil, nil),
+		createdAt: time.Now(),
+	}
+	srv.sessions.notifyLocked()
+	srv.sessions.mu.Unlock()
+
+	err := srv.Shutdown(20 * time.Millisecond)
+	if !errors.Is(err, ErrShutdownIncomplete) {
+		t.Fatalf("Shutdown() error = %v, want ErrShutdownIncomplete", err)
+	}
+	select {
+	case <-srv.Done():
+		t.Fatal("Done closed while a session still retained debugger ownership")
+	default:
+	}
+
+	srv.sessions.remove(id)
+	select {
+	case <-srv.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Done did not close after retained cleanup completed")
+	}
 }

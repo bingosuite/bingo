@@ -81,7 +81,18 @@ func (f *fakeDebugger) Attach(pid int, binaryPath string) error {
 	f.record("Attach")
 	return f.attachErr
 }
-func (f *fakeDebugger) Kill() error { f.record("Kill"); return f.killErr }
+func (f *fakeDebugger) Kill() error {
+	f.record("Kill")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.killErr
+}
+
+func (f *fakeDebugger) setKillError(err error) {
+	f.mu.Lock()
+	f.killErr = err
+	f.mu.Unlock()
+}
 func (f *fakeDebugger) Continue() error {
 	f.record("Continue")
 	if f.continueErr == nil && f.emitContinued {
@@ -920,6 +931,38 @@ var _ = Describe("Hub", func() {
 			// that signal rather than inferring death from the command kind.
 			fd.closeEvents()
 			Eventually(h.Done(), "1s", "10ms").Should(BeClosed())
+		})
+	})
+
+	Describe("retained shutdown ownership", func() {
+		It("retries an incomplete attached detach before reporting the hub done", func() {
+			fd.setKillError(fmt.Errorf("%w: injected detach failure",
+				debugger.ErrAttachedDetachIncomplete))
+			h := hub.New(fd, nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			go h.Run(ctx)
+			cancel()
+
+			Eventually(func() int {
+				return countCalls(fd.recordedCalls(), "Kill")
+			}, "1s", "10ms").Should(BeNumerically(">=", 2))
+			Consistently(h.Done(), "100ms", "10ms").ShouldNot(BeClosed(),
+				"hub completion would discard the only owner of the attached process")
+
+			fd.setKillError(nil)
+			Eventually(h.Done(), "1s", "10ms").Should(BeClosed())
+		})
+
+		It("does not retry after the engine has already lost attached ownership", func() {
+			fd.setKillError(debugger.ErrAttachedOwnershipLost)
+			h := hub.New(fd, nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			go h.Run(ctx)
+			cancel()
+
+			Eventually(h.Done(), "1s", "10ms").Should(BeClosed())
+			expectCallCount(fd, "Kill", 1,
+				"a terminal ownership loss cannot be recovered by retrying a dead engine")
 		})
 	})
 
