@@ -3,6 +3,7 @@
 package debugger
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -145,6 +146,10 @@ func (b *stopTIDRaceBackend) Wait() (StopEvent, error) {
 	}
 }
 
+func (b *stopTIDRaceBackend) wait(context.Context) (StopEvent, error) {
+	return b.Wait()
+}
+
 func seedBreakpointEntries(e *engine, count int) {
 	for i := 0; i < count; i++ {
 		id := i + 1
@@ -195,7 +200,7 @@ func testLinuxBackendRunningKillStopTIDConcurrentAccess(t *testing.T) {
 		}
 		e.setState(stateRunning)
 		seedBreakpointEntries(e, 16)
-		go e.waitLoop()
+		e.startWait()
 		return nil
 	}); err != nil {
 		t.Fatalf("prepare running engine: %v", err)

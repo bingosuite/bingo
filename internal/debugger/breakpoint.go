@@ -3,6 +3,7 @@ package debugger
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"sync/atomic"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
@@ -131,10 +132,40 @@ func (t *breakpointTable) reinstall(b Backend, entry *breakpointEntry) error {
 	return nil
 }
 
-// clearAll best-effort restores all breakpoints during Kill; ignores per-entry
-// failures so a bad write doesn't block shutdown.
-func (t *breakpointTable) clearAll(b Backend) {
+// clearAll restores every installed instruction before dropping any table
+// entry. A failed attached detach can therefore retry the complete restore
+// transaction without having to reconstruct which writes already succeeded.
+func (t *breakpointTable) clearAll(b Backend) error {
+	ids := make([]int, 0, len(t.byID))
 	for id := range t.byID {
-		_ = t.clear(b, id)
+		ids = append(ids, id)
 	}
+	sort.Ints(ids)
+
+	var restoreErr error
+	for _, id := range ids {
+		entry := t.byID[id]
+		if err := b.WriteMemory(entry.addr, entry.originalBytes); err != nil {
+			restoreErr = errors.Join(restoreErr,
+				fmt.Errorf("breakpoint clear: restore bytes at 0x%x: %w", entry.addr, err))
+		}
+	}
+	if restoreErr != nil {
+		return restoreErr
+	}
+	for _, id := range ids {
+		entry := t.byID[id]
+		entry.enabled = false
+		delete(t.byID, id)
+		delete(t.byAddr, entry.addr)
+	}
+	return nil
+}
+
+func (t *breakpointTable) discardAll() {
+	for _, entry := range t.byID {
+		entry.enabled = false
+	}
+	clear(t.byID)
+	clear(t.byAddr)
 }

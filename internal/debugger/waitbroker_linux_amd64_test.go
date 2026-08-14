@@ -3,15 +3,21 @@
 package debugger
 
 import (
+	"bytes"
 	"context"
+	"embed"
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
+
+//go:embed *linux*.go
+var linuxSources embed.FS
 
 type scriptedExactWait4 struct {
 	mu      sync.Mutex
@@ -69,10 +75,10 @@ func TestLinuxWaitBrokerRoutesExactTIDsWithoutConsumingUnrelatedChildren(t *test
 	broker := newLinuxWaitBrokerWithRunner(wait4.wait4, false)
 	first := broker.newOwner()
 	second := broker.newOwner()
-	if err := first.register(firstTID); err != nil {
+	if _, err := first.register(firstTID); err != nil {
 		t.Fatal(err)
 	}
-	if err := second.register(secondTID); err != nil {
+	if _, err := second.register(secondTID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -105,7 +111,7 @@ func TestLinuxWaitBrokerClaimsAStatusThatPredatesRegistration(t *testing.T) {
 
 	broker := newLinuxWaitBrokerWithRunner(wait4.wait4, false)
 	owner := broker.newOwner()
-	if err := owner.register(tid); err != nil {
+	if _, err := owner.register(tid); err != nil {
 		t.Fatal(err)
 	}
 	broker.scan()
@@ -125,7 +131,7 @@ func TestLinuxWaitBrokerRetiresOnlyAfterTheFinalStatus(t *testing.T) {
 	)
 	broker := newLinuxWaitBrokerWithRunner(wait4.wait4, false)
 	owner := broker.newOwner()
-	if err := owner.register(tid); err != nil {
+	if _, err := owner.register(tid); err != nil {
 		t.Fatal(err)
 	}
 
@@ -157,17 +163,17 @@ func TestLinuxWaitBrokerRejectsLiveCrossOwnerAliasingAndAllowsReuseAfterRetireme
 	broker := newLinuxWaitBrokerWithRunner(wait4.wait4, false)
 	first := broker.newOwner()
 	second := broker.newOwner()
-	if err := first.register(tid); err != nil {
+	if _, err := first.register(tid); err != nil {
 		t.Fatal(err)
 	}
-	if err := second.register(tid); err == nil {
+	if _, err := second.register(tid); err == nil {
 		t.Fatal("second owner registered a live TID already owned by the first")
 	}
 
 	wait4.add(tid, exitedWith(0))
 	broker.scan()
 	_ = nextBrokerResult(t, first)
-	if err := second.register(tid); err != nil {
+	if _, err := second.register(tid); err != nil {
 		t.Fatalf("register reused tid after retirement: %v", err)
 	}
 }
@@ -177,7 +183,7 @@ func TestLinuxWaitBrokerKeepsReapingAfterItsConsumerCloses(t *testing.T) {
 	wait4 := newScriptedExactWait4()
 	broker := newLinuxWaitBrokerWithRunner(wait4.wait4, false)
 	owner := broker.newOwner()
-	if err := owner.register(tid); err != nil {
+	if _, err := owner.register(tid); err != nil {
 		t.Fatal(err)
 	}
 	owner.close()
@@ -198,11 +204,11 @@ func TestLinuxWaitBrokerClosedOwnerCannotStealALaterInitialStop(t *testing.T) {
 	broker := newLinuxWaitBrokerWithRunner(wait4.wait4, false)
 	retiring := broker.newOwner()
 	next := broker.newOwner()
-	if err := retiring.register(retiringTID); err != nil {
+	if _, err := retiring.register(retiringTID); err != nil {
 		t.Fatal(err)
 	}
 	retiring.close()
-	if err := next.register(newTID); err != nil {
+	if _, err := next.register(newTID); err != nil {
 		t.Fatal(err)
 	}
 	wait4.add(newTID, stoppedAt(syscall.SIGTRAP, 0))
@@ -221,15 +227,86 @@ func TestLinuxWaitBrokerClosedOwnerCannotStealALaterInitialStop(t *testing.T) {
 	}
 }
 
+func TestLinuxWaitOwnerReleaseIsGenerationCheckedAndPurgesQueuedStops(t *testing.T) {
+	const tid = 11421
+	wait4 := newScriptedExactWait4()
+	broker := newLinuxWaitBrokerWithRunner(wait4.wait4, false)
+	owner := broker.newOwner()
+	firstGeneration, err := owner.register(tid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait4.add(tid, stoppedAt(syscall.SIGTRAP, 0))
+	broker.scan()
+
+	if owner.release(tid, firstGeneration+1) {
+		t.Fatal("release accepted the wrong registration generation")
+	}
+	if !owner.release(tid, firstGeneration) {
+		t.Fatal("release rejected the live registration generation")
+	}
+	if _, ok, err := owner.tryNext(); ok || !errors.Is(err, syscall.ECHILD) {
+		t.Fatalf("tryNext after release = ok:%v err:%v, want empty ECHILD", ok, err)
+	}
+
+	secondGeneration, err := owner.register(tid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondGeneration == firstGeneration {
+		t.Fatal("re-registration reused the released generation")
+	}
+}
+
+func TestLinuxWaitBrokerReportsExactGenerationRetirement(t *testing.T) {
+	const tid = 11431
+	broker := newLinuxWaitBrokerWithRunner(newScriptedExactWait4().wait4, false)
+	owner := broker.newOwner()
+	generation, err := owner.register(tid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registration := broker.registrations[tid]
+	broker.retire(tid, registration)
+
+	result := nextBrokerResult(t, owner)
+	if !result.retired || result.tid != tid || result.generation != generation {
+		t.Fatalf("retirement = %+v, want tid %d generation %d", result, tid, generation)
+	}
+}
+
+func TestLinuxProductionWait4CallsStayInsideTheBroker(t *testing.T) {
+	files, err := linuxSources.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range files {
+		name := file.Name()
+		if strings.HasSuffix(name, "_test.go") || name == "waitbroker_linux_amd64.go" {
+			continue
+		}
+		raw, err := linuxSources.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(raw, []byte("syscall.Wait4(")) ||
+			bytes.Contains(raw, []byte("unix.Wait4(")) {
+			t.Fatalf("production Linux wait syscall escaped the broker: %s", name)
+		}
+	}
+}
+
 type recordingWaitSource struct {
 	events  *[]string
 	results []linuxWaitResult
 }
 
-func (s *recordingWaitSource) register(tid int) error {
+func (s *recordingWaitSource) register(tid int) (uint64, error) {
 	*s.events = append(*s.events, fmt.Sprintf("register %d", tid))
-	return nil
+	return uint64(tid), nil
 }
+
+func (*recordingWaitSource) release(int, uint64) bool { return true }
 
 func (s *recordingWaitSource) next(context.Context) (linuxWaitResult, error) {
 	if len(s.results) == 0 {
@@ -238,6 +315,15 @@ func (s *recordingWaitSource) next(context.Context) (linuxWaitResult, error) {
 	result := s.results[0]
 	s.results = s.results[1:]
 	return result, nil
+}
+
+func (s *recordingWaitSource) tryNext() (linuxWaitResult, bool, error) {
+	if len(s.results) == 0 {
+		return linuxWaitResult{}, false, nil
+	}
+	result := s.results[0]
+	s.results = s.results[1:]
+	return result, true, nil
 }
 
 func (*recordingWaitSource) close() {}

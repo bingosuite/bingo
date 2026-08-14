@@ -318,6 +318,9 @@ const (
 	absorbPreempt
 	// absorbContinued is SIGCONT.
 	absorbContinued
+	// absorbInterrupt is PTRACE_EVENT_STOP from PTRACE_INTERRUPT or a seized
+	// tracee's internal stop notification.
+	absorbInterrupt
 	// absorbThreadExit is a non-main thread's PTRACE_EVENT_EXIT.
 	absorbThreadExit
 	// absorbUnknownEvent is a PTRACE_EVENT we never enabled.

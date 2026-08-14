@@ -2,12 +2,14 @@ package debugger
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
 	"runtime"
 	"sync"
+	"time"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
@@ -26,6 +28,8 @@ const (
 	stepOverNextFile  = "<stepover-next>"
 	stepOutReturnFile = "<stepout-return>"
 )
+
+var attachedDetachTimeout = 5 * time.Second
 
 type engineState uint8
 
@@ -63,6 +67,14 @@ type engine struct {
 	// done is closed by the loop on exit; waitLoop selects on it to abandon
 	// pending sends to stopCh.
 	done chan struct{}
+
+	// waitActive/waitCancel are loop-thread-owned. Every backend Wait starts
+	// through startWait; attached teardown cancels and joins that exact waiter
+	// before consuming the Linux wait owner's queue synchronously.
+	waitActive bool
+	waitCancel context.CancelFunc
+
+	detachPending bool
 
 	seq   uint64
 	state engineState
@@ -156,6 +168,19 @@ type threadStepper interface {
 // the session down: the tracee is intact and Kill/Restart remains the recovery.
 type stepThreadExitCompleter interface {
 	completeStepThreadExit() error
+}
+
+type contextWaiter interface {
+	wait(context.Context) (StopEvent, error)
+}
+
+type attachedProcessDetacher interface {
+	retainsAttachedOwnership() bool
+	quiesceAttached(context.Context) (bool, error)
+	attachedDetachStops() []StopEvent
+	attachedQuiesced() bool
+	attachedImageReplaced() bool
+	selectAttachedWriteTID() (int, error)
 }
 
 // stepThreadOverBP single-steps tid over a just-disarmed breakpoint at addr. On
@@ -259,12 +284,23 @@ func (e *engine) Attach(pid int, binaryPath string) error {
 func (e *engine) Kill() error {
 	select {
 	case <-e.done:
+		if _, ok := e.backend.(attachedProcessDetacher); e.proc.attached() && ok {
+			return fmt.Errorf("%w: engine stopped while attached ownership remains",
+				ErrAttachedOwnershipLost)
+		}
 		return nil
 	default:
 	}
 	return e.dispatch(func() error {
 		if e.getState() == stateExited {
+			if _, ok := e.backend.(attachedProcessDetacher); e.proc.attached() && ok {
+				return fmt.Errorf("%w: engine exited while attached ownership remains",
+					ErrAttachedOwnershipLost)
+			}
 			return nil
+		}
+		if _, ok := e.backend.(attachedProcessDetacher); e.proc.attached() && ok {
+			return e.killAttachedProcess()
 		}
 		// A running tracee has an in-flight waitLoop consuming its broker-owned
 		// status queue; a suspended one needs killProcess to drain that queue.
@@ -273,21 +309,171 @@ func (e *engine) Kill() error {
 		// Release any threads held for an in-flight atomic step-over first, so
 		// a detach (attached-process Kill) never leaves them Mach-suspended.
 		e.endThreadStep()
-		e.clearAllBreakpoints()
+		_ = e.clearAllBreakpoints()
 		killErr := e.proc.kill(e.backend, running)
-		e.setState(stateExited)
-		// Inject a synthetic StopExited so the loop sees stateExited and exits.
-		select {
-		case e.stopCh <- stopResult{evt: StopEvent{Reason: StopExited}}:
-		default:
-		}
+		e.finishKill()
 		return killErr
 	})
+}
+
+func (e *engine) killAttachedProcess() error {
+	detacher, ok := e.backend.(attachedProcessDetacher)
+	if !ok {
+		return fmt.Errorf("%w: backend cannot safely detach an attached process",
+			ErrAttachedDetachIncomplete)
+	}
+	wasRunning := e.getState() == stateRunning
+	e.detachPending = true
+
+	if result, ok := e.cancelAndJoinWait(); ok {
+		switch {
+		case result.err == nil:
+			// The backend recorded the exact stop before handing it to the
+			// waiter; quiesce adopts that state without normal stop handling.
+		case errors.Is(result.err, context.Canceled), errors.Is(result.err, ErrProcessExited):
+		default:
+			e.log.Warn("attached detach joined a waiter that had already failed",
+				"err", result.err)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), attachedDetachTimeout)
+	defer cancel()
+	gone, err := detacher.quiesceAttached(ctx)
+	if err != nil {
+		return e.holdAttachedDetachFailure(detacher, wasRunning, StopEvent{}, err)
+	}
+	e.setState(stateSuspended)
+
+	stops := detacher.attachedDetachStops()
+	halt := StopEvent{}
+	if len(stops) > 0 {
+		halt = stops[0]
+	}
+	if !gone && !detacher.attachedImageReplaced() {
+		if _, err := detacher.selectAttachedWriteTID(); err != nil {
+			return e.holdAttachedDetachFailure(detacher, wasRunning, halt, err)
+		}
+		if err := e.rewindAttachedDetachStops(stops); err != nil {
+			return e.holdAttachedDetachFailure(detacher, wasRunning, halt, err)
+		}
+		if err := e.clearAllBreakpoints(); err != nil {
+			return e.holdAttachedDetachFailure(detacher, wasRunning, halt, err)
+		}
+	} else {
+		e.bps.discardAll()
+	}
+	e.clearAttachedDetachStopState()
+
+	if err := e.proc.kill(e.backend, false); err != nil {
+		return e.holdAttachedDetachFailure(detacher, wasRunning, halt, err)
+	}
+	e.detachPending = false
+	e.finishKill()
+	return nil
+}
+
+func (e *engine) holdAttachedDetachFailure(
+	detacher attachedProcessDetacher,
+	wasRunning bool,
+	stop StopEvent,
+	cause error,
+) error {
+	if detacher.attachedQuiesced() {
+		e.setState(stateSuspended)
+	} else {
+		e.setState(stateRunning)
+	}
+	if wasRunning && detacher.attachedQuiesced() {
+		e.emitHaltedOnError(stop)
+	}
+	return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, cause)
+}
+
+func (e *engine) rewindAttachedDetachStops(stops []StopEvent) error {
+	for _, stop := range stops {
+		regs, err := e.backend.GetRegisters(stop.TID)
+		if err != nil {
+			return fmt.Errorf("read attached breakpoint registers for tid %d: %w", stop.TID, err)
+		}
+		resumePC := regs.PC
+		owned, err := e.attachedBreakpointOwned(resumePC)
+		if err != nil {
+			return err
+		}
+		if !owned {
+			resumePC = archRewindPC(regs.PC)
+			owned, err = e.attachedBreakpointOwned(resumePC)
+			if err != nil {
+				return err
+			}
+			if !owned {
+				continue
+			}
+		}
+		if regs.PC == resumePC {
+			continue
+		}
+		regs.PC = resumePC
+		if err := e.backend.SetRegisters(stop.TID, regs); err != nil {
+			return fmt.Errorf("rewind attached breakpoint on tid %d to 0x%x: %w",
+				stop.TID, resumePC, err)
+		}
+	}
+	return nil
+}
+
+func (e *engine) attachedBreakpointOwned(addr uint64) (bool, error) {
+	if e.bps.atAddr(addr) != nil || (e.steppingOverBP != nil && e.steppingOverBP.addr == addr) {
+		return true, nil
+	}
+	internal := e.retiredInternalBreakpointBytes[addr]
+	cleared := e.retiredClearedBreakpointBytes[addr]
+	if len(internal) == 0 && len(cleared) == 0 {
+		return false, nil
+	}
+	_, liveTrap, current, err := archLiveTrapResumePC(e.backend, addr)
+	if err != nil {
+		return false, fmt.Errorf("inspect retired attached breakpoint at 0x%x: %w", addr, err)
+	}
+	if liveTrap {
+		return false, nil
+	}
+	return matchesRetiredBreakpointBytes(current, internal) ||
+		matchesRetiredBreakpointBytes(current, cleared), nil
+}
+
+func (e *engine) clearAttachedDetachStopState() {
+	e.lastBP = nil
+	e.lastBPTID = 0
+	if e.steppingOverBP != nil {
+		e.steppingOverBP.enabled = false
+	}
+	e.steppingOverBP = nil
+	e.curTID = 0
+	e.bpResume = bpResumeContinue
+	e.bpRetAddr = 0
+	e.stepOverFile = ""
+	e.stepOverLine = 0
+	e.manualStopPending = false
+	e.endThreadStep()
+}
+
+func (e *engine) finishKill() {
+	e.setState(stateExited)
+	select {
+	case e.stopCh <- stopResult{evt: StopEvent{Reason: StopExited}}:
+	default:
+	}
 }
 
 func (e *engine) SetBreakpoint(file string, line int) (protocol.Breakpoint, error) {
 	var bp protocol.Breakpoint
 	err := e.dispatch(func() error {
+		if e.detachPending {
+			return fmt.Errorf("%w: retry Kill before setting breakpoints",
+				ErrAttachedDetachIncomplete)
+		}
 		if e.dw == nil {
 			return fmt.Errorf("SetBreakpoint: no DWARF info — was a binary path provided to Launch/Attach?")
 		}
@@ -314,6 +500,10 @@ func (e *engine) setBreakpoint(file string, line int, addr uint64) (*breakpointE
 
 func (e *engine) ClearBreakpoint(id int) error {
 	return e.dispatch(func() error {
+		if e.detachPending {
+			return fmt.Errorf("%w: retry Kill before clearing breakpoints",
+				ErrAttachedDetachIncomplete)
+		}
 		return e.clearBreakpoint(id)
 	})
 }
@@ -351,8 +541,10 @@ func (e *engine) invalidateClearedBreakpoint(entry *breakpointEntry) {
 	e.lastBPTID = 0
 }
 
-func (e *engine) clearAllBreakpoints() {
-	e.bps.clearAll(e.backend)
+func (e *engine) clearAllBreakpoints() error {
+	if err := e.bps.clearAll(e.backend); err != nil {
+		return err
+	}
 	if e.lastBP != nil && !e.lastBP.enabled {
 		e.invalidateClearedBreakpoint(e.lastBP)
 	}
@@ -361,6 +553,7 @@ func (e *engine) clearAllBreakpoints() {
 		// write is needed to clear the transiently table-less entry.
 		e.steppingOverBP.enabled = false
 	}
+	return nil
 }
 
 func (e *engine) Continue() error {
@@ -379,7 +572,7 @@ func (e *engine) Continue() error {
 			return err
 		}
 		e.setState(stateRunning)
-		go e.waitLoop()
+		e.startWait()
 		e.emitContinued()
 		return nil
 	})
@@ -420,7 +613,7 @@ func (e *engine) StepInto() error {
 			return err
 		}
 		e.setState(stateRunning)
-		go e.waitLoop()
+		e.startWait()
 		return nil
 	})
 }
@@ -443,6 +636,10 @@ func (e *engine) StepOut() error {
 // this returns as soon as the interrupt is armed.
 func (e *engine) Pause() error {
 	return e.dispatch(func() error {
+		if e.detachPending {
+			return fmt.Errorf("%w: retry Kill instead of pausing",
+				ErrAttachedDetachIncomplete)
+		}
 		if e.getState() != stateRunning {
 			return ErrNotRunning
 		}
@@ -618,8 +815,29 @@ func (e *engine) loop() {
 			cmd.err <- cmd.fn()
 
 		case result := <-e.stopCh:
+			e.finishWait()
 			if result.err != nil {
+				if e.proc.attached() {
+					if err := e.discardTracee(!errors.Is(result.err, ErrImageReplaced)); err != nil {
+						cause := errors.Join(result.err, err)
+						if e.getState() == stateSuspended {
+							e.haltOnError(protocol.CmdNone, cause, StopEvent{})
+						} else {
+							e.emitError(protocol.CmdNone, cause)
+						}
+						continue
+					}
+					if errors.Is(result.err, ErrProcessExited) {
+						e.emitProcessExited(0)
+					} else {
+						e.emitError(protocol.CmdNone, result.err)
+					}
+					e.drainCmds()
+					return
+				}
 				if errors.Is(result.err, ErrProcessExited) {
+					e.detachPending = false
+					e.proc.markExited()
 					e.emitProcessExited(0)
 				} else {
 					e.emitError(protocol.CmdNone, result.err)
@@ -633,7 +851,10 @@ func (e *engine) loop() {
 						// Restoring saved bytes into an image that has already
 						// been replaced would poke old instructions at old
 						// addresses into the NEW one. Nothing of ours is in it.
-						e.discardTracee(!errors.Is(result.err, ErrImageReplaced))
+						if err := e.discardTracee(!errors.Is(result.err, ErrImageReplaced)); err != nil {
+							e.emitError(protocol.CmdNone, errors.Join(result.err, err))
+							continue
+						}
 					}
 				}
 				e.drainCmds()
@@ -659,12 +880,49 @@ func (e *engine) loop() {
 	}
 }
 
-func (e *engine) waitLoop() {
+func (e *engine) startWait() {
+	if e.waitActive {
+		e.log.Error("refusing to start a second backend waiter")
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	e.waitActive = true
+	e.waitCancel = cancel
+	go e.waitLoop(ctx)
+}
+
+func (e *engine) finishWait() {
+	if e.waitCancel != nil {
+		e.waitCancel()
+	}
+	e.waitCancel = nil
+	e.waitActive = false
+}
+
+func (e *engine) cancelAndJoinWait() (stopResult, bool) {
+	if !e.waitActive {
+		return stopResult{}, false
+	}
+	if e.waitCancel != nil {
+		e.waitCancel()
+	}
+	result := <-e.stopCh
+	e.finishWait()
+	return result, true
+}
+
+func (e *engine) waitLoop(ctx context.Context) {
 	// Backends may have thread-affine wait primitives even though Linux status
 	// collection now routes through a process-global broker.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
-	evt, err := e.backend.Wait()
+	var evt StopEvent
+	var err error
+	if waiter, ok := e.backend.(contextWaiter); ok {
+		evt, err = waiter.wait(ctx)
+	} else {
+		evt, err = e.backend.Wait()
+	}
 	select {
 	case e.stopCh <- stopResult{evt: evt, err: err}:
 	case <-e.done:
@@ -689,15 +947,62 @@ func (e *engine) waitLoop() {
 // running is false because the waitLoop that produced this failure has already
 // delivered its result, so killProcess is the sole active consumer of the
 // broker-routed statuses (see #111).
-func (e *engine) discardTracee(restore bool) {
+func (e *engine) discardTracee(restore bool) error {
+	if e.proc.attached() {
+		detacher, ok := e.backend.(attachedProcessDetacher)
+		if ok {
+			e.detachPending = true
+			ctx, cancel := context.WithTimeout(context.Background(), attachedDetachTimeout)
+			defer cancel()
+			gone, err := detacher.quiesceAttached(ctx)
+			if err != nil {
+				if detacher.attachedQuiesced() {
+					e.setState(stateSuspended)
+				} else {
+					e.setState(stateRunning)
+				}
+				return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, err)
+			}
+			if restore && !gone && !detacher.attachedImageReplaced() {
+				stops := detacher.attachedDetachStops()
+				if _, err := detacher.selectAttachedWriteTID(); err != nil {
+					e.setState(stateSuspended)
+					return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, err)
+				}
+				if err := e.rewindAttachedDetachStops(stops); err != nil {
+					e.setState(stateSuspended)
+					return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, err)
+				}
+				if err := e.clearAllBreakpoints(); err != nil {
+					e.setState(stateSuspended)
+					return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, err)
+				}
+			} else {
+				e.bps.discardAll()
+			}
+			e.clearAttachedDetachStopState()
+			if err := e.proc.kill(e.backend, false); err != nil {
+				if detacher.attachedQuiesced() {
+					e.setState(stateSuspended)
+				} else {
+					e.setState(stateRunning)
+				}
+				return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, err)
+			}
+			e.detachPending = false
+			return nil
+		}
+	}
+
 	e.endThreadStep()
 	if restore {
-		e.bps.clearAll(e.backend)
+		_ = e.bps.clearAll(e.backend)
 	}
 	if err := e.proc.kill(e.backend, false); err != nil {
 		e.log.Warn("discarding the tracee after a session-invalidating stop failed",
 			"err", err)
 	}
+	return nil
 }
 
 //nolint:gocognit,gocyclo // Stop handling is a single serialized debugger state machine.
@@ -708,6 +1013,8 @@ func (e *engine) handleStop(stop StopEvent) {
 			return
 		}
 		e.setState(stateExited)
+		e.detachPending = false
+		e.proc.markExited()
 		e.emitProcessExited(stop.ExitCode)
 
 	case StopKilled:
@@ -715,6 +1022,8 @@ func (e *engine) handleStop(stop StopEvent) {
 			return
 		}
 		e.setState(stateExited)
+		e.detachPending = false
+		e.proc.markExited()
 		e.emitProcessExited(-1)
 
 	case StopBreakpoint:
@@ -838,7 +1147,7 @@ func (e *engine) handleStop(stop StopEvent) {
 					return
 				}
 				e.setState(stateRunning)
-				go e.waitLoop()
+				e.startWait()
 			case bpResumeStep:
 				e.setState(stateSuspended)
 				e.emitStepped(stop)
@@ -857,7 +1166,7 @@ func (e *engine) handleStop(stop StopEvent) {
 							e.stepOverLine = nextLine
 							if cerr := e.backend.ContinueProcess(); cerr == nil {
 								e.setState(stateRunning)
-								go e.waitLoop()
+								e.startWait()
 								return
 							} else {
 								if entry != nil {
@@ -904,7 +1213,7 @@ func (e *engine) handleStop(stop StopEvent) {
 					return
 				}
 				e.setState(stateRunning)
-				go e.waitLoop()
+				e.startWait()
 			}
 			return
 		}
@@ -947,7 +1256,7 @@ func (e *engine) handleStop(stop StopEvent) {
 			return
 		}
 		e.setState(stateRunning)
-		go e.waitLoop()
+		e.startWait()
 
 	case StopSignal:
 		// Reinstall any still-live in-flight BP before resuming or suspending.
@@ -993,7 +1302,7 @@ func (e *engine) handleStop(stop StopEvent) {
 				return
 			}
 			e.setState(stateRunning)
-			go e.waitLoop()
+			e.startWait()
 			return
 		}
 		e.emitOutput("stderr", fmt.Sprintf("signal %d", stop.Signal))
@@ -1003,7 +1312,7 @@ func (e *engine) handleStop(stop StopEvent) {
 			return
 		}
 		e.setState(stateRunning)
-		go e.waitLoop()
+		e.startWait()
 	}
 }
 
@@ -1107,7 +1416,7 @@ func (e *engine) resumeRetiredBreakpoint(stop StopEvent) bool {
 		e.retiredInternalBreakpointHits++
 	}
 	e.setState(stateRunning)
-	go e.waitLoop()
+	e.startWait()
 	return true
 }
 
@@ -1120,7 +1429,7 @@ func (e *engine) resumeUnownedBreakpoint(stop StopEvent, resumePC uint64) {
 	}
 	_ = e.backend.ContinueProcess()
 	e.setState(stateRunning)
-	go e.waitLoop()
+	e.startWait()
 }
 
 func (e *engine) populateStopPC(stop StopEvent, rewind bool) (StopEvent, error) {
@@ -1320,7 +1629,7 @@ func (e *engine) sourceStepOver() error {
 						return cerr
 					}
 					e.setState(stateRunning)
-					go e.waitLoop()
+					e.startWait()
 					return nil
 				}
 			}
@@ -1341,7 +1650,7 @@ func (e *engine) sourceStepOver() error {
 		return err
 	}
 	e.setState(stateRunning)
-	go e.waitLoop()
+	e.startWait()
 	return nil
 }
 
@@ -1382,7 +1691,7 @@ func (e *engine) stepOut() error {
 		return fmt.Errorf("StepOut: continue: %w", err)
 	}
 	e.setState(stateRunning)
-	go e.waitLoop()
+	e.startWait()
 	return nil
 }
 
@@ -1424,7 +1733,7 @@ func (e *engine) resumeFromBreakpoint(action bpResumeAction, retAddr uint64) err
 		return fmt.Errorf("resume BP: single step: %w", err)
 	}
 	e.setState(stateRunning)
-	go e.waitLoop()
+	e.startWait()
 	return nil
 }
 
@@ -1744,6 +2053,10 @@ func (e *engine) getState() engineState {
 }
 
 func (e *engine) requireSuspended() error {
+	if e.detachPending {
+		return fmt.Errorf("%w: retry Kill before resuming or inspecting",
+			ErrAttachedDetachIncomplete)
+	}
 	if e.getState() != stateSuspended {
 		return ErrNotSuspended
 	}

@@ -9,9 +9,14 @@ import (
 // process tracks the OS handle for the tracee, with platform-specific hooks
 // (startTracedProcess, attachToProcess, killProcess) defined per OS.
 type process struct {
-	pid  int
-	cmd  *exec.Cmd // non-nil for launched (not attached) processes
-	live bool
+	pid        int
+	cmd        *exec.Cmd // non-nil for launched (not attached) processes
+	live       bool
+	isAttached bool
+}
+
+type attachedBackendDetacher interface {
+	detachAttached() error
 }
 
 func (p *process) launch(b Backend, binaryPath string, args []string, env []string) error {
@@ -30,6 +35,7 @@ func (p *process) launch(b Backend, binaryPath string, args []string, env []stri
 	p.pid = pid
 	p.cmd = cmd
 	p.live = true
+	p.isAttached = false
 	return nil
 }
 
@@ -38,12 +44,31 @@ func (p *process) attach(b Backend, pid int) error {
 		return ErrAlreadyRunning
 	}
 	if err := attachToProcess(b, pid); err != nil {
+		if detacher, ok := b.(interface{ retainsAttachedOwnership() bool }); ok &&
+			detacher.retainsAttachedOwnership() {
+			p.pid = pid
+			p.cmd = nil
+			p.live = true
+			p.isAttached = true
+		}
 		return fmt.Errorf("attach: %w", err)
 	}
 	p.pid = pid
 	p.cmd = nil
 	p.live = true
+	p.isAttached = true
 	return nil
+}
+
+func (p *process) attached() bool {
+	return p.live && p.isAttached
+}
+
+func (p *process) markExited() {
+	p.pid = 0
+	p.cmd = nil
+	p.live = false
+	p.isAttached = false
 }
 
 // kill terminates the tracee. The Backend argument lets platform kill paths run
@@ -56,11 +81,25 @@ func (p *process) kill(b Backend, running bool) error {
 	}
 	if p.pid == 0 {
 		p.live = false
+		p.isAttached = false
 		return nil
 	}
-	p.live = false
-	if err := killProcess(b, p.pid, p.cmd, running); err != nil {
+	var err error
+	if p.isAttached {
+		if detacher, ok := b.(attachedBackendDetacher); ok {
+			err = detacher.detachAttached()
+		} else {
+			err = killProcess(b, p.pid, p.cmd, running)
+		}
+	} else {
+		err = killProcess(b, p.pid, p.cmd, running)
+	}
+	if err != nil {
 		return fmt.Errorf("kill: %w", err)
 	}
+	p.live = false
+	p.isAttached = false
+	p.pid = 0
+	p.cmd = nil
 	return nil
 }
