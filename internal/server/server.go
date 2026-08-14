@@ -150,7 +150,7 @@ func (s *Server) Start() error {
 		if s.lifecycleStopping() && errors.Is(err, context.Canceled) {
 			return nil
 		}
-		s.Shutdown(idleShutdownGrace)
+		_ = s.Shutdown(idleShutdownGrace)
 		return err
 	}
 
@@ -170,7 +170,7 @@ func (s *Server) Start() error {
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
-	s.Shutdown(idleShutdownGrace)
+	_ = s.Shutdown(idleShutdownGrace)
 	return err
 }
 
@@ -369,7 +369,7 @@ func (s *Server) resolveIdleDecision(state *idleMonitorState, decision idleDecis
 		return false
 	}
 	s.log.Info("managed server idle timeout elapsed", "timeout", s.idleTimeout)
-	s.Shutdown(idleShutdownGrace)
+	_ = s.Shutdown(idleShutdownGrace)
 	return true
 }
 

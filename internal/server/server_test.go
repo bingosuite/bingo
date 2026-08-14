@@ -327,7 +327,7 @@ var _ = Describe("Server", func() {
 
 			time.Sleep(50 * time.Millisecond)
 
-			s.Shutdown(time.Second)
+			_ = s.Shutdown(time.Second)
 
 			Eventually(errCh, "2s").Should(Receive(BeNil()))
 		})
