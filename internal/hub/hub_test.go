@@ -500,6 +500,161 @@ var _ = Describe("Hub", func() {
 	})
 
 	Describe("event sequence numbers", func() {
+		It("keeps existing clients on the managed-session sequence stream when another client joins", func() {
+			managedFD := newFakeDebugger()
+			managed := hub.NewSession("session", func() debugger.Debugger { return managedFD }, nil)
+			cancelManaged := runHub(managed)
+			defer cancelManaged()
+
+			conn1 := newFakeWSConn()
+			mustAddClient(managed, conn1)
+			first, ok := recvEvent(conn1)
+			Expect(ok).To(BeTrue())
+			Expect(first.Kind).To(Equal(protocol.EventSessionState))
+			Expect(first.Seq).To(Equal(uint64(1)))
+
+			conn2 := newFakeWSConn()
+			mustAddClient(managed, conn2)
+
+			existingState, ok := recvEvent(conn1)
+			Expect(ok).To(BeTrue())
+			joiningState, ok := recvEvent(conn2)
+			Expect(ok).To(BeTrue())
+			Expect(existingState.Kind).To(Equal(protocol.EventSessionState))
+			Expect(joiningState.Kind).To(Equal(protocol.EventSessionState))
+			Expect(existingState.Seq).To(Equal(first.Seq + 1))
+			Expect(joiningState.Seq).To(Equal(existingState.Seq))
+		})
+
+		It("serializes concurrent joins and broadcasts into contiguous client streams", func() {
+			managedFD := newFakeDebugger()
+			managed := hub.NewSession("session", func() debugger.Debugger { return managedFD }, nil)
+			cancelManaged := runHub(managed)
+			defer cancelManaged()
+
+			const (
+				joiners = 24
+				outputs = 64
+			)
+
+			conns := make([]*fakeWSConn, joiners+1)
+			conns[0] = newFakeWSConn()
+			mustAddClient(managed, conns[0])
+			welcome, ok := recvEvent(conns[0])
+			Expect(ok).To(BeTrue())
+			Expect(welcome.Seq).To(Equal(uint64(1)))
+
+			conns[0].inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: "stress"}))
+			running, ok := recvEvent(conns[0])
+			Expect(ok).To(BeTrue())
+			Expect(running.Kind).To(Equal(protocol.EventSessionState))
+			Expect(running.Seq).To(Equal(welcome.Seq + 1))
+
+			start := make(chan struct{})
+			addErrs := make(chan error, joiners)
+			var joins sync.WaitGroup
+			joins.Add(joiners)
+			for i := 1; i <= joiners; i++ {
+				conns[i] = newFakeWSConn()
+				go func(conn *fakeWSConn) {
+					defer joins.Done()
+					<-start
+					_, err := managed.AddClient(conn, nil)
+					addErrs <- err
+				}(conns[i])
+			}
+
+			emitted := make(chan struct{})
+			go func() {
+				<-start
+				for i := 0; i < outputs; i++ {
+					managedFD.push(protocol.MustEvent(protocol.EventOutput, uint64(i+1),
+						protocol.OutputPayload{Content: fmt.Sprintf("output-%d", i)}))
+				}
+				close(emitted)
+			}()
+
+			close(start)
+			joins.Wait()
+			for i := 0; i < joiners; i++ {
+				Expect(<-addErrs).NotTo(HaveOccurred())
+			}
+			Eventually(emitted, "2s").Should(BeClosed())
+
+			managedFD.push(protocol.MustEvent(protocol.EventOutput, 1,
+				protocol.OutputPayload{Content: "sentinel"}))
+
+			for i, conn := range conns {
+				previous := uint64(0)
+				if i == 0 {
+					previous = running.Seq
+				} else {
+					first, ok := recvEvent(conn)
+					Expect(ok).To(BeTrue(), "client %d did not receive its join state", i)
+					Expect(first.Kind).To(Equal(protocol.EventSessionState))
+					Expect(first.Seq).To(BeNumerically(">=", uint64(1)))
+					previous = first.Seq
+				}
+
+				for {
+					evt, ok := recvEvent(conn)
+					Expect(ok).To(BeTrue(), "client %d stream ended before sentinel", i)
+					Expect(evt.Seq).To(Equal(previous+1),
+						"client %d received a non-contiguous stream", i)
+					previous = evt.Seq
+
+					if evt.Kind != protocol.EventOutput {
+						continue
+					}
+					var payload protocol.OutputPayload
+					Expect(protocol.DecodeEventPayload(evt, &payload)).To(Succeed())
+					if payload.Content == "sentinel" {
+						break
+					}
+				}
+			}
+		})
+
+		It("admits a client while Run is waiting for a suspended-session resume", func() {
+			managedFD := newFakeDebugger()
+			managed := hub.NewSession("session", func() debugger.Debugger { return managedFD }, nil)
+			cancelManaged := runHub(managed)
+			defer cancelManaged()
+
+			conn1 := newFakeWSConn()
+			mustAddClient(managed, conn1)
+			_, _ = recvEvent(conn1)
+			conn1.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: "paused"}))
+			_, _ = recvEvent(conn1)
+
+			managedFD.push(protocol.MustEvent(protocol.EventBreakpointHit, 1,
+				protocol.BreakpointHitPayload{Breakpoint: protocol.Breakpoint{ID: 1}}))
+			waitForEventKind(conn1, protocol.EventBreakpointHit, nil)
+			suspended, ok := recvEvent(conn1)
+			Expect(ok).To(BeTrue())
+			Expect(suspended.Kind).To(Equal(protocol.EventSessionState))
+
+			conn2 := newFakeWSConn()
+			addResult := make(chan error, 1)
+			go func() {
+				_, err := managed.AddClient(conn2, nil)
+				addResult <- err
+			}()
+			Eventually(addResult, "500ms").Should(Receive(BeNil()))
+
+			existingState, ok := recvEvent(conn1)
+			Expect(ok).To(BeTrue())
+			joiningState, ok := recvEvent(conn2)
+			Expect(ok).To(BeTrue())
+			Expect(existingState.Seq).To(Equal(suspended.Seq + 1))
+			Expect(joiningState.Seq).To(Equal(existingState.Seq))
+
+			var payload protocol.SessionStatePayload
+			Expect(protocol.DecodeEventPayload(joiningState, &payload)).To(Succeed())
+			Expect(payload.State).To(Equal(protocol.StateSuspended))
+			Expect(payload.Clients).To(Equal(2))
+		})
+
 		It("assigns strictly increasing hub-managed seq to all outbound events", func() {
 			conn := newFakeWSConn()
 			_, err := h.AddClient(conn, nil)

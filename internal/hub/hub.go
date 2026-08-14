@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/bingosuite/bingo/internal/debugger"
@@ -87,10 +86,11 @@ type Hub struct {
 	// safety-resume path without a mutable process-wide setting.
 	suspendTimeout time.Duration
 
-	// seq is the single counter for ALL outbound events. The hub re-stamps
-	// debugger events with this counter, so clients see one monotonic stream
-	// and can detect gaps. The engine has its own seq.
-	seq atomic.Uint64
+	// outboundMu keeps admission, sequence allocation, marshal, and delivery in
+	// one order. deliver is nonblocking, so the lock is never held across socket
+	// I/O. The engine has its own seq; broadcastLocked re-stamps every event.
+	outboundMu sync.Mutex
+	seq        uint64
 
 	// shutdownOnce: Kill and registry teardown must happen exactly once,
 	// even when ctx.Done() and last-client-disconnect race.
@@ -274,17 +274,21 @@ func (h *Hub) discardDebugger(dbg debugger.Debugger, reason string) {
 // hub after its one-shot shutdown has completed.
 func (h *Hub) AddClient(conn WSConn, log *slog.Logger) (*Client, error) {
 	c := newClient(conn, h, log)
+
+	h.outboundMu.Lock()
 	if !h.registry.add(c) {
+		h.outboundMu.Unlock()
 		_ = conn.Close()
 		return nil, ErrHubClosed
 	}
+	if h.sessionID != "" {
+		h.broadcastSessionStateLocked()
+	}
+	h.outboundMu.Unlock()
+
 	go c.writePump()
 	go c.readPump()
 	h.log.Info("client connected", "total", h.registry.count())
-
-	if h.sessionID != "" {
-		h.sendStateTo(c)
-	}
 
 	return c, nil
 }
@@ -327,14 +331,13 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 		h.drainResumeCh()
 	}
 
-	evt.Seq = h.seq.Add(1)
-	h.broadcast(evt)
-
 	switch evt.Kind {
 	case protocol.EventBreakpointHit, protocol.EventPanic, protocol.EventStepped, protocol.EventPaused:
-		h.transitionState(protocol.StateSuspended)
+		h.broadcastAndTransition(evt, protocol.StateSuspended)
 	case protocol.EventProcessExited:
-		h.transitionState(protocol.StateExited)
+		h.broadcastAndTransition(evt, protocol.StateExited)
+	default:
+		h.broadcast(evt)
 	}
 
 	if !suspending {
@@ -367,12 +370,11 @@ func (h *Hub) handleEvent(ctx context.Context, evt protocol.Event) {
 				return
 			}
 			nextEvt = h.localizeBreakpointIDs(nextEvt)
-			nextEvt.Seq = h.seq.Add(1)
-			h.broadcast(nextEvt)
 			if nextEvt.Kind == protocol.EventProcessExited {
-				h.transitionState(protocol.StateExited)
+				h.broadcastAndTransition(nextEvt, protocol.StateExited)
 				return
 			}
+			h.broadcast(nextEvt)
 
 		case cmd := <-h.resumeCh:
 			h.log.Info("resuming", "command", cmd.Kind)
@@ -558,7 +560,6 @@ func (h *Hub) executeCommand(cmd protocol.Command) {
 	}
 
 	if result.event != nil {
-		result.event.Seq = h.seq.Add(1)
 		h.broadcast(*result.event)
 	}
 }
@@ -720,7 +721,7 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 		installed = append(installed, bp)
 	}
 
-	evt, err := protocol.NewEvent(protocol.EventRestarted, h.seq.Add(1), protocol.RestartedPayload{
+	evt, err := protocol.NewEvent(protocol.EventRestarted, 0, protocol.RestartedPayload{
 		Program:     program,
 		Breakpoints: installed,
 		Discarded:   discarded,
@@ -792,6 +793,12 @@ func (h *Hub) drainResumeCh() {
 // transitionState updates state and, for managed sessions, broadcasts. State
 // changes linearize before shutdown so a closed hub cannot be resurrected.
 func (h *Hub) transitionState(newState protocol.SessionState) bool {
+	h.outboundMu.Lock()
+	defer h.outboundMu.Unlock()
+	return h.transitionStateLocked(newState)
+}
+
+func (h *Hub) transitionStateLocked(newState protocol.SessionState) bool {
 	h.dbgMu.Lock()
 	if h.closing {
 		h.dbgMu.Unlock()
@@ -811,17 +818,24 @@ func (h *Hub) transitionState(newState protocol.SessionState) bool {
 	h.log.Info("state transition", "from", old, "to", newState)
 
 	if h.sessionID != "" {
-		h.broadcastSessionState()
+		h.broadcastSessionStateLocked()
 	}
 	return true
 }
 
-func (h *Hub) broadcastSessionState() {
+func (h *Hub) broadcastAndTransition(evt protocol.Event, state protocol.SessionState) {
+	h.outboundMu.Lock()
+	defer h.outboundMu.Unlock()
+	h.broadcastLocked(evt)
+	h.transitionStateLocked(state)
+}
+
+func (h *Hub) broadcastSessionStateLocked() {
 	h.stateMu.RLock()
 	state := h.state
 	h.stateMu.RUnlock()
 
-	evt, err := protocol.NewEvent(protocol.EventSessionState, h.seq.Add(1), protocol.SessionStatePayload{
+	evt, err := protocol.NewEvent(protocol.EventSessionState, 0, protocol.SessionStatePayload{
 		SessionID: h.sessionID,
 		State:     state,
 		Clients:   h.registry.count(),
@@ -830,40 +844,24 @@ func (h *Hub) broadcastSessionState() {
 		h.log.Error("failed to create session state event", "err", err)
 		return
 	}
-	h.broadcast(evt)
-}
-
-// sendStateTo delivers the current state to a single client (welcome message).
-func (h *Hub) sendStateTo(c *Client) {
-	h.stateMu.RLock()
-	state := h.state
-	h.stateMu.RUnlock()
-
-	evt, err := protocol.NewEvent(protocol.EventSessionState, h.seq.Add(1), protocol.SessionStatePayload{
-		SessionID: h.sessionID,
-		State:     state,
-		Clients:   h.registry.count(),
-	})
-	if err != nil {
-		h.log.Error("failed to create welcome state event", "err", err)
-		return
-	}
-	wire, err := protocol.MarshalEvent(evt)
-	if err != nil {
-		h.log.Error("failed to marshal welcome state event", "err", err)
-		return
-	}
-	if !c.deliver(wire) {
-		h.removeClient(c)
-	}
+	h.broadcastLocked(evt)
 }
 
 func (h *Hub) broadcast(evt protocol.Event) {
+	h.outboundMu.Lock()
+	defer h.outboundMu.Unlock()
+	h.broadcastLocked(evt)
+}
+
+func (h *Hub) broadcastLocked(evt protocol.Event) {
+	nextSeq := h.seq + 1
+	evt.Seq = nextSeq
 	wire, err := protocol.MarshalEvent(evt)
 	if err != nil {
 		h.log.Error("marshal event failed", "err", err)
 		return
 	}
+	h.seq = nextSeq
 	for _, c := range h.registry.snapshot() {
 		if !c.deliver(wire) {
 			h.removeClient(c)
@@ -872,7 +870,7 @@ func (h *Hub) broadcast(evt protocol.Event) {
 }
 
 func (h *Hub) broadcastError(kind protocol.CommandKind, err error) {
-	evt, e := protocol.NewEvent(protocol.EventError, h.seq.Add(1), protocol.ErrorPayload{
+	evt, e := protocol.NewEvent(protocol.EventError, 0, protocol.ErrorPayload{
 		Command: kind,
 		Message: err.Error(),
 	})
@@ -890,7 +888,9 @@ func (h *Hub) shutdown() {
 		h.log.Info("hub shutting down")
 		dbg := h.beginShutdown()
 		close(h.shutdownCh)
+		h.outboundMu.Lock()
 		h.registry.closeAll()
+		h.outboundMu.Unlock()
 		h.discardDebugger(dbg, "hub shutdown")
 	})
 }
