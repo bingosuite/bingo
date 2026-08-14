@@ -585,3 +585,32 @@ func TestLinuxAttachedQuiescePreservesStepCompletionIdentity(t *testing.T) {
 		t.Fatalf("step completion was exposed as breakpoint stops: %+v", stops)
 	}
 }
+
+func TestLinuxAttachedQuiesceTimeoutReportsTraceeState(t *testing.T) {
+	const tid = 25061
+	source := newAttachWaitSource()
+	generation, _ := source.register(tid)
+	b := &linuxBackend{
+		pid:    tid,
+		tracer: newTracerThread(),
+		waits:  source,
+		attachedTracees: map[int]*linuxTracee{
+			tid: {generation: generation},
+		},
+		ptraceSyscall6Fn: recordingPtraceSyscall(&[]linuxResumeCall{}, 0),
+		threadsFn:        func() ([]int, error) { return []int{tid}, nil },
+		processExistsFn:  func() bool { return true },
+		tidExistsFn:      func(int) bool { return true },
+	}
+	t.Cleanup(b.closeTracer)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+	defer cancel()
+	_, err := b.quiesceAttached(ctx)
+	if err == nil {
+		t.Fatal("quiesceAttached() unexpectedly succeeded")
+	}
+	if !strings.Contains(err.Error(), "tid=25061 stopped=false interrupt=true") {
+		t.Fatalf("timeout error lacks tracee state: %v", err)
+	}
+}
