@@ -2035,7 +2035,7 @@ func TestLinuxWaitClearsReusedTIDStateBeforeNewThreadResume(t *testing.T) {
 // resuming on an identity it cannot even establish.
 //
 // Startup is out of reach by construction and is not tested here: the launch
-// path consumes its own execve stop in startTracedProcess's private Wait4 before
+// path consumes its own execve stop through the wait broker before
 // PTRACE_O_TRACEEXEC is enabled, and the attach path installs no options at all.
 func TestLinuxWaitAlwaysFailsOnExec(t *testing.T) {
 	const (
