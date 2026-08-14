@@ -199,15 +199,11 @@ func main() {
 `
 
 // attachTargetSrc is the target for the Attach spec: a process the debugger did
-// NOT launch. It pins the main goroutine to the main OS thread. Attach on linux
-// only traces the single thread we PTRACE_ATTACH to (the main thread; the
-// PTRACE_O_TRACECLONE option that launch relies on cannot be applied
-// retroactively to the runtime's pre-existing threads), so the breakpointed
-// line must only ever execute on that thread for its SIGTRAP to reach the
-// tracer — otherwise the Go runtime takes the trap as "fatal: trace trap".
-// LockOSThread guarantees it; darwin's task-level exception port would catch
-// the fault on any thread regardless. Otherwise it mirrors basicTargetSrc: a
-// quiet hot loop calling a function on a clearly-marked line.
+// NOT launch. It pins the main goroutine to the main OS thread so the stop is
+// deterministic across platforms. Linux attach seizes every pre-existing TID
+// and enables clone tracing before resuming; Darwin's task-level exception port
+// observes every thread by construction. Otherwise it mirrors basicTargetSrc:
+// a quiet hot loop calling a function on a clearly-marked line.
 const attachTargetSrc = `package main
 
 import (
