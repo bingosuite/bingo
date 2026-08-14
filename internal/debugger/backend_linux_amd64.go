@@ -819,6 +819,11 @@ func (b *linuxBackend) wait(ctx context.Context) (StopEvent, error) {
 		}
 
 		sig := ws.StopSignal()
+		if int(uint32(ws)>>16) == unix.PTRACE_EVENT_STOP && sig != syscall.SIGTRAP {
+			event := StopEvent{Reason: StopSignal, TID: tid, Signal: int(sig)}
+			b.markAttachedStopped(tid, event, false, int(sig), true)
+			return event, nil
+		}
 
 		// PTRACE_EVENT stops are encoded as SIGTRAP | (event << 8).
 		if sig == syscall.SIGTRAP {

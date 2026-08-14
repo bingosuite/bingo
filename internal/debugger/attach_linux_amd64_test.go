@@ -520,3 +520,34 @@ func TestLinuxAttachedQuiescePreservesARealGroupStop(t *testing.T) {
 		t.Fatal("successful group-stop requeue remained pending for a retry")
 	}
 }
+
+func TestLinuxAttachedWaitPreservesARealGroupStop(t *testing.T) {
+	const tid = 25041
+	b := &linuxBackend{
+		pid:    tid,
+		tracer: newTracerThread(),
+		attachedTracees: map[int]*linuxTracee{
+			tid: {generation: 1},
+		},
+	}
+	t.Cleanup(b.closeTracer)
+	script := &scriptedWait{stops: []scriptedStop{
+		{tid: tid, status: stoppedAt(syscall.SIGTSTP, unix.PTRACE_EVENT_STOP)},
+	}}
+	script.install(b)
+
+	event, err := b.Wait()
+	if err != nil {
+		t.Fatalf("Wait() error = %v", err)
+	}
+	if event.Reason != StopSignal || event.Signal != int(syscall.SIGTSTP) {
+		t.Fatalf("Wait() event = %+v", event)
+	}
+	state := b.attachedTracees[tid]
+	if state.groupStopSignal != int(syscall.SIGTSTP) || state.signalDelivery {
+		t.Fatalf("running group-stop state = %+v", state)
+	}
+	if pending := b.pendingSignals.takeForContinue(tid); pending.current != 0 || len(pending.deferred) != 0 {
+		t.Fatalf("running group stop entered delivery-signal state: %+v", pending)
+	}
+}
