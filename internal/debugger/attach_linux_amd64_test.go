@@ -551,3 +551,37 @@ func TestLinuxAttachedWaitPreservesARealGroupStop(t *testing.T) {
 		t.Fatalf("running group stop entered delivery-signal state: %+v", pending)
 	}
 }
+
+func TestLinuxAttachedQuiescePreservesStepCompletionIdentity(t *testing.T) {
+	const tid = 25051
+	source := newAttachWaitSource(
+		linuxWaitResult{tid: tid, status: stoppedAt(syscall.SIGTRAP, 0)},
+	)
+	generation, _ := source.register(tid)
+	b := &linuxBackend{
+		pid:    tid,
+		tracer: newTracerThread(),
+		waits:  source,
+		attachedTracees: map[int]*linuxTracee{
+			tid: {generation: generation},
+		},
+		ptraceSyscall6Fn: recordingPtraceSyscall(&[]linuxResumeCall{}, 0),
+		threadsFn:        func() ([]int, error) { return []int{tid}, nil },
+		processExistsFn:  func() bool { return true },
+		tidExistsFn:      func(int) bool { return true },
+	}
+	t.Cleanup(b.closeTracer)
+	b.beginStep(tid)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := b.quiesceAttached(ctx); err != nil {
+		t.Fatalf("quiesceAttached() error = %v", err)
+	}
+	if got := b.attachedTracees[tid].stop.Reason; got != StopSingleStep {
+		t.Fatalf("quiesced step reason = %v, want StopSingleStep", got)
+	}
+	if stops := b.attachedDetachStops(); len(stops) != 0 {
+		t.Fatalf("step completion was exposed as breakpoint stops: %+v", stops)
+	}
+}
