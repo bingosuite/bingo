@@ -61,10 +61,10 @@ func classifyUserStop(trap, stepping bool, stepTID, tid int) (StopReason, stopDi
 }
 
 // stepQueue is the single-step bookkeeping plus the stops held back because of
-// it. A backend whose wait primitive reports stops for ANY thread (linux
-// Wait4(-1, …, WALL)) must not hand the engine a stop from a thread other than
-// the one it is stepping; those stops are queued here instead and released once
-// the step has completed.
+// it. A backend whose wait stream reports stops for ANY owned thread (linux)
+// must not hand the engine a stop from a thread other than the one it is
+// stepping; those stops are queued here instead and released once the step has
+// completed.
 //
 // It is deliberately platform-neutral and free of any backend dependency so the
 // ordering and gating rules are unit-testable without a tracee. It carries NO

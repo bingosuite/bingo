@@ -56,9 +56,176 @@ var _ = Describe("Linux amd64 debugger backend (ptrace) E2E", Label("linux"), fu
 	declareStepOwnerExitSpec()
 	declareStepOwnerHoldSpec()
 	declareLeaderRetirementSpec()
+	declareLinuxWaitOwnershipSpecs()
 })
 
 const signalTargetExitOK = 43
+
+const waitOwnershipExitTargetSrc = `package main
+
+import (
+	"os"
+	"strconv"
+	"time"
+)
+
+func main() {
+	_ = os.WriteFile(os.Args[1], []byte(strconv.Itoa(os.Getpid())), 0o600)
+	delay, _ := strconv.Atoi(os.Args[2])
+	code, _ := strconv.Atoi(os.Args[3])
+	time.Sleep(time.Duration(delay) * time.Millisecond)
+	os.Exit(code)
+}
+`
+
+func declareLinuxWaitOwnershipSpecs() {
+	It("kills a suspended tracee without waiting on an unrelated live child",
+		Label("kill"), func() {
+			bin := buildTarget("wait_owner_unrelated", basicTargetSrc)
+			unrelated := exec.Command(bin)
+			Expect(unrelated.Start()).To(Succeed(), "start unrelated child")
+			DeferCleanup(func() {
+				_ = unrelated.Process.Kill()
+				_ = unrelated.Wait()
+			})
+
+			before := directChildPIDs()
+			d := debugger.New(nil)
+			DeferCleanup(func() {
+				done := make(chan struct{})
+				go func() {
+					_ = d.Kill()
+					close(done)
+				}()
+				select {
+				case <-done:
+				case <-time.After(5 * time.Second):
+				}
+			})
+			Expect(d.Launch(bin, nil, nil)).To(Succeed(), "launch suspended tracee")
+			awaitEvent(d.Events(), 15*time.Second, protocol.EventStepped)
+
+			added := addedPIDs(before, directChildPIDs())
+			Expect(added).To(HaveLen(1), "identify the debugger-owned child")
+			traceePID := added[0]
+
+			killDone := make(chan error, 1)
+			go func() { killDone <- d.Kill() }()
+			select {
+			case err := <-killDone:
+				Expect(err).NotTo(HaveOccurred(), "kill suspended tracee")
+			case <-time.After(15 * time.Second):
+				Fail("Kill waited on an unrelated live child")
+			}
+
+			Eventually(func() bool { return !processExists(traceePID) }, 10*time.Second, 20*time.Millisecond).
+				Should(BeTrue(), "the debugger-owned tracee must be reaped")
+			Expect(syscall.Kill(unrelated.Process.Pid, 0)).To(Succeed(),
+				"killing one debugger session must not consume or terminate an unrelated child")
+		})
+
+	It("routes concurrent initial stops and natural exits to their owning sessions",
+		Label("exit"), func() {
+			bin := buildTarget("wait_owner_exit", waitOwnershipExitTargetSrc)
+			dir := GinkgoT().TempDir()
+
+			const sessions = 4
+			type liveSession struct {
+				debugger debugger.Debugger
+				pid      int
+				exitCode int
+			}
+			live := make([]liveSession, 0, sessions)
+			DeferCleanup(func() {
+				for _, session := range live {
+					_ = session.debugger.Kill()
+				}
+			})
+
+			for i := 0; i < sessions; i++ {
+				pidFile := filepath.Join(dir, fmt.Sprintf("session-%d.pid", i))
+				exitCode := 50 + i
+				d := debugger.New(nil)
+				args := []string{pidFile, strconv.Itoa(1500 + i*250), strconv.Itoa(exitCode)}
+				Expect(d.Launch(bin, args, nil)).To(Succeed(),
+					"session %d initial stop must not be stolen by an earlier running session", i)
+				awaitEvent(d.Events(), 15*time.Second, protocol.EventStepped)
+				Expect(d.Continue()).To(Succeed(), "continue session %d", i)
+				Eventually(func() bool { return pathExists(pidFile) }, 5*time.Second, 20*time.Millisecond).
+					Should(BeTrue(), "session %d target must publish its PID", i)
+				raw, err := os.ReadFile(pidFile)
+				Expect(err).NotTo(HaveOccurred(), "read session %d PID", i)
+				pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+				Expect(err).NotTo(HaveOccurred(), "parse session %d PID", i)
+				live = append(live, liveSession{debugger: d, pid: pid, exitCode: exitCode})
+			}
+
+			for i, session := range live {
+				evt := awaitEvent(session.debugger.Events(), 20*time.Second,
+					protocol.EventProcessExited, protocol.EventError)
+				Expect(evt.Kind).To(Equal(protocol.EventProcessExited),
+					"session %d must receive its own natural exit, got %s: %s", i, evt.Kind, evt.Payload)
+				var payload protocol.ProcessExitedPayload
+				Expect(json.Unmarshal(evt.Payload, &payload)).To(Succeed(), "decode session %d exit", i)
+				Expect(payload.ExitCode).To(Equal(session.exitCode),
+					"session %d received another tracee's status", i)
+				Eventually(func() bool { return !processExists(session.pid) }, 10*time.Second, 20*time.Millisecond).
+					Should(BeTrue(), "session %d natural exit must be reaped", i)
+			}
+		})
+}
+
+func directChildPIDs() []int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	var children []int
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join("/proc", entry.Name(), "status"))
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(raw), "\n") {
+			if !strings.HasPrefix(line, "PPid:") {
+				continue
+			}
+			ppid, _ := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "PPid:")))
+			if ppid == os.Getpid() {
+				children = append(children, pid)
+			}
+			break
+		}
+	}
+	return children
+}
+
+func addedPIDs(before, after []int) []int {
+	known := make(map[int]struct{}, len(before))
+	for _, pid := range before {
+		known[pid] = struct{}{}
+	}
+	var added []int
+	for _, pid := range after {
+		if _, ok := known[pid]; !ok {
+			added = append(added, pid)
+		}
+	}
+	return added
+}
+
+func processExists(pid int) bool {
+	return pathExists(filepath.Join("/proc", strconv.Itoa(pid)))
+}
+
+func pathExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
 
 const segvSignalTargetSrc = `package main
 
@@ -1427,13 +1594,11 @@ func declareStepOverlapPauseSpec() {
 //     trap and re-adds it to the table under the same id (the documented
 //     clear-while-parked behaviour). A spinner hits it and the pause loses to a
 //     BreakpointHit.
-//  2. Launch a second tracee while the first is still alive. The linux backend
-//     waits with Wait4(-1, …, WALL), which is scoped to the whole *process*,
-//     not to one tracee: two live debuggers in this test binary steal each
-//     other's stops. Observed as PTRACE_GETREGS ESRCH for a foreign tid and
-//     BOTH harnesses wedging in Kill. That is a pre-existing property of the
-//     backend, not of the park queue, and it is why every spec here owns
-//     exactly one tracee for its whole lifetime.
+//  2. Launch a second tracee while the first is still alive. Before the
+//     process-global exact-TID wait broker, per-session Wait4(-1, …, WALL)
+//     callers stole each other's stops. Dedicated wait-ownership specs now
+//     exercise concurrent sessions; this focused control still uses one tracee
+//     so only Pause delivery can stop it.
 //
 // As its own It, Ginkgo has already run the previous spec's DeferCleanup Kill,
 // so this tracee is alone. It never sets a breakpoint, so the SIGSTOP that

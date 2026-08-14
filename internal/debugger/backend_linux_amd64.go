@@ -3,6 +3,7 @@
 package debugger
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -11,12 +12,16 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
 
 func newBackend() Backend {
-	return &linuxBackend{tracer: newTracerThread()}
+	return &linuxBackend{
+		tracer: newTracerThread(),
+		waits:  processLinuxWaitBroker.newOwner(),
+	}
 }
 
 // tracerThread pins a single OS thread and runs every ptrace(2) control op on
@@ -100,6 +105,7 @@ type linuxBackend struct {
 
 	pid    int
 	tracer *tracerThread
+	waits  linuxWaitSource
 
 	// Wait writes this from a waitLoop while running engine commands may read it
 	// for TID-less memory operations. Atomicity defines that snapshot; it does
@@ -163,13 +169,22 @@ func (b *linuxBackend) eventMsg(tid int) (uint, error) {
 	return msg, err
 }
 
-// waitAny blocks for the next stop from any thread of the tracee. WALL includes
-// clone()d threads.
+// waitAny receives the next status owned by this debugger. Production statuses
+// come from the process-global exact-TID broker; tests can still script the
+// serialized Wait state machine directly.
 func (b *linuxBackend) waitAny(ws *syscall.WaitStatus) (int, error) {
 	if b.waitFn != nil {
 		return b.waitFn(ws)
 	}
-	return syscall.Wait4(-1, ws, syscall.WALL, nil)
+	if b.waits == nil {
+		return 0, syscall.ECHILD
+	}
+	result, err := b.waits.next(context.Background())
+	if err != nil {
+		return 0, err
+	}
+	*ws = result.status
+	return result.tid, nil
 }
 
 // drainParked returns the next held stop if one may be surfaced now, installing
@@ -276,6 +291,9 @@ func (b *linuxBackend) leaderExitPendingForTest() bool { return b.leaderExitStas
 func (b *linuxBackend) closeTracer() {
 	b.pendingSignals.purge()
 	b.tracer.close()
+	if b.waits != nil {
+		b.waits.close()
+	}
 }
 
 const linuxPtraceOptions = syscall.PTRACE_O_TRACEEXIT |
@@ -284,14 +302,15 @@ const linuxPtraceOptions = syscall.PTRACE_O_TRACEEXIT |
 
 // startTracedProcess forks under ptrace. The child is stopped at its first
 // instruction (execve SIGTRAP) ready for the engine to set breakpoints. The
-// fork+exec, the reap of the initial execve stop and PTRACE_SETOPTIONS all run
-// on the backend's dedicated tracer thread: the forking thread becomes the
-// tracee's tracer, so every later ptrace op must originate from that same
-// thread.
-func startTracedProcess(b Backend, binaryPath string, args []string, env []string) (int, *exec.Cmd, error) {
-	tracer, ok := b.(tracerExecer)
-	if !ok {
-		return 0, nil, fmt.Errorf("startTracedProcess: backend does not support a tracer thread")
+// fork+exec and PTRACE_SETOPTIONS run on the backend's dedicated tracer thread:
+// the forking thread becomes the tracee's tracer, so every later ptrace op must
+// originate from that same thread. The initial status is consumed outside the
+// tracer closure through the process-global wait broker; blocking the tracer
+// thread on a wait would prevent every later control operation.
+func startTracedProcess(b Backend, binaryPath string, args []string, env []string) (retPID int, retCmd *exec.Cmd, retErr error) {
+	lb, ok := b.(*linuxBackend)
+	if !ok || lb.tracer == nil || lb.waits == nil {
+		return 0, nil, fmt.Errorf("startTracedProcess: backend does not support Linux wait ownership")
 	}
 
 	// codeql-suppress[go/command-injection]: The debugger intentionally launches the local binary selected by the operator.
@@ -305,54 +324,101 @@ func startTracedProcess(b Backend, binaryPath string, args []string, env []strin
 	}
 
 	var startErr error
-	tracer.execPtrace(func() {
+	lb.execPtrace(func() {
 		if err := cmd.Start(); err != nil {
 			startErr = fmt.Errorf("exec %q: %w", binaryPath, err)
-			return
-		}
-		pid := cmd.Process.Pid
-		var ws syscall.WaitStatus
-		if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
-			_ = cmd.Process.Kill()
-			startErr = fmt.Errorf("wait for execve stop: %w", err)
-			return
-		}
-		if !ws.Stopped() || ws.StopSignal() != syscall.SIGTRAP {
-			_ = cmd.Process.Kill()
-			startErr = fmt.Errorf("unexpected initial stop: %v", ws)
-			return
-		}
-		if err := syscall.PtraceSetOptions(pid, linuxPtraceOptions); err != nil {
-			_ = cmd.Process.Kill()
-			startErr = fmt.Errorf("PTRACE_SETOPTIONS: %w", err)
-			return
 		}
 	})
 	if startErr != nil {
 		return 0, nil, startErr
 	}
 
-	return cmd.Process.Pid, cmd, nil
+	pid := cmd.Process.Pid
+	lb.setPID(pid)
+	if err := lb.waits.register(pid); err != nil {
+		_ = cmd.Process.Kill()
+		return 0, nil, fmt.Errorf("register initial tid %d: %w", pid, err)
+	}
+	defer func() {
+		if retErr == nil {
+			return
+		}
+		killErr := cmd.Process.Kill()
+		if errors.Is(killErr, os.ErrProcessDone) || isNoSuchProcess(killErr) {
+			killErr = nil
+		}
+		reapErr := lb.reapAfterKill()
+		lb.setPID(0)
+		if cleanupErr := errors.Join(killErr, reapErr); cleanupErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("discard failed launch: %w", cleanupErr))
+		}
+	}()
+
+	var ws syscall.WaitStatus
+	if _, err := lb.waitAny(&ws); err != nil {
+		return 0, nil, fmt.Errorf("wait for execve stop: %w", err)
+	}
+	if !ws.Stopped() || ws.StopSignal() != syscall.SIGTRAP {
+		return 0, nil, fmt.Errorf("unexpected initial stop: %v", ws)
+	}
+
+	lb.execPtrace(func() {
+		if err := syscall.PtraceSetOptions(pid, linuxPtraceOptions); err != nil {
+			startErr = fmt.Errorf("PTRACE_SETOPTIONS: %w", err)
+		}
+	})
+	if startErr != nil {
+		return 0, nil, startErr
+	}
+	return pid, cmd, nil
 }
 
-func attachToProcess(b Backend, pid int) error {
-	tracer, ok := b.(tracerExecer)
-	if !ok {
-		return fmt.Errorf("attachToProcess: backend does not support a tracer thread")
+func attachToProcess(b Backend, pid int) (retErr error) {
+	lb, ok := b.(*linuxBackend)
+	if !ok || lb.tracer == nil || lb.waits == nil {
+		return fmt.Errorf("attachToProcess: backend does not support Linux wait ownership")
 	}
 	var attachErr error
-	tracer.execPtrace(func() {
+	attached := false
+	lb.execPtrace(func() {
 		if err := syscall.PtraceAttach(pid); err != nil {
 			attachErr = fmt.Errorf("PTRACE_ATTACH pid %d: %w", pid, err)
 			return
 		}
-		var ws syscall.WaitStatus
-		if _, err := syscall.Wait4(pid, &ws, 0, nil); err != nil {
-			attachErr = fmt.Errorf("wait after PTRACE_ATTACH: %w", err)
-			return
-		}
+		attached = true
 	})
-	return attachErr
+	if attachErr != nil {
+		return attachErr
+	}
+	success := false
+	defer func() {
+		if attached && !success {
+			var detachErr error
+			lb.execPtrace(func() {
+				if err := syscall.PtraceDetach(pid); err != nil && !isNoSuchProcess(err) {
+					detachErr = err
+				}
+			})
+			if detachErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("discard failed attach: %w", detachErr))
+			}
+			lb.setPID(0)
+		}
+	}()
+
+	lb.setPID(pid)
+	if err := lb.waits.register(pid); err != nil {
+		return fmt.Errorf("register attached tid %d: %w", pid, err)
+	}
+	var ws syscall.WaitStatus
+	if _, err := lb.waitAny(&ws); err != nil {
+		return fmt.Errorf("wait after PTRACE_ATTACH: %w", err)
+	}
+	if !ws.Stopped() {
+		return fmt.Errorf("unexpected attach status: %v", ws)
+	}
+	success = true
+	return nil
 }
 
 // killProcess terminates a launched tracee (SIGKILL) or detaches from an
@@ -366,27 +432,33 @@ func killProcess(b Backend, pid int, cmd *exec.Cmd, running bool) error {
 		lb.pendingSignals.purge()
 	}
 	if cmd != nil {
+		var cleanupErr error
+		if lb, ok := b.(*linuxBackend); ok {
+			if err := lb.registerThreadGroup(); err != nil && !isNoSuchProcess(err) {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("register thread group before kill: %w", err))
+			}
+		}
 		// SIGKILL via the OS handle is not a ptrace op, so it is safe from any
 		// thread and keeps Kill responsive even if the tracer thread is busy.
 		if err := cmd.Process.Kill(); err != nil && !isAlreadyExited(err) {
-			return err
+			return errors.Join(cleanupErr, err)
 		}
-		// Reaping the zombie belongs to the waitLoop whenever one is in flight
-		// (a running tracee). It is blocked in Wait4(-1, WALL) and will absorb
-		// every thread's SIGKILL death and surface StopKilled. A second reaper
-		// here would both (a) race that waitLoop for the same stops and (b) —
-		// since a Go tracee is always multi-threaded — never make progress:
-		// Wait4(pid) targets only the thread-group leader, whose zombie is not
-		// reapable until all siblings are, and killProcess cannot reach the
-		// siblings. Either way Kill wedges (the deadlock reported in #111). So
-		// only reap here when there is NO waitLoop — the tracee was suspended at
-		// a stop, making killProcess the sole reaper.
-		if !running {
-			if lb, ok := b.(*linuxBackend); ok {
-				lb.reapAfterKill()
+		if lb, ok := b.(*linuxBackend); ok {
+			if err := lb.registerThreadGroup(); err != nil && !isNoSuchProcess(err) {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("register thread group after kill: %w", err))
 			}
 		}
-		return nil
+		// A running tracee already has an engine waitLoop consuming this
+		// owner's routed queue. A suspended tracee does not, so Kill drains the
+		// same queue itself until the broker retires every exact TID.
+		if !running {
+			if lb, ok := b.(*linuxBackend); ok {
+				if err := lb.reapAfterKill(); err != nil {
+					cleanupErr = errors.Join(cleanupErr, err)
+				}
+			}
+		}
+		return cleanupErr
 	}
 	// Attached (not launched): detach, don't kill — we don't own the process.
 	// PTRACE_DETACH must run on the tracer thread.
@@ -398,37 +470,71 @@ func killProcess(b Backend, pid int, cmd *exec.Cmd, running bool) error {
 	return nil
 }
 
-// reapAfterKill drains a SIGKILL'd tracee that has no waitLoop to reap it (it
-// was suspended at a ptrace stop when killed). It waits on Wait4(-1) — any
-// thread — never Wait4(pid): a Go tracee is always multi-threaded and the
-// thread-group leader's zombie stays unreapable until every sibling thread is
-// reaped, so waiting on the leader's pid alone blocks forever. A thread frozen
-// at a ptrace stop (e.g. the breakpoint we were suspended at) will not proceed
-// to death until resumed, so continue any stopped thread before waiting again;
-// the process-wide SIGKILL then kills it. Returns once ECHILD reports the whole
-// thread group gone.
-//
-// It must never run concurrently with the engine's waitLoop: two Wait4(-1)
-// callers would steal each other's stops. killProcess guarantees that by only
-// invoking it when the tracee was not running (no waitLoop in flight).
-func (b *linuxBackend) reapAfterKill() {
+// reapAfterKill drains a SIGKILL'd tracee that has no engine waitLoop. Raw wait
+// ownership remains with the broker; this consumer only resumes owned stopped
+// TIDs until the broker has retired the exact registered set.
+func (b *linuxBackend) reapAfterKill() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	for {
-		var ws syscall.WaitStatus
-		wpid, err := syscall.Wait4(-1, &ws, syscall.WALL, nil)
+		if b.waits == nil {
+			return nil
+		}
+		result, err := b.waits.next(ctx)
 		switch {
 		case err == nil:
-			if ws.Stopped() {
-				_ = b.continueWithoutPendingSignals(wpid)
+			if result.status.Stopped() {
+				if result.status.StopSignal() == syscall.SIGTRAP &&
+					result.status.TrapCause() == syscall.PTRACE_EVENT_CLONE {
+					if err := b.registerClone(result.tid); err != nil {
+						return err
+					}
+				}
+				if err := b.continueWithoutPendingSignals(result.tid); err != nil {
+					return fmt.Errorf("resume killed tid %d: %w", result.tid, err)
+				}
 			}
-			// Exited/Signaled: that thread is reaped; loop for the rest.
 		case isNoChildProcess(err):
-			return // whole thread group reaped
-		case errors.Is(err, syscall.EINTR):
-			// interrupted by a signal; retry
+			return nil
+		case errors.Is(err, context.DeadlineExceeded):
+			return fmt.Errorf("timed out reaping killed process %d", b.pid)
 		default:
-			return // unexpected wait4 error: nothing left to reap
+			return fmt.Errorf("reap killed process %d: %w", b.pid, err)
 		}
 	}
+}
+
+func (b *linuxBackend) registerClone(parentTID int) error {
+	if b.waits == nil {
+		return nil
+	}
+	childTID, err := b.eventMsg(parentTID)
+	if err != nil {
+		return fmt.Errorf("%w: read cloned tid from parent %d: %v",
+			ErrSessionInvalidated, parentTID, err)
+	}
+	if err := b.waits.register(int(childTID)); err != nil {
+		return fmt.Errorf("%w: register cloned tid %d from parent %d: %v",
+			ErrSessionInvalidated, childTID, parentTID, err)
+	}
+	return nil
+}
+
+func (b *linuxBackend) registerThreadGroup() error {
+	if b.waits == nil || b.pid == 0 {
+		return nil
+	}
+	tids, err := b.Threads()
+	if err != nil {
+		return err
+	}
+	for _, tid := range tids {
+		if err := b.waits.register(tid); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func isAlreadyExited(err error) bool {
@@ -636,11 +742,10 @@ func (b *linuxBackend) Threads() ([]int, error) {
 // consumes it on resume; keeping it per TID prevents another stop from stealing
 // or clearing the signal.
 //
-// wait4 runs on the calling (waitLoop) thread, NOT the tracer thread: waiting
-// for a tracee is legal from any thread of the tracer process, and keeping it
-// off the tracer thread lets the engine issue control ops concurrently. Every
-// ptrace CONTROL op below, however, is funnelled through b.execPtrace so it
-// executes on the one thread the kernel accepts ptrace requests from.
+// The process-global broker collects wait statuses without occupying the tracer
+// thread, so the engine can issue control ops concurrently. Every ptrace CONTROL
+// op below is funnelled through b.execPtrace and executes on the one thread the
+// kernel accepts ptrace requests from.
 //
 //nolint:gocognit,gocyclo // The wait loop is one serialized ptrace state machine.
 func (b *linuxBackend) Wait() (StopEvent, error) {
@@ -708,6 +813,10 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 			switch cause {
 			case syscall.PTRACE_EVENT_CLONE:
+				if err := b.registerClone(tid); err != nil {
+					b.abortStep()
+					return StopEvent{}, err
+				}
 				if err := b.absorbStop(absorbClone, tid, 0); err != nil {
 					return StopEvent{}, fmt.Errorf("resume clone parent tid %d: %w", tid, err)
 				}
@@ -743,6 +852,12 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				// or ECHILD) and retracted if an exec proves retirement.
 				msg, msgErr := b.eventMsg(tid)
 				b.noteLeaderExit(msg, msgErr == nil)
+				if err := b.registerThreadGroup(); err != nil && !isNoSuchProcess(err) {
+					b.abortStep()
+					return StopEvent{}, fmt.Errorf(
+						"%w: register threads while retiring leader tid %d: %v",
+						ErrSessionInvalidated, tid, err)
+				}
 				// Route the resume through the ordinary dying-thread absorb.
 				// The leader can be the thread under a single step, and a bare
 				// continue there consumes that step while stepping/stepTID stay
@@ -776,8 +891,8 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 				// The exec stop is deliberately NOT resumed here — the engine's
 				// discard reaps or detaches it, along with anything parked. Nor
 				// is startup affected: the launch path consumes its own execve
-				// stop in startTracedProcess's private Wait4 BEFORE enabling
-				// PTRACE_O_TRACEEXEC, and Restart runs on a brand-new debugger.
+				// stop through the broker BEFORE enabling PTRACE_O_TRACEEXEC,
+				// and Restart runs on a brand-new debugger.
 				formerTID, _ := b.eventMsg(tid)
 				retracted := b.retractLeaderExit()
 				b.pendingSignals.purge()

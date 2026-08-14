@@ -114,7 +114,7 @@ func startSteppingSIGURGTracee(t *testing.T, binary string) *steppingSIGURGTrace
 func (p *steppingSIGURGTracee) cleanup() {
 	if !p.finished {
 		_ = p.cmd.Process.Kill()
-		p.backend.reapAfterKill()
+		_ = p.backend.reapAfterKill()
 	}
 	p.backend.closeTracer()
 }

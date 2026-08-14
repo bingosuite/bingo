@@ -266,25 +266,22 @@ func (e *engine) Kill() error {
 		if e.getState() == stateExited {
 			return nil
 		}
-		// A running tracee has an in-flight waitLoop blocked in Wait4(-1); on
-		// linux that waitLoop — not killProcess — must reap the SIGKILL death,
-		// since two concurrent wait4 callers race and wedge Kill (#111). Capture
-		// whether we're running before endThreadStep/clearAll touch anything.
+		// A running tracee has an in-flight waitLoop consuming its broker-owned
+		// status queue; a suspended one needs killProcess to drain that queue.
+		// Capture the state before endThreadStep/clearAll touch anything.
 		running := e.getState() == stateRunning
 		// Release any threads held for an in-flight atomic step-over first, so
 		// a detach (attached-process Kill) never leaves them Mach-suspended.
 		e.endThreadStep()
 		e.clearAllBreakpoints()
-		if killErr := e.proc.kill(e.backend, running); killErr != nil {
-			return killErr
-		}
+		killErr := e.proc.kill(e.backend, running)
 		e.setState(stateExited)
 		// Inject a synthetic StopExited so the loop sees stateExited and exits.
 		select {
 		case e.stopCh <- stopResult{evt: StopEvent{Reason: StopExited}}:
 		default:
 		}
-		return nil
+		return killErr
 	})
 }
 
@@ -663,8 +660,8 @@ func (e *engine) loop() {
 }
 
 func (e *engine) waitLoop() {
-	// Lock to an OS thread: wait4 has per-thread semantics on some platforms
-	// and we don't want a thread carrying unrelated ptrace state.
+	// Backends may have thread-affine wait primitives even though Linux status
+	// collection now routes through a process-global broker.
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	evt, err := e.backend.Wait()
@@ -690,7 +687,8 @@ func (e *engine) waitLoop() {
 // kernel releases its remaining threads when the tracer thread closes.
 //
 // running is false because the waitLoop that produced this failure has already
-// delivered its result, so killProcess is the sole reaper (see #111).
+// delivered its result, so killProcess is the sole active consumer of the
+// broker-routed statuses (see #111).
 func (e *engine) discardTracee(restore bool) {
 	e.endThreadStep()
 	if restore {
