@@ -473,3 +473,50 @@ func TestLinuxAttachedEventStopNeverBecomesInjectableSIGTRAP(t *testing.T) {
 		t.Fatalf("pending batch = %+v, want only SIGUSR1", batch)
 	}
 }
+
+func TestLinuxAttachedQuiescePreservesARealGroupStop(t *testing.T) {
+	const (
+		pid = 25031
+		tid = 25032
+	)
+	var ptraceCalls []linuxResumeCall
+	var tgkillCalls []linuxTgkillCall
+	b := &linuxBackend{
+		pid:    pid,
+		tracer: newTracerThread(),
+		attachedTracees: map[int]*linuxTracee{
+			tid: {generation: 1},
+		},
+		ptraceSyscall6Fn: recordingPtraceSyscall(&ptraceCalls, 0),
+		tgkillFn:         recordingTgkill(&tgkillCalls),
+	}
+	t.Cleanup(b.closeTracer)
+
+	result := linuxWaitResult{
+		tid:    tid,
+		status: stoppedAt(syscall.SIGSTOP, unix.PTRACE_EVENT_STOP),
+	}
+	if err := b.recordAttachedQuiesceResult(result); err != nil {
+		t.Fatalf("recordAttachedQuiesceResult() error = %v", err)
+	}
+	state := b.attachedTracees[tid]
+	if state.groupStopSignal != int(syscall.SIGSTOP) || state.signalDelivery {
+		t.Fatalf("group-stop state = %+v", state)
+	}
+	if pending := b.pendingSignals.takeForContinue(tid); pending.current != 0 || len(pending.deferred) != 0 {
+		t.Fatalf("group stop entered delivery-signal state: %+v", pending)
+	}
+
+	if err := b.detachAttachedTID(tid, state); err != nil {
+		t.Fatalf("detachAttachedTID() error = %v", err)
+	}
+	if len(tgkillCalls) != 1 || tgkillCalls[0].signal != int(syscall.SIGSTOP) {
+		t.Fatalf("group-stop requeues = %+v", tgkillCalls)
+	}
+	if len(ptraceCalls) != 1 || int(ptraceCalls[0].signal) != 0 {
+		t.Fatalf("group-stop detach calls = %+v, want signal-zero detach", ptraceCalls)
+	}
+	if state.groupStopSignal != 0 {
+		t.Fatal("successful group-stop requeue remained pending for a retry")
+	}
+}
