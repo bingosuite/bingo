@@ -416,13 +416,22 @@ func (h *Handler) onVariables(req *godap.VariablesRequest) {
 	ref := req.Arguments.VariablesReference
 
 	h.mu.Lock()
+	suspended := h.suspended
 	// A child ref addresses an already-computed subtree (cached eagerly from a
 	// typed EventLocals/EventEvaluate). Serve it synchronously — no round-trip.
-	if children, ok := h.varCache[ref]; ok {
+	if children, ok := h.varCache[ref]; ok && suspended {
 		h.mu.Unlock()
 		h.send(&godap.VariablesResponse{
 			Response: h.response(req.Seq, "variables"),
 			Body:     godap.VariablesResponseBody{Variables: children},
+		})
+		return
+	}
+	if ref >= varRefBase {
+		h.mu.Unlock()
+		h.send(&godap.VariablesResponse{
+			Response: h.response(req.Seq, "variables"),
+			Body:     godap.VariablesResponseBody{Variables: []godap.Variable{}},
 		})
 		return
 	}
@@ -432,7 +441,6 @@ func (h *Handler) onVariables(req *godap.VariablesRequest) {
 	if frameIndex < 0 {
 		frameIndex = 0
 	}
-	suspended := h.suspended
 	if suspended {
 		h.localsQ = append(h.localsQ, &varsReq{seq: req.Seq, frameIndex: frameIndex})
 	}
