@@ -1254,6 +1254,143 @@ func TestVariablesExpandsNestedStruct(t *testing.T) {
 	}
 }
 
+func cachedChildRef(t *testing.T, hh *harness) int {
+	t.Helper()
+	suspendAtBreakpoint(t, hh)
+	return cacheChildRef(t, hh, "X")
+}
+
+func cacheChildRef(t *testing.T, hh *harness, childName string) int {
+	t.Helper()
+	locals := hh.cmds.count(protocol.CmdLocals)
+	hh.sendReq("variables", &godap.VariablesRequest{Arguments: godap.VariablesArguments{VariablesReference: 1}})
+	hh.cmds.waitForCommands(t, protocol.CmdLocals, locals+1)
+	hh.inject(protocol.EventLocals, protocol.LocalsPayload{Variables: []protocol.Variable{{
+		Name: "p", Value: "main.Point", Type: "main.Point", Kind: "struct",
+		Children: []protocol.Variable{{Name: childName, Value: "1", Type: "int"}},
+	}}})
+	resp := recvType[*godap.VariablesResponse](hh)
+	if len(resp.Body.Variables) != 1 || resp.Body.Variables[0].VariablesReference == 0 {
+		t.Fatalf("variables = %+v, want one expandable child", resp.Body.Variables)
+	}
+	return resp.Body.Variables[0].VariablesReference
+}
+
+func requireStaleChildRefEmpty(t *testing.T, hh *harness, ref int) {
+	t.Helper()
+	locals := hh.cmds.count(protocol.CmdLocals)
+	hh.sendReq("variables", &godap.VariablesRequest{Arguments: godap.VariablesArguments{VariablesReference: ref}})
+	resp := recvType[*godap.VariablesResponse](hh)
+	if len(resp.Body.Variables) != 0 {
+		t.Fatalf("stale child ref expanded to %+v, want empty", resp.Body.Variables)
+	}
+	hh.cmds.requireNoAdditionalCommands(t, protocol.CmdLocals, locals)
+}
+
+func requireChildRefExpands(t *testing.T, hh *harness, ref int, childName string) {
+	t.Helper()
+	locals := hh.cmds.count(protocol.CmdLocals)
+	hh.sendReq("variables", &godap.VariablesRequest{Arguments: godap.VariablesArguments{VariablesReference: ref}})
+	resp := recvType[*godap.VariablesResponse](hh)
+	if len(resp.Body.Variables) != 1 || resp.Body.Variables[0].Name != childName {
+		t.Fatalf("child ref expanded to %+v, want %q", resp.Body.Variables, childName)
+	}
+	hh.cmds.requireNoAdditionalCommands(t, protocol.CmdLocals, locals)
+}
+
+func TestChildVariableRefIsStaleAfterOwnContinue(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	ref := cachedChildRef(t, hh)
+
+	driveContinue(t, hh)
+
+	requireStaleChildRefEmpty(t, hh, ref)
+}
+
+func TestChildVariableRefIsStaleAfterOutOfBandContinue(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	ref := cachedChildRef(t, hh)
+
+	hh.inject(protocol.EventContinued, protocol.ContinuedPayload{})
+	_ = recvType[*godap.ContinuedEvent](hh)
+
+	requireStaleChildRefEmpty(t, hh, ref)
+}
+
+func TestChildVariableRefSurvivesRejectedContinue(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	ref := cachedChildRef(t, hh)
+
+	driveContinue(t, hh)
+	const msg = "continue rejected without moving the process"
+	rejectResume(t, hh, protocol.CmdContinue, "continue", msg)
+	requireResyncStopped(t, hh, msg)
+
+	requireChildRefExpands(t, hh, ref, "X")
+}
+
+func TestChildVariableRefSurvivesRejectedStep(t *testing.T) {
+	tests := []struct {
+		request string
+		kind    protocol.CommandKind
+	}{
+		{request: "next", kind: protocol.CmdStepOver},
+		{request: "stepIn", kind: protocol.CmdStepInto},
+		{request: "stepOut", kind: protocol.CmdStepOut},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.request, func(t *testing.T) {
+			hh := newHarness(t)
+			hh.doHandshake(t)
+			ref := cachedChildRef(t, hh)
+
+			sendStepRequest(t, hh, tt.request)
+			hh.cmds.waitForCommand(t, tt.kind)
+			const msg = "step rejected without moving the process"
+			rejectResume(t, hh, tt.kind, tt.request, msg)
+			requireResyncStopped(t, hh, msg)
+
+			requireChildRefExpands(t, hh, ref, "X")
+		})
+	}
+}
+
+func TestChildVariableRefResetsAtNextStop(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	staleRef := cachedChildRef(t, hh)
+
+	hh.inject(protocol.EventContinued, protocol.ContinuedPayload{})
+	_ = recvType[*godap.ContinuedEvent](hh)
+	suspendAtBreakpoint(t, hh)
+
+	requireStaleChildRefEmpty(t, hh, staleRef)
+	freshRef := cacheChildRef(t, hh, "Y")
+	requireChildRefExpands(t, hh, freshRef, "Y")
+}
+
+func TestChildVariableRefIsStaleDuringOutOfBandStep(t *testing.T) {
+	hh := newHarness(t)
+	hh.doHandshake(t)
+	staleRef := cachedChildRef(t, hh)
+
+	hh.inject(protocol.EventSessionState, protocol.SessionStatePayload{
+		SessionID: "sess-test", State: protocol.StateRunning, Clients: 2,
+	})
+	requireStaleChildRefEmpty(t, hh, staleRef)
+
+	hh.inject(protocol.EventStepped, protocol.SteppedPayload{Goroutine: protocol.Goroutine{ID: 7}})
+	_ = recvType[*godap.StoppedEvent](hh)
+	requireStaleChildRefEmpty(t, hh, staleRef)
+
+	freshRef := cacheChildRef(t, hh, "Y")
+	requireChildRefExpands(t, hh, freshRef, "Y")
+}
+
 // TestEvaluateName drives evaluate(name)→value and evalQ correlation, including
 // a nested result that yields an expandable child ref.
 func TestEvaluateName(t *testing.T) {

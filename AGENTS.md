@@ -2903,10 +2903,12 @@ reason=step; `EventBreakpointHit`→`stopped` reason=breakpoint;
 `EventPanic`→reason=exception; `EventPaused`→reason=pause;
 `EventProcessExited`→`exited`(code)+`terminated`; `EventOutput`→`output`;
 `EventRestarted`→delayed `restart` response; `EventEvaluate`→`evaluate` response
-(correlated via `evalQ`, NOT a stop — see below); `EventSessionState`→sends
-nothing on the launch/attach path (only recorded as the session's lifecycle
-state, which gates resume-rejection resync), but consumed **once** as the initial
-state on the join path (see *Joining an existing session*);
+(correlated via `evalQ`, NOT a stop — see below); `EventSessionState`→sends no
+DAP message on the launch/attach path, but records lifecycle state for
+resume-rejection resync and clears the suspended view on `running` (the managed
+hub's propagation path for a successful out-of-band step, which emits no
+`EventContinued`); it is consumed **once** as the initial state on the join path
+(see *Joining an existing session*);
 `EventGoroutineSnapshot`→**deliberately
 ignored** (WebSocket-only concurrency stream with no DAP equivalent; translating
 it would corrupt the `threads`→`EventGoroutines` FIFO — see the goroutine
@@ -3008,11 +3010,22 @@ a fresh `variablesReference` from `varRefBase` (`1<<16`) upward via `allocVarRef
 and caches the node's DAP children under it in `varCache` (`ref→[]godap.Variable`).
 Child refs start above `varRefBase` so they never collide with a frame-root ref
 (a scope's reference == `frameIndex+1`, bounded by the max stack depth), letting
-`onVariables` tell them apart by magnitude: a ref in `varCache` is served
-synchronously (no round-trip); anything else is a frame-root ref that enqueues
-`CmdLocals`. The cache reflects ONE memory snapshot, so `resetVarsLocked` clears
-`varCache`/`nextVarRef` on every stop (`onStop`) — a child ref from a prior
-suspension is stale and must not expand.
+`onVariables` tell them apart by magnitude. A cached child ref is served
+synchronously (no round-trip) only while the Handler believes the process is
+suspended; a child-range cache miss is rejected rather than reinterpreted as a
+frame root. An observed resume suppresses the still-resident cache until the
+next stop, where `resetVarsLocked` clears `varCache`/`nextVarRef` before the new
+snapshot is built. For an out-of-band Continue, the translated `EventContinued`
+propagates that running state to the adapter. Steps deliberately emit no
+`EventContinued`, so a managed session's `EventSessionState(running)` provides
+the equivalent suppression while the step executes; the resulting
+`EventStepped` is the next-stop reset.
+
+Do **not** eagerly clear the cache on Continue/Step. Those requests clear the
+suspended view optimistically, but a synchronously rejected resume never moved
+the process; `failResume` restores the same suspension without routing through
+`onStop`, so the same cached snapshot is still valid and must expand again. A
+genuine later stop is the invalidation boundary.
 
 **`evaluate` is name-only.** `onEvaluate` sends `CmdEvaluate{FrameIndex, Name}`
 (Expression = the bare variable name; the `context` field — watch/hover/repl — is

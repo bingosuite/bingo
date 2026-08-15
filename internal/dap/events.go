@@ -43,8 +43,8 @@ func (h *Handler) translateEvent(evt protocol.Event) {
 		h.onError(evt)
 	case protocol.EventSessionState:
 		// For a JOINING connection, the hub's welcome state seeds the joiner's
-		// initial DAP state. For the normal launch/attach path it is
-		// informational (the entry stop drives the initial state instead).
+		// initial DAP state. Later running states also propagate successful
+		// out-of-band steps, which intentionally emit no EventContinued.
 		h.onSessionState(evt)
 	}
 }
@@ -57,10 +57,10 @@ func (h *Handler) translateEvent(evt protocol.Event) {
 // awaitingWelcome) and is a no-op for the normal launch/attach path, where
 // awaitingWelcome is never set.
 //
-// Outside that welcome, the state is only recorded — with one exception: idle
-// and exited mean the process is gone (a failed relaunch leaves a managed
-// session idle), so a stale suspended view is dropped. Nothing is sent; process
-// death is already reported by EventProcessExited.
+// Outside that welcome, running clears the suspended view so an out-of-band
+// step cannot leave inspection enabled while the process executes. Idle and
+// exited clear it because the process is gone. Nothing is sent: steps do not map
+// to DAP continued, and process death is already reported by EventProcessExited.
 func (h *Handler) onSessionState(evt protocol.Event) {
 	var p protocol.SessionStatePayload
 	if err := protocol.DecodeEventPayload(evt, &p); err != nil {
@@ -70,7 +70,7 @@ func (h *Handler) onSessionState(evt protocol.Event) {
 	h.mu.Lock()
 	h.sessionState = p.State
 	if !h.awaitingWelcome {
-		if h.sessionEndedLocked() {
+		if p.State == protocol.StateRunning || h.sessionEndedLocked() {
 			h.suspended = false
 		}
 		h.mu.Unlock()

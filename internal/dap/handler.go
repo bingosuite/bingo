@@ -153,7 +153,8 @@ type Handler struct {
 	// (buildVarTree) and read synchronously by a follow-up variables request.
 	// nextVarRef allocates those child refs from varRefBase upward. Both reset
 	// at every stop — the tree reflects one memory snapshot, so refs from a
-	// prior suspension are stale.
+	// prior suspension are stale. Since the reset happens at the next stop,
+	// onVariables also gates cache hits on the current suspended state.
 	varCache   map[int][]godap.Variable
 	nextVarRef int
 }
