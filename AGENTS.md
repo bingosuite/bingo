@@ -2147,16 +2147,19 @@ cause event and receive a stale welcome that DAP would treat as authoritative.
 
 ## Hub debugger ownership — shutdown is a linearization point
 
-`internal/hub.Hub` guards both `dbg` and `closing` with `dbgMu`. A factory-created
-debugger is not owned by the hub until `installDebugger` accepts it under that
-lock. Shutdown takes the same lock, marks ownership closed, and removes the
-currently installed debugger atomically; it calls `Kill` only after releasing
-the lock. If shutdown wins, installation is rejected and the command path must
-discard the candidate debugger itself, then return without changing session
-state or broadcasting. If installation wins, shutdown removes and tears down
-that debugger. This covers both the initial Launch/Attach factory gap and
-Restart's longer constructor/relaunch gap, so no live tracee can appear after
-the hub and session have already exited.
+`internal/hub.Hub` guards both `dbg` and `closing` with `dbgMu`. Before invoking
+the debugger factory, the command path registers a candidate cleanup obligation
+under that lock. The obligation ends only when `installDebuggerCandidate`
+atomically transfers the candidate into `dbg`, or when candidate disposal
+actually succeeds. Shutdown takes the same lock, closes candidate admission,
+and removes the currently installed debugger atomically; it calls `Kill` only
+after releasing the lock, then waits for every pre-admitted candidate obligation.
+If shutdown wins, installation is rejected and the command path discards the
+candidate debugger itself without changing session state or broadcasting. If
+installation wins, shutdown removes and tears down that debugger. This covers
+the initial Launch/Attach factory gap, retained cleanup after a failed start, and
+Restart's longer constructor/relaunch gap, so no live tracee or cleanup owner can
+outlive hub/session completion.
 
 Never hold `dbgMu` across a `Debugger` method or socket I/O. Run-loop reads take
 a short snapshot via `currentDebugger`; teardown paths detach ownership under
@@ -2174,18 +2177,23 @@ cheap value — `newEngine` starts `go e.loop()` immediately, that loop
 tracer thread at construction. **Only `Kill` drives that loop to exit**, so a
 dropped candidate permanently strands a goroutine plus a locked OS thread per
 attempt (issue #188: repeated failed Restarts accumulated them). `handleRestart`
-therefore registers a deferred `discardDebugger` the moment the candidate
-exists and clears it at the single ownership-transfer point — immediately after
-`installDebugger` accepts it — so relaunch failure, install rejection, and any
-future early return all dispose exactly once, and a successful restart's now
-hub-owned debugger is never killed by the caller. Disposal targets the captured
-candidate by identity, so it can never kill a newer or currently installed
-debugger.
+therefore registers a deferred `discardDebuggerCandidate` the moment the
+candidate exists and clears it at the single ownership-transfer point —
+immediately after `installDebuggerCandidate` accepts it — so relaunch failure,
+install rejection, and any future early return all dispose exactly once, and a
+successful restart's now hub-owned debugger is never killed by the caller.
+Disposal targets the captured candidate by identity, so it can never kill a
+newer or currently installed debugger.
 
 `discardDebugger` is a `Hub` method because the hub is the last owner of a
 discarded debugger: a failing `Kill` is logged there (the owning top level, per
 [docs/ErrorHandling.md](docs/ErrorHandling.md)) rather than returned, so cleanup
-never replaces the original launch error the client is told about.
+never replaces the original launch error the client is told about. A retry
+goroutine for a caller-owned candidate is not detached work: its cleanup
+obligation was registered before factory construction, and shutdown cannot close
+`shutdownCh`/`Done` until that exact obligation completes. Multiple failed starts
+remain independently owned, and a concurrent successful cleanup satisfies only
+its own obligation once.
 
 **Shutdown completion is withheld while an attached detach is retryable.**
 `ErrAttachedDetachIncomplete` means the engine and tracer still own the foreign
@@ -2280,15 +2288,15 @@ Launch) still works. The replacement that failed to launch is killed by
 [Hub debugger ownership](#hub-debugger-ownership--shutdown-is-a-linearization-point).
 
 **A failed breakpoint reinstall is NOT a failed relaunch** — do not extend the
-disposal rule to it. By the time the reinstall loop runs, `installDebugger` has
-already accepted the replacement, so it is hub-owned and the tracee is running;
-a `SetBreakpoint` error is collected as a `DiscardedBreakpoint` and reported in
-`EventRestarted` (mirroring Delve), and the session stays `running`. Killing the
-replacement there would terminate a healthy process over one unresolvable
-`file:line`. Only locations that *did* resolve are carried into
-`restartBreakpoints`. Both directions are pinned by the `Restart relaunch
-failure` and `Restart breakpoint reinstall failure` specs in
-[hub_test.go](internal/hub/hub_test.go).
+disposal rule to it. By the time the reinstall loop runs,
+`installDebuggerCandidate` has already accepted the replacement, so it is
+hub-owned and the tracee is running; a `SetBreakpoint` error is collected as a
+`DiscardedBreakpoint` and reported in `EventRestarted` (mirroring Delve), and
+the session stays `running`. Killing the replacement there would terminate a
+healthy process over one unresolvable `file:line`. Only locations that *did*
+resolve are carried into `restartBreakpoints`. Both directions are pinned by
+the `Restart relaunch failure` and `Restart breakpoint reinstall failure` specs
+in [hub_test.go](internal/hub/hub_test.go).
 
 ## Breakpoint identity — hub-owned logical ids
 

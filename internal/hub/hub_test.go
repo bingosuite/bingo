@@ -155,6 +155,19 @@ func (f *blockingLaunchDebugger) Launch(string, []string, []string) error {
 	return f.launchErr
 }
 
+type blockingKillDebugger struct {
+	*fakeDebugger
+	started chan struct{}
+	release <-chan struct{}
+}
+
+func (f *blockingKillDebugger) Kill() error {
+	f.record("Kill")
+	close(f.started)
+	<-f.release
+	return nil
+}
+
 // leakyLaunchDebugger models a partially started engine: Launch acquires a
 // goroutine that only a disposal Kill can release — the same shape as the real
 // engine's LockOSThread'd loop, whose sole exit is Kill driving it to
@@ -967,7 +980,7 @@ var _ = Describe("Hub", func() {
 	})
 
 	Describe("failed startup ownership retention", func() {
-		It("reports the original Attach error without blocking the Run loop on cleanup retries", func() {
+		It("keeps failed Attach cleanup owned through hub cancellation", func() {
 			fd := newFakeDebugger()
 			fd.attachErr = errors.New("attach failed")
 			fd.setKillError(fmt.Errorf("%w: retained partial attach",
@@ -976,6 +989,7 @@ var _ = Describe("Hub", func() {
 			ctx, cancel := context.WithCancel(context.Background())
 			go h.Run(ctx)
 			defer cancel()
+			defer fd.setKillError(nil)
 
 			conn := newFakeWSConn()
 			mustAddClient(h, conn)
@@ -988,7 +1002,102 @@ var _ = Describe("Hub", func() {
 			Eventually(func() int {
 				return countCalls(fd.recordedCalls(), "Kill")
 			}, "1s", "10ms").Should(BeNumerically(">=", 2))
+			cancel()
+			Consistently(h.ExportedShutdownCh(), "100ms", "10ms").ShouldNot(BeClosed())
+			Consistently(h.Done(), "100ms", "10ms").ShouldNot(BeClosed(),
+				"hub completion would discard the failed Attach cleanup owner")
+
 			fd.setKillError(nil)
+			Eventually(h.ExportedShutdownCh(), "1s", "10ms").Should(BeClosed())
+			Eventually(h.Done(), "1s", "10ms").Should(BeClosed())
+		})
+
+		It("waits for every failed startup candidate before completing shutdown", func() {
+			first := newFakeDebugger()
+			first.attachErr = errors.New("first attach failed")
+			first.setKillError(fmt.Errorf("%w: first partial attach",
+				debugger.ErrAttachedDetachIncomplete))
+			second := newFakeDebugger()
+			second.attachErr = errors.New("second attach failed")
+			second.setKillError(fmt.Errorf("%w: second partial attach",
+				debugger.ErrAttachedDetachIncomplete))
+			candidates := []debugger.Debugger{first, second}
+			h := hub.NewSession("session", func() debugger.Debugger {
+				candidate := candidates[0]
+				candidates = candidates[1:]
+				return candidate
+			}, nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			go h.Run(ctx)
+			defer cancel()
+			defer first.setKillError(nil)
+			defer second.setKillError(nil)
+
+			conn := newFakeWSConn()
+			mustAddClient(h, conn)
+			for _, pid := range []int{1234, 5678} {
+				conn.inject(mustCommand(protocol.CmdAttach, protocol.AttachPayload{PID: pid}))
+				waitForEventKind(conn, protocol.EventError, nil)
+			}
+			Eventually(func() int {
+				return countCalls(first.recordedCalls(), "Kill")
+			}, "1s", "10ms").Should(BeNumerically(">=", 2))
+			Eventually(func() int {
+				return countCalls(second.recordedCalls(), "Kill")
+			}, "1s", "10ms").Should(BeNumerically(">=", 2))
+
+			cancel()
+			first.setKillError(nil)
+			Consistently(h.Done(), "150ms", "10ms").ShouldNot(BeClosed(),
+				"the second retained candidate still owns its partial attach")
+			second.setKillError(nil)
+			Eventually(h.Done(), "1s", "10ms").Should(BeClosed())
+		})
+
+		It("linearizes successful candidate cleanup with concurrent shutdown", func() {
+			releaseKill := make(chan struct{})
+			var releaseOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(releaseKill) }) }
+			DeferCleanup(release)
+			fd := &blockingKillDebugger{
+				fakeDebugger: newFakeDebugger(),
+				started:      make(chan struct{}),
+				release:      releaseKill,
+			}
+			fd.attachErr = errors.New("attach failed")
+			h := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			go h.Run(ctx)
+			defer cancel()
+
+			conn := newFakeWSConn()
+			mustAddClient(h, conn)
+			conn.inject(mustCommand(protocol.CmdAttach, protocol.AttachPayload{PID: 1234}))
+			Eventually(fd.started, "1s").Should(BeClosed())
+			closeFakeWS(conn)
+			Eventually(func() bool { return hub.ExportedIsClosing(h) }, "500ms").Should(BeTrue())
+			Consistently(h.ExportedShutdownCh(), "100ms", "10ms").ShouldNot(BeClosed())
+
+			release()
+			Eventually(h.Done(), "1s", "10ms").Should(BeClosed())
+			expectCallCount(fd.fakeDebugger, "Kill", 1,
+				"candidate cleanup and shutdown must share one ownership obligation")
+		})
+
+		It("does not retain a cleanup obligation for a nil factory result", func() {
+			h := hub.NewSession("session", func() debugger.Debugger { return nil }, nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			go h.Run(ctx)
+			defer cancel()
+
+			conn := newFakeWSConn()
+			mustAddClient(h, conn)
+			conn.inject(mustCommand(protocol.CmdLaunch, protocol.LaunchPayload{Program: "myapp"}))
+			var payload protocol.ErrorPayload
+			waitForEventKind(conn, protocol.EventError, &payload)
+			Expect(payload.Message).To(ContainSubstring("debugger factory returned nil"))
+			cancel()
+			Eventually(h.Done(), "1s", "10ms").Should(BeClosed())
 		})
 	})
 
@@ -1968,7 +2077,8 @@ var _ = Describe("Restart relaunch failure", func() {
 		Eventually(replacement.started, "500ms").Should(BeClosed())
 
 		closeFakeWS(conn)
-		Eventually(managed.ExportedShutdownCh(), "500ms").Should(BeClosed())
+		Eventually(func() bool { return hub.ExportedIsClosing(managed) }, "500ms").Should(BeTrue())
+		Consistently(managed.ExportedShutdownCh(), "100ms").ShouldNot(BeClosed())
 		close(releaseLaunch)
 
 		Eventually(managed.Done(), "500ms").Should(BeClosed())
@@ -2075,14 +2185,20 @@ var _ = Describe("Restart breakpoint reinstall failure", func() {
 })
 
 var _ = Describe("debugger ownership during shutdown", func() {
-	It("discards a restart replacement whose Launch finishes after shutdown", func() {
+	It("retains a restart replacement whose cleanup remains incomplete after shutdown", func() {
 		old := newFakeDebugger()
 		releaseLaunch := make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(releaseLaunch) }) }
+		DeferCleanup(release)
 		replacement := &blockingLaunchDebugger{
 			fakeDebugger: newFakeDebugger(),
 			started:      make(chan struct{}),
 			release:      releaseLaunch,
 		}
+		replacement.setKillError(fmt.Errorf("%w: retained restart candidate",
+			debugger.ErrAttachedDetachIncomplete))
+		defer replacement.setKillError(nil)
 		factoryCalls := 0
 		managed := hub.NewSession("session", func() debugger.Debugger {
 			factoryCalls++
@@ -2103,9 +2219,15 @@ var _ = Describe("debugger ownership during shutdown", func() {
 		Eventually(replacement.started, "500ms").Should(BeClosed())
 
 		closeFakeWS(conn)
-		Eventually(managed.ExportedShutdownCh(), "500ms").Should(BeClosed())
-		close(releaseLaunch)
+		Eventually(func() bool { return hub.ExportedIsClosing(managed) }, "500ms").Should(BeTrue())
+		Consistently(managed.ExportedShutdownCh(), "100ms").ShouldNot(BeClosed())
+		release()
 
+		Eventually(func() int {
+			return countCalls(replacement.recordedCalls(), "Kill")
+		}, "1s", "10ms").Should(BeNumerically(">=", 2))
+		Consistently(managed.ExportedShutdownCh(), "100ms", "10ms").ShouldNot(BeClosed())
+		replacement.setKillError(nil)
 		Eventually(managed.Done(), "500ms").Should(BeClosed())
 		Expect(replacement.recordedCalls()).To(ContainElements("Launch", "Kill"))
 	})
@@ -2129,7 +2251,8 @@ var _ = Describe("debugger ownership during shutdown", func() {
 		Eventually(factoryStarted, "500ms").Should(BeClosed())
 
 		closeFakeWS(conn)
-		Eventually(managed.ExportedShutdownCh(), "500ms").Should(BeClosed())
+		Eventually(func() bool { return hub.ExportedIsClosing(managed) }, "500ms").Should(BeTrue())
+		Consistently(managed.ExportedShutdownCh(), "100ms").ShouldNot(BeClosed())
 		close(releaseFactory)
 
 		Eventually(managed.Done(), "500ms").Should(BeClosed())
@@ -2157,7 +2280,8 @@ var _ = Describe("debugger ownership during shutdown", func() {
 		Eventually(candidate.started, "500ms").Should(BeClosed())
 
 		closeFakeWS(conn)
-		Eventually(managed.ExportedShutdownCh(), "500ms").Should(BeClosed())
+		Eventually(func() bool { return hub.ExportedIsClosing(managed) }, "500ms").Should(BeTrue())
+		Consistently(managed.ExportedShutdownCh(), "100ms").ShouldNot(BeClosed())
 		close(releaseLaunch)
 
 		Eventually(managed.Done(), "500ms").Should(BeClosed())

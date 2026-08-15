@@ -11,3 +11,7 @@ func ExportedSetSuspendTimeout(h *Hub, timeout time.Duration) {
 func (h *Hub) ExportedShutdownCh() <-chan struct{} {
 	return h.shutdownCh
 }
+
+func ExportedIsClosing(h *Hub) bool {
+	return h.isClosing()
+}

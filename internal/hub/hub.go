@@ -61,9 +61,15 @@ type Hub struct {
 	// dbg and closing are guarded by dbgMu. Factory results and shutdown race
 	// through that lock so every debugger is owned either by the running hub or
 	// by the path responsible for discarding it.
-	dbgMu   sync.Mutex
-	dbg     debugger.Debugger
-	closing bool
+	dbgMu sync.Mutex
+	dbg   debugger.Debugger
+
+	// candidateCleanup counts factory work from before construction until the
+	// candidate is either installed or fully discarded. Add happens only under
+	// dbgMu while closing is false, so beginShutdown is the admission fence that
+	// makes Wait safe.
+	candidateCleanup sync.WaitGroup
+	closing          bool
 
 	registry *registry
 	log      *slog.Logger
@@ -218,13 +224,31 @@ func (h *Hub) currentDebugger() debugger.Debugger {
 	return h.dbg
 }
 
-func (h *Hub) installDebugger(dbg debugger.Debugger) bool {
+func (h *Hub) newDebuggerCandidate() (debugger.Debugger, bool) {
+	h.dbgMu.Lock()
+	if h.closing {
+		h.dbgMu.Unlock()
+		return nil, false
+	}
+	h.candidateCleanup.Add(1)
+	factory := h.newDebugger
+	h.dbgMu.Unlock()
+	dbg := factory()
+	if dbg == nil {
+		h.candidateCleanup.Done()
+		return nil, false
+	}
+	return dbg, true
+}
+
+func (h *Hub) installDebuggerCandidate(dbg debugger.Debugger) bool {
 	h.dbgMu.Lock()
 	defer h.dbgMu.Unlock()
 	if h.closing {
 		return false
 	}
 	h.dbg = dbg
+	h.candidateCleanup.Done()
 	return true
 }
 
@@ -254,12 +278,12 @@ func (h *Hub) beginShutdown() debugger.Debugger {
 	return dbg
 }
 
-// discardDebugger tears down a debugger this hub does not own — a candidate
-// rejected during startup, or the instance claimed by shutdown. Kill is
-// idempotent and the hub is the last owner of a discarded debugger, so its
-// failure is logged here (the owning top level, per docs/ErrorHandling.md)
-// rather than returned: every caller is already on a failure path whose
-// original cause must reach the client unchanged.
+// discardDebugger tears down a debugger that is not installed as h.dbg — a
+// tracked candidate rejected during startup, or the instance claimed by
+// shutdown. Kill is idempotent and the hub is the last owner of a discarded
+// debugger, so its failure is logged here (the owning top level, per
+// docs/ErrorHandling.md) rather than returned: every caller is already on a
+// failure path whose original cause must reach the client unchanged.
 func (h *Hub) discardDebugger(dbg debugger.Debugger, reason string) bool {
 	if dbg == nil {
 		return true
@@ -289,6 +313,17 @@ func (h *Hub) discardDebuggerUntilSuccess(dbg debugger.Debugger, reason string) 
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+func (h *Hub) discardDebuggerCandidate(dbg debugger.Debugger, reason string) {
+	if h.discardDebugger(dbg, reason) {
+		h.candidateCleanup.Done()
+		return
+	}
+	go func() {
+		h.discardDebuggerUntilSuccess(dbg, reason)
+		h.candidateCleanup.Done()
+	}()
 }
 
 // AddClient registers conn as a new client. Safe from any goroutine. Admission
@@ -493,9 +528,16 @@ func (h *Hub) prepareCommandDebugger(cmd protocol.Command) (dbg debugger.Debugge
 		return nil, false, false
 	}
 
-	dbg = h.newDebugger()
+	var created bool
+	dbg, created = h.newDebuggerCandidate()
+	if !created {
+		if !h.isClosing() {
+			h.broadcastError(cmd.Kind, fmt.Errorf("debugger factory returned nil"))
+		}
+		return nil, false, false
+	}
 	if h.isClosing() {
-		h.discardDebuggerUntilSuccess(dbg, "start: hub closed before startup")
+		h.discardDebuggerCandidate(dbg, "start: hub closed before startup")
 		return nil, false, false
 	}
 	// Keep the candidate caller-owned through startup. Installing it first
@@ -506,9 +548,7 @@ func (h *Hub) prepareCommandDebugger(cmd protocol.Command) (dbg debugger.Debugge
 
 func (h *Hub) transferStartedDebugger(dbg debugger.Debugger, cmd protocol.Command, startErr error) bool {
 	if startErr != nil {
-		if !h.discardDebugger(dbg, "start: startup failed") {
-			go h.discardDebuggerUntilSuccess(dbg, "start: startup failed")
-		}
+		h.discardDebuggerCandidate(dbg, "start: startup failed")
 		if h.isClosing() {
 			return false
 		}
@@ -516,8 +556,8 @@ func (h *Hub) transferStartedDebugger(dbg debugger.Debugger, cmd protocol.Comman
 		h.broadcastError(cmd.Kind, startErr)
 		return false
 	}
-	if !h.installDebugger(dbg) {
-		h.discardDebuggerUntilSuccess(dbg, "start: hub closed before install")
+	if !h.installDebuggerCandidate(dbg) {
+		h.discardDebuggerCandidate(dbg, "start: hub closed before install")
 		return false
 	}
 	return true
@@ -639,6 +679,25 @@ type restartTarget struct {
 	loc       protocol.Location
 }
 
+func (h *Hub) restartLaunchPayload(cmd protocol.Command) (protocol.LaunchPayload, error) {
+	launch := *h.lastLaunch
+	if len(cmd.Payload) == 0 {
+		return launch, nil
+	}
+
+	var override protocol.RestartPayload
+	if err := protocol.DecodeCommandPayload(cmd, &override); err != nil {
+		return protocol.LaunchPayload{}, err
+	}
+	if override.Args != nil {
+		launch.Args = override.Args
+	}
+	if override.Env != nil {
+		launch.Env = override.Env
+	}
+	return launch, nil
+}
+
 // handleRestart kills the current process (if any), relaunches the last
 // Launch'd binary, and reinstalls previously-set breakpoints at their
 // original file:line locations — addresses are re-resolved via DWARF since a
@@ -663,23 +722,12 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 		return
 	}
 
-	var override protocol.RestartPayload
-	if len(cmd.Payload) > 0 {
-		if err := protocol.DecodeCommandPayload(cmd, &override); err != nil {
-			h.broadcastError(cmd.Kind, err)
-			return
-		}
+	launch, err := h.restartLaunchPayload(cmd)
+	if err != nil {
+		h.broadcastError(cmd.Kind, err)
+		return
 	}
-
-	program := h.lastLaunch.Program
-	args := h.lastLaunch.Args
-	if override.Args != nil {
-		args = override.Args
-	}
-	env := h.lastLaunch.Env
-	if override.Env != nil {
-		env = override.Env
-	}
+	program, args, env := launch.Program, launch.Args, launch.Env
 
 	saved := h.sortedRestartTargets()
 
@@ -692,7 +740,14 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 	if h.isClosing() {
 		return
 	}
-	newDbg := h.newDebugger()
+	newDbg, created := h.newDebuggerCandidate()
+	if !created {
+		if !h.isClosing() {
+			h.broadcastError(cmd.Kind, fmt.Errorf("restart: debugger factory returned nil"))
+			h.transitionState(protocol.StateIdle)
+		}
+		return
+	}
 
 	// The replacement is caller-owned from construction until installDebugger
 	// accepts it: it is not in h.dbg, so neither shutdown's snapshot nor Run's
@@ -703,8 +758,8 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 	// clearing candidate is the single ownership-transfer point.
 	candidate := newDbg
 	defer func() {
-		if !h.discardDebugger(candidate, "restart: abandoned replacement") {
-			go h.discardDebuggerUntilSuccess(candidate, "restart: abandoned replacement")
+		if candidate != nil {
+			h.discardDebuggerCandidate(candidate, "restart: abandoned replacement")
 		}
 	}()
 
@@ -720,7 +775,7 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 		h.transitionState(protocol.StateIdle)
 		return
 	}
-	if !h.installDebugger(newDbg) {
+	if !h.installDebuggerCandidate(newDbg) {
 		return
 	}
 	candidate = nil
@@ -919,6 +974,7 @@ func (h *Hub) shutdown() {
 		h.registry.closeAll()
 		h.outboundMu.Unlock()
 		h.discardDebuggerUntilSuccess(dbg, "hub shutdown")
+		h.candidateCleanup.Wait()
 		close(h.shutdownCh)
 	})
 }
