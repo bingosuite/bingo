@@ -610,6 +610,11 @@ func (h *dapCLI) addBreakpoint(file string, line int) {
 }
 
 func (h *dapCLI) clearBreakpoint(id int) {
+	if id <= 0 {
+		fmt.Printf("  no breakpoint with id %d\n", id)
+		return
+	}
+
 	h.stateMu.Lock()
 	var file string
 	found := false
