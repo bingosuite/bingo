@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -356,6 +357,115 @@ func TestDispatchRejectsInvalidFramesBeforeRequest(t *testing.T) {
 	}
 }
 
+func TestClearBreakpointRejectsNonPositiveIDs(t *testing.T) {
+	for _, id := range []int{0, -1} {
+		t.Run(fmt.Sprintf("id=%d", id), func(t *testing.T) {
+			h := &dapCLI{
+				configured: true,
+				bpsByFile: map[string][]breakpoint{
+					"main.go": {{line: 10, id: id}, {line: 20, id: 2, verified: true}},
+				},
+			}
+
+			output := captureStdout(t, func() {
+				h.clearBreakpoint(id)
+			})
+
+			if got := h.bpsByFile["main.go"]; len(got) != 2 || got[0].id != id || got[1].id != 2 {
+				t.Fatalf("breakpoints = %#v, want unchanged", got)
+			}
+			h.mu.Lock()
+			seq := h.seq
+			pending := len(h.pending)
+			h.mu.Unlock()
+			if seq != 0 || pending != 0 {
+				t.Fatalf("request state = (seq %d, pending %d), want no DAP request", seq, pending)
+			}
+			want := fmt.Sprintf("  no breakpoint with id %d\n", id)
+			if output != want {
+				t.Fatalf("output = %q, want %q", output, want)
+			}
+		})
+	}
+}
+
+func TestClearBreakpointPreservesPositiveID(t *testing.T) {
+	server, client := net.Pipe()
+	t.Cleanup(func() {
+		_ = server.Close()
+		_ = client.Close()
+	})
+
+	h := newTestDAPCLI(client, io.Discard, func() {})
+	h.configured = true
+	h.bpsByFile = map[string][]breakpoint{
+		"main.go":  {{line: 10, id: 1, verified: true}, {line: 20, id: 2, verified: true}},
+		"other.go": {{line: 30, id: 3, verified: true}},
+	}
+	requests := make(chan *godap.SetBreakpointsRequest, 1)
+	readErr := make(chan error, 1)
+	go func() {
+		message, err := readDAPMessage(bufio.NewReader(server))
+		if err != nil {
+			readErr <- err
+			return
+		}
+		request, ok := message.(*godap.SetBreakpointsRequest)
+		if !ok {
+			readErr <- fmt.Errorf("unexpected DAP message %T", message)
+			return
+		}
+		requests <- request
+		response := &godap.SetBreakpointsResponse{
+			Response: godap.Response{
+				ProtocolMessage: godap.ProtocolMessage{Seq: 1, Type: "response"},
+				RequestSeq:      request.Seq,
+				Success:         true,
+				Command:         "setBreakpoints",
+			},
+			Body: godap.SetBreakpointsResponseBody{
+				Breakpoints: []godap.Breakpoint{{Id: 2, Verified: true, Line: 20}},
+			},
+		}
+		h.onResponse(response, response)
+		readErr <- nil
+	}()
+
+	output := captureStdout(t, func() {
+		h.clearBreakpoint(1)
+	})
+
+	select {
+	case err := <-readErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("positive breakpoint clear did not send a DAP request")
+	}
+	var request *godap.SetBreakpointsRequest
+	select {
+	case request = <-requests:
+	case <-time.After(time.Second):
+		t.Fatal("positive breakpoint clear request was not recorded")
+	}
+	if request.Arguments.Source.Path != "main.go" {
+		t.Fatalf("source path = %q, want main.go", request.Arguments.Source.Path)
+	}
+	if got := request.Arguments.Breakpoints; len(got) != 1 || got[0].Line != 20 {
+		t.Fatalf("breakpoints request = %#v, want only line 20", got)
+	}
+	if got := h.bpsByFile["main.go"]; len(got) != 1 || got[0].id != 2 || got[0].line != 20 {
+		t.Fatalf("main.go breakpoints = %#v, want retained breakpoint 2", got)
+	}
+	if got := h.bpsByFile["other.go"]; len(got) != 1 || got[0].id != 3 {
+		t.Fatalf("other.go breakpoints = %#v, want unchanged", got)
+	}
+	if output != "  breakpoint 1 cleared\n" {
+		t.Fatalf("output = %q, want positive clear confirmation", output)
+	}
+}
+
 func newTestDAPCLI(conn net.Conn, out io.Writer, closeEditor func()) *dapCLI {
 	return &dapCLI{
 		conn:         conn,
@@ -367,6 +477,32 @@ func newTestDAPCLI(conn net.Conn, out io.Writer, closeEditor func()) *dapCLI {
 		disconnected: make(chan struct{}),
 		readDone:     make(chan struct{}),
 	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := os.Stdout
+	os.Stdout = writer
+	defer func() {
+		os.Stdout = original
+		_ = reader.Close()
+		_ = writer.Close()
+	}()
+
+	fn()
+	os.Stdout = original
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(output)
 }
 
 func writeDAPFrame(buffer *bytes.Buffer, content string) {
