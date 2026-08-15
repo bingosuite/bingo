@@ -145,6 +145,7 @@ Lifecycle configuration is explicit per launch: `serverMode`,
 `auto`; remote, forwarded, and custom endpoints must use
 `"serverMode": "connectOnly"`, which neither probes nor spawns. Startup failures
 name the endpoint and persistent log path in the **bingo Server** output channel.
+Auto mode rejects identical management and DAP endpoints before either operation.
 
 Install the platform VSIX once (and update it when a newer version ships), then
 select **bingo DAP: launch example (stop on entry)** from the repository's Run

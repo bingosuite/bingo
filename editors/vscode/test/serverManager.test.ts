@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import type { BingoServerConfiguration } from "../src/configuration.js";
+import {
+  resolveServerConfiguration,
+  type BingoServerConfiguration,
+} from "../src/configuration.js";
 import type {
   HealthProbe,
   HealthProbeResult,
@@ -201,7 +204,30 @@ describe("server manager", () => {
     await test.manager.ensureServer(configuration());
   });
 
-  it("rejects remote auto mode without probing or spawning", () => {
+  it("rejects normalized identical auto endpoints without probing or spawning", () => {
+    let probes = 0;
+    const test = harness(() => {
+      probes += 1;
+      return Promise.resolve(compatible);
+    });
+    const config = resolveServerConfiguration({
+      managementHost: " 127.0.0.1 ",
+      managementPort: 6060,
+      dapHost: "127.0.0.1",
+      dapPort: 6060,
+    });
+    assert.throws(
+      () => test.manager.ensureServer(config),
+      (error: unknown) =>
+        error instanceof ServerManagerError &&
+        error.code === "invalidConfiguration" &&
+        /requires distinct management and DAP endpoints/.test(error.message),
+    );
+    assert.equal(probes, 0);
+    assert.equal(test.requests.length, 0);
+  });
+
+  it("keeps literal auto-host validation ahead of endpoint equality", () => {
     let probes = 0;
     const test = harness(() => {
       probes += 1;
@@ -210,23 +236,29 @@ describe("server manager", () => {
     assert.throws(
       () => test.manager.ensureServer(
         configuration({
-          managementEndpoint: { host: "remote.example", port: 6060 },
+          managementEndpoint: { host: "localhost", port: 6060 },
+          dapEndpoint: { host: "localhost", port: 6060 },
         }),
       ),
-      hasCode("invalidConfiguration"),
+      (error: unknown) =>
+        error instanceof ServerManagerError &&
+        error.code === "invalidConfiguration" &&
+        /requires managementHost and dapHost to be 127\.0\.0\.1/.test(
+          error.message,
+        ),
     );
     assert.equal(probes, 0);
     assert.equal(test.requests.length, 0);
   });
 
-  it("connect-only bypasses platform, probing, binary checks, and spawning", async () => {
+  it("connect-only accepts identical custom endpoints without managed work", async () => {
     const test = harness(() =>
       Promise.reject(new Error("probe must not run")),
     );
     const config = configuration({
       mode: "connectOnly",
       managementEndpoint: { host: "remote.example", port: 16060 },
-      dapEndpoint: { host: "remote.example", port: 14711 },
+      dapEndpoint: { host: "remote.example", port: 16060 },
     });
 
     assert.deepEqual(await test.manager.ensureServer(config), config.dapEndpoint);

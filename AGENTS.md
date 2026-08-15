@@ -2555,7 +2555,9 @@ wire protocol or `launchConfig`.
 
 **VS Code connect-or-start invariants.** Default `serverMode:"auto"` is local
 only: management `127.0.0.1:6060`, DAP `127.0.0.1:4711`, readiness 5s, managed
-idle grace 30s. It health-checks before spawning and requires
+idle grace 30s. Its management and DAP endpoints must be distinct; an identical
+pair is rejected synchronously before probes or spawn, while `connectOnly`
+remains permissive. It health-checks before spawning and requires
 `service:"bingo"`, management API 1, the exact wire version, enabled DAP,
 `dap.sessionEventVersion:1`, and
 the expected DAP port/host (wildcard advertised hosts retain the configured
@@ -2593,7 +2595,7 @@ target metadata, architecture, mode, and entitlements.
 The extension package version is the installed-runtime upgrade boundary:
 material shipped behavior changes must bump both `package.json` and the lockfile
 or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.4.1**) in source and VSIX
+and package verifier pin the current version (**0.4.2**) in source and VSIX
 metadata.
 The root Run and Debug dropdown exposes exactly two `"type":"bingo"` choices:
 launch one of five progressive examples through a `pickString`, and join a
