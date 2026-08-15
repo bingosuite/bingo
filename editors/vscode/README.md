@@ -25,7 +25,8 @@ reuse, and 0.3.2 added wire 1.3's honest unknown stopped-goroutine rendering;
 **0.4.0** adds wire 1.4's bounded goroutine event contract, which is what keeps
 the concurrency view alive on highly concurrent targets. **0.4.1** adds
 bounded-family error classification, truthful omission states, and manual
-recovery after reconnect exhaustion. 0.4.0 is the minimum supported version.
+recovery after reconnect exhaustion. **0.4.2** rejects colliding management and
+DAP listeners before managed startup. 0.4.0 is the minimum supported version.
 Rerun the command to update, then run
 **Developer: Reload Window** once so the active extension host loads the new
 bundle. Package without installing with `just vscode-package`. Uninstall with:
@@ -62,6 +63,10 @@ Concurrent VS Code extension hosts may both try to start. Listener binding
 chooses the winner; a child that loses the race is harmless because both hosts
 reuse the compatible winner. Requests in one extension host for the same
 endpoint share one readiness operation.
+
+Auto mode requires distinct management and DAP endpoints and rejects an
+identical host/port pair before probing or spawning. `connectOnly` remains
+permissive for custom endpoint arrangements.
 
 The child is detached and logs to persistent extension storage. Open the
 **bingo Server** output channel to see the absolute server log path. The
