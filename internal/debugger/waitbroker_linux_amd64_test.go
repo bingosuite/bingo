@@ -258,6 +258,126 @@ func TestLinuxWaitOwnerReleaseIsGenerationCheckedAndPurgesQueuedStops(t *testing
 	}
 }
 
+func TestLinuxWaitBrokerStaleScanCannotConsumeReplacementGenerationStop(t *testing.T) {
+	const tid = 11426
+	wait4 := newScriptedExactWait4()
+	broker := newLinuxWaitBrokerWithRunner(wait4.wait4, false)
+	owner := broker.newOwner()
+	firstGeneration, err := owner.register(tid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stale := broker.snapshot()
+	if len(stale) != 1 {
+		t.Fatalf("snapshot registrations = %d, want 1", len(stale))
+	}
+	scanPaused := make(chan struct{})
+	resumeScan := make(chan struct{})
+	scanResult := make(chan bool, 1)
+	go func() {
+		close(scanPaused)
+		<-resumeScan
+		scanResult <- broker.scanRegistration(stale[0])
+	}()
+	<-scanPaused
+
+	if !owner.release(tid, firstGeneration) {
+		t.Fatal("release rejected the original registration")
+	}
+	secondGeneration, err := owner.register(tid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait4.add(tid, stoppedAt(syscall.SIGTRAP, 0))
+	close(resumeScan)
+	if <-scanResult {
+		t.Fatal("stale scan reported progress for a replacement registration")
+	}
+
+	wait4.mu.Lock()
+	staleCalls := append([]int(nil), wait4.calls...)
+	wait4.mu.Unlock()
+	if len(staleCalls) != 0 {
+		t.Fatalf("stale scan called wait4 for replacement generation: %v", staleCalls)
+	}
+
+	if !broker.scan() {
+		t.Fatal("fresh scan reported no progress")
+	}
+	result := nextBrokerResult(t, owner)
+	if result.tid != tid || result.generation != secondGeneration || !result.status.Stopped() {
+		t.Fatalf("replacement result = %+v, want stopped tid %d generation %d",
+			result, tid, secondGeneration)
+	}
+}
+
+func TestLinuxWaitBrokerReleaseCannotCrossValidatedWait(t *testing.T) {
+	const tid = 11427
+	wait4 := newScriptedExactWait4()
+	waitEntered := make(chan struct{})
+	releaseWait := make(chan struct{})
+	var gateOnce sync.Once
+	var broker *linuxWaitBroker
+	gatedWait4 := func(pid int, status *syscall.WaitStatus, options int, rusage *syscall.Rusage) (int, error) {
+		if broker.mu.TryLock() {
+			broker.mu.Unlock()
+			t.Error("broker lock was released between generation validation and wait4")
+		}
+		gateOnce.Do(func() {
+			close(waitEntered)
+			<-releaseWait
+		})
+		return wait4.wait4(pid, status, options, rusage)
+	}
+	broker = newLinuxWaitBrokerWithRunner(gatedWait4, false)
+	owner := broker.newOwner()
+	firstGeneration, err := owner.register(tid)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scanDone := make(chan bool, 1)
+	go func() { scanDone <- broker.scan() }()
+	<-waitEntered
+
+	releaseDone := make(chan bool, 1)
+	releaseStarted := make(chan struct{})
+	go func() {
+		close(releaseStarted)
+		releaseDone <- owner.release(tid, firstGeneration)
+	}()
+	<-releaseStarted
+	select {
+	case released := <-releaseDone:
+		close(releaseWait)
+		<-scanDone
+		t.Fatalf("release completed across a validated wait4 call: %v", released)
+	case <-time.After(250 * time.Millisecond):
+	}
+	close(releaseWait)
+	if <-scanDone {
+		t.Fatal("empty validated scan reported progress")
+	}
+	if !<-releaseDone {
+		t.Fatal("release rejected the original registration after the scan completed")
+	}
+
+	secondGeneration, err := owner.register(tid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wait4.add(tid, stoppedAt(syscall.SIGTRAP, 0))
+	if !broker.scan() {
+		t.Fatal("replacement scan reported no progress")
+	}
+	result := nextBrokerResult(t, owner)
+	if result.generation != secondGeneration || !result.status.Stopped() {
+		t.Fatalf("replacement result = %+v, want generation %d stop",
+			result, secondGeneration)
+	}
+}
+
 func TestLinuxWaitBrokerReportsExactGenerationRetirement(t *testing.T) {
 	const tid = 11431
 	broker := newLinuxWaitBrokerWithRunner(newScriptedExactWait4().wait4, false)

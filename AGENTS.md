@@ -1508,8 +1508,13 @@ are detected by a `mach_msg` receive loop.
   `Wait4(tid, WNOHANG|WALL)`, and uses a one-second fallback scan for a missed or
   coalesced notification. It never calls `Wait4(-1, ...)` and therefore cannot
   steal another debugger's status or reap an unrelated child. One live TID has
-  one owner; monotonically increasing registration generations prevent a scan
-  result for a retired TID from reaching a later owner after TID reuse. A
+  one owner. Each exact nonblocking wait stays under the broker lock from its
+  generation check through status consumption and queue delivery; release and
+  replacement registration take that same lock. A scan snapshot that became
+  stale therefore skips the syscall instead of consuming the replacement
+  generation's stop and dropping it on delivery. Monotonically increasing
+  registration generations prevent a result for a retired TID from reaching a
+  later owner after TID reuse. A
   successful attached detach explicitly releases the exact generation and
   purges only its queued results; exact `ECHILD` retirement is routed as a
   generation-bearing result so quiesce can distinguish it from a live stop. A closed
