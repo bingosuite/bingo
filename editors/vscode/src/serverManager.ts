@@ -302,6 +302,15 @@ export class ServerManager {
         'bingo serverMode "auto" requires managementHost and dapHost to be 127.0.0.1; use "connectOnly" for remote or custom endpoints',
       );
     }
+    if (
+      formatEndpoint(config.managementEndpoint) ===
+      formatEndpoint(config.dapEndpoint)
+    ) {
+      throw new ServerManagerError(
+        "invalidConfiguration",
+        'bingo serverMode "auto" requires distinct management and DAP endpoints; choose different managementPort and dapPort values',
+      );
+    }
     const target = supportedTargetFor(this.#dependencies.runtime);
     if (target === undefined) {
       throw unsupportedTargetError(this.#dependencies.runtime);
