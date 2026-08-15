@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	"github.com/bingosuite/bingo/internal/dap"
+	"github.com/bingosuite/bingo/internal/debugger"
 	"github.com/bingosuite/bingo/internal/hub"
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
@@ -710,4 +712,114 @@ func TestShutdownTimeoutRetainsSessionsUntilCleanupCompletes(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Done did not close after retained cleanup completed")
 	}
+}
+
+type retainedStartupDebugger struct {
+	mu      sync.Mutex
+	events  chan protocol.Event
+	killErr error
+	kills   int
+}
+
+func newRetainedStartupDebugger() *retainedStartupDebugger {
+	return &retainedStartupDebugger{events: make(chan protocol.Event)}
+}
+
+func (*retainedStartupDebugger) Launch(string, []string, []string) error { return nil }
+func (*retainedStartupDebugger) Attach(int, string) error {
+	return errors.New("injected attach failure")
+}
+func (d *retainedStartupDebugger) Kill() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.kills++
+	return d.killErr
+}
+func (*retainedStartupDebugger) SetBreakpoint(string, int) (protocol.Breakpoint, error) {
+	return protocol.Breakpoint{}, nil
+}
+func (*retainedStartupDebugger) ClearBreakpoint(int) error { return nil }
+func (*retainedStartupDebugger) Continue() error           { return nil }
+func (*retainedStartupDebugger) StepOver() error           { return nil }
+func (*retainedStartupDebugger) StepInto() error           { return nil }
+func (*retainedStartupDebugger) StepOut() error            { return nil }
+func (*retainedStartupDebugger) Pause() error              { return nil }
+func (*retainedStartupDebugger) Locals(int) ([]protocol.Variable, error) {
+	return nil, nil
+}
+func (*retainedStartupDebugger) Evaluate(int, string) (protocol.Variable, error) {
+	return protocol.Variable{}, nil
+}
+func (*retainedStartupDebugger) StackFrames() ([]protocol.Frame, error) { return nil, nil }
+func (*retainedStartupDebugger) Goroutines() (protocol.GoroutinesPayload, error) {
+	return protocol.GoroutinesPayload{}, nil
+}
+func (*retainedStartupDebugger) GoroutineSnapshot() (protocol.GoroutineSnapshotPayload, error) {
+	return protocol.GoroutineSnapshotPayload{}, nil
+}
+func (d *retainedStartupDebugger) Events() <-chan protocol.Event { return d.events }
+
+func (d *retainedStartupDebugger) setKillError(err error) {
+	d.mu.Lock()
+	d.killErr = err
+	d.mu.Unlock()
+}
+
+func (d *retainedStartupDebugger) killCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.kills
+}
+
+func TestServerDoneWaitsForFailedStartupCleanup(t *testing.T) {
+	g := NewWithT(t)
+	srv := New("127.0.0.1:0", nil)
+	running := startConstructedServer(t, srv)
+	fd := newRetainedStartupDebugger()
+	fd.setKillError(fmt.Errorf("%w: retained partial attach",
+		debugger.ErrAttachedDetachIncomplete))
+
+	const id = "failed-startup-cleanup"
+	h := hub.NewSession(id, func() debugger.Debugger { return fd }, nil)
+	srv.sessions.mu.Lock()
+	srv.sessions.sessions[id] = &session{id: id, hub: h, createdAt: time.Now()}
+	srv.sessions.notifyLocked()
+	srv.sessions.mu.Unlock()
+	go func() {
+		h.Run(srv.ctx)
+		srv.sessions.remove(id)
+	}()
+
+	wsURL := "ws" + strings.TrimPrefix(running.url, "http") + "/ws?session=" + id
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	g.Expect(err).NotTo(HaveOccurred())
+	_, _, err = recvStateEvent(conn)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	payload, err := json.Marshal(protocol.AttachPayload{PID: 1234})
+	g.Expect(err).NotTo(HaveOccurred())
+	command, err := json.Marshal(protocol.Command{
+		Version: protocol.Version,
+		Kind:    protocol.CmdAttach,
+		Payload: payload,
+	})
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(conn.WriteMessage(websocket.TextMessage, command)).To(Succeed())
+	g.Eventually(fd.killCount, time.Second, 10*time.Millisecond).Should(BeNumerically(">=", 2))
+
+	err = srv.Shutdown(20 * time.Millisecond)
+	g.Expect(err).To(MatchError(ErrShutdownIncomplete))
+	g.Consistently(h.Done(), 100*time.Millisecond, 10*time.Millisecond).ShouldNot(BeClosed())
+	g.Consistently(srv.Done(), 100*time.Millisecond, 10*time.Millisecond).ShouldNot(BeClosed())
+	g.Expect(srv.sessions.count()).To(Equal(1))
+	killsAtTimeout := fd.killCount()
+	g.Eventually(fd.killCount, time.Second, 10*time.Millisecond).
+		Should(BeNumerically(">", killsAtTimeout),
+			"failed startup cleanup must remain actively owned after Shutdown returns")
+
+	fd.setKillError(nil)
+	g.Eventually(h.Done(), time.Second, 10*time.Millisecond).Should(BeClosed())
+	g.Eventually(srv.Done(), time.Second, 10*time.Millisecond).Should(BeClosed())
+	g.Eventually(srv.sessions.count, time.Second, 10*time.Millisecond).Should(Equal(0))
+	g.Eventually(running.errCh, time.Second).Should(Receive(BeNil()))
 }
