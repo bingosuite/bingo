@@ -1242,6 +1242,12 @@ func assertCurrentGoroutineScan(count int) {
 	GinkgoHelper()
 	Expect(count).To(BeNumerically(">", 0), "target count must be positive")
 	const richScanLimit = 8192
+	snapshotRuntimeSymbols := []string{
+		"runtime.allglen",
+		"runtime.allgptr",
+		"runtime.allgs",
+		"runtime.allm",
+	}
 
 	releaseIndex := count - 1
 	if count > 1024 {
@@ -1255,7 +1261,18 @@ func assertCurrentGoroutineScan(count int) {
 	h := newE2EHarness(bin)
 	h.waitFor(15*time.Second, protocol.EventStepped)
 
-	_, err := h.d.SetBreakpoint(filepath.Base(bin)+".go", line)
+	warm, err := debugger.WarmSnapshotDWARFForE2E(h.d)
+	Expect(err).NotTo(HaveOccurred(), "warm image-only snapshot DWARF")
+	Expect(warm.FunctionIndexEntries).To(BeNumerically(">", 0),
+		"function index must be warm before the timed stop")
+	Expect(warm.GoLayoutCached).To(BeTrue(),
+		"runtime layout must be resolved before the timed stop")
+	for _, name := range snapshotRuntimeSymbols {
+		Expect(warm.RuntimeSymbols[name]).NotTo(BeZero(),
+			"%s must be resolved before the timed stop", name)
+	}
+
+	_, err = h.d.SetBreakpoint(filepath.Base(bin)+".go", line)
 	Expect(err).NotTo(HaveOccurred(), "SetBreakpoint on current-goroutine worker")
 	Expect(h.d.Continue()).To(Succeed(), "Continue to current-goroutine worker")
 
@@ -1330,8 +1347,12 @@ func assertCurrentGoroutineScan(count int) {
 	Expect(snapshotThread.GoID).To(Equal(snap.Current),
 		"the uniquely current runtime thread must run snapshot Current")
 	if count > richScanLimit {
-		Expect(snap.Goroutines).To(HaveLen(richScanLimit+1),
-			"heavy proof must append one current anchor beyond the full rich prefix")
+		Expect(snap.Totals).NotTo(BeNil(),
+			"the packed heavy snapshot must report omitted goroutines")
+		Expect(snap.Totals.Goroutines).To(BeNumerically(">=", richScanLimit+1),
+			"the full scan must include the rich prefix plus the current anchor")
+		Expect(snap.Totals.Goroutines).To(BeNumerically(">", len(snap.Goroutines)),
+			"the byte-bounded payload must report its omitted tail")
 		Expect(snap.Goroutines[0].ID).To(Equal(hit.Goroutine.ID),
 			"beyond-prefix current anchor must lead the bounded snapshot")
 	}

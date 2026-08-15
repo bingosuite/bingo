@@ -53,6 +53,67 @@ func ExportedLoadDWARF(d Debugger, binaryPath string) {
 	}
 }
 
+type ExportedDWARFInspectionState struct {
+	FunctionIndexEntries int
+	GoLayoutCached       bool
+	RuntimeSymbols       map[string]ExportedRuntimeSymbolState
+}
+
+type ExportedRuntimeSymbolState struct {
+	Cached  bool
+	Address uint64
+}
+
+// ExportedWarmDWARFInspection moves image-only lazy scans outside tests' timed
+// stop window while preserving the engine-loop ownership used in production.
+func ExportedWarmDWARFInspection(d Debugger) {
+	e := d.(*engine)
+	if err := e.dispatch(func() error {
+		if e.dw == nil {
+			return fmt.Errorf("no DWARF loaded")
+		}
+		e.dw.funcIndexOnce.Do(e.dw.buildFuncIndex)
+		_, _ = e.getGoLayout()
+		_ = e.dw.runtimeVarAddrs("runtime.allglen", "runtime.allgptr", "runtime.allgs")
+		_, _ = e.dw.runtimeVarAddr("runtime.allm")
+		return nil
+	}); err != nil {
+		panic("ExportedWarmDWARFInspection: " + err.Error())
+	}
+}
+
+func ExportedDWARFInspectionCacheState(d Debugger) ExportedDWARFInspectionState {
+	e := d.(*engine)
+	state := ExportedDWARFInspectionState{
+		RuntimeSymbols: make(map[string]ExportedRuntimeSymbolState),
+	}
+	if err := e.dispatch(func() error {
+		if e.dw == nil {
+			return fmt.Errorf("no DWARF loaded")
+		}
+		state.FunctionIndexEntries = len(e.dw.funcIndex)
+		state.GoLayoutCached = e.goLayout != nil && e.goLayout.valid
+		e.dw.cacheMu.Lock()
+		for _, name := range []string{
+			"runtime.allglen",
+			"runtime.allgptr",
+			"runtime.allgs",
+			"runtime.allm",
+		} {
+			addr, cached := e.dw.varAddrs[name]
+			state.RuntimeSymbols[name] = ExportedRuntimeSymbolState{
+				Cached:  cached,
+				Address: addr,
+			}
+		}
+		e.dw.cacheMu.Unlock()
+		return nil
+	}); err != nil {
+		panic("ExportedDWARFInspectionCacheState: " + err.Error())
+	}
+	return state
+}
+
 // ExportedPCForFileLine resolves file:line to a runtime PC via the loaded DWARF.
 func ExportedPCForFileLine(d Debugger, file string, line int) (uint64, error) {
 	e := d.(*engine)

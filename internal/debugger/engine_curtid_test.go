@@ -107,6 +107,15 @@ var _ = Describe("current-thread inspection", func() {
 		d = debugger.NewWithBackend(fb, nil)
 		debugger.ExportedLoadDWARF(d, bin)
 
+		cold := debugger.ExportedDWARFInspectionCacheState(d)
+		Expect(cold.FunctionIndexEntries).To(BeZero())
+		Expect(cold.GoLayoutCached).To(BeFalse())
+		for _, name := range snapshotRuntimeSymbols {
+			Expect(cold.RuntimeSymbols[name].Cached).To(BeFalse(),
+				"%s must start cold so this spec proves the warmup", name)
+		}
+		debugger.ExportedWarmDWARFInspection(d)
+
 		pcAlpha, err = debugger.ExportedPCForFileLine(d, fileName, inspectMarkerLine("alpha-marker"))
 		Expect(err).NotTo(HaveOccurred())
 		pcBeta, err = debugger.ExportedPCForFileLine(d, fileName, inspectMarkerLine("beta-marker"))
@@ -130,6 +139,19 @@ var _ = Describe("current-thread inspection", func() {
 	// stopOnThread2 drives a breakpoint stop on TID 2, leaving the engine
 	// suspended with curTID==2 (thread 2 in beta) while threads[0]==1 is alpha.
 	stopOnThread2 := func() {
+		warm := debugger.ExportedDWARFInspectionCacheState(d)
+		Expect(warm.FunctionIndexEntries).To(BeNumerically(">", 0),
+			"function index must be warm before the timed stop")
+		Expect(warm.GoLayoutCached).To(BeTrue(),
+			"runtime layout must be resolved before the timed stop")
+		for _, name := range snapshotRuntimeSymbols {
+			symbol := warm.RuntimeSymbols[name]
+			Expect(symbol.Cached).To(BeTrue(),
+				"%s must be cached before the timed stop", name)
+			Expect(symbol.Address).NotTo(BeZero(),
+				"%s must resolve in the current Go runtime", name)
+		}
+
 		debugger.ExportedForceSuspended(d)
 		debugger.ExportedSetBreakpointAt(d, pcBeta)
 		continueAndConsumeContinued(d)
@@ -187,3 +209,10 @@ var _ = Describe("current-thread inspection", func() {
 			"after a step, StackFrames should follow curTID (2), got %q", frames[0].Location.Function)
 	})
 })
+
+var snapshotRuntimeSymbols = []string{
+	"runtime.allglen",
+	"runtime.allgptr",
+	"runtime.allgs",
+	"runtime.allm",
+}
