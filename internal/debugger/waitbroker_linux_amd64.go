@@ -40,6 +40,11 @@ type linuxWaitRegistration struct {
 	generation uint64
 }
 
+type linuxWaitScan struct {
+	tid int
+	reg linuxWaitRegistration
+}
+
 // linuxWaitBroker is the process-wide owner of Linux wait syscalls. SIGCHLD
 // triggers exact registered-TID scans, so one debugger can never consume
 // another debugger's stop or the status of an unrelated child.
@@ -277,22 +282,13 @@ func (b *linuxWaitBroker) registrationCount() int {
 	return len(b.registrations)
 }
 
-func (b *linuxWaitBroker) snapshot() []struct {
-	tid int
-	reg linuxWaitRegistration
-} {
+func (b *linuxWaitBroker) snapshot() []linuxWaitScan {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	snapshot := make([]struct {
-		tid int
-		reg linuxWaitRegistration
-	}, 0, len(b.registrations))
+	snapshot := make([]linuxWaitScan, 0, len(b.registrations))
 	for tid, reg := range b.registrations {
-		snapshot = append(snapshot, struct {
-			tid int
-			reg linuxWaitRegistration
-		}{tid: tid, reg: reg})
+		snapshot = append(snapshot, linuxWaitScan{tid: tid, reg: reg})
 	}
 	sort.Slice(snapshot, func(i, j int) bool { return snapshot[i].tid < snapshot[j].tid })
 	return snapshot
@@ -303,41 +299,46 @@ func (b *linuxWaitBroker) snapshot() []struct {
 func (b *linuxWaitBroker) scan() bool {
 	progressed := false
 	for _, item := range b.snapshot() {
-		var status syscall.WaitStatus
-		tid, err := b.wait4(item.tid, &status, syscall.WNOHANG|syscall.WALL, nil)
-		switch {
-		case err == nil && tid == 0:
-			continue
-		case err == nil:
-			progressed = true
-			b.deliver(item.tid, item.reg, linuxWaitResult{
-				tid: tid, generation: item.reg.generation, status: status,
-			},
-				status.Exited() || status.Signaled())
-		case errors.Is(err, syscall.EINTR):
-			progressed = true
-		case errors.Is(err, syscall.ECHILD):
-			progressed = true
-			b.retire(item.tid, item.reg)
-		default:
-			progressed = true
-			b.deliver(item.tid, item.reg, linuxWaitResult{
-				tid:        item.tid,
-				generation: item.reg.generation,
-				err:        fmt.Errorf("wait4 tid %d: %w", item.tid, err),
-			}, true)
-		}
+		progressed = b.scanRegistration(item) || progressed
 	}
 	return progressed
 }
 
-func (b *linuxWaitBroker) deliver(tid int, expected linuxWaitRegistration, result linuxWaitResult, terminal bool) {
+func (b *linuxWaitBroker) scanRegistration(item linuxWaitScan) bool {
 	b.mu.Lock()
-	current, ok := b.registrations[tid]
-	if !ok || current != expected {
-		b.mu.Unlock()
-		return
+	defer b.mu.Unlock()
+
+	current, ok := b.registrations[item.tid]
+	if !ok || current != item.reg {
+		return false
 	}
+
+	// The exact wait is nonblocking. Keeping registration validation and status
+	// consumption in one critical section prevents detach recovery from replacing
+	// this TID's generation after validation but before wait4 consumes its stop.
+	var status syscall.WaitStatus
+	tid, err := b.wait4(item.tid, &status, syscall.WNOHANG|syscall.WALL, nil)
+	switch {
+	case err == nil && tid == 0:
+		return false
+	case err == nil:
+		b.deliverLocked(item.tid, current, linuxWaitResult{
+			tid: tid, generation: current.generation, status: status,
+		}, status.Exited() || status.Signaled())
+	case errors.Is(err, syscall.EINTR):
+	case errors.Is(err, syscall.ECHILD):
+		b.retireLocked(item.tid, current)
+	default:
+		b.deliverLocked(item.tid, current, linuxWaitResult{
+			tid:        item.tid,
+			generation: current.generation,
+			err:        fmt.Errorf("wait4 tid %d: %w", item.tid, err),
+		}, true)
+	}
+	return true
+}
+
+func (b *linuxWaitBroker) deliverLocked(tid int, current linuxWaitRegistration, result linuxWaitResult, terminal bool) {
 	if terminal {
 		delete(b.registrations, tid)
 	}
@@ -352,16 +353,19 @@ func (b *linuxWaitBroker) deliver(tid int, expected linuxWaitRegistration, resul
 	}
 	owner.signalLocked()
 	owner.mu.Unlock()
-	b.mu.Unlock()
 }
 
 func (b *linuxWaitBroker) retire(tid int, expected linuxWaitRegistration) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	current, ok := b.registrations[tid]
 	if !ok || current != expected {
-		b.mu.Unlock()
 		return
 	}
+	b.retireLocked(tid, current)
+}
+
+func (b *linuxWaitBroker) retireLocked(tid int, current linuxWaitRegistration) {
 	delete(b.registrations, tid)
 
 	owner := current.owner
@@ -378,5 +382,4 @@ func (b *linuxWaitBroker) retire(tid int, expected linuxWaitRegistration) {
 	}
 	owner.signalLocked()
 	owner.mu.Unlock()
-	b.mu.Unlock()
 }
