@@ -48,3 +48,6 @@ test/coverage.out
 /editors/vscode/bin/
 /editors/vscode/dist/
 /editors/vscode/*.vsix
+
+# Neovim companion native server
+/editors/neovim/bin/

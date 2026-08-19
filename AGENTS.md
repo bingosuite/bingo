@@ -94,6 +94,7 @@ follow them so reviews stay about substance, not style.
 | [cmd/internal/repl](cmd/internal/repl/) | Shared interactive-client loop: readline interrupt/cancellation semantics, refresh-safe async output, and frame-index validation. |
 | [cmd/wsmon](cmd/wsmon/) | Read-only terminal telemetry observer. `-session`-joins a running session over WebSocket and live-renders the goroutine spawn tree + OS threads + created/exited lifecycle deltas from the `EventGoroutineSnapshot` stream, reporting included/total honestly and distinguishing wire omission from a clipped runtime scan. Never drives execution — the WS-observes half of the DAP-drives/WS-observes demo. |
 | [editors/vscode](editors/vscode/) | Platform-packaged TypeScript companion extension. Owns debugger type `bingo`, manages the shared server, and hosts the read-only Bingo Concurrency Activity Bar WebSocket observer. |
+| [editors/neovim](editors/neovim/) | Lua companion for `nvim-dap`. Mirrors managed server discovery/start, drives launch/attach/join over DAP, and exposes the announced session ID for a separate WebSocket observer. |
 | [cmd/target](cmd/target/) | Trivial target program for manual testing. |
 | [examples/level1-loop](examples/level1-loop/) … [examples/level5-workflow](examples/level5-workflow/) | Progressive debugger targets, selected by the root VS Code launch picker and built together with `just build-examples` (see [examples/README.md](examples/README.md)). |
 | [examples/spawntree](examples/spawntree/) | Concurrency demo target: a deterministic main → supervisor → worker×N goroutine spawn tree for exercising the telemetry stream (see [docs/ConcurrencyTelemetry.md](docs/ConcurrencyTelemetry.md)). |
@@ -2553,6 +2554,24 @@ Code's raw launch/attach arguments; Go's JSON decoder ignores those unknown
 fields, so they never enter the bingo command payload. Do not add them to the
 wire protocol or `launchConfig`.
 
+**Neovim companion — the same managed transport through `nvim-dap`.**
+[editors/neovim](editors/neovim/) registers a function-form `dap.adapters.bingo`
+that asynchronously resolves to the existing TCP listener; it does not
+implement another adapter or invoke Delve. `auto` mode mirrors the VS Code
+health contract and spawn safety: exact service/management/wire/session-event
+compatibility, loopback-only start, detached argv-based spawn, endpoint-level
+coalescing, persistent logs, and server-owned idle teardown. `connectOnly`
+bypasses health and spawn. The prepared native binary is generated under
+`editors/neovim/bin/` by `just neovim-prepare` and is never committed; runtime
+falls back to `PATH` or explicit `server.binary`.
+
+The plugin listens on nvim-dap's literal
+`event_bingo/session/v1` listener key, validates the strict two-field payload,
+and emits `User BingoSession`; `Session.on_close` owns cleanup across terminate,
+disconnect, and transport failure. DAP remains drive-only. The plugin does not
+reimplement RFC 6455 in Lua: concurrency telemetry stays on the WebSocket side
+and uses `cmd/wsmon` until a bounded native observer exists.
+
 **VS Code connect-or-start invariants.** Default `serverMode:"auto"` is local
 only: management `127.0.0.1:6060`, DAP `127.0.0.1:4711`, readiness 5s, managed
 idle grace 30s. Its management and DAP endpoints must be distinct; an identical
@@ -3324,6 +3343,10 @@ translator keeps DAP entirely outside the hub — a strictly additive package.
   dedicated [vscode-extension.yml](.github/workflows/vscode-extension.yml)
   workflow lints, typechecks, tests, bundles, and builds the local VSIX without
   changing the Go CI jobs.
+- Neovim: [editors/neovim](editors/neovim/) keeps configuration, health-contract,
+  HTTP framing, adapter registration, and session-event validation independent
+  of a real `nvim-dap` install and runs them in headless Neovim with
+  `just neovim-check`; the same recipe parses every Lua source file.
 
 ## Error handling
 
@@ -3729,6 +3752,8 @@ just vscode-package                        # writes verified dist/bingo-<platfor
 just vscode-install                        # explicitly installs/updates bingosuite.bingo
 npm --prefix editors/vscode run test:integration # pinned Electron activation/view/custom-event test
 npm --prefix editors/vscode run e2e:packaged     # real native packaged DAP + graphical telemetry path
+just neovim-prepare                        # stage the host-native server for the Lua companion
+just neovim-check                          # parse and test the Neovim companion
 just e2e-linux                             # native linux/amd64 ptrace E2E (all labels)
 just e2e-darwin                            # native darwin/arm64 Mach-exception E2E (codesigned; all labels)
 # Filter to one label, e.g. only the correctness gate (package path must come
