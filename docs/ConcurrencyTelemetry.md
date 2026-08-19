@@ -2,8 +2,8 @@
 
 bingo speaks two protocols against **one** debug session at the same time:
 
-- **DAP** (`-dap-addr`) — an IDE (VS Code) or `cmd/dapcli` *drives* the session:
-  breakpoints, stepping, continue/pause, stack/variables. This is the
+- **DAP** (`-dap-addr`) — an IDE (VS Code or Neovim) or `cmd/dapcli` *drives*
+  the session: breakpoints, stepping, continue/pause, stack/variables. This is the
   least-common-denominator debug loop.
 - **WebSocket** (`-addr`) — any number of clients *observe* (and can also drive)
   the same session. The richer concurrency telemetry — the goroutine spawn tree,
@@ -14,10 +14,14 @@ The VS Code 0.3.1 extension wires both together automatically: DAP drives while
 the **Bingo Concurrency** Activity Bar view observes the exact session over
 WebSocket. `cmd/wsmon` remains the terminal observer for non-VS Code workflows.
 
+The Neovim companion drives the same DAP workflow through `nvim-dap`, captures
+the managed-session announcement, and pairs with `cmd/wsmon` for read-only
+telemetry.
+
 ```
-             drives (DAP :4711)                observes (WS :6060)
-  VS Code  ─────────────────────►  bingo server  ◄─────────────────  Concurrency view
-  / dapcli                          (one session)                    / cmd/wsmon
+                 drives (DAP :4711)                observes (WS :6060)
+  VS Code / Neovim ─────────────►  bingo server  ◄─────────────────  Concurrency view
+  / dapcli                           (one session)                    / cmd/wsmon
                                           │                            threads,
                                           ▼                            lifecycle)
                                     spawntree tracee
@@ -46,6 +50,10 @@ architecture behind this.
   it neither invokes nor validates `dlv`, and it does not replace the Go
   extension's `"go"` type. To update, rerun `just vscode-install`; uninstall with
   `code --uninstall-extension bingosuite.bingo`.
+
+- For Neovim: Neovim 0.11.7 or newer plus `nvim-dap`. Run
+  `just neovim-prepare`, add `editors/neovim` to the runtime path, and call
+  `require("bingo").setup()`. See the [Neovim guide](../editors/neovim/README.md).
 
 ## 1. Demo targets
 
@@ -107,7 +115,23 @@ path in **bingo Server** rather than killing a potentially shared process.
 > `binaryPath` attaches to an OS process instead; the extension README has the
 > full shape.
 
-## 3. Drive with cmd/dapcli (DAP, no IDE)
+## 3. Drive with Neovim (DAP, automatic server)
+
+1. Run `just neovim-prepare` and configure the companion as described in
+   [editors/neovim/README.md](../editors/neovim/README.md).
+2. Open a Go source file and run `:BingoLaunch ./build/examples/level5-workflow`.
+   The adapter health-checks the loopback management endpoint, reuses or starts
+   a compatible detached server, and connects `nvim-dap`.
+3. Use normal `nvim-dap` breakpoint and continue mappings. The plugin validates
+   `bingo/session/v1`; `:BingoSession` shows the ID.
+4. Run `go run ./cmd/wsmon -session <session-id>` in another terminal for the
+   goroutine tree, OS threads, and lifecycle deltas.
+
+`:BingoAttach <pid> [binary]` attaches to an OS process, while
+`:BingoJoin <session-id>` joins an existing managed session without relaunching
+or resuming it. Remote endpoints use `server.mode = "connectOnly"`.
+
+## 4. Drive with cmd/dapcli (DAP, no IDE)
 
 Equivalent driver in a terminal requires a manual server:
 
@@ -124,7 +148,7 @@ c                             # continue → hits the breakpoint
 `dapcli` prints the session id it created (also on the server console). Continue
 again to churn rounds; each stop pushes a fresh telemetry snapshot to observers.
 
-## 4. Terminal fallback with cmd/wsmon
+## 5. Terminal fallback with cmd/wsmon
 
 In another terminal, join the **same session id** read-only and watch it update:
 

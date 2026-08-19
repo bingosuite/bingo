@@ -16,7 +16,7 @@ BinGo is a standalone visual concurrency debugger for Go that helps you:
 
 - Visualize and understand goroutines, channels, and synchronization behavior
 - Capture detailed runtime events and turn them into clear, interactive visualizations
-- Use in a terminal UI or inside editors like VS Code or Vim
+- Use in a terminal UI or inside editors like VS Code or Neovim
 - Track goroutine lifecycles
 - Inspect channels and mutexes
 - Replay timelines of concurrent execution
@@ -36,7 +36,7 @@ Builds on other GOOS/GOARCH combinations will fail with `undefined: newBackend` 
 ## Debug Adapter Protocol (DAP)
 
 BinGo speaks the [Debug Adapter Protocol](https://microsoft.github.io/debug-adapter-protocol/)
-alongside its native WebSocket protocol, so a standard IDE (VS Code, neovim) can
+alongside its native WebSocket protocol, so a standard IDE (VS Code, Neovim) can
 drive a debug session over a TCP socket while BinGo's own visual clients observe
 — and optionally also drive — the **same** session in parallel.
 
@@ -49,8 +49,8 @@ bingo -addr 127.0.0.1:6060 -dap-addr 127.0.0.1:4711
 ```
 
 `just server` starts both listeners with the defaults above; use `just server-ws`
-for a WebSocket-only run (DAP disabled). The VS Code companion can instead
-connect-or-start automatically.
+for a WebSocket-only run (DAP disabled). The VS Code and Neovim companions can
+instead connect-or-start automatically.
 
 ### Server discovery and managed lifetime
 
@@ -171,6 +171,31 @@ automatically follows the exact DAP-created session over WebSocket—no session
 ID copy is needed. It visualizes the goroutine spawn tree, OS threads, current
 goroutine, source locations, and bounded created/exited timeline while keeping
 all run control in VS Code's Debug UI.
+
+### Neovim companion
+
+Prepare the platform-native server and add `editors/neovim` to Neovim's runtime
+path with `nvim-dap` installed:
+
+```sh
+just neovim-prepare
+```
+
+```lua
+require("bingo").setup()
+```
+
+The companion registers a function-form `nvim-dap` adapter with managed local
+`auto` mode and remote/custom `connectOnly` mode. It provides
+`:BingoLaunch`, `:BingoAttach`, and `:BingoJoin` commands while normal
+`nvim-dap` commands drive breakpoints, stepping, stack frames, variables, and
+evaluate requests.
+
+The validated `bingo/session/v1` event is available through `:BingoSession` and
+`require("bingo").session_id()` so `cmd/wsmon` can observe the same managed
+session over WebSocket. See the
+[Neovim companion guide](editors/neovim/README.md) for installation,
+configuration, lifecycle, and remote-use details.
 
 Other DAP clients can point at `127.0.0.1:4711`. The DAP client creates a
 managed session on `launch`/`attach`; WebSocket observers join that same session

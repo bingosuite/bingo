@@ -40,8 +40,8 @@ dap_addr := "127.0.0.1:4711"
 
 # Build then run the server with EVERYTHING enabled: both the WebSocket (-addr)
 # and DAP (-dap-addr) listeners, using the standard defaults so a DAP driver
-# (VS Code / `just dapcli`) and a `go run ./cmd/wsmon` observer can share one
-# session out of the box (see docs/ConcurrencyTelemetry.md). Override addresses
+# (VS Code / Neovim / `just dapcli`) and a `go run ./cmd/wsmon` observer can
+# share one session out of the box (see docs/ConcurrencyTelemetry.md). Override addresses
 # via the ADDR/DAP_ADDR positionals; extra flags (e.g. `-idle-timeout 30s`) pass
 # through in ARGS. No idle timeout is supplied by default, so manual servers
 # remain persistent.
@@ -115,6 +115,17 @@ vscode-package: vscode-check
 # profile while still providing a one-command local install/update path.
 vscode-install: vscode-package
 	code --install-extension ./dist/bingo-{{vscode_target}}.vsix --force
+
+# Stage the host-native server where the Neovim companion resolves it before
+# falling back to PATH. The macOS build is already codesigned by `build`.
+neovim-prepare: (build os_name arch_name)
+	mkdir -p ./editors/neovim/bin
+	cp ./build/bingo/bingo_{{os_name}}_{{arch_name}} ./editors/neovim/bin/bingo
+	chmod 755 ./editors/neovim/bin/bingo
+
+# Parse all plugin files and run the contract tests in Neovim's Lua runtime.
+neovim-check:
+	nvim --headless -u NONE -l ./editors/neovim/tests/run.lua
 
 # Run unit tests on the PKG (defaults to ./...)
 test PKG="./...":
