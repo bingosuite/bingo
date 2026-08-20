@@ -135,4 +135,5 @@ just neovim-check
 
 The headless-Neovim check parses every Lua file and runs the dependency-free
 configuration, adapter-registration, health-contract, HTTP, and session-event
-tests.
+tests. Run `:checkhealth bingo` inside Neovim to verify the required Neovim and
+`nvim-dap` dependencies are available.

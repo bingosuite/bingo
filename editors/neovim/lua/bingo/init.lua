@@ -9,6 +9,10 @@ local state = {
   options = nil,
   current_session = nil,
   session_ids = setmetatable({}, { __mode = "k" }),
+  adapter = nil,
+  previous_adapter = nil,
+  configurations = {},
+  listeners = {},
 }
 
 local default_configuration_names = {
@@ -42,9 +46,9 @@ local function remove_session(dap_session)
   end
 end
 
-local function register_session_listeners(dap)
+local function register_session_listeners(dap, options)
   local event_key = "event_" .. session_event.event_name
-  ensure_listener(dap, "before", event_key).bingo = function(dap_session, body)
+  local event_listener = function(dap_session, body)
     local announcement, decode_error = session_event.decode(body)
     if announcement == nil then
       notify("ignored invalid bingo session event: " .. decode_error, vim.log.levels.WARN)
@@ -53,7 +57,7 @@ local function register_session_listeners(dap)
 
     state.session_ids[dap_session] = announcement.session_id
     state.current_session = announcement.session_id
-    if state.options.notify_session then
+    if options.notify_session then
       notify("managed session " .. announcement.session_id, vim.log.levels.INFO)
     end
     vim.api.nvim_exec_autocmds("User", {
@@ -64,10 +68,7 @@ local function register_session_listeners(dap)
       },
     })
   end
-
-  ensure_listener(dap, "before", "event_terminated").bingo = remove_session
-  ensure_listener(dap, "before", "event_exited").bingo = remove_session
-  dap.listeners.on_session.bingo = function(_, new_session)
+  local on_session = function(_, new_session)
     if
       new_session == nil
       or new_session.config == nil
@@ -82,16 +83,44 @@ local function register_session_listeners(dap)
       end)
     end
   end
+  local listeners = {
+    event_key = event_key,
+    event = event_listener,
+    terminated = remove_session,
+    exited = remove_session,
+    on_session = on_session,
+  }
+  state.listeners = listeners
+
+  ensure_listener(dap, "before", event_key).bingo = event_listener
+  ensure_listener(dap, "before", "event_terminated").bingo = remove_session
+  ensure_listener(dap, "before", "event_exited").bingo = remove_session
+  dap.listeners.on_session.bingo = on_session
+
+  return listeners
 end
 
-local function default_configurations()
+local function required_prompt(dap, label, default, completion)
+  local value = prompt(label, default, completion)
+  if type(value) ~= "string" or value:match("^%s*$") then
+    return dap.ABORT
+  end
+  return value
+end
+
+local function default_configurations(dap)
   return {
     {
       name = "bingo: Launch binary",
       type = "bingo",
       request = "launch",
       program = function()
-        return prompt("Path to executable: ", vim.fn.getcwd() .. "/", "file")
+        return required_prompt(
+          dap,
+          "Path to executable: ",
+          vim.fn.getcwd() .. "/",
+          "file"
+        )
       end,
       args = {},
       env = {},
@@ -102,10 +131,14 @@ local function default_configurations()
       type = "bingo",
       request = "attach",
       pid = function()
-        return tonumber(prompt("Process ID: "))
+        local pid = tonumber(prompt("Process ID: "))
+        if type(pid) ~= "number" or pid % 1 ~= 0 or pid <= 0 then
+          return dap.ABORT
+        end
+        return pid
       end,
       binaryPath = function()
-        return prompt("Path to executable (optional): ", vim.fn.getcwd() .. "/", "file")
+        return prompt("Path to executable (optional): ", "", "file")
       end,
       stopOnEntry = true,
     },
@@ -114,7 +147,7 @@ local function default_configurations()
       type = "bingo",
       request = "attach",
       session = function()
-        return prompt("Managed bingo session ID: ")
+        return required_prompt(dap, "Managed bingo session ID: ")
       end,
     },
   }
@@ -128,11 +161,79 @@ local function add_configurations(dap)
       present[item.name] = true
     end
   end
-  for _, item in ipairs(default_configurations()) do
+  local added = {}
+  for _, item in ipairs(default_configurations(dap)) do
     if not present[item.name] then
       dap.configurations.go[#dap.configurations.go + 1] = item
+      added[#added + 1] = item
     end
   end
+  return added
+end
+
+local function remove_configurations(dap)
+  local go_configurations = dap.configurations.go
+  if type(go_configurations) ~= "table" then
+    state.configurations = {}
+    return
+  end
+  local owned = {}
+  for _, item in ipairs(state.configurations) do
+    owned[item] = true
+  end
+  for index = #go_configurations, 1, -1 do
+    if owned[go_configurations[index]] then
+      table.remove(go_configurations, index)
+    end
+  end
+  state.configurations = {}
+end
+
+local function remove_listener(dap, stage, name, callback)
+  local stage_listeners = dap.listeners[stage]
+  if type(stage_listeners) ~= "table" then
+    return
+  end
+  local listeners = rawget(stage_listeners, name)
+  if listeners ~= nil and listeners.bingo == callback then
+    listeners.bingo = nil
+  end
+end
+
+local function unregister_dap()
+  local dap = state.dap
+  if dap == nil then
+    return
+  end
+
+  remove_configurations(dap)
+  if state.adapter ~= nil and dap.adapters.bingo == state.adapter then
+    dap.adapters.bingo = state.previous_adapter
+  end
+  local listeners = state.listeners
+  if listeners.event_key ~= nil then
+    remove_listener(dap, "before", listeners.event_key, listeners.event)
+    remove_listener(dap, "before", "event_terminated", listeners.terminated)
+    remove_listener(dap, "before", "event_exited", listeners.exited)
+  end
+  local on_session = dap.listeners.on_session
+  if type(on_session) == "table" and on_session.bingo == listeners.on_session then
+    on_session.bingo = nil
+  end
+
+  state.adapter = nil
+  state.previous_adapter = nil
+  state.listeners = {}
+end
+
+local function clear_setup()
+  if state.manager ~= nil then
+    state.manager:dispose()
+  end
+  unregister_dap()
+  state.manager = nil
+  state.dap = nil
+  state.options = nil
 end
 
 function M.setup(options)
@@ -141,15 +242,17 @@ function M.setup(options)
   end
 
   local dap = require("dap")
-  if state.manager ~= nil then
-    state.manager:dispose()
-  end
-  state.options = config.normalize(options)
-  state.manager = server.new(state.options)
-  state.dap = dap
+  local normalized = config.normalize(options)
+  local manager = server.new(normalized)
+  clear_setup()
 
-  dap.adapters.bingo = function(callback, debug_config)
-    state.manager:ensure(debug_config, function(error_message, endpoint)
+  state.options = normalized
+  state.manager = manager
+  state.dap = dap
+  state.previous_adapter = dap.adapters.bingo
+
+  local adapter = function(callback, debug_config)
+    manager:ensure(debug_config, function(error_message, endpoint)
       if error_message ~= nil then
         notify(error_message, vim.log.levels.ERROR)
         return
@@ -165,10 +268,17 @@ function M.setup(options)
       })
     end)
   end
+  state.adapter = adapter
+  dap.adapters.bingo = adapter
 
-  register_session_listeners(dap)
+  local listeners_ok, listeners = pcall(register_session_listeners, dap, normalized)
+  if not listeners_ok then
+    clear_setup()
+    error(listeners, 0)
+  end
+  state.listeners = listeners
   if state.options.configurations then
-    add_configurations(dap)
+    state.configurations = add_configurations(dap)
   end
   return M
 end
@@ -215,7 +325,7 @@ function M.attach(pid, binary_path)
   if binary_path == nil then
     binary_path = prompt(
       "Path to executable (optional): ",
-      vim.fn.getcwd() .. "/",
+      "",
       "file"
     )
   end
@@ -258,11 +368,7 @@ function M.show_session()
 end
 
 function M.dispose()
-  if state.manager ~= nil then
-    state.manager:dispose()
-  end
-  state.manager = nil
-  state.dap = nil
+  clear_setup()
   state.current_session = nil
   state.session_ids = setmetatable({}, { __mode = "k" })
 end
