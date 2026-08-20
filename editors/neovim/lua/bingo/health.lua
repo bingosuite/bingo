@@ -147,6 +147,23 @@ local function refused(error_message)
     and error_message:find("ECONNREFUSED", 1, true) ~= nil
 end
 
+function M.check()
+  vim.health.start("bingo")
+  if vim.fn.has("nvim-0.11.7") == 1 then
+    vim.health.ok("Neovim 0.11.7 or newer is available")
+  else
+    vim.health.error("bingo requires Neovim 0.11.7 or newer")
+  end
+
+  local dap_ok = pcall(require, "dap")
+  if dap_ok then
+    vim.health.ok("nvim-dap is available")
+  else
+    vim.health.error("nvim-dap is required")
+  end
+  vim.health.info("Server compatibility is checked when a bingo debug session starts")
+end
+
 function M.probe(endpoint, expected_dap, timeout_ms, callback, dependencies)
   local deps = dependencies or default_dependencies()
   local uv = deps.uv

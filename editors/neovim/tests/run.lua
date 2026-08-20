@@ -144,6 +144,47 @@ test("HTTP health response parsing preserves the JSON body", function()
   equal(response.body, '{"service":"bingo"}')
 end)
 
+test("bingo exposes a valid Neovim healthcheck", function()
+  local real_vim = _G.vim
+  local previous_preload = package.preload.dap
+  local previous_loaded = package.loaded.dap
+  local reports = {}
+  _G.vim = setmetatable({
+    health = {
+      start = function(name)
+        reports[#reports + 1] = "start:" .. name
+      end,
+      ok = function(message)
+        reports[#reports + 1] = "ok:" .. message
+      end,
+      error = function(message)
+        reports[#reports + 1] = "error:" .. message
+      end,
+      info = function(message)
+        reports[#reports + 1] = "info:" .. message
+      end,
+    },
+    fn = setmetatable({
+      has = function()
+        return 1
+      end,
+    }, { __index = real_vim.fn }),
+  }, { __index = real_vim })
+  package.preload.dap = function()
+    return {}
+  end
+  package.loaded.dap = nil
+
+  health.check()
+  equal(reports[1], "start:bingo")
+  equal(reports[2], "ok:Neovim 0.11.7 or newer is available")
+  equal(reports[3], "ok:nvim-dap is available")
+
+  package.preload.dap = previous_preload
+  package.loaded.dap = previous_loaded
+  _G.vim = real_vim
+end)
+
 test("health timeout prevents stale TCP callbacks from advancing", function()
   local timer_callback
   local connect_callback
@@ -251,6 +292,262 @@ test("disposing a server manager prevents a stale probe from spawning", function
   equal(binary_checks, 0)
 end)
 
+test("server startup failures release every coalesced waiter", function()
+  local probe_callbacks = {}
+  local callbacks = 0
+  local callback_errors = {}
+  local notifications = {}
+  local manager = server.new(config.normalize({
+    server = {
+      binary = "/tmp/bingo",
+      log_path = "/protected/bingo/server.log",
+    },
+  }), {
+    uv = {
+      os_uname = function()
+        return { sysname = "Darwin", machine = "arm64" }
+      end,
+    },
+    schedule = function(callback)
+      callback()
+    end,
+    executable = function()
+      return 1
+    end,
+    exepath = function(path)
+      return path
+    end,
+    mkdir = function()
+      error("Vim:E739: Cannot create directory")
+    end,
+    notify = function(message)
+      notifications[#notifications + 1] = message
+    end,
+    stdpath = function()
+      return "/tmp"
+    end,
+    probe = function(_, _, _, callback)
+      probe_callbacks[#probe_callbacks + 1] = callback
+    end,
+  })
+
+  manager:ensure({ request = "launch" }, function(error_message)
+    callbacks = callbacks + 1
+    callback_errors[#callback_errors + 1] = error_message
+    error("first waiter failed")
+  end)
+  manager:ensure({ request = "launch" }, function(error_message)
+    callbacks = callbacks + 1
+    callback_errors[#callback_errors + 1] = error_message
+  end)
+  equal(#probe_callbacks, 1)
+  probe_callbacks[1]({ kind = "absent" })
+  equal(callbacks, 2)
+  equal(next(manager.in_flight), nil)
+  if notifications[1]:find("first waiter failed", 1, true) == nil then
+    error("waiter callback failure was not reported")
+  end
+  if callback_errors[1]:find("cannot create bingo server log directory", 1, true) == nil then
+    error("startup failure did not identify the log directory")
+  end
+
+  manager:ensure({ request = "launch" }, function(error_message)
+    callbacks = callbacks + 1
+    callback_errors[#callback_errors + 1] = error_message
+  end)
+  equal(#probe_callbacks, 2)
+  probe_callbacks[2]({ kind = "absent" })
+  equal(callbacks, 3)
+  equal(next(manager.in_flight), nil)
+end)
+
+test("synchronous probe failures do not wedge future starts", function()
+  local results = {}
+  local probes = 0
+  local manager = server.new(config.normalize(), {
+    uv = {
+      os_uname = function()
+        return { sysname = "Darwin", machine = "arm64" }
+      end,
+    },
+    schedule = function(callback)
+      callback()
+    end,
+    executable = function()
+      return 0
+    end,
+    exepath = function()
+      return ""
+    end,
+    mkdir = function()
+    end,
+    stdpath = function()
+      return "/tmp"
+    end,
+    probe = function()
+      probes = probes + 1
+      error("probe construction failed")
+    end,
+  })
+
+  for _ = 1, 2 do
+    manager:ensure({ request = "launch" }, function(error_message)
+      results[#results + 1] = error_message
+    end)
+  end
+  equal(probes, 2)
+  equal(#results, 2)
+  equal(next(manager.in_flight), nil)
+  if results[1]:find("probe construction failed", 1, true) == nil then
+    error("probe failure was not surfaced")
+  end
+end)
+
+test("stale probes cannot complete a newer startup attempt", function()
+  local probe_callbacks = {}
+  local results = {}
+  local manager = server.new(config.normalize(), {
+    uv = {
+      os_uname = function()
+        return { sysname = "Darwin", machine = "arm64" }
+      end,
+    },
+    schedule = function(callback)
+      callback()
+    end,
+    executable = function()
+      return 0
+    end,
+    exepath = function()
+      return ""
+    end,
+    mkdir = function()
+    end,
+    stdpath = function()
+      return "/tmp"
+    end,
+    probe = function(_, _, _, callback)
+      probe_callbacks[#probe_callbacks + 1] = callback
+      if #probe_callbacks == 1 then
+        error("probe failed after arming a callback")
+      end
+    end,
+  })
+
+  manager:ensure({ request = "launch" }, function(error_message, endpoint)
+    results[#results + 1] = { error = error_message, endpoint = endpoint }
+  end)
+  equal(#results, 1)
+  manager:ensure({ request = "launch" }, function(error_message, endpoint)
+    results[#results + 1] = { error = error_message, endpoint = endpoint }
+  end)
+  equal(#probe_callbacks, 2)
+
+  probe_callbacks[1]({
+    kind = "compatible",
+    health = { instance_id = "stale" },
+  })
+  equal(#results, 1)
+  probe_callbacks[2]({
+    kind = "compatible",
+    health = { instance_id = "current" },
+  })
+  equal(#results, 2)
+  equal(results[2].error, nil)
+  equal(results[2].endpoint.port, 4711)
+end)
+
+test("server manager starts and observes a compatible server", function()
+  local probes = 0
+  local spawn_request
+  local closed_fd
+  local unrefed = false
+  local result_error
+  local result_endpoint
+  local handle = {
+    unref = function()
+      unrefed = true
+    end,
+    is_closing = function()
+      return false
+    end,
+    close = function()
+    end,
+  }
+  local manager = server.new(config.normalize({
+    server = {
+      binary = "/tmp/bingo",
+      log_path = "/tmp/bingo.log",
+      ready_timeout_ms = 100,
+      idle_timeout_ms = 250,
+    },
+  }), {
+    uv = {
+      os_uname = function()
+        return { sysname = "Darwin", machine = "arm64" }
+      end,
+      fs_open = function()
+        return 17
+      end,
+      fs_close = function(fd)
+        closed_fd = fd
+      end,
+      spawn = function(binary, options)
+        spawn_request = { binary = binary, options = options }
+        return handle, 4242
+      end,
+      hrtime = function()
+        return 0
+      end,
+    },
+    schedule = function(callback)
+      callback()
+    end,
+    executable = function()
+      return 1
+    end,
+    exepath = function(path)
+      return path
+    end,
+    mkdir = function()
+    end,
+    stdpath = function()
+      return "/tmp"
+    end,
+    probe = function(_, _, _, callback)
+      probes = probes + 1
+      if probes == 1 then
+        callback({ kind = "absent" })
+      else
+        callback({
+          kind = "compatible",
+          health = { instance_id = "instance-ready" },
+        })
+      end
+    end,
+  })
+
+  manager:ensure({ request = "launch" }, function(error_message, endpoint)
+    result_error = error_message
+    result_endpoint = endpoint
+  end)
+
+  equal(result_error, nil)
+  equal(result_endpoint.host, "127.0.0.1")
+  equal(result_endpoint.port, 4711)
+  equal(probes, 2)
+  equal(spawn_request.binary, "/tmp/bingo")
+  equal(spawn_request.options.detached, true)
+  equal(spawn_request.options.args[1], "-addr")
+  equal(spawn_request.options.args[2], "127.0.0.1:6060")
+  equal(spawn_request.options.args[5], "-idle-timeout")
+  equal(spawn_request.options.args[6], "250ms")
+  equal(spawn_request.options.stdio[2], 17)
+  equal(spawn_request.options.stdio[3], 17)
+  equal(closed_fd, 17)
+  equal(unrefed, true)
+end)
+
 test("managed session announcements are strict", function()
   local announcement, decode_error = session.decode({
     version = 1,
@@ -269,10 +566,13 @@ test("managed session announcements are strict", function()
   end
 end)
 
-test("nvim-dap adapter and session listener are registered", function()
+test("nvim-dap registrations and prompts follow the plugin lifecycle", function()
   local real_vim = _G.vim
   local notifications = {}
   local autocmd
+  local input_value = ""
+  local input_defaults = {}
+  local runs = {}
   _G.vim = setmetatable({
     notify = function(message, level)
       notifications[#notifications + 1] = { message = message, level = level }
@@ -285,17 +585,32 @@ test("nvim-dap adapter and session listener are registered", function()
         autocmd = options
       end,
     }, { __index = real_vim.api }),
+    fn = setmetatable({
+      input = function(_, default)
+        input_defaults[#input_defaults + 1] = default
+        return input_value
+      end,
+    }, { __index = real_vim.fn }),
   }, { __index = real_vim })
 
+  local previous_adapter = function()
+  end
+  local user_configuration = {
+    name = "user configuration",
+    type = "bingo",
+    request = "launch",
+  }
   local dap = {
-    adapters = {},
-    configurations = {},
+    ABORT = {},
+    adapters = { bingo = previous_adapter },
+    configurations = { go = { user_configuration } },
     listeners = {
       before = {},
       after = {},
       on_session = {},
     },
-    run = function()
+    run = function(value)
+      runs[#runs + 1] = value
     end,
   }
   package.preload.dap = function()
@@ -308,7 +623,8 @@ test("nvim-dap adapter and session listener are registered", function()
   local bingo = require("bingo")
   bingo.setup()
   equal(type(dap.adapters.bingo), "function")
-  equal(#dap.configurations.go, 3)
+  equal(#dap.configurations.go, 4)
+  local first_adapter = dap.adapters.bingo
 
   local adapter
   dap.adapters.bingo(function(value)
@@ -320,6 +636,20 @@ test("nvim-dap adapter and session listener are registered", function()
   equal(adapter.type, "server")
   equal(adapter.host, "127.0.0.1")
   equal(adapter.port, 4711)
+
+  local configurations = {}
+  for _, item in ipairs(dap.configurations.go) do
+    configurations[item.name] = item
+  end
+  equal(configurations["bingo: Launch binary"].program(), dap.ABORT)
+  equal(configurations["bingo: Attach to process"].pid(), dap.ABORT)
+  equal(configurations["bingo: Attach to process"].binaryPath(), "")
+  equal(input_defaults[#input_defaults], "")
+  equal(configurations["bingo: Join session"].session(), dap.ABORT)
+
+  bingo.attach(123)
+  equal(#runs, 1)
+  equal(runs[1].binaryPath, "")
 
   local event_listener = dap.listeners.before["event_bingo/session/v1"].bingo
   local dap_session = {}
@@ -339,8 +669,53 @@ test("nvim-dap adapter and session listener are registered", function()
   equal(type(managed_session.on_close.bingo), "function")
   managed_session.on_close.bingo(dap_session)
   equal(bingo.session_id(), nil)
-  equal(#notifications, 1)
+
+  local setup_ok = pcall(function()
+    bingo.setup({ server = "invalid" })
+  end)
+  equal(setup_ok, false)
+  equal(dap.adapters.bingo, first_adapter)
+
+  bingo.setup()
+  equal(#dap.configurations.go, 4)
+  equal(dap.configurations.go[1], user_configuration)
+
+  bingo.setup({ configurations = false })
+  equal(#dap.configurations.go, 1)
+  equal(dap.configurations.go[1], user_configuration)
+  local second_adapter = dap.adapters.bingo
+  equal(type(second_adapter), "function")
+
+  local stale_ok = pcall(first_adapter, function()
+    error("disposed adapter unexpectedly resolved")
+  end, {
+    request = "launch",
+    serverMode = "connectOnly",
+  })
+  equal(stale_ok, true)
+  if notifications[#notifications].message:find("disposed", 1, true) == nil then
+    error("stale adapter did not report its disposed manager")
+  end
+
   bingo.dispose()
+  equal(dap.adapters.bingo, previous_adapter)
+  equal(#dap.configurations.go, 1)
+  equal(dap.listeners.before["event_bingo/session/v1"].bingo, nil)
+  equal(dap.listeners.before.event_terminated.bingo, nil)
+  equal(dap.listeners.before.event_exited.bingo, nil)
+  equal(dap.listeners.on_session.bingo, nil)
+
+  local disposed_ok = pcall(second_adapter, function()
+    error("disposed adapter unexpectedly resolved")
+  end, {
+    request = "launch",
+    serverMode = "connectOnly",
+  })
+  equal(disposed_ok, true)
+  if notifications[#notifications].message:find("disposed", 1, true) == nil then
+    error("disposed adapter did not report its state")
+  end
+
   package.preload.dap = nil
   package.loaded.dap = nil
   _G.vim = real_vim
