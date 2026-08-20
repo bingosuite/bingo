@@ -18,6 +18,9 @@ local function default_dependencies()
     mkdir = function(path)
       vim.fn.mkdir(path, "p")
     end,
+    notify = function(message)
+      vim.notify(message, vim.log.levels.ERROR, { title = "bingo" })
+    end,
     stdpath = vim.fn.stdpath,
     probe = health.probe,
   }
@@ -72,14 +75,42 @@ function Manager:_log(message)
   end
 end
 
-function Manager:_complete(key, error_message, endpoint)
+function Manager:_complete(key, error_message, endpoint, attempt)
   local waiters = self.in_flight[key]
-  if waiters == nil then
+  if waiters == nil or (attempt ~= nil and waiters ~= attempt) then
     return
   end
   self.in_flight[key] = nil
   for _, callback in ipairs(waiters) do
-    callback(error_message, endpoint)
+    local ok, callback_error = pcall(callback, error_message, endpoint)
+    if not ok then
+      pcall(
+        self._log,
+        self,
+        "bingo server completion callback failed: " .. tostring(callback_error)
+      )
+      if self.deps.notify ~= nil then
+        pcall(
+          self.deps.notify,
+          "bingo server completion callback failed: " .. tostring(callback_error)
+        )
+      end
+    end
+  end
+end
+
+function Manager:_guard(key, attempt, callback)
+  if self.in_flight[key] ~= attempt then
+    return
+  end
+  local ok, startup_error = pcall(callback)
+  if not ok then
+    self:_complete(
+      key,
+      "bingo server startup failed: " .. tostring(startup_error),
+      nil,
+      attempt
+    )
   end
 end
 
@@ -133,7 +164,14 @@ function Manager:_spawn(resolved)
   end
 
   local log_path = self:_log_path(resolved)
-  self.deps.mkdir(vim.fs.dirname(log_path))
+  local mkdir_ok, mkdir_error = pcall(self.deps.mkdir, vim.fs.dirname(log_path))
+  if not mkdir_ok then
+    return nil,
+      "cannot create bingo server log directory for "
+        .. log_path
+        .. ": "
+        .. tostring(mkdir_error)
+  end
   local log_fd, open_error = self.deps.uv.fs_open(log_path, "a", 420)
   if log_fd == nil then
     return nil, "cannot open bingo server log " .. log_path .. ": " .. tostring(open_error)
@@ -149,29 +187,43 @@ function Manager:_spawn(resolved)
   }
   local handle
   local pid
-  handle, pid = self.deps.uv.spawn(binary, {
-    args = args,
-    detached = true,
-    stdio = { nil, log_fd, log_fd },
-  }, function(code, signal)
-    if handle ~= nil and not handle:is_closing() then
-      handle:close()
-    end
-    self.deps.schedule(function()
-      self.processes[pid] = nil
-      self:_log(
-        string.format(
-          "managed bingo server %s exited with code %d signal %d",
-          tostring(pid),
-          code,
-          signal
+  local spawn_ok, spawn_error
+  spawn_ok, handle, pid = pcall(
+    self.deps.uv.spawn,
+    binary,
+    {
+      args = args,
+      detached = true,
+      stdio = { nil, log_fd, log_fd },
+    },
+    function(code, signal)
+      if handle ~= nil and not handle:is_closing() then
+        handle:close()
+      end
+      self.deps.schedule(function()
+        self.processes[pid] = nil
+        self:_log(
+          string.format(
+            "managed bingo server %s exited with code %d signal %d",
+            tostring(pid),
+            code,
+            signal
+          )
         )
-      )
-    end)
-  end)
+      end)
+    end
+  )
+  if not spawn_ok then
+    spawn_error = handle
+    handle = nil
+  end
   self.deps.uv.fs_close(log_fd)
   if handle == nil then
-    return nil, "cannot start bingo server: " .. tostring(pid) .. "; logs: " .. log_path
+    return nil,
+      "cannot start bingo server: "
+        .. tostring(spawn_error or pid)
+        .. "; logs: "
+        .. log_path
   end
 
   handle:unref()
@@ -180,8 +232,8 @@ function Manager:_spawn(resolved)
   return { pid = pid, log_path = log_path }
 end
 
-function Manager:_poll_ready(key, resolved, child, deadline_ms, last_result)
-  if self.disposed or self.in_flight[key] == nil then
+function Manager:_poll_ready(key, resolved, child, deadline_ms, last_result, attempt)
+  if self.disposed or self.in_flight[key] ~= attempt then
     return
   end
   local now_ms = self.deps.uv.hrtime() / 1000000
@@ -196,7 +248,9 @@ function Manager:_poll_ready(key, resolved, child, deadline_ms, last_result)
         describe_probe(last_result),
         config.endpoint(resolved.dap),
         child.log_path
-      )
+      ),
+      nil,
+      attempt
     )
     return
   end
@@ -206,44 +260,54 @@ function Manager:_poll_ready(key, resolved, child, deadline_ms, last_result)
     resolved.dap,
     math.min(probe_timeout_ms, math.max(1, math.floor(remaining))),
     function(result)
-      if self.disposed or self.in_flight[key] == nil then
-        return
-      end
-      if result.kind == "compatible" then
-        self:_log("reusing compatible bingo instance " .. result.health.instance_id)
-        self:_complete(key, nil, resolved.dap)
-        return
-      end
-      if result.kind == "incompatible" then
-        self:_complete(
-          key,
-          "cannot use bingo management endpoint "
-            .. config.endpoint(resolved.management)
-            .. ": "
-            .. result.reason
-        )
-        return
-      end
-      local poll_remaining = deadline_ms - self.deps.uv.hrtime() / 1000000
-      self:_later(math.max(1, math.min(poll_interval_ms, poll_remaining)), function()
-        self:_poll_ready(key, resolved, child, deadline_ms, result)
+      self:_guard(key, attempt, function()
+        if self.disposed or self.in_flight[key] ~= attempt then
+          return
+        end
+        if result.kind == "compatible" then
+          self:_log("reusing compatible bingo instance " .. result.health.instance_id)
+          self:_complete(key, nil, resolved.dap, attempt)
+          return
+        end
+        if result.kind == "incompatible" then
+          self:_complete(
+            key,
+            "cannot use bingo management endpoint "
+              .. config.endpoint(resolved.management)
+              .. ": "
+              .. result.reason,
+            nil,
+            attempt
+          )
+          return
+        end
+        local poll_remaining = deadline_ms - self.deps.uv.hrtime() / 1000000
+        self:_later(math.max(1, math.min(poll_interval_ms, poll_remaining)), function()
+          self:_guard(key, attempt, function()
+            self:_poll_ready(key, resolved, child, deadline_ms, result, attempt)
+          end)
+        end)
       end)
     end
   )
 end
 
-function Manager:_ensure_auto(key, resolved)
+function Manager:_ensure_auto(key, resolved, attempt)
   if resolved.management.host ~= "127.0.0.1" or resolved.dap.host ~= "127.0.0.1" then
     self:_complete(
       key,
-      'serverMode "auto" requires managementHost and dapHost to be 127.0.0.1; use "connectOnly" for remote or custom endpoints'
+      'serverMode "auto" requires managementHost and dapHost to be 127.0.0.1; use "connectOnly" for remote or custom endpoints',
+      nil,
+      attempt
     )
     return
   end
   if not supported_platform(self.deps.uv) then
     self:_complete(
       key,
-      'bingo server autostart supports only linux/amd64 and darwin/arm64; use serverMode "connectOnly" with an existing server'
+      'bingo server autostart supports only linux/amd64 and darwin/arm64; use serverMode "connectOnly" with an existing server',
+      nil,
+      attempt
     )
     return
   end
@@ -253,43 +317,49 @@ function Manager:_ensure_auto(key, resolved)
     resolved.dap,
     math.min(probe_timeout_ms, resolved.ready_timeout_ms),
     function(result)
-      if self.disposed or self.in_flight[key] == nil then
-        return
-      end
-      if result.kind == "compatible" then
-        self:_log("reusing compatible bingo instance " .. result.health.instance_id)
-        self:_complete(key, nil, resolved.dap)
-        return
-      end
-      if result.kind == "incompatible" then
-        self:_complete(
-          key,
-          "cannot use bingo management endpoint "
-            .. config.endpoint(resolved.management)
-            .. ": "
-            .. result.reason
-            .. "; no server was started"
-        )
-        return
-      end
-      if result.kind == "transportError" then
-        self:_complete(
-          key,
-          "cannot probe bingo management endpoint "
-            .. config.endpoint(resolved.management)
-            .. ": "
-            .. tostring(result.error)
-        )
-        return
-      end
+      self:_guard(key, attempt, function()
+        if self.disposed or self.in_flight[key] ~= attempt then
+          return
+        end
+        if result.kind == "compatible" then
+          self:_log("reusing compatible bingo instance " .. result.health.instance_id)
+          self:_complete(key, nil, resolved.dap, attempt)
+          return
+        end
+        if result.kind == "incompatible" then
+          self:_complete(
+            key,
+            "cannot use bingo management endpoint "
+              .. config.endpoint(resolved.management)
+              .. ": "
+              .. result.reason
+              .. "; no server was started",
+            nil,
+            attempt
+          )
+          return
+        end
+        if result.kind == "transportError" then
+          self:_complete(
+            key,
+            "cannot probe bingo management endpoint "
+              .. config.endpoint(resolved.management)
+              .. ": "
+              .. tostring(result.error),
+            nil,
+            attempt
+          )
+          return
+        end
 
-      local child, spawn_error = self:_spawn(resolved)
-      if child == nil then
-        self:_complete(key, spawn_error)
-        return
-      end
-      local deadline = self.deps.uv.hrtime() / 1000000 + resolved.ready_timeout_ms
-      self:_poll_ready(key, resolved, child, deadline, result)
+        local child, spawn_error = self:_spawn(resolved)
+        if child == nil then
+          self:_complete(key, spawn_error, nil, attempt)
+          return
+        end
+        local deadline = self.deps.uv.hrtime() / 1000000 + resolved.ready_timeout_ms
+        self:_poll_ready(key, resolved, child, deadline, result, attempt)
+      end)
     end
   )
 end
@@ -321,8 +391,11 @@ function Manager:ensure(debug_config, callback)
     self.in_flight[key][#self.in_flight[key] + 1] = callback
     return
   end
-  self.in_flight[key] = { callback }
-  self:_ensure_auto(key, resolved)
+  local attempt = { callback }
+  self.in_flight[key] = attempt
+  self:_guard(key, attempt, function()
+    self:_ensure_auto(key, resolved, attempt)
+  end)
 end
 
 function Manager:dispose()
