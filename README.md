@@ -17,15 +17,22 @@ VS Code, Neovim, or the terminal while the same process streams its goroutine
 hierarchy, OS-thread state, source locations, and lifecycle changes to visual or
 terminal observers.
 
+**Start here:** [Setup](docs/SETUP.md) ·
+[VS Code](editors/vscode/README.md) ·
+[Neovim](editors/neovim/README.md) ·
+[Examples](examples/README.md) ·
+[Architecture](AGENTS.md) ·
+[Roadmap](docs/ROADMAP.md)
+
 ## Current capabilities
 
 - **Go debugging:** launch, attach, restart, source breakpoints, pause, continue,
   step over, step in, and step out.
 - **Program inspection:** stack frames, lexically scoped locals, expandable typed
   values, and name-based evaluate/hover support.
-- **Concurrency visibility:** per-stop goroutine snapshots with a spawn tree, parent-child
-  relationships, current goroutine and thread, creation sites, and created/exited
-  lifecycle deltas.
+- **Concurrency visibility:** per-stop goroutine snapshots with a spawn tree,
+  parent-child relationships, current goroutine and thread, creation sites, and
+  created/exited lifecycle deltas.
 - **Shared sessions:** DAP and WebSocket clients can drive or observe the same
   tracee at the same time.
 - **Managed tooling:** the VS Code and Neovim companions discover, reuse, or
@@ -34,31 +41,17 @@ terminal observers.
 - **Progressive examples:** five debugger-friendly programs grow from a simple
   loop to channels, worker pools, pipelines, and nested concurrent workflows.
 
-The wire protocol is currently **1.2**, including structured variable trees and
-the evaluate command. Recent debugger work also hardened breakpoint ownership,
-restart reconciliation, exact protocol-version enforcement, Linux signal
-forwarding, and concurrent single-step behavior.
+The wire protocol is currently **1.4**, including structured variable trees,
+bounded goroutine events, and exact per-envelope version enforcement.
 
-## Getting started
+## Quick start
 
-### Requirements
+bingo is built from source and supports Apple Silicon macOS and x86-64 Linux.
+You need Go 1.25.5 and [`just`](https://github.com/casey/just). The
+[setup guide](docs/SETUP.md) covers platform prerequisites, editor-specific
+dependencies, verification, and troubleshooting.
 
-| Requirement | Supported version |
-| --- | --- |
-| Platform | Apple Silicon macOS (`darwin/arm64`) or x86-64 Linux (`linux/amd64`) |
-| Go toolchain | 1.25.5 |
-| Task runner | [`just`](https://github.com/casey/just) |
-| VS Code | 1.85+ |
-| Extension build | Node.js 22.x, npm, and the `code` CLI |
-| Neovim | 0.11.7+ with [`nvim-dap`](https://github.com/mfussenegger/nvim-dap) |
-
-On macOS, the build recipes enable the `bingonative` tag and ad hoc sign native
-binaries with the debugger entitlement.
-
-### VS Code (recommended)
-
-Clone the repository and build/install the platform-specific companion
-extension:
+For the recommended VS Code workflow:
 
 ```sh
 git clone https://github.com/bingosuite/bingo.git
@@ -72,78 +65,14 @@ Then:
 2. Open **Run and Debug** and select **bingo DAP: launch example (stop on entry)**.
 3. Press F5 and choose one of the five progressive examples.
 4. Use VS Code's Debug UI for breakpoints, stepping, stack frames, and variables.
-5. The **Bingo Concurrency** editor opens automatically for the session. The
-   compact Activity Bar view remains available, and selecting a goroutine can
-   open its recorded spawn site beside the visualization.
+5. The **Bingo Concurrency** Activity Bar view follows the session
+   automatically and shows its goroutine tree, threads, and source locations.
 
-The launch task rebuilds the selected examples with optimizations and inlining
-disabled. No separate server process or extension-development host is required.
-Keep the Go extension installed for `gopls`, formatting, navigation, and tests;
-bingo owns only debugger type `"bingo"` and does not invoke Delve.
-
-See the [VS Code extension guide](editors/vscode/README.md) for custom launch
-configurations, PID attach, joining a session, remote `connectOnly` mode, server
-logs, and extension development.
-
-### Neovim
-
-Prepare the native server and add `editors/neovim` to Neovim's runtime path:
-
-```sh
-just neovim-prepare
-```
-
-```lua
-{
-  dir = "/absolute/path/to/bingo/editors/neovim",
-  dependencies = { "mfussenegger/nvim-dap" },
-  config = function()
-    require("bingo").setup()
-  end,
-}
-```
-
-The companion registers a function-form `nvim-dap` adapter with the same
-managed `auto` and remote `connectOnly` modes as VS Code. Use `:BingoLaunch`,
-`:BingoAttach`, or `:BingoJoin`, then drive breakpoints, stepping, stacks, and
-variables through normal `nvim-dap` commands. `:BingoSession` shows the managed
-session ID for a read-only `wsmon` telemetry observer. See the
-[Neovim guide](editors/neovim/README.md) for setup and configuration.
-
-### Terminal-only workflow
-
-Build the examples and start both the WebSocket management listener and DAP
-listener:
-
-```sh
-just build-examples
-just server
-```
-
-In a second terminal, start the interactive DAP client:
-
-```sh
-just dapcli
-```
-
-Launch and debug an example from its prompt:
-
-```text
-launch ./build/examples/level3-worker-pool
-break examples/level3-worker-pool/main.go:20
-c
-```
-
-The client announces the managed session ID. A third terminal can join it with
-the read-only telemetry monitor:
-
-```sh
-go run ./cmd/wsmon -session <session-id>
-```
-
-Use `just dapcli -session <session-id>` or `just cli -session <session-id>` to
-join as another driver. For the complete DAP-drives/WebSocket-observes walkthrough,
-see [Concurrency telemetry](docs/ConcurrencyTelemetry.md).
+No separate server process or extension-development host is required. Prefer
+another frontend? Follow the [Neovim setup](docs/SETUP.md#neovim) or the
+[terminal-only setup](docs/SETUP.md#terminal-only), then use the
+[concurrency telemetry runbook](docs/ConcurrencyTelemetry.md) for a complete
+DAP-driver/WebSocket-observer walkthrough.
 
 ## How it works
 
@@ -166,10 +95,9 @@ monotonic hub sequence number.
 
 ## VS Code concurrency view
 
-The repository currently packages extension version **0.4.0**. Its primary
-concurrency surface is a full editor tab, with a compact Activity Bar view for
-quick inspection. It automatically follows the exact DAP-created session over
-WebSocket without copying a session ID and provides:
+The repository currently packages extension version **0.4.2**. Its
+**Bingo Concurrency** Activity Bar view automatically follows the exact
+DAP-created session over WebSocket without copying a session ID and provides:
 
 - a deterministic, bounded goroutine spawn tree;
 - current goroutine and OS-thread state;
@@ -258,14 +186,18 @@ just e2e-darwin            # signed native macOS acceptance suite
 On macOS, use the `just` recipes or pass `-tags bingonative` to Go commands.
 Plain `go test ./...` cannot compile the Darwin backend.
 
-## Documentation
+## Resources
 
-| Guide | Contents |
+| Resource | Use it for |
 | --- | --- |
-| [VS Code extension](editors/vscode/README.md) | Install, configure, attach, join, troubleshoot, and develop |
-| [Neovim companion](editors/neovim/README.md) | Configure `nvim-dap`, managed startup, launch, attach, and join |
+| [Setup guide](docs/SETUP.md) | Prerequisites, installation, frontend setup, platform notes, and troubleshooting |
+| [VS Code extension](editors/vscode/README.md) | Launch, attach, join, remote endpoints, logs, and extension development |
+| [Neovim companion](editors/neovim/README.md) | `nvim-dap` configuration, managed startup, and session commands |
 | [Concurrency telemetry](docs/ConcurrencyTelemetry.md) | End-to-end DAP driver and WebSocket observer runbook |
-| [Progressive examples](examples/README.md) | Example concepts, breakpoints, and expected telemetry |
+| [Progressive examples](examples/README.md) | Suggested breakpoints and expected telemetry |
+| [Architecture and contributor guide](AGENTS.md) | System design, invariants, code conventions, and test commands |
 | [Error handling](docs/ErrorHandling.md) | Error propagation and logging conventions |
-| [Roadmap](docs/ROADMAP.md) | Planned work |
-| [AGENTS.md](AGENTS.md) | Architecture, invariants, testing, and contributor guidance |
+| [Roadmap](docs/ROADMAP.md) | Planned work and project direction |
+| [Issues](https://github.com/bingosuite/bingo/issues) | Bug reports and tracked work |
+| [Discussions](https://github.com/bingosuite/bingo/discussions) | Questions, ideas, and community conversation |
+| [MIT license](LICENSE) | Project licensing terms |
