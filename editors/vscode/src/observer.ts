@@ -347,7 +347,9 @@ export class TelemetryObserver {
         });
         break;
       case "Error":
-        this.#update({ error: payloadText(payload.message, "debugger error") });
+        if (payload.command === "GoroutineSnapshot") {
+          this.#update({ error: payloadText(payload.message, "debugger error") });
+        }
         break;
     }
   }
