@@ -17,6 +17,21 @@
       "managedIdleTimeoutMs": 30000
     },
     {
+      "name": "bingo DAP: launch spawntree telemetry demo",
+      "type": "bingo",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/spawntree",
+      "preLaunchTask": "bingo: build spawntree",
+      "stopOnEntry": false,
+      "serverMode": "auto",
+      "managementHost": "127.0.0.1",
+      "managementPort": 6060,
+      "dapHost": "127.0.0.1",
+      "dapPort": 4711,
+      "serverReadyTimeoutMs": 5000,
+      "managedIdleTimeoutMs": 30000
+    },
+    {
       "name": "bingo DAP: join running session",
       "type": "bingo",
       "request": "attach",
