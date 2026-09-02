@@ -142,6 +142,32 @@ describe("telemetry observer", () => {
     observer.dispose();
   });
 
+  it("does not report other clients' debugger errors as telemetry failures", () => {
+    const { observer, sockets } = setup();
+    observer.start();
+    const socket = sockets[0]!;
+    socket.open();
+    socket.emit("message", envelope(1, "GoroutineSnapshot", snapshot()));
+    socket.emit(
+      "message",
+      envelope(2, "Error", {
+        command: "SetBreakpoint",
+        message: "no address for examples/spawntree/main.go:27",
+      }),
+    );
+    assert.equal(observer.model.error, "");
+
+    socket.emit(
+      "message",
+      envelope(3, "Error", {
+        command: "GoroutineSnapshot",
+        message: "runtime data unavailable",
+      }),
+    );
+    assert.equal(observer.model.error, "runtime data unavailable");
+    observer.dispose();
+  });
+
   it("reconnects only while live and cancels pending reconnect on dispose", async () => {
     const { observer, sockets, delays } = setup();
     observer.start();

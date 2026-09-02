@@ -2175,12 +2175,13 @@ target metadata, architecture, mode, and entitlements.
 The extension package version is the installed-runtime upgrade boundary:
 material shipped behavior changes must bump both `package.json` and the lockfile
 or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.3.1**) in source and VSIX
+and package verifier pin the current version (**0.4.1**) in source and VSIX
 metadata.
-The root Run and Debug dropdown exposes exactly two `"type":"bingo"` choices:
-launch one of five progressive examples through a `pickString`, and join a
-running session. Normal F5 uses the installed VSIX and rebuilds the five targets
-with `just build-examples`; contributor source-extension development runs
+The root Run and Debug dropdown exposes three `"type":"bingo"` choices: launch
+one of five progressive examples through a `pickString`, launch the dedicated
+`spawntree` telemetry target, and join a running session. Normal F5 uses the
+installed VSIX and rebuilds the selected target with `just build-examples` or
+`just build-spawntree`; contributor source-extension development runs
 `just vscode-dev` and launches an Extension Development Host explicitly from
 the CLI with
 `code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"`,

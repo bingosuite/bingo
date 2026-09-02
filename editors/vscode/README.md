@@ -20,8 +20,10 @@ just vscode-install
 ```
 
 This builds, verifies, and installs `dist/bingo-<platform>.vsix`. The graphical
-concurrency view debuted in 0.3.0; **0.3.1** adds capability-safe managed-server
-reuse and is the minimum supported version. Rerun the command to update, then run
+concurrency view debuted in 0.3.0, 0.3.1 added capability-safe managed-server
+reuse, and **0.4.1** adds the spawntree launch config plus telemetry-error
+filtering (unrelated debugger errors are no longer misreported as telemetry
+failures). Rerun the command to update, then run
 **Developer: Reload Window** once so the active extension host loads the new
 bundle. Package without installing with `just vscode-package`. Uninstall with:
 
@@ -36,6 +38,7 @@ binary and VSIX twice and requires both SHA-256 hashes to match.
 
 Install the matching platform VSIX once, select
 **bingo DAP: launch example (stop on entry)** (or
+**bingo DAP: launch spawntree telemetry demo**, or
 **bingo DAP: join running session**) from the repository's Run and Debug
 dropdown, press F5, and choose one of the five progressive targets. There is no
 separate server-start or extension-host choice. In the default `auto` mode the extension:

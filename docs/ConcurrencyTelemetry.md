@@ -10,7 +10,7 @@ bingo speaks two protocols against **one** debug session at the same time:
   the OS-thread set, and created/exited lifecycle deltas — streams here as
   `EventGoroutineSnapshot`.
 
-The VS Code 0.3.1 extension wires both together automatically: DAP drives while
+The VS Code 0.4.1 extension wires both together automatically: DAP drives while
 the **Bingo Concurrency** Activity Bar view observes the exact session over
 WebSocket. `cmd/wsmon` remains the terminal observer for non-VS Code workflows.
 
@@ -44,7 +44,7 @@ architecture behind this.
   just vscode-install
   ```
 
-  Automatic graphical telemetry requires **bingosuite.bingo 0.3.1 or newer**. Run
+  Automatic graphical telemetry requires **bingosuite.bingo 0.4.1 or newer**. Run
   **Developer: Reload Window** once after installation or update. The companion
   owns debugger type `"bingo"` and connects directly to bingo's DAP listener;
   it neither invokes nor validates `dlv`, and it does not replace the Go
@@ -65,20 +65,22 @@ The intended telemetry breakpoint is the result send in `inventoryStage`
 **bingo: build examples** before F5 and uses the installed VSIX's bundled
 server; it does not rebuild or codesign extension sources.
 
-`examples/spawntree` remains the dedicated long-running lifecycle demo. It
-churns a deterministic **main → supervisor → worker×3** tree so consecutive
-snapshots show workers appearing in `created` and leaving in `exited`. Build it
+`examples/spawntree` is the dedicated long-running lifecycle demo. It churns a
+deterministic **main → supervisor → worker×3** tree so consecutive snapshots
+show workers appearing in `created` and leaving in `exited`. VS Code exposes it
+as **“bingo DAP: launch spawntree telemetry demo”**, which runs
+**“bingo: build spawntree”** before launch; terminal users can still build it
 with `just build-spawntree` and drive it with `cmd/dapcli` as shown below.
 Contributor source-extension work is a separate command-line path: run
 `just vscode-dev`, then
 `code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"`.
-It is intentionally absent from the root Run and Debug dropdown.
 
 ## 2. Drive with VS Code (DAP, automatic server)
 
 1. Open this repo in VS Code.
-2. Select **“bingo DAP: launch example (stop on entry)”**. The only other root
-   choice is **“bingo DAP: join running session”**.
+2. Select **“bingo DAP: launch example (stop on entry)”**. To run the dedicated
+   lifecycle target instead, select **“bingo DAP: launch spawntree telemetry
+   demo”**; the other root choice is **“bingo DAP: join running session”**.
 3. Press F5, choose **level5-workflow**, and let VS Code run
    **“bingo: build examples”**. The companion
    health-checks `127.0.0.1:6060`,

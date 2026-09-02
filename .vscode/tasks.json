@@ -9,6 +9,15 @@
         "build-examples"
       ],
       "problemMatcher": []
+    },
+    {
+      "label": "bingo: build spawntree",
+      "type": "process",
+      "command": "just",
+      "args": [
+        "build-spawntree"
+      ],
+      "problemMatcher": []
     }
   ]
 }

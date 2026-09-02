@@ -58,16 +58,17 @@ describe("repository VS Code integration", () => {
     assert.match(smoke, /if \(child === undefined \|\| childExited\)/);
   });
 
-  it("exposes exactly the two normal bingo debug choices", () => {
+  it("exposes the normal bingo debug choices", () => {
     const launch = readJSON(".vscode/launch.json");
     const configurations = requireArray(launch.configurations).map(requireRecord);
     const serialized = JSON.stringify(configurations);
 
-    assert.equal(configurations.length, 2);
+    assert.equal(configurations.length, 3);
     assert.deepEqual(
       configurations.map((configuration) => configuration.name),
       [
         "bingo DAP: launch example (stop on entry)",
+        "bingo DAP: launch spawntree telemetry demo",
         "bingo DAP: join running session",
       ],
     );
@@ -81,20 +82,30 @@ describe("repository VS Code integration", () => {
     assert.doesNotMatch(serialized, /"type":"go"/);
     assert.doesNotMatch(serialized, /\bdlv\b/i);
 
-    const binaryLaunch = configurations.find(
+    const binaryLaunches = configurations.filter(
       (configuration) => configuration.request === "launch",
     );
-    assert.notEqual(binaryLaunch, undefined);
-    assert.equal(
-      binaryLaunch?.name,
-      "bingo DAP: launch example (stop on entry)",
+    assert.equal(binaryLaunches.length, 2);
+    const binaryLaunch = binaryLaunches.find(
+      (configuration) =>
+        configuration.name === "bingo DAP: launch example (stop on entry)",
     );
+    assert.notEqual(binaryLaunch, undefined);
     assert.equal(
       binaryLaunch?.program,
       "${workspaceFolder}/build/examples/${input:bingoExample}",
     );
     assert.equal(binaryLaunch?.preLaunchTask, "bingo: build examples");
     assert.equal(binaryLaunch?.stopOnEntry, true);
+
+    const spawntreeLaunch = binaryLaunches.find(
+      (configuration) =>
+        configuration.name === "bingo DAP: launch spawntree telemetry demo",
+    );
+    assert.notEqual(spawntreeLaunch, undefined);
+    assert.equal(spawntreeLaunch?.program, "${workspaceFolder}/build/spawntree");
+    assert.equal(spawntreeLaunch?.preLaunchTask, "bingo: build spawntree");
+    assert.equal(spawntreeLaunch?.stopOnEntry, false);
 
     const inputs = requireArray(launch.inputs).map(requireRecord);
     assert.equal(inputs.length, 2);
@@ -119,24 +130,32 @@ describe("repository VS Code integration", () => {
     assert.equal("preLaunchTask" in (sessionJoin ?? {}), false);
   });
 
-  it("defines only the fast target preparation task", () => {
+  it("defines target preparation tasks for launchable examples", () => {
     const tasksConfig = readJSON(".vscode/tasks.json");
     const tasks = requireArray(tasksConfig.tasks).map(requireRecord);
 
-    assert.equal(tasks.length, 1);
-    const [targetTask] = tasks;
+    assert.equal(tasks.length, 2);
+    const targetTask = tasks.find((task) => task.label === "bingo: build examples");
     assert.notEqual(targetTask, undefined);
-    assert.equal(targetTask?.label, "bingo: build examples");
     assert.equal(targetTask?.type, "process");
     assert.equal(targetTask?.command, "just");
     assert.deepEqual(targetTask?.args, ["build-examples"]);
 
+    const spawntreeTask = tasks.find((task) => task.label === "bingo: build spawntree");
+    assert.notEqual(spawntreeTask, undefined);
+    assert.equal(spawntreeTask?.type, "process");
+    assert.equal(spawntreeTask?.command, "just");
+    assert.deepEqual(spawntreeTask?.args, ["build-spawntree"]);
+
     const launch = readJSON(".vscode/launch.json");
     const configurations = requireArray(launch.configurations).map(requireRecord);
-    const binaryLaunch = configurations.find(
+    for (const binaryLaunch of configurations.filter(
       (configuration) => configuration.request === "launch",
-    );
-    assert.equal(binaryLaunch?.preLaunchTask, targetTask?.label);
+    )) {
+      assert.ok(
+        tasks.some((task) => task.label === binaryLaunch.preLaunchTask),
+      );
+    }
 
     const justfile = readText("justfile");
     const devStart = justfile.indexOf("vscode-dev:");
