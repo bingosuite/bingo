@@ -17,6 +17,15 @@ export type WebviewMessage =
       readonly revision: number;
     }
   | { readonly type: "selectGoroutine"; readonly id: number }
+  | { readonly type: "selectFrame"; readonly id: number }
+  | { readonly type: "expandVariable"; readonly reference: number }
+  | { readonly type: "refreshInspection" }
+  | {
+      readonly type: "openSource";
+      readonly path: string;
+      readonly line: number;
+      readonly column: number;
+    }
   | { readonly type: "selectSession"; readonly id: string }
   | { readonly type: "refresh" }
   | { readonly type: "fit" }
@@ -35,6 +44,7 @@ export function decodeWebviewMessage(value: unknown): WebviewMessage {
     case "refresh":
     case "fit":
     case "copySnapshot":
+    case "refreshInspection":
       exactKeys(message, ["type"]);
       return { type: message.type };
     case "rendered":
@@ -49,6 +59,37 @@ export function decodeWebviewMessage(value: unknown): WebviewMessage {
       return {
         type: "selectGoroutine",
         id: safeInteger(message.id, "goroutine id", 0),
+      };
+    case "selectFrame":
+      exactKeys(message, ["type", "id"]);
+      return {
+        type: "selectFrame",
+        id: safeInteger(message.id, "stack frame id", 1),
+      };
+    case "expandVariable":
+      exactKeys(message, ["type", "reference"]);
+      return {
+        type: "expandVariable",
+        reference: safeInteger(
+          message.reference,
+          "variables reference",
+          1,
+        ),
+      };
+    case "openSource":
+      exactKeys(message, ["type", "path", "line", "column"]);
+      if (
+        typeof message.path !== "string" ||
+        message.path.length === 0 ||
+        message.path.length > 4096
+      ) {
+        throw new TypeError("source path must be a bounded non-empty string");
+      }
+      return {
+        type: "openSource",
+        path: message.path,
+        line: safeInteger(message.line, "source line", 1),
+        column: safeInteger(message.column, "source column", 0),
       };
     case "selectSession":
       exactKeys(message, ["type", "id"]);

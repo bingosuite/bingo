@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { describe, it } from "node:test";
 
 import type { ObserverDependencies, Socket } from "../src/observer.js";
+import { emptyInspection } from "../src/model.js";
 import { SessionRegistry } from "../src/registry.js";
 
 class SocketStub extends EventEmitter implements Socket {
@@ -50,8 +51,46 @@ describe("session registry", () => {
     assert.equal(registry.viewModel.activeDebugSessionId, "b");
     assert.equal(registry.select("a"), true);
     assert.equal(registry.viewModel.activeDebugSessionId, "a");
+    const inspection = {
+      ...emptyInspection(1),
+      stackStatus: "ready" as const,
+      stackMessage: "",
+    };
+    assert.equal(registry.updateInspection("a", inspection), true);
+    assert.equal(registry.inspectionFor("a"), inspection);
+    assert.equal(
+      registry.viewModel.sessions.find(
+        (session) => session.debugSessionId === "a",
+      )?.inspection,
+      inspection,
+    );
+    const delivered: number[] = [];
+    let updateFromListener = true;
+    const unsubscribeUpdater = registry.onChange(() => {
+      if (!updateFromListener) {
+        return;
+      }
+      updateFromListener = false;
+      registry.updateInspection("a", {
+        ...inspection,
+        stackMessage: "newest",
+      });
+    });
+    const unsubscribeReader = registry.onChange((next) => {
+      delivered.push(next.revision);
+      assert.equal(
+        next.sessions.find((session) => session.debugSessionId === "a")
+          ?.inspection.stackMessage,
+        "newest",
+      );
+    });
+    registry.select("a");
+    assert.equal(delivered.length, 1);
+    unsubscribeUpdater();
+    unsubscribeReader();
     registry.remove("a");
     assert.equal(sockets[0]?.closed, true);
+    assert.equal(registry.inspectionFor("a"), undefined);
     assert.equal(registry.viewModel.activeDebugSessionId, "b");
     registry.dispose();
     assert.equal(sockets[1]?.closed, true);

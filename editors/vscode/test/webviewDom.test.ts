@@ -2,13 +2,18 @@ import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import { parseHTML } from "linkedom";
 
-import type { ConcurrencyViewModel, SessionModel } from "../src/model.js";
-import { toSessionViewModel } from "../src/model.js";
+import type {
+  ConcurrencyViewModel,
+  DebugInspection,
+  SessionModel,
+} from "../src/model.js";
+import { emptyInspection, toSessionViewModel } from "../src/model.js";
 import { mountConcurrencyView } from "../src/webviewApp.js";
 import { goroutine, snapshot, thread } from "./fixtures.js";
 
 function model(
   patch: Partial<SessionModel> = {},
+  inspection?: DebugInspection,
 ): ConcurrencyViewModel {
   const session: SessionModel = {
     debugSessionId: "debug",
@@ -35,7 +40,12 @@ function model(
   return {
     revision: 1,
     activeDebugSessionId: "debug",
-    sessions: [toSessionViewModel(session)],
+    sessions: [
+      toSessionViewModel(
+        session,
+        inspection ?? emptyInspection(session.selectedGoroutine),
+      ),
+    ],
   };
 }
 
@@ -86,6 +96,125 @@ describe("concurrency webview DOM", () => {
     assert.equal(document.querySelectorAll(".tree-node.filtered").length, 0);
     document.querySelectorAll<SVGGElement>(".tree-node")[1]?.dispatchEvent(new window.Event("click"));
     assert.deepEqual(messages.at(-1), { type: "selectGoroutine", id: 2 });
+  });
+
+  it("renders interactive stack frames, locals, expansion, and source navigation", () => {
+    const { document } = parseHTML(
+      "<html><body><div id=app></div></body></html>",
+    );
+    const messages: Record<string, unknown>[] = [];
+    const inspection: DebugInspection = {
+      ...emptyInspection(1),
+      stackStatus: "ready",
+      frames: [
+        {
+          id: 1,
+          name: "main.worker",
+          file: "/workspace/main.go",
+          line: 42,
+          column: 3,
+        },
+        {
+          id: 2,
+          name: "main.main",
+          file: "/workspace/main.go",
+          line: 12,
+          column: 1,
+        },
+      ],
+      selectedFrameId: 1,
+      localsStatus: "ready",
+      variables: [
+        {
+          name: "jobs",
+          value: "[]string len: 2, cap: 2",
+          type: "[]string",
+          variablesReference: 65_536,
+        },
+      ],
+    };
+    mountConcurrencyView(document, {
+      postMessage: (message) => messages.push(message),
+    })(model({}, inspection));
+
+    assert.equal(document.querySelectorAll(".stack-frame").length, 2);
+    assert.match(
+      document.querySelector(".debug-inspection")?.textContent ?? "",
+      /main\.worker/,
+    );
+    assert.match(
+      document.querySelector(".variable-tree")?.textContent ?? "",
+      /jobs/,
+    );
+
+    document
+      .querySelectorAll<HTMLButtonElement>(".frame-name")[1]
+      ?.click();
+    assert.deepEqual(messages.at(-1), { type: "selectFrame", id: 2 });
+
+    document
+      .querySelector<HTMLButtonElement>(".variable-expand")
+      ?.click();
+    assert.deepEqual(messages.at(-1), {
+      type: "expandVariable",
+      reference: 65_536,
+    });
+
+    document
+      .querySelector<HTMLButtonElement>(".stack-frame .source-link")
+      ?.click();
+    assert.deepEqual(messages.at(-1), {
+      type: "openSource",
+      path: "/workspace/main.go",
+      line: 42,
+      column: 3,
+    });
+  });
+
+  it("explains degraded concurrency data without hiding debugger inspection", () => {
+    const { document } = parseHTML(
+      "<html><body><div id=app></div></body></html>",
+    );
+    const degraded = snapshot(
+      [goroutine(0, 0, { current: true, status: "unknown" })],
+      [],
+    );
+    const inspection: DebugInspection = {
+      ...emptyInspection(0),
+      stackStatus: "ready",
+      frames: [
+        {
+          id: 1,
+          name: "runtime.rt0_go",
+          file: "/workspace/main.go",
+          line: 1,
+          column: 1,
+        },
+      ],
+      selectedFrameId: 1,
+      localsStatus: "ready",
+      variables: [],
+    };
+    mountConcurrencyView(document, { postMessage() {} })(
+      model(
+        {
+          snapshot: degraded,
+          selectedGoroutine: 0,
+        },
+        inspection,
+      ),
+    );
+
+    assert.match(document.body.textContent, /common before runtime initialization/);
+    assert.match(document.body.textContent, /runtime\.rt0_go/);
+    assert.match(
+      document.body.textContent,
+      /did not identify the stopped goroutine/,
+    );
+    assert.doesNotMatch(
+      document.body.textContent,
+      /DWARF or runtime data was unavailable/,
+    );
   });
 
   it("moves DOM focus with keyboard tree selection", () => {
