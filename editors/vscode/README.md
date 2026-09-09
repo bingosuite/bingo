@@ -26,7 +26,10 @@ reuse, and 0.3.2 added wire 1.3's honest unknown stopped-goroutine rendering;
 the concurrency view alive on highly concurrent targets. **0.4.1** adds
 bounded-family error classification, truthful omission states, and manual
 recovery after reconnect exhaustion. **0.4.2** rejects colliding management and
-DAP listeners before managed startup. 0.4.0 is the minimum supported version.
+DAP listeners before managed startup. **0.5.0** keeps the Bingo view visible
+through the initial stop and adds call stacks, frame locals, expandable
+variables, and source navigation to the goroutine inspector. 0.4.0 is the
+minimum supported version.
 Rerun the command to update, then run
 **Developer: Reload Window** once so the active extension host loads the new
 bundle. Package without installing with `just vscode-package`. Uninstall with:
@@ -90,22 +93,35 @@ in the selector; the status bar shows active goroutine/thread counts.
   across updates, including missing-parent and cyclic runtime data. Search runs
   against the full validated snapshot before the 500-node rendering cap, then
   fits a bounded match/ancestor layout.
-- Selecting a goroutine shows wait reason, thread, and current/start/creation
-  source locations. Thread cards and a bounded created/exited timeline provide
+- Selecting a goroutine now opens a real debugger inspector: runtime metadata,
+  clickable current/start/creation locations, the stopped goroutine's DAP call
+  stack, frame selection, locals, and lazy variable expansion. Stack and locals
+  are currently available only for the goroutine that is actually stopped;
+  selecting another node explains that limit and offers a shortcut back to the
+  stopped goroutine rather than showing misleading data.
+- Source links in goroutine metadata and stack frames open the exact file and
+  line in the editor. Thread cards and a bounded created/exited timeline provide
   physical and lifecycle context.
 - Snapshots arrive at entry, breakpoints, and pauses—not per step. The view sends
   one read-only `GoroutineSnapshot` request after joining and only sends another
-  when **Refresh** is explicit. It never sends run-control commands.
+  when **Refresh** is explicit. Stack, scope, and variable reads use standard
+  read-only DAP requests, including after step stops where the graph intentionally
+  keeps its last snapshot. The view never sends run-control commands.
 - **Bingo: Copy Concurrency Snapshot** copies validated JSON. **Select
   Concurrency Session**, **Refresh**, and **Fit** are available from the
   Command Palette; the Activity Bar icon and status item focus the view through
   VS Code's generated `bingo.concurrency.focus` command.
 
-`bingo.concurrency.autoReveal` defaults to `true` and reveals the first session
-once. Disable it to keep the view in the background. Connection, degraded,
-empty, sequence-gap, and error states remain visible. Rendering uses a strict
-nonce CSP, local bundles only, DOM `textContent` for tracee strings, VS Code
-theme/high-contrast colors, labelled controls, and keyboard selection.
+`bingo.concurrency.autoReveal` defaults to `true`. It reveals a new session and
+refocuses Bingo after that session's first DAP stop, after VS Code's normal
+debug-stop handling has had a chance to select Run and Debug. Disable it to keep
+the view in the background. A synthetic degraded snapshot now explicitly means
+that rich Go runtime concurrency metadata was unavailable—commonly at the early
+entry stop—not that DAP stack frames and locals are necessarily unavailable.
+Connection, degraded, empty, sequence-gap, and error states remain visible.
+Rendering uses a strict nonce CSP, local bundles only, DOM `textContent` for
+tracee strings, VS Code theme/high-contrast colors, labelled controls, and
+keyboard selection.
 Treeitems expose hierarchy level, parent context, sibling position, selection,
 and synchronized keyboard focus to assistive technology.
 

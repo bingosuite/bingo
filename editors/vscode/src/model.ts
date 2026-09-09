@@ -35,11 +35,49 @@ export interface SessionModel {
 export interface SessionViewModel extends SessionModel {
   readonly tree: TreeLayout;
   readonly degraded: boolean;
+  readonly inspection: DebugInspection;
 
   // What the SERVER left off the wire, kept deliberately separate from
   // tree.omitted (this view's own filter and render cap). Conflating them would
   // let a truncated payload masquerade as a local display choice.
   readonly serverTotals: ServerTotals | undefined;
+}
+
+export type InspectionStatus =
+  | "idle"
+  | "loading"
+  | "ready"
+  | "unavailable"
+  | "error";
+
+export interface DebugStackFrame {
+  readonly id: number;
+  readonly name: string;
+  readonly file: string;
+  readonly line: number;
+  readonly column: number;
+}
+
+export interface DebugVariable {
+  readonly name: string;
+  readonly value: string;
+  readonly type: string;
+  readonly variablesReference: number;
+}
+
+export interface DebugInspection {
+  readonly targetGoroutine: number;
+  readonly stackStatus: InspectionStatus;
+  readonly stackMessage: string;
+  readonly frames: readonly DebugStackFrame[];
+  readonly selectedFrameId: number;
+  readonly localsStatus: InspectionStatus;
+  readonly localsMessage: string;
+  readonly variables: readonly DebugVariable[];
+  readonly variablesByReference: Readonly<
+    Record<string, readonly DebugVariable[]>
+  >;
+  readonly loadingReferences: readonly number[];
 }
 
 // ServerTotals restates a snapshot's SnapshotTotals in terms this view renders:
@@ -74,7 +112,25 @@ export function appendLifecycle(
   return [...existing, ...additions].slice(-maximumTimelineEntries);
 }
 
-export function toSessionViewModel(model: SessionModel): SessionViewModel {
+export function emptyInspection(targetGoroutine = 0): DebugInspection {
+  return {
+    targetGoroutine,
+    stackStatus: "idle",
+    stackMessage: "",
+    frames: [],
+    selectedFrameId: 0,
+    localsStatus: "idle",
+    localsMessage: "",
+    variables: [],
+    variablesByReference: {},
+    loadingReferences: [],
+  };
+}
+
+export function toSessionViewModel(
+  model: SessionModel,
+  inspection: DebugInspection = emptyInspection(model.selectedGoroutine),
+): SessionViewModel {
   const snapshot = model.snapshot;
   return {
     ...model,
@@ -83,6 +139,7 @@ export function toSessionViewModel(model: SessionModel): SessionViewModel {
       model.selectedGoroutine,
     ]),
     degraded: snapshot === undefined ? false : isDegraded(snapshot),
+    inspection,
     serverTotals: serverTotals(snapshot),
   };
 }

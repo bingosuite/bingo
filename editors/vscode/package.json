@@ -2,7 +2,7 @@
   "name": "bingo",
   "displayName": "bingo Debugger",
   "description": "Debug Go concurrency with bingo's DAP adapter and live goroutine visualization.",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "publisher": "bingosuite",
   "license": "MIT",
   "private": true,
@@ -66,7 +66,7 @@
         "bingo.concurrency.autoReveal": {
           "type": "boolean",
           "default": true,
-          "description": "Reveal Bingo Concurrency when the first debug session publishes its telemetry session."
+          "description": "Keep Bingo Concurrency visible when a debug session starts and reaches its first stop."
         }
       }
     },

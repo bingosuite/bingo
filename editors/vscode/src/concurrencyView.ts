@@ -9,6 +9,13 @@ import type { SessionRegistry } from "./registry.js";
 
 export const concurrencyViewId = "bingo.concurrency";
 
+export interface ConcurrencyViewActions {
+  selectFrame(frameId: number): void;
+  expandVariable(reference: number): void;
+  refreshInspection(): void;
+  openSource(path: string, line: number, column: number): void;
+}
+
 export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
   #view: vscode.WebviewView | undefined;
   #fitPending = false;
@@ -19,6 +26,7 @@ export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
   public constructor(
     private readonly extensionUri: vscode.Uri,
     private readonly registry: SessionRegistry,
+    private readonly actions: ConcurrencyViewActions,
   ) {
     this.#model = registry.viewModel;
     this.#unsubscribe = registry.onChange((model) => {
@@ -67,10 +75,12 @@ export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
   public get status(): {
     readonly resolved: boolean;
     readonly ready: boolean;
+    readonly visible: boolean;
   } {
     return {
       resolved: this.#view !== undefined,
       ready: this.#delivery.ready,
+      visible: this.#view?.visible ?? false,
     };
   }
 
@@ -109,6 +119,22 @@ export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
         break;
       case "selectGoroutine":
         this.registry.selectGoroutine(message.id);
+        break;
+      case "selectFrame":
+        this.actions.selectFrame(message.id);
+        break;
+      case "expandVariable":
+        this.actions.expandVariable(message.reference);
+        break;
+      case "refreshInspection":
+        this.actions.refreshInspection();
+        break;
+      case "openSource":
+        this.actions.openSource(
+          message.path,
+          message.line,
+          message.column,
+        );
         break;
       case "copySnapshot":
         void copySnapshot(this.registry);
@@ -232,7 +258,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, .graph-viewport
 .last-stop { grid-column: 1 / -1; padding: 7px 9px; border-left: 3px solid var(--vscode-debugIcon-breakpointCurrentStackframeForeground); background: var(--vscode-textBlockQuote-background); overflow-wrap: anywhere; }
 .toolbar { display: flex; gap: 6px; }
 .toolbar input { flex: 1; min-width: 80px; padding: 6px 8px; }
-.workspace { display: grid; grid-template-columns: minmax(0, 2fr) minmax(175px, 1fr); gap: 10px; }
+.workspace { display: grid; grid-template-columns: minmax(0, 2fr) minmax(270px, 1.2fr); gap: 10px; }
 .graph-panel, .inspector, .threads, .timeline { position: relative; min-width: 0; border: 1px solid var(--vscode-widget-border); border-radius: 9px; background: var(--vscode-editorWidget-background); overflow: hidden; }
 .graph-controls { position: absolute; right: 7px; top: 7px; z-index: 2; display: flex; gap: 4px; }
 .graph-viewport { height: 410px; overflow: hidden; touch-action: none; }
@@ -242,6 +268,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, .graph-viewport
 .tree-node rect { fill: var(--vscode-editorWidget-background); stroke: var(--vscode-widget-border); stroke-width: 1.5; }
 .tree-node:hover rect, .tree-node.selected rect { stroke: var(--vscode-focusBorder); stroke-width: 2.5; }
 .tree-node.current rect { fill: var(--vscode-list-activeSelectionBackground); stroke: var(--vscode-debugIcon-breakpointCurrentStackframeForeground); }
+.tree-node.selected rect { fill: var(--vscode-list-inactiveSelectionBackground); filter: drop-shadow(0 0 3px var(--vscode-focusBorder)); }
+.tree-node.current.selected rect { fill: var(--vscode-list-activeSelectionBackground); stroke: var(--vscode-focusBorder); stroke-width: 3; }
 .tree-node text { fill: var(--vscode-foreground); pointer-events: none; }
 .node-id { font-size: 14px; font-weight: 700; }
 .node-status, .node-thread { font-size: 10px; fill: var(--vscode-descriptionForeground) !important; }
@@ -254,6 +282,32 @@ h2 { margin: 0 0 10px; font-size: 12px; text-transform: uppercase; color: var(--
 dl { margin: 0; display: grid; grid-template-columns: 58px 1fr; gap: 6px; }
 dt { color: var(--vscode-descriptionForeground); }
 dd { margin: 0; overflow-wrap: anywhere; }
+.source-link { min-width: 0; padding: 0; border: 0; color: var(--vscode-textLink-foreground); background: transparent; text-align: left; overflow-wrap: anywhere; }
+.source-link:hover { color: var(--vscode-textLink-activeForeground); background: transparent; text-decoration: underline; }
+.debug-inspection { display: grid; gap: 7px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--vscode-widget-border); }
+.inspection-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.inspection-heading h2, .locals-heading { margin: 0; }
+.subtle-button { padding: 2px 6px; color: var(--vscode-descriptionForeground); font-size: 10px; }
+.inspection-state { margin: 0; padding: 8px; border-radius: 5px; color: var(--vscode-descriptionForeground); background: var(--vscode-textBlockQuote-background); overflow-wrap: anywhere; }
+.inspection-state.error { color: var(--vscode-errorForeground); border-left: 2px solid var(--vscode-errorForeground); }
+.inspection-state.unavailable { border-left: 2px solid var(--vscode-editorWarning-foreground); }
+.inspection-state.loading { color: var(--vscode-progressBar-background); }
+.inspect-current { justify-self: start; }
+.stack-list { display: grid; gap: 4px; max-height: 240px; padding: 0; margin: 0; overflow: auto; list-style: none; }
+.stack-frame { display: grid; gap: 2px; min-width: 0; padding: 6px 7px; border-left: 2px solid transparent; border-radius: 4px; background: var(--vscode-list-inactiveSelectionBackground); }
+.stack-frame.selected { border-left-color: var(--vscode-debugIcon-breakpointCurrentStackframeForeground); background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
+.frame-name { min-width: 0; padding: 0; border: 0; background: transparent; text-align: left; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.frame-name:hover { background: transparent; text-decoration: underline; }
+.frame-source { width: fit-content; max-width: 100%; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.variable-tree, .variable-tree ul { display: grid; gap: 2px; padding: 0; margin: 0; list-style: none; }
+.variable-tree ul { margin-left: 13px; padding-left: 5px; border-left: 1px solid var(--vscode-tree-inactiveIndentGuidesStroke, var(--vscode-editorIndentGuide-background)); }
+.variable-row { display: grid; grid-template-columns: 18px minmax(55px, auto) minmax(0, 1fr); align-items: baseline; column-gap: 4px; min-width: 0; padding: 2px 0; }
+.variable-expand { width: 18px; padding: 0; border: 0; background: transparent; }
+.variable-expand:hover { background: var(--vscode-toolbar-hoverBackground); }
+.variable-spacer { width: 18px; }
+.variable-name { color: var(--vscode-symbolIcon-variableForeground, var(--vscode-foreground)); overflow-wrap: anywhere; }
+.variable-value { min-width: 0; overflow: hidden; color: var(--vscode-debugTokenExpression-value); font-family: var(--vscode-editor-font-family); text-overflow: ellipsis; white-space: nowrap; }
+.variable-type { grid-column: 3; color: var(--vscode-descriptionForeground); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .thread-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(105px, 1fr)); gap: 6px; }
 .thread { display: grid; padding: 7px; border: 1px solid var(--vscode-widget-border); border-radius: 6px; }
 .thread.current { border-color: var(--vscode-focusBorder); }
@@ -267,6 +321,6 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .callout { display: grid; gap: 3px; padding: 8px; border-radius: 6px; }
 .callout.error { border-left: 3px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground); }
 .callout.warning { border-left: 3px solid var(--vscode-editorWarning-foreground); background: var(--vscode-inputValidation-warningBackground); }
-@media (max-width: 520px) { .workspace { grid-template-columns: 1fr; } .graph-viewport { height: 330px; } .cards { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 520px) { .workspace { grid-template-columns: 1fr; } .inspector { order: -1; } .graph-viewport { height: 330px; } .cards { grid-template-columns: repeat(2, 1fr); } }
 @media (forced-colors: active) { .tree-node rect, .graph-panel, .inspector, .threads, .timeline, .card { border: 1px solid CanvasText; } }
 `;

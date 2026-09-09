@@ -93,7 +93,7 @@ follow them so reviews stay about substance, not style.
 | [cmd/dapcli](cmd/dapcli/) | Interactive readline client that drives a session over DAP (mirrors `cmd/cli`'s UX). Talks to the server's `-dap-addr` listener; can create a session or `-session` join an existing one. |
 | [cmd/internal/repl](cmd/internal/repl/) | Shared interactive-client loop: readline interrupt/cancellation semantics, refresh-safe async output, and frame-index validation. |
 | [cmd/wsmon](cmd/wsmon/) | Read-only terminal telemetry observer. `-session`-joins a running session over WebSocket and live-renders the goroutine spawn tree + OS threads + created/exited lifecycle deltas from the `EventGoroutineSnapshot` stream, reporting included/total honestly and distinguishing wire omission from a clipped runtime scan. Never drives execution — the WS-observes half of the DAP-drives/WS-observes demo. |
-| [editors/vscode](editors/vscode/) | Platform-packaged TypeScript companion extension. Owns debugger type `bingo`, manages the shared server, and hosts the read-only Bingo Concurrency Activity Bar WebSocket observer. |
+| [editors/vscode](editors/vscode/) | Platform-packaged TypeScript companion extension. Owns debugger type `bingo`, manages the shared server, and hosts the Bingo Concurrency Activity Bar observer plus its read-only DAP stack/locals inspector. |
 | [editors/neovim](editors/neovim/) | Lua companion for `nvim-dap`. Mirrors managed server discovery/start, drives launch/attach/join over DAP, and exposes the announced session ID for a separate WebSocket observer. |
 | [cmd/target](cmd/target/) | Trivial target program for manual testing. |
 | [examples/level1-loop](examples/level1-loop/) … [examples/level5-workflow](examples/level5-workflow/) | Progressive debugger targets, selected by the root VS Code launch picker and built together with `just build-examples` (see [examples/README.md](examples/README.md)). |
@@ -2614,7 +2614,7 @@ target metadata, architecture, mode, and entitlements.
 The extension package version is the installed-runtime upgrade boundary:
 material shipped behavior changes must bump both `package.json` and the lockfile
 or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.4.2**) in source and VSIX
+and package verifier pin the current version (**0.5.0**) in source and VSIX
 metadata.
 The root Run and Debug dropdown exposes exactly two `"type":"bingo"` choices:
 launch one of five progressive examples through a `pickString`, and join a
@@ -2695,6 +2695,23 @@ reuses the normalized management endpoint, validates protocol 1.4 envelopes,
 payload/string/count limits and seq gaps, and reconnects only while the DAP
 session lives. It sends `CmdGoroutineSnapshot` once after every successful
 WebSocket join and thereafter only for explicit Refresh—never run control.
+The extension host also owns a bounded read-only DAP inspector. On each DAP
+`stopped` event it requests `stackTrace`, then `scopes` and `variables` for the
+selected frame; selecting frames and expanding variables issues only those
+inspection requests. Results are bound to the exact session, telemetry snapshot,
+selected stopped goroutine, and stop generation so delayed responses cannot
+replace a newer stop. The adapter currently exposes stacks only for the stopped
+goroutine, so selecting another graph node reports that limit instead of
+fabricating frames. A stop with no DAP `threadId` is inspected with thread zero,
+which preserves stack/locals after cheap synthetic step stops even though the
+goroutine graph intentionally keeps its previous snapshot. No webview action
+sends Continue, Step, Pause, Kill, or any other run-control command.
+
+With `bingo.concurrency.autoReveal`, the extension reveals the session on its
+announcement and refocuses the Bingo view after that session's first DAP
+`stopped` event. The second focus is deliberately scheduled after VS Code handles
+the event; otherwise VS Code's normal stopped-event UI switch wins the race and
+returns the user to Run and Debug.
 `refresh()` is the manual recovery for EVERY terminal state — a fatal latch or an
 exhausted reconnect ladder — and redials whenever no socket is left, because
 re-sending a snapshot request over a socket that is gone silently strands the

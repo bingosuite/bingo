@@ -67,7 +67,9 @@ export async function run(): Promise<void> {
         const current = api.getConcurrencyState();
         const observed = current.sessions[0];
         return observed?.sessionId === managedSessionID &&
-          observed.snapshot?.goroutines.length === 2
+          observed.snapshot?.goroutines.length === 2 &&
+          observed.inspection.stackStatus === "ready" &&
+          observed.inspection.localsStatus === "ready"
           ? current
           : undefined;
       },
@@ -75,12 +77,14 @@ export async function run(): Promise<void> {
       "custom session event and telemetry snapshot",
     );
     assert.equal(model.sessions[0]?.tree.edges.length, 1);
-    await vscode.commands.executeCommand("bingo.concurrency.focus");
     await waitFor(
       () =>
-        api.getConcurrencyViewStatus().ready ? true : undefined,
+        api.getConcurrencyViewStatus().ready &&
+        api.getConcurrencyViewStatus().visible
+          ? true
+          : undefined,
       5000,
-      "focused concurrency webview",
+      "Bingo view refocused after initial stop",
     );
     await waitFor(
       () =>
@@ -231,15 +235,43 @@ class FakeDAPServer {
         break;
       case "stackTrace":
         this.#respond(socket, request, {
-          stackFrames: [],
-          totalFrames: 0,
+          stackFrames: [
+            {
+              id: 1,
+              name: "main.worker",
+              source: {
+                name: "main.go",
+                path: "/integration/main.go",
+              },
+              line: 42,
+              column: 3,
+            },
+          ],
+          totalFrames: 1,
         });
         break;
       case "scopes":
-        this.#respond(socket, request, { scopes: [] });
+        this.#respond(socket, request, {
+          scopes: [
+            {
+              name: "Locals",
+              variablesReference: 100,
+              expensive: false,
+            },
+          ],
+        });
         break;
       case "variables":
-        this.#respond(socket, request, { variables: [] });
+        this.#respond(socket, request, {
+          variables: [
+            {
+              name: "answer",
+              value: "42",
+              type: "int",
+              variablesReference: 0,
+            },
+          ],
+        });
         break;
       case "loadedSources":
         this.#respond(socket, request, { sources: [] });

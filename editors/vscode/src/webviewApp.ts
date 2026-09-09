@@ -1,10 +1,14 @@
 import type {
   ConcurrencyViewModel,
   ConnectionState,
+  DebugInspection,
+  DebugStackFrame,
+  DebugVariable,
   ServerTotals,
   SessionViewModel,
 } from "./model.js";
 import { formatServerCount } from "./model.js";
+import type { Location } from "./telemetry.js";
 import { filterFullTree, type TreeNode } from "./tree.js";
 
 export interface WebviewHost {
@@ -128,8 +132,8 @@ function renderSession(
       callout(
         document,
         "warning",
-        "Degraded runtime snapshot",
-        "DWARF or runtime data was unavailable; showing the synthetic fallback.",
+        "Concurrency metadata unavailable at this stop",
+        "The Go runtime could not provide its goroutine and thread model, which is common before runtime initialization. Bingo is showing an unresolved stopped goroutine; call stack and locals are loaded separately below when the debug adapter can provide them.",
       ),
     );
   }
@@ -171,7 +175,7 @@ function renderSession(
     host,
     state,
   );
-  const side = renderInspector(document, session);
+  const side = renderInspector(document, session, host);
   workspace.append(graph, side);
   main.append(workspace, renderThreads(document, session), renderTimeline(document, session));
 
@@ -558,6 +562,7 @@ function filteredSession(
 function renderInspector(
   document: Document,
   session: SessionViewModel,
+  host: WebviewHost,
 ): HTMLElement {
   const panel = document.createElement("aside");
   panel.className = "inspector";
@@ -573,25 +578,344 @@ function renderInspector(
   }
   const title = document.createElement("strong");
   title.className = "inspector-title";
-  title.textContent = `g${String(goroutine.id)} · ${goroutine.status}`;
+  title.textContent =
+    goroutine.id === 0
+      ? "Stopped goroutine · identity unresolved"
+      : `g${String(goroutine.id)} · ${goroutine.status}`;
   panel.append(title);
   const list = document.createElement("dl");
-  const values: readonly [string, string][] = [
-    ["Wait", goroutine.waitReason || "—"],
-    ["Thread", goroutine.threadId > 0 ? `t${String(goroutine.threadId)}` : "not scheduled"],
-    ["Current", locationText(goroutine.currentLoc)],
-    ["Started", locationText(goroutine.startLoc)],
-    ["Created", locationText(goroutine.createdLoc)],
+  const values: readonly [
+    string,
+    string,
+    Location | undefined,
+  ][] = [
+    ["Wait", goroutine.waitReason || "—", undefined],
+    [
+      "Thread",
+      goroutine.threadId > 0
+        ? `t${String(goroutine.threadId)}`
+        : "not scheduled",
+      undefined,
+    ],
+    ["Current", locationText(goroutine.currentLoc), goroutine.currentLoc],
+    ["Started", locationText(goroutine.startLoc), goroutine.startLoc],
+    ["Created", locationText(goroutine.createdLoc), goroutine.createdLoc],
   ];
-  for (const [term, value] of values) {
+  for (const [term, value, location] of values) {
     const dt = document.createElement("dt");
     dt.textContent = term;
     const dd = document.createElement("dd");
-    dd.textContent = value;
+    if (
+      location !== undefined &&
+      location.file.length > 0 &&
+      location.line > 0
+    ) {
+      dd.append(
+        sourceButton(
+          document,
+          value,
+          location.file,
+          location.line,
+          0,
+          host,
+        ),
+      );
+    } else {
+      dd.textContent = value;
+    }
     list.append(dt, dd);
   }
-  panel.append(list);
+  panel.append(list, renderDebugInspection(document, session, host));
   return panel;
+}
+
+function renderDebugInspection(
+  document: Document,
+  session: SessionViewModel,
+  host: WebviewHost,
+): HTMLElement {
+  const inspection = session.inspection;
+  const section = document.createElement("section");
+  section.className = "debug-inspection";
+  const heading = document.createElement("div");
+  heading.className = "inspection-heading";
+  const title = document.createElement("h2");
+  title.textContent = "Call stack";
+  const refresh = button(document, "Reload", () => {
+    host.postMessage({ type: "refreshInspection" });
+  });
+  refresh.className = "subtle-button";
+  heading.append(title, refresh);
+  section.append(heading);
+
+  if (inspection.stackStatus !== "ready") {
+    section.append(
+      inspectionState(
+        document,
+        inspection.stackStatus,
+        inspection.stackMessage,
+        inspection.stackStatus === "idle"
+          ? "Waiting for a suspended debugger snapshot."
+          : "Loading call stack…",
+      ),
+    );
+    const current = session.snapshot?.current ?? 0;
+    if (
+      inspection.stackStatus === "unavailable" &&
+      current > 0 &&
+      current !== session.selectedGoroutine
+    ) {
+      const inspectCurrent = button(
+        document,
+        `Inspect stopped g${String(current)}`,
+        () => {
+          host.postMessage({ type: "selectGoroutine", id: current });
+        },
+      );
+      inspectCurrent.className = "inspect-current";
+      section.append(inspectCurrent);
+    }
+    return section;
+  }
+
+  const frames = document.createElement("ol");
+  frames.className = "stack-list";
+  if (inspection.targetGoroutine === 0) {
+    section.append(
+      inspectionState(
+        document,
+        "unavailable",
+        "The debug adapter did not identify the stopped goroutine. This stack belongs to the current stop and is not attributed to the selected graph node.",
+        "",
+      ),
+    );
+  }
+  for (const frame of inspection.frames) {
+    frames.append(renderStackFrame(document, frame, inspection, host));
+  }
+  if (inspection.frames.length === 0) {
+    frames.append(
+      inspectionState(
+        document,
+        "unavailable",
+        "The debug adapter returned no stack frames.",
+        "",
+      ),
+    );
+  }
+  section.append(frames);
+
+  const localsHeading = document.createElement("h2");
+  localsHeading.className = "locals-heading";
+  localsHeading.textContent = "Locals";
+  section.append(
+    localsHeading,
+    renderLocals(document, inspection, host),
+  );
+  return section;
+}
+
+function renderStackFrame(
+  document: Document,
+  frame: DebugStackFrame,
+  inspection: DebugInspection,
+  host: WebviewHost,
+): HTMLElement {
+  const item = document.createElement("li");
+  item.className = `stack-frame${
+    frame.id === inspection.selectedFrameId ? " selected" : ""
+  }`;
+  const select = button(document, frame.name, () => {
+    host.postMessage({ type: "selectFrame", id: frame.id });
+  });
+  select.className = "frame-name";
+  select.setAttribute(
+    "aria-pressed",
+    String(frame.id === inspection.selectedFrameId),
+  );
+  item.append(select);
+  if (frame.file.length > 0 && frame.line > 0) {
+    item.append(
+      sourceButton(
+        document,
+        compactSource(frame.file, frame.line),
+        frame.file,
+        frame.line,
+        frame.column,
+        host,
+      ),
+    );
+  } else {
+    const missing = document.createElement("span");
+    missing.className = "frame-source muted";
+    missing.textContent = "source unavailable";
+    item.append(missing);
+  }
+  return item;
+}
+
+function renderLocals(
+  document: Document,
+  inspection: DebugInspection,
+  host: WebviewHost,
+): HTMLElement {
+  if (inspection.localsStatus !== "ready") {
+    return inspectionState(
+      document,
+      inspection.localsStatus,
+      inspection.localsMessage,
+      inspection.localsStatus === "idle"
+        ? "Select a stack frame to inspect its locals."
+        : "Loading locals…",
+    );
+  }
+  if (inspection.variables.length === 0) {
+    return inspectionState(
+      document,
+      "unavailable",
+      "No local variables are available for this frame.",
+      "",
+    );
+  }
+  const tree = document.createElement("ul");
+  tree.className = "variable-tree";
+  appendVariables(
+    document,
+    tree,
+    inspection.variables,
+    inspection,
+    host,
+    new Set<number>(),
+  );
+  if (inspection.localsMessage.length === 0) {
+    return tree;
+  }
+  const container = document.createElement("div");
+  container.className = "locals-content";
+  container.append(
+    inspectionState(
+      document,
+      "error",
+      inspection.localsMessage,
+      "",
+    ),
+    tree,
+  );
+  return container;
+}
+
+function appendVariables(
+  document: Document,
+  parent: HTMLUListElement,
+  variables: readonly DebugVariable[],
+  inspection: DebugInspection,
+  host: WebviewHost,
+  ancestors: ReadonlySet<number>,
+): void {
+  for (const variable of variables) {
+    const item = document.createElement("li");
+    item.className = "variable";
+    const row = document.createElement("div");
+    row.className = "variable-row";
+    const reference = variable.variablesReference;
+    const children =
+      reference > 0
+        ? inspection.variablesByReference[String(reference)]
+        : undefined;
+    const loading = inspection.loadingReferences.includes(reference);
+    if (reference > 0) {
+      const expand = button(
+        document,
+        loading ? "…" : children === undefined ? "▸" : "▾",
+        () => {
+          if (children === undefined && !loading) {
+            host.postMessage({ type: "expandVariable", reference });
+          }
+        },
+      );
+      expand.className = "variable-expand";
+      expand.disabled = loading || children !== undefined;
+      expand.setAttribute(
+        "aria-label",
+        `${children === undefined ? "Expand" : "Expanded"} ${variable.name}`,
+      );
+      expand.setAttribute("aria-expanded", String(children !== undefined));
+      row.append(expand);
+    } else {
+      const spacer = document.createElement("span");
+      spacer.className = "variable-spacer";
+      row.append(spacer);
+    }
+    const name = document.createElement("span");
+    name.className = "variable-name";
+    name.textContent = variable.name;
+    const value = document.createElement("span");
+    value.className = "variable-value";
+    value.textContent = variable.value;
+    value.title = variable.value;
+    row.append(name, value);
+    if (variable.type.length > 0) {
+      const type = document.createElement("span");
+      type.className = "variable-type";
+      type.textContent = variable.type;
+      row.append(type);
+    }
+    item.append(row);
+    if (
+      reference > 0 &&
+      children !== undefined &&
+      children.length > 0 &&
+      !ancestors.has(reference)
+    ) {
+      const nested = document.createElement("ul");
+      const nextAncestors = new Set(ancestors);
+      nextAncestors.add(reference);
+      appendVariables(
+        document,
+        nested,
+        children,
+        inspection,
+        host,
+        nextAncestors,
+      );
+      item.append(nested);
+    }
+    parent.append(item);
+  }
+}
+
+function inspectionState(
+  document: Document,
+  status: DebugInspection["stackStatus"],
+  message: string,
+  fallback: string,
+): HTMLElement {
+  const state = document.createElement("p");
+  state.className = `inspection-state ${status}`;
+  state.textContent = message || fallback;
+  return state;
+}
+
+function sourceButton(
+  document: Document,
+  label: string,
+  path: string,
+  line: number,
+  column: number,
+  host: WebviewHost,
+): HTMLButtonElement {
+  const source = button(document, label, () => {
+    host.postMessage({ type: "openSource", path, line, column });
+  });
+  source.className = "source-link";
+  source.title = `${path}:${String(line)}`;
+  return source;
+}
+
+function compactSource(file: string, line: number): string {
+  const normalized = file.replaceAll("\\", "/");
+  const basename = normalized.slice(normalized.lastIndexOf("/") + 1);
+  return `${basename}:${String(line)}`;
 }
 
 function renderThreads(

@@ -21,9 +21,13 @@ import {
   ConcurrencyViewProvider,
   copySnapshot,
 } from "./concurrencyView.js";
+import { DebugInspectionController } from "./inspection.js";
 import type { ConcurrencyViewModel } from "./model.js";
 import { SessionRegistry } from "./registry.js";
-import { decodeSessionAnnouncement } from "./sessionEvent.js";
+import {
+  decodeSessionAnnouncement,
+  sessionDAPEventName,
+} from "./sessionEvent.js";
 
 const debugType = "bingo";
 
@@ -34,6 +38,7 @@ export interface BingoExtensionAPI {
   getConcurrencyViewStatus(): {
     readonly resolved: boolean;
     readonly ready: boolean;
+    readonly visible: boolean;
   };
 }
 
@@ -105,9 +110,27 @@ class BingoDebugAdapterDescriptorFactory
 export function activate(context: vscode.ExtensionContext): BingoExtensionAPI {
   const output = vscode.window.createOutputChannel("bingo Server");
   const registry = new SessionRegistry();
+  const debugSessions = new Map<string, vscode.DebugSession>();
+  const inspection = new DebugInspectionController(registry, (id) =>
+    debugSessions.get(id),
+  );
   const concurrencyView = new ConcurrencyViewProvider(
     context.extensionUri,
     registry,
+    {
+      selectFrame: (frameId) => {
+        inspection.selectFrame(frameId);
+      },
+      expandVariable: (reference) => {
+        inspection.expandVariable(reference);
+      },
+      refreshInspection: () => {
+        inspection.refresh();
+      },
+      openSource: (path, line, column) => {
+        void openSource(path, line, column);
+      },
+    },
   );
   const status = vscode.window.createStatusBarItem(
     vscode.StatusBarAlignment.Left,
@@ -115,7 +138,15 @@ export function activate(context: vscode.ExtensionContext): BingoExtensionAPI {
   );
   status.command = "bingo.concurrency.focus";
   status.name = "Bingo Concurrency";
-  let autoRevealed = false;
+  const announcedSessions = new Set<string>();
+  const refocusedSessions = new Set<string>();
+  const autoRevealEnabled = (): boolean =>
+    vscode.workspace
+      .getConfiguration("bingo.concurrency")
+      .get<boolean>("autoReveal", true);
+  const focusConcurrency = (): void => {
+    void vscode.commands.executeCommand(`${concurrencyViewId}.focus`);
+  };
   const updateStatus = (): void => {
     const active = registry.activeModel();
     if (active === undefined) {
@@ -157,6 +188,7 @@ export function activate(context: vscode.ExtensionContext): BingoExtensionAPI {
     output,
     status,
     registry,
+    inspection,
     concurrencyView,
     { dispose: unsubscribeStatus },
     {
@@ -172,6 +204,31 @@ export function activate(context: vscode.ExtensionContext): BingoExtensionAPI {
       debugType,
       new BingoDebugAdapterDescriptorFactory(manager, output),
     ),
+    vscode.debug.registerDebugAdapterTrackerFactory(debugType, {
+      createDebugAdapterTracker(session) {
+        return {
+          onDidSendMessage(message: unknown): void {
+            if (isDAPEvent(message, sessionDAPEventName)) {
+              announcedSessions.add(session.id);
+              return;
+            }
+            if (!isDAPEvent(message, "stopped")) {
+              return;
+            }
+            inspection.stopped(session.id, stoppedThreadId(message));
+            if (
+              !announcedSessions.has(session.id) ||
+              refocusedSessions.has(session.id) ||
+              !autoRevealEnabled()
+            ) {
+              return;
+            }
+            refocusedSessions.add(session.id);
+            setTimeout(focusConcurrency, 0);
+          },
+        };
+      },
+    }),
     vscode.window.registerWebviewViewProvider(
       concurrencyViewId,
       concurrencyView,
@@ -179,6 +236,7 @@ export function activate(context: vscode.ExtensionContext): BingoExtensionAPI {
     ),
     vscode.debug.onDidStartDebugSession((session) => {
       if (session.type === debugType) {
+        debugSessions.set(session.id, session);
         registry.select(session.id);
       }
     }),
@@ -200,6 +258,7 @@ export function activate(context: vscode.ExtensionContext): BingoExtensionAPI {
       ) {
         return;
       }
+      debugSessions.set(event.session.id, event.session);
       let server;
       try {
         server = resolveServerConfiguration(event.session.configuration);
@@ -217,15 +276,9 @@ export function activate(context: vscode.ExtensionContext): BingoExtensionAPI {
         sessionId: announcement.sessionId,
         managementEndpoint: server.managementEndpoint,
       });
-      if (
-        added &&
-        !autoRevealed &&
-        vscode.workspace
-          .getConfiguration("bingo.concurrency")
-          .get<boolean>("autoReveal", true)
-      ) {
-        autoRevealed = true;
-        void vscode.commands.executeCommand(`${concurrencyViewId}.focus`);
+      announcedSessions.add(event.session.id);
+      if (added && autoRevealEnabled()) {
+        focusConcurrency();
       }
     }),
     vscode.debug.onDidChangeActiveDebugSession((session) => {
@@ -235,6 +288,10 @@ export function activate(context: vscode.ExtensionContext): BingoExtensionAPI {
     }),
     vscode.debug.onDidTerminateDebugSession((session) => {
       registry.remove(session.id);
+      inspection.forgetSession(session.id);
+      debugSessions.delete(session.id);
+      announcedSessions.delete(session.id);
+      refocusedSessions.delete(session.id);
     }),
     vscode.commands.registerCommand("bingo.concurrency.refresh", () => {
       registry.refresh();
@@ -268,4 +325,60 @@ export function activate(context: vscode.ExtensionContext): BingoExtensionAPI {
     getLastRenderedRevision: () => concurrencyView.lastRenderedRevision,
     getConcurrencyViewStatus: () => concurrencyView.status,
   };
+}
+
+function isDAPEvent(value: unknown, event: string): boolean {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "type" in value &&
+    value.type === "event" &&
+    "event" in value &&
+    value.event === event
+  );
+}
+
+function stoppedThreadId(value: unknown): number {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !("body" in value) ||
+    typeof value.body !== "object" ||
+    value.body === null ||
+    !("threadId" in value.body)
+  ) {
+    return 0;
+  }
+  const threadId = value.body.threadId;
+  return typeof threadId === "number" &&
+    Number.isSafeInteger(threadId) &&
+    threadId > 0
+    ? threadId
+    : 0;
+}
+
+async function openSource(
+  path: string,
+  line: number,
+  column: number,
+): Promise<void> {
+  try {
+    const document = await vscode.workspace.openTextDocument(
+      vscode.Uri.file(path),
+    );
+    const position = new vscode.Position(
+      Math.max(0, line - 1),
+      Math.max(0, column - 1),
+    );
+    await vscode.window.showTextDocument(document, {
+      selection: new vscode.Range(position, position),
+      preserveFocus: false,
+    });
+  } catch (error: unknown) {
+    void vscode.window.showErrorMessage(
+      `Cannot open ${path}:${String(line)}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
 }

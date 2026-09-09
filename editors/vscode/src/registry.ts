@@ -1,6 +1,8 @@
 import type { BingoEndpoint } from "./configuration.js";
 import {
   type ConcurrencyViewModel,
+  type DebugInspection,
+  emptyInspection,
   serializeSnapshot,
   type SessionModel,
   toSessionViewModel,
@@ -23,17 +25,26 @@ export class SessionRegistry {
     { readonly observer: TelemetryObserver; readonly unsubscribe: () => void }
   >();
   readonly #listeners = new Set<(model: ConcurrencyViewModel) => void>();
+  readonly #inspections = new Map<string, DebugInspection>();
   readonly #dependencies: ObserverDependencies | undefined;
   #activeDebugSessionId = "";
   #revision = 0;
+  #notifying = false;
+  #notificationPending = false;
 
   public constructor(dependencies?: ObserverDependencies) {
     this.#dependencies = dependencies;
   }
 
   public get viewModel(): ConcurrencyViewModel {
-    const sessions = [...this.#sessions.values()]
-      .map(({ observer }) => toSessionViewModel(observer.model))
+    const sessions = [...this.#sessions.entries()]
+      .map(([debugSessionId, { observer }]) =>
+        toSessionViewModel(
+          observer.model,
+          this.#inspections.get(debugSessionId) ??
+            emptyInspection(observer.model.selectedGoroutine),
+        ),
+      )
       .sort((left, right) =>
         left.debugSessionName.localeCompare(right.debugSessionName) ||
         left.debugSessionId.localeCompare(right.debugSessionId),
@@ -64,6 +75,7 @@ export class SessionRegistry {
       this.#changed();
     });
     this.#sessions.set(registration.debugSessionId, { observer, unsubscribe });
+    this.#inspections.set(registration.debugSessionId, emptyInspection());
     this.#activeDebugSessionId = registration.debugSessionId;
     observer.start();
     this.#changed();
@@ -78,6 +90,7 @@ export class SessionRegistry {
     entry.unsubscribe();
     entry.observer.dispose();
     this.#sessions.delete(debugSessionId);
+    this.#inspections.delete(debugSessionId);
     if (this.#activeDebugSessionId === debugSessionId) {
       this.#activeDebugSessionId = this.viewModel.sessions[0]?.debugSessionId ?? "";
     }
@@ -95,6 +108,22 @@ export class SessionRegistry {
 
   public selectGoroutine(id: number): void {
     this.#active()?.observer.selectGoroutine(id);
+  }
+
+  public inspectionFor(debugSessionId: string): DebugInspection | undefined {
+    return this.#inspections.get(debugSessionId);
+  }
+
+  public updateInspection(
+    debugSessionId: string,
+    inspection: DebugInspection,
+  ): boolean {
+    if (!this.#sessions.has(debugSessionId)) {
+      return false;
+    }
+    this.#inspections.set(debugSessionId, inspection);
+    this.#changed();
+    return true;
   }
 
   public refresh(): void {
@@ -116,6 +145,7 @@ export class SessionRegistry {
       observer.dispose();
     }
     this.#sessions.clear();
+    this.#inspections.clear();
     this.#changed();
   }
 
@@ -127,9 +157,24 @@ export class SessionRegistry {
 
   #changed(): void {
     this.#revision += 1;
-    const model = this.viewModel;
-    for (const listener of this.#listeners) {
-      listener(model);
+    if (this.#notifying) {
+      this.#notificationPending = true;
+      return;
+    }
+    this.#notifying = true;
+    try {
+      do {
+        this.#notificationPending = false;
+        const model = this.viewModel;
+        for (const listener of this.#listeners) {
+          listener(model);
+          if (this.#notificationPending) {
+            break;
+          }
+        }
+      } while (this.#notificationPending);
+    } finally {
+      this.#notifying = false;
     }
   }
 }
