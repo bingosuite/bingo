@@ -72,6 +72,7 @@ describe("extension manifest", () => {
       "bingo.concurrency.refresh",
       "bingo.concurrency.selectSession",
       "bingo.concurrency.fit",
+      "bingo.concurrency.fitSidebar",
       "bingo.concurrency.copySnapshot",
     ]) {
       assert.ok(commands.includes(command));

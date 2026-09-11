@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { resolve } from "node:path";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
+import { pathToFileURL } from "node:url";
 
 import { build } from "esbuild";
 import type * as vscode from "vscode";
 
 import type * as concurrencyView from "../src/concurrencyView.js";
+import type { activate } from "../src/extension.js";
 import type {
   ConcurrencyViewActions,
   ConcurrencyViewProvider,
@@ -22,7 +26,7 @@ import type { SessionRegistry } from "../src/registry.js";
 import type { DisplayedState } from "../src/webviewTest.js";
 import { goroutine, snapshot } from "./fixtures.js";
 
-type ViewModule = typeof concurrencyView;
+type ViewModule = typeof concurrencyView & { activate: typeof activate };
 type Render = Extract<HostMessage, { type: "render" }>;
 
 class Emitter<T> {
@@ -165,9 +169,46 @@ class VscodeMock {
   readonly statuses: string[] = [];
   readonly Uri = FakeUri;
   readonly ViewColumn = { One: 1, Two: 2, Beside: -2 };
+  readonly ExtensionMode = { Test: 3 };
+  readonly StatusBarAlignment = { Left: 1 };
+  readonly registeredCommands = new Map<string, () => unknown>();
+  readonly registeredViews = new Map<string, ConcurrencyViewProvider>();
+  readonly commands = {
+    registerCommand: (id: string, callback: () => unknown): vscode.Disposable => {
+      assert.equal(this.registeredCommands.has(id), false);
+      this.registeredCommands.set(id, callback);
+      return { dispose: () => { this.registeredCommands.delete(id); } };
+    },
+    executeCommand: (id: string): Promise<unknown> => {
+      const callback = this.registeredCommands.get(id);
+      assert.ok(callback, `command ${id} must be registered by activate`);
+      return Promise.resolve(callback());
+    },
+  };
+  readonly workspace = {
+    isTrusted: true,
+    workspaceFolders: [],
+    getConfiguration: () => ({ get: () => false }),
+  };
+  readonly debug = {
+    registerDebugConfigurationProvider: disposable,
+    registerDebugAdapterDescriptorFactory: disposable,
+    registerDebugAdapterTrackerFactory: disposable,
+    onDidStartDebugSession: disposable,
+    onDidReceiveDebugSessionCustomEvent: disposable,
+    onDidChangeActiveDebugSession: disposable,
+    onDidTerminateDebugSession: disposable,
+  };
   readonly window = {
     activeTextEditor: { viewColumn: 1 } as { viewColumn: vscode.ViewColumn } | undefined,
     visibleTextEditors: [{ viewColumn: 1 }] as { viewColumn: vscode.ViewColumn }[],
+    createOutputChannel: () => ({ appendLine() {}, dispose() {} }),
+    createStatusBarItem: () => ({ show() {}, hide() {}, dispose() {} }),
+    registerWebviewViewProvider: (id: string, provider: ConcurrencyViewProvider): vscode.Disposable => {
+      assert.equal(this.registeredViews.has(id), false);
+      this.registeredViews.set(id, provider);
+      return { dispose: () => { this.registeredViews.delete(id); } };
+    },
     createWebviewPanel: (
       viewType: string,
       title: string,
@@ -206,6 +247,10 @@ class VscodeMock {
     this.window.activeTextEditor = { viewColumn: 1 };
     this.window.visibleTextEditors = [{ viewColumn: 1 }];
   }
+}
+
+function disposable(): vscode.Disposable {
+  return { dispose() {} };
 }
 
 function session(patch: Partial<SessionModel> = {}): SessionModel {
@@ -328,13 +373,21 @@ describe("concurrency host surfaces", () => {
   const globals = globalThis as typeof globalThis & { __bingoViewTest?: VscodeMock };
   let module: ViewModule;
   const providers: ConcurrencyViewProvider[] = [];
+  const subscriptions: vscode.Disposable[] = [];
 
   before(async () => {
     globals.__bingoViewTest = mock;
     // Bundle in memory so the real host code runs without Electron or a fake
     // vscode package leaking into other tests' module resolution.
     const result = await build({
-      entryPoints: [resolve(process.cwd(), "src/concurrencyView.ts")],
+      stdin: {
+        contents: `
+          export * from "./src/concurrencyView.ts";
+          export { activate } from "./src/extension.ts";
+        `,
+        resolveDir: process.cwd(),
+        loader: "ts",
+      },
       bundle: true,
       platform: "node",
       format: "esm",
@@ -342,6 +395,10 @@ describe("concurrency host surfaces", () => {
       plugins: [{
         name: "injected-vscode",
         setup(build) {
+          build.onResolve({ filter: /^ws$/ }, () => ({
+            path: pathToFileURL(createRequire(resolve(process.cwd(), "package.json")).resolve("ws")).href,
+            external: true,
+          }));
           build.onResolve({ filter: /^vscode$/ }, () => ({
             path: "vscode",
             namespace: "test-vscode",
@@ -351,8 +408,17 @@ describe("concurrency host surfaces", () => {
               const mock = globalThis.__bingoViewTest;
               export const Uri = mock.Uri;
               export const ViewColumn = mock.ViewColumn;
+              export const ExtensionMode = mock.ExtensionMode;
+              export const StatusBarAlignment = mock.StatusBarAlignment;
               export const window = mock.window;
               export const env = mock.env;
+              export const workspace = mock.workspace;
+              export const commands = mock.commands;
+              export const debug = mock.debug;
+              class UnexpectedAPI {
+                constructor() { throw new Error("Unexpected VS Code API in Fit/provider test"); }
+              }
+              export { UnexpectedAPI as DebugAdapterServer, UnexpectedAPI as Position, UnexpectedAPI as Range };
             `,
             loader: "js",
           }));
@@ -368,8 +434,11 @@ describe("concurrency host surfaces", () => {
 
   beforeEach(() => { mock.reset(); });
   afterEach(() => {
+    subscriptions.splice(0).reverse().forEach((subscription) => { subscription.dispose(); });
     providers.splice(0).forEach((provider) => { provider.dispose(); });
     mock.panels.forEach((panel) => { panel.dispose(); });
+    assert.equal(mock.registeredCommands.size, 0);
+    assert.equal(mock.registeredViews.size, 0);
   });
   after(() => { delete globals.__bingoViewTest; });
 
@@ -403,6 +472,97 @@ describe("concurrency host surfaces", () => {
     surface.webview.acknowledge();
     return { ...state, surface, render };
   }
+
+  function activatedSidebar(): FakeSurface {
+    module.activate({
+      extensionUri: new FakeUri("/extension"),
+      extensionPath: "/extension",
+      globalStorageUri: { fsPath: "/storage" },
+      extensionMode: mock.ExtensionMode.Test,
+      subscriptions,
+    } as unknown as vscode.ExtensionContext);
+    const provider = mock.registeredViews.get("bingo.concurrency");
+    assert.ok(provider, "activate must register the Activity Bar provider");
+    const sidebar = new FakeSurface();
+    provider.resolveWebviewView(sidebar.asSidebar());
+    sidebar.webview.ready();
+    sidebar.webview.acknowledge();
+    return sidebar;
+  }
+
+  function sidebarFitCommand(): string {
+    const manifest = JSON.parse(readFileSync(resolve(process.cwd(), "package.json"), "utf8")) as {
+      contributes: {
+        commands: { command: string; icon?: string }[];
+        menus: { "view/title": { command: string; when: string }[] };
+      };
+    };
+    const fitCommands = manifest.contributes.commands
+      .filter((command) => command.icon === "$(screen-full)")
+      .map((command) => command.command);
+    const routes = manifest.contributes.menus["view/title"].filter((route) =>
+      route.when === "view == bingo.concurrency" && fitCommands.includes(route.command));
+    assert.equal(routes.length, 1, "the sidebar must contribute exactly one Fit title action");
+    return routes[0]!.command;
+  }
+
+  function fitCount(surface: FakeSurface): number {
+    return surface.webview.posts.filter((post) => post.message.type === "fit").length;
+  }
+
+  for (const state of ["never-opened", "user-closed", "both-open"] as const) {
+    it(`routes the registered Activity Bar title Fit only to the sidebar with editor ${state}`, async () => {
+      const sidebar = activatedSidebar();
+      let panel: FakeSurface | undefined;
+      if (state !== "never-opened") {
+        await mock.commands.executeCommand("bingo.concurrency.openEditor");
+        panel = mock.panels[0]!;
+        panel.webview.ready();
+        panel.webview.acknowledge();
+        if (state === "user-closed") {
+          panel.dispose();
+        }
+      }
+      const creations = mock.creations.length;
+      const activeSource = mock.window.activeTextEditor;
+      const sourceEditors = [...mock.window.visibleTextEditors];
+      await mock.commands.executeCommand(sidebarFitCommand());
+      assert.equal(fitCount(sidebar), 1);
+      assert.equal(panel === undefined ? 0 : fitCount(panel), 0);
+      assert.equal(mock.creations.length, creations, "sidebar Fit must not create an editor/group");
+      assert.deepEqual(panel?.reveals ?? [], [], "sidebar Fit must not reveal or focus the editor");
+      assert.equal(mock.window.activeTextEditor, activeSource);
+      assert.deepEqual(mock.window.visibleTextEditors, sourceEditors);
+      assert.equal(sidebar.visible, true);
+      if (state === "user-closed") {
+        assert.equal(panel?.visible, false);
+      }
+    });
+  }
+
+  it("preserves the explicit registered editor Fit command and surface-local webview Fit", async () => {
+    const sidebar = activatedSidebar();
+    await mock.commands.executeCommand("bingo.concurrency.fit");
+    assert.equal(mock.creations.length, 1);
+    assert.equal(mock.creations[0]?.showOptions.preserveFocus, false);
+    const panel = mock.panels[0]!;
+    panel.webview.ready();
+    panel.webview.acknowledge();
+    assert.equal(fitCount(panel), 1, "Fit queued before editor ready must reach that document");
+    assert.equal(fitCount(sidebar), 0);
+    await mock.commands.executeCommand("bingo.concurrency.fit");
+    assert.equal(fitCount(panel), 2);
+    assert.equal(mock.creations.length, 1);
+    assert.deepEqual(panel.reveals, [{ column: 2, preserveFocus: false }]);
+
+    panel.webview.received.fire(action(panel.webview.latest, { type: "fit" }));
+    assert.equal(fitCount(panel), 3);
+    assert.equal(fitCount(sidebar), 0);
+    sidebar.webview.received.fire(action(sidebar.webview.latest, { type: "fit" }));
+    assert.equal(fitCount(sidebar), 1);
+    assert.equal(fitCount(panel), 3);
+    assert.equal(panel.reveals.length, 1, "webview Fit must not reveal another surface");
+  });
 
   it("automatically opens one beside-source editor without taking focus", () => {
     const { provider, registry } = harness();

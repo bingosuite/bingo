@@ -2645,7 +2645,11 @@ lockfile with lifecycle scripts disabled before building. The macOS packaging
 job uses the supported `macos-15` arm64 image, asserts `uname -m`, and runs the
 real packaged-server smoke. Both package matrix legs run the pinned Electron
 activation/view/custom-event acknowledgement test; linux additionally runs the
-real packaged DAP→WebSocket graphical-model E2E. Darwin native-debug execution
+real packaged DAP→WebSocket graphical-model E2E. The floor/current Electron matrix
+passes `VSCODE_TEST_VERSION` to the runner, which passes its selected version
+(including the default) into the test host; the suite asserts `vscode.version`
+matches before UI work so a mislabeled matrix cannot silently exercise a fallback.
+Darwin native-debug execution
 requires local/self-hosted Apple Silicon, where the same E2E covers all five
 examples. Both tests observe server-owned idle exit on success. On failure the
 smoke may SIGKILL only the detached process group it created; the packaged E2E
@@ -2734,6 +2738,9 @@ restart never open/refocus panels. A user-closed panel stays closed for that
 session until explicitly reopened; another session may auto-open it. Each surface
 owns its own delivery generation/listeners and shares the registry/renderer/CSP,
 so closing one never disposes the observer or other surface.
+The Activity Bar title Fit routes to `bingo.concurrency.fitSidebar` and fits only
+its own provider, without opening/revealing the editor. The explicit
+`bingo.concurrency.fit` command opens/fits the editor; in-webview Fit stays local.
 
 Every graph node exposes parent goid, full `CreatedLoc`, and `StartLoc`; the
 creation statement and the possibly wrapped entry function are distinct.

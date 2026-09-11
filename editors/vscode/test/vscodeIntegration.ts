@@ -15,6 +15,12 @@ const managedSessionID = "integration-session";
 const editorTitle = "Bingo Concurrency";
 
 export async function run(): Promise<void> {
+  assert.equal(
+    vscode.version,
+    process.env.VSCODE_TEST_VERSION,
+    "Electron must run the exact editor version requested by the runner",
+  );
+  console.log(`Verified requested Electron editor version: ${vscode.version}`);
   const fixture = await loadFixture();
   const configuration = vscode.workspace.getConfiguration();
   const settings = [

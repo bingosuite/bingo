@@ -328,6 +328,9 @@ export function activate(context: vscode.ExtensionContext): BingoExtensionAPI {
       editor.open();
       editorView.fit();
     }),
+    vscode.commands.registerCommand("bingo.concurrency.fitSidebar", () => {
+      concurrencyView.fit();
+    }),
     vscode.commands.registerCommand("bingo.concurrency.copySnapshot", () =>
       copySnapshot(registry),
     ),

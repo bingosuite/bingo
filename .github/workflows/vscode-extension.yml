@@ -28,7 +28,7 @@ jobs:
         run: npm --prefix editors/vscode ci --ignore-scripts
       - name: Exercise supported floor and current editor lifecycle
         env:
-          BINGO_VSCODE_TEST_VERSION: ${{ matrix.version }}
+          VSCODE_TEST_VERSION: ${{ matrix.version }}
         run: xvfb-run -a npm --prefix editors/vscode run test:integration
 
   package:

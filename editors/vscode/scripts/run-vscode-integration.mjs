@@ -8,6 +8,7 @@ import { runTests } from "@vscode/test-electron";
 
 const extensionRoot = fileURLToPath(new URL("../", import.meta.url));
 const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
+const version = process.env.VSCODE_TEST_VERSION ?? "1.107.1";
 const runID = randomBytes(16).toString("hex");
 const scratch = join(
   repositoryRoot,
@@ -38,7 +39,7 @@ process.env.TEMP = scratch; // NOSONAR
 
 try {
   await runTests({
-    version: process.env.VSCODE_TEST_VERSION ?? "1.107.1",
+    version,
     cachePath: join(repositoryRoot, ".vscode-test"),
     extensionDevelopmentPath: extensionRoot,
     extensionTestsPath: join(
@@ -57,6 +58,7 @@ try {
     ],
     extensionTestsEnv: {
       ...process.env,
+      VSCODE_TEST_VERSION: version,
       TMPDIR: scratch, // NOSONAR -- same private directory described above.
       TMP: scratch, // NOSONAR
       TEMP: scratch, // NOSONAR

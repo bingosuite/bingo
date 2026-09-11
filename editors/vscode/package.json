@@ -57,7 +57,12 @@
       },
       {
         "command": "bingo.concurrency.fit",
-        "title": "Bingo: Fit Concurrency Tree",
+        "title": "Bingo: Fit Concurrency Tree in Editor",
+        "icon": "$(screen-full)"
+      },
+      {
+        "command": "bingo.concurrency.fitSidebar",
+        "title": "Bingo: Fit Concurrency Tree in Sidebar",
         "icon": "$(screen-full)"
       },
       {
@@ -102,7 +107,7 @@
           "group": "navigation@1"
         },
         {
-          "command": "bingo.concurrency.fit",
+          "command": "bingo.concurrency.fitSidebar",
           "when": "view == bingo.concurrency",
           "group": "navigation@2"
         }
