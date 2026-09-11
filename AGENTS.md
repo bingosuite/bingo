@@ -2565,12 +2565,29 @@ bypasses health and spawn. The prepared native binary is generated under
 `editors/neovim/bin/` by `just neovim-prepare` and is never committed; runtime
 falls back to `PATH` or explicit `server.binary`.
 
+Neovim health compatibility uses the exact wire version **1.4**; tests derive
+their fixture from Go's service/API/wire/DAP constants, not the Lua consumer.
+Auto management/DAP endpoints must be distinct. Request validation runs before
+adapter transport; DNS/IPv6 host normalization must reject header delimiters
+without changing a scoped IPv6 interface's case. The health reader supports
+Content-Length/chunked/EOF framing, caps headers/trailers at 8 KiB and the whole
+response at 64 KiB, and completes framed bodies without EOF. A single absolute
+timer bounds slow-drip peers. Each ensure attempt owns its cancellable probe and
+retry timer; disposal fences stale callbacks, closes handles, and never signals
+the child/shared server. A timer allocation/start error must settle its waiters,
+not leave an attempt with no future wakeup.
+
 The plugin listens on nvim-dap's literal
 `event_bingo/session/v1` listener key, validates the strict two-field payload,
 and emits `User BingoSession`; `Session.on_close` owns cleanup across terminate,
 disconnect, and transport failure. DAP remains drive-only. The plugin does not
 reimplement RFC 6455 in Lua: concurrency telemetry stays on the WebSocket side
 and uses `cmd/wsmon` until a bounded native observer exists.
+Only registered live bingo sessions in the current setup generation may
+announce IDs. Duplicate announcements are idempotent; conflicting IDs are
+reported and ignored. Cleanup restores an owned previous `on_close` hook, even
+across repeated setup, and queued old-generation closes/events cannot remove or
+revive a new session.
 
 **VS Code connect-or-start invariants.** Default `serverMode:"auto"` is local
 only: management `127.0.0.1:6060`, DAP `127.0.0.1:4711`, readiness 5s, managed
@@ -3444,10 +3461,24 @@ translator keeps DAP entirely outside the hub — a strictly additive package.
   dedicated [vscode-extension.yml](.github/workflows/vscode-extension.yml)
   workflow lints, typechecks, tests, bundles, and builds the local VSIX without
   changing the Go CI jobs.
-- Neovim: [editors/neovim](editors/neovim/) keeps configuration, health-contract,
-  HTTP framing, adapter registration, and session-event validation independent
-  of a real `nvim-dap` install and runs them in headless Neovim with
-  `just neovim-check`; the same recipe parses every Lua source file.
+- Neovim: [editors/neovim](editors/neovim/) runs focused contract, transport,
+  manager, plugin lifecycle and real-loopback modules with `just neovim-check`;
+  the same runner parses every Lua source file. The default suite is independent
+  of nvim-dap and a debugger binary. Deterministic helpers restore globals and
+  module tables after failures, count exact ownership/cleanup and fence stale
+  callbacks; real libuv tests use ephemeral listeners and bounded wall deadlines.
+  [neovim-extension.yml](.github/workflows/neovim-extension.yml) runs the suite
+  with checksum-pinned minimum Neovim 0.11.7 on native linux/amd64 and
+  darwin/arm64, with read-only permissions and no user's configuration. The
+  separately invoked `bash editors/neovim/scripts/integration.sh` pins a real
+  nvim-dap archive by revision/hash in isolated build storage and runs native
+  launch/breakpoint/stack/locals/session discovery. Its second real DAP client
+  must receive exactly one `terminated` after one terminate intent: the
+  initiating nvim-dap client closes on the response and alone would mask a
+  missing terminal event. Both registries must empty, the target disappear, and
+  the owned server exit by idle grace without a test signal. Linux CI runs it;
+  Mach execution requires local/self-hosted Apple Silicon, never hosted macOS
+  or emulation. Only failure cleanup may signal exact test-owned processes.
 
 ## Error handling
 

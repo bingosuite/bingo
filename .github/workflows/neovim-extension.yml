@@ -1,0 +1,84 @@
+name: Neovim extension
+
+on:
+  pull_request:
+  push:
+    branches: ["main", "dev"]
+
+permissions:
+  contents: read
+
+jobs:
+  headless:
+    name: Headless ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: linux-x86_64
+            archive: nvim-linux-x86_64
+            arch: x86_64
+            sha256: 38a7c6317f94503841096c00e8fde05ef04b9472fc9d7d62b6e033cecd6f7991
+          - runner: macos-15
+            target: darwin-arm64
+            archive: nvim-macos-arm64
+            arch: arm64
+            sha256: 9c84686ce84bbab725ff3d88ca3ac1d6da5a72128b68d9dd8094e34d4049a126
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install pinned minimum Neovim
+        env:
+          ARCHIVE: ${{ matrix.archive }}
+          SHA256: ${{ matrix.sha256 }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          test "$(uname -m)" = "$EXPECTED_ARCH"
+          curl --fail --location --retry 3 \
+            "https://github.com/neovim/neovim/releases/download/v0.11.7/$ARCHIVE.tar.gz" \
+            --output "$RUNNER_TEMP/$ARCHIVE.tar.gz"
+          echo "$SHA256  $RUNNER_TEMP/$ARCHIVE.tar.gz" | shasum -a 256 -c -
+          tar -xzf "$RUNNER_TEMP/$ARCHIVE.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/$ARCHIVE/bin" >> "$GITHUB_PATH"
+
+      - name: Exercise contracts, fault injection, lifecycle, and real loopback TCP
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/bingo-nvim/config
+          XDG_DATA_HOME: ${{ runner.temp }}/bingo-nvim/data
+          XDG_STATE_HOME: ${{ runner.temp }}/bingo-nvim/state
+          XDG_CACHE_HOME: ${{ runner.temp }}/bingo-nvim/cache
+        run: |
+          nvim --version | head -3
+          nvim --headless -u NONE -i NONE -l ./editors/neovim/tests/run.lua
+          bash -n editors/neovim/scripts/integration.sh
+          git diff --exit-code
+
+      - name: Set up native Go toolchain
+        if: runner.os == 'Linux'
+        uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Exercise real nvim-dap launch, inspection, and one-terminate lifecycle
+        if: runner.os == 'Linux'
+        env:
+          BINGO_NVIM_SMOKE_RETAIN_OBSERVER: "1"
+        run: bash editors/neovim/scripts/integration.sh
+
+      - name: Explain native Darwin execution boundary
+        if: runner.os == 'macOS'
+        run: echo "Native Mach debugger smoke requires local/self-hosted Apple Silicon; hosted CI covers the Lua and real TCP suite."
+
+      - name: Preserve native failure diagnostics
+        if: failure() && runner.os == 'Linux'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: neovim-native-failure
+          if-no-files-found: ignore
+          path: |
+            build/neovim-integration/**/*.log
+            build/neovim-integration/**/server-build.txt
+            build/neovim-integration/**/neovim-version.txt

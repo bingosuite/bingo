@@ -13,6 +13,11 @@ end, {
 
 vim.api.nvim_create_user_command("BingoAttach", function(command)
   local pid = tonumber(command.fargs[1])
+  if #command.fargs > 2 or (#command.fargs > 0 and pid == nil) then
+    vim.notify("BingoAttach requires a positive PID and optional binary path",
+      vim.log.levels.ERROR, { title = "bingo" })
+    return
+  end
   require("bingo").attach(pid, command.fargs[2])
 end, {
   nargs = "*",

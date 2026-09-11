@@ -13,6 +13,8 @@ local state = {
   previous_adapter = nil,
   configurations = {},
   listeners = {},
+  generation = 0,
+  sessions = setmetatable({}, { __mode = "k" }),
 }
 
 local default_configuration_names = {
@@ -35,6 +37,11 @@ local function ensure_listener(dap, stage, name)
 end
 
 local function remove_session(dap_session)
+  local owned = state.sessions[dap_session]
+  if owned and dap_session.on_close.bingo == owned.callback then
+    dap_session.on_close.bingo = owned.previous
+  end
+  state.sessions[dap_session] = nil
   local removed = state.session_ids[dap_session]
   state.session_ids[dap_session] = nil
   if state.current_session == removed then
@@ -47,11 +54,27 @@ local function remove_session(dap_session)
 end
 
 local function register_session_listeners(dap, options)
+  local generation = state.generation
+  local function remove_current(dap_session)
+    if generation == state.generation then
+      remove_session(dap_session)
+    end
+  end
   local event_key = "event_" .. session_event.event_name
   local event_listener = function(dap_session, body)
+    if generation ~= state.generation or state.sessions[dap_session] == nil then
+      return
+    end
     local announcement, decode_error = session_event.decode(body)
     if announcement == nil then
       notify("ignored invalid bingo session event: " .. decode_error, vim.log.levels.WARN)
+      return
+    end
+    local prior = state.session_ids[dap_session]
+    if prior then
+      if prior ~= announcement.session_id then
+        notify("ignored conflicting bingo session announcement", vim.log.levels.WARN)
+      end
       return
     end
 
@@ -70,31 +93,41 @@ local function register_session_listeners(dap, options)
   end
   local on_session = function(_, new_session)
     if
-      new_session == nil
+      generation ~= state.generation
+      or new_session == nil
       or new_session.config == nil
       or new_session.config.type ~= "bingo"
     then
       return
     end
-    new_session.on_close = new_session.on_close or {}
-    new_session.on_close.bingo = function(closed_session)
-      vim.schedule(function()
-        remove_session(closed_session)
-      end)
+    if state.sessions[new_session] then
+      return
     end
+    new_session.on_close = new_session.on_close or {}
+    local previous = new_session.on_close.bingo
+    local on_close = function(closed_session)
+      vim.schedule(function()
+        remove_current(closed_session)
+      end)
+      if previous then
+        previous(closed_session)
+      end
+    end
+    state.sessions[new_session] = { callback = on_close, previous = previous }
+    new_session.on_close.bingo = on_close
   end
   local listeners = {
     event_key = event_key,
     event = event_listener,
-    terminated = remove_session,
-    exited = remove_session,
+    terminated = remove_current,
+    exited = remove_current,
     on_session = on_session,
   }
   state.listeners = listeners
 
   ensure_listener(dap, "before", event_key).bingo = event_listener
-  ensure_listener(dap, "before", "event_terminated").bingo = remove_session
-  ensure_listener(dap, "before", "event_exited").bingo = remove_session
+  ensure_listener(dap, "before", "event_terminated").bingo = remove_current
+  ensure_listener(dap, "before", "event_exited").bingo = remove_current
   dap.listeners.on_session.bingo = on_session
 
   return listeners
@@ -227,6 +260,11 @@ local function unregister_dap()
 end
 
 local function clear_setup()
+  state.generation = state.generation + 1
+  for dap_session in pairs(state.sessions) do
+    remove_session(dap_session)
+  end
+  state.current_session = nil
   if state.manager ~= nil then
     state.manager:dispose()
   end
@@ -252,12 +290,17 @@ function M.setup(options)
   state.previous_adapter = dap.adapters.bingo
 
   local adapter = function(callback, debug_config)
+    local valid, validation_error = pcall(config.validate_request, debug_config)
+    if not valid then
+      notify(tostring(validation_error), vim.log.levels.ERROR)
+      return
+    end
     manager:ensure(debug_config, function(error_message, endpoint)
       if error_message ~= nil then
         notify(error_message, vim.log.levels.ERROR)
         return
       end
-      callback({
+      local ok, callback_error = pcall(callback, {
         type = "server",
         host = endpoint.host,
         port = endpoint.port,
@@ -266,6 +309,9 @@ function M.setup(options)
           disconnect_timeout_sec = 5,
         },
       })
+      if not ok then
+        notify("bingo adapter callback failed: " .. tostring(callback_error), vim.log.levels.ERROR)
+      end
     end)
   end
   state.adapter = adapter
@@ -297,6 +343,15 @@ local function require_non_empty(value, label)
   return value
 end
 
+local function run(configuration)
+  local ok, message = pcall(config.validate_request, configuration)
+  if not ok then
+    notify(tostring(message), vim.log.levels.ERROR)
+    return
+  end
+  state.dap.run(configuration)
+end
+
 function M.launch(program)
   ensure_setup()
   program = program or prompt("Path to executable: ", vim.fn.getcwd() .. "/", "file")
@@ -304,7 +359,7 @@ function M.launch(program)
   if program == nil then
     return
   end
-  state.dap.run({
+  run({
     name = "bingo: " .. vim.fs.basename(program),
     type = "bingo",
     request = "launch",
@@ -329,7 +384,7 @@ function M.attach(pid, binary_path)
       "file"
     )
   end
-  state.dap.run({
+  run({
     name = "bingo: Attach " .. tostring(pid),
     type = "bingo",
     request = "attach",
@@ -346,7 +401,7 @@ function M.join(session_id)
   if session_id == nil then
     return
   end
-  state.dap.run({
+  run({
     name = "bingo: Join " .. session_id,
     type = "bingo",
     request = "attach",
