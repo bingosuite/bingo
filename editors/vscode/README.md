@@ -91,8 +91,10 @@ Variables, and the normal debug controls. Debug Console remains VS Code's native
 panel. These native views cannot all be embedded through supported extension
 APIs, so Bingo complements them rather than replacing or fighting their focus.
 The Bingo Activity Bar icon still opens the same observer as a manual sidebar.
-The
-extension host owns the WebSocket and validated model, so hiding or recreating
+Its title-bar Fit action fits only that sidebar and never opens or focuses the
+editor panel. **Bingo: Fit Concurrency Tree in Editor** explicitly opens/fits
+the editor; each webview's own Fit button stays local to that surface.
+The extension host owns the WebSocket and validated model, so hiding or recreating
 the webview does not lose the latest snapshot. Multiple debug sessions appear
 in the selector; the status bar shows active goroutine/thread counts.
 
@@ -348,8 +350,11 @@ extension-local server.
 Electron tests run in isolated profiles, not the user's installed editor. The
 default runner is pinned to 1.107.1; the compatibility matrix additionally pins
 the supported 1.85.2 floor and 1.137.0. The host bundle targets Node 18 for the
-floor's extension host. Fake DAP tests exercise the real editor/webview lifecycle;
-native packaged tests exercise the real debugger with a lightweight DOM renderer.
+floor's extension host. CI and local overrides use `VSCODE_TEST_VERSION`; the
+Electron suite asserts `vscode.version` equals the runner's requested version,
+including its default, before exercising the UI. Fake DAP tests exercise the real
+editor/webview lifecycle; native packaged tests exercise the real debugger with
+a lightweight DOM renderer.
 These are complementary layers, not a claim that the native target ran inside
 Electron.
 

@@ -199,11 +199,23 @@ describe("repository VS Code integration", () => {
   it("keeps floor/current Electron coverage unprivileged and runtime compatible with Node18", () => {
     const workflow = readText(".github/workflows/vscode-extension.yml");
     assert.match(workflow, /version: \["1\.85\.2", "1\.137\.0"\]/);
-    assert.match(workflow, /BINGO_VSCODE_TEST_VERSION: \$\{\{ matrix\.version \}\}/);
     assert.match(workflow, /permissions:\s+contents: read/);
     assert.doesNotMatch(workflow, /pull_request_target|contents: write|secrets\./);
     const manifest = readJSON("editors/vscode/package.json");
     assert.match(String(requireRecord(manifest.scripts).build), /--target=node18/);
+  });
+
+  it("carries the CI matrix version through the runner into the Electron runtime assertion", () => {
+    const workflow = readText(".github/workflows/vscode-extension.yml");
+    const runner = readText("editors/vscode/scripts/run-vscode-integration.mjs");
+    const integration = readText("editors/vscode/test/vscodeIntegration.ts");
+    const workflowKey = /^\s+([A-Z_]+): \$\{\{ matrix\.version \}\}$/m.exec(workflow)?.[1];
+    const runnerKey = /const version = process\.env\.([A-Z_]+) \?\? "1\.107\.1";/.exec(runner)?.[1];
+    assert.equal(workflowKey, "VSCODE_TEST_VERSION");
+    assert.equal(runnerKey, workflowKey);
+    assert.match(runner, /await runTests\(\{\s+version,/);
+    assert.match(runner, /extensionTestsEnv: \{\s+\.\.\.process\.env,\s+VSCODE_TEST_VERSION: version,/);
+    assert.match(integration, /assert\.equal\(\s+vscode\.version,\s+process\.env\.VSCODE_TEST_VERSION,/);
   });
 
   it("uses supported editor layout without focus timers or mutating user debug settings", () => {
