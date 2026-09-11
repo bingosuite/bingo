@@ -1,5 +1,6 @@
 import type { ConcurrencyViewModel } from "./model.js";
 import { mountConcurrencyView } from "./webviewApp.js";
+import { driveDocument } from "./webviewTest.js";
 
 declare function acquireVsCodeApi(): {
   postMessage(message: Record<string, unknown>): void;
@@ -10,6 +11,21 @@ const render = mountConcurrencyView(document, vscode);
 
 window.addEventListener("message", (event: MessageEvent<unknown>) => {
   if (event.origin !== window.location.origin) {
+    return;
+  }
+  const probe = event.data;
+  if (typeof probe === "object" && probe !== null && "type" in probe &&
+    probe.type === "testInspect" && "id" in probe && Number.isSafeInteger(probe.id) &&
+    "target" in probe && typeof probe.target === "number" && Number.isSafeInteger(probe.target) &&
+    probe.target >= 0 && "operation" in probe &&
+    (probe.operation === "inspect" || probe.operation === "selectGoroutine" ||
+      probe.operation === "selectFrame" || probe.operation === "expandVariable" ||
+      probe.operation === "openCreationSource")) {
+    vscode.postMessage({
+      type: "testResult",
+      id: probe.id,
+      state: driveDocument(document, probe.operation, probe.target),
+    });
     return;
   }
   if (isFitMessage(event.data)) {

@@ -1,4 +1,5 @@
 import type { BingoEndpoint } from "./configuration.js";
+import { emptySource, type SourceSnippet } from "./sourceModel.js";
 import {
   type ConcurrencyViewModel,
   type DebugInspection,
@@ -26,6 +27,7 @@ export class SessionRegistry {
   >();
   readonly #listeners = new Set<(model: ConcurrencyViewModel) => void>();
   readonly #inspections = new Map<string, DebugInspection>();
+  readonly #sources = new Map<string, SourceSnippet>();
   readonly #dependencies: ObserverDependencies | undefined;
   #activeDebugSessionId = "";
   #revision = 0;
@@ -43,6 +45,7 @@ export class SessionRegistry {
           observer.model,
           this.#inspections.get(debugSessionId) ??
             emptyInspection(observer.model.selectedGoroutine),
+          this.#sources.get(debugSessionId) ?? emptySource,
         ),
       )
       .sort((left, right) =>
@@ -91,6 +94,7 @@ export class SessionRegistry {
     entry.observer.dispose();
     this.#sessions.delete(debugSessionId);
     this.#inspections.delete(debugSessionId);
+    this.#sources.delete(debugSessionId);
     if (this.#activeDebugSessionId === debugSessionId) {
       this.#activeDebugSessionId = this.viewModel.sessions[0]?.debugSessionId ?? "";
     }
@@ -130,6 +134,15 @@ export class SessionRegistry {
     this.#active()?.observer.refresh();
   }
 
+  public updateSource(debugSessionId: string, source: SourceSnippet): boolean {
+    if (!this.#sessions.has(debugSessionId)) {
+      return false;
+    }
+    this.#sources.set(debugSessionId, source);
+    this.#changed();
+    return true;
+  }
+
   public activeSnapshotJSON(): string | undefined {
     const model = this.#active()?.observer.model;
     return model === undefined ? undefined : serializeSnapshot(model);
@@ -146,6 +159,7 @@ export class SessionRegistry {
     }
     this.#sessions.clear();
     this.#inspections.clear();
+    this.#sources.clear();
     this.#changed();
   }
 

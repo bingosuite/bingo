@@ -9,11 +9,18 @@ import type {
 } from "../src/model.js";
 import { emptyInspection, toSessionViewModel } from "../src/model.js";
 import { mountConcurrencyView } from "../src/webviewApp.js";
+import { decodeAction } from "../src/messages.js";
+import type { SourceSnippet } from "../src/sourceModel.js";
 import { goroutine, snapshot, thread } from "./fixtures.js";
+
+function content(message: Record<string, unknown>): Record<string, unknown> {
+  return message.type === "action" ? decodeAction(message).action : message;
+}
 
 function model(
   patch: Partial<SessionModel> = {},
   inspection?: DebugInspection,
+  spawnSource?: SourceSnippet,
 ): ConcurrencyViewModel {
   const session: SessionModel = {
     debugSessionId: "debug",
@@ -44,6 +51,7 @@ function model(
       toSessionViewModel(
         session,
         inspection ?? emptyInspection(session.selectedGoroutine),
+        spawnSource,
       ),
     ],
   };
@@ -55,7 +63,7 @@ describe("concurrency webview DOM", () => {
     const messages: Record<string, unknown>[] = [];
     const render = mountConcurrencyView(document, {
       postMessage(message) {
-        messages.push(message);
+        messages.push(content(message));
       },
     });
     render(model());
@@ -86,10 +94,29 @@ describe("concurrency webview DOM", () => {
     });
   });
 
+  it("keeps ready-state inspection limits visible even when no variable fits", () => {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    const render = mountConcurrencyView(document, { postMessage() {} });
+    for (const variables of [[], [{
+      name: "value", value: "42", type: "int", variablesReference: 0,
+    }]]) {
+      render(model({}, {
+        ...emptyInspection(1),
+        stackStatus: "ready", stackMessage: "Stack truncated at 200 frames.",
+        localsStatus: "ready", localsMessage: "Variable inspection budget exhausted.",
+        variables,
+      }));
+      const inspector = document.querySelector(".debug-inspection")?.textContent ??
+        document.body.textContent ?? "";
+      assert.match(inspector, /Stack truncated at 200 frames/);
+      assert.match(inspector, /Variable inspection budget exhausted/);
+    }
+  });
+
   it("filters and selects through DOM events", () => {
     const { document, window } = parseHTML("<html><body><div id=app></div></body></html>");
     const messages: Record<string, unknown>[] = [];
-    mountConcurrencyView(document, { postMessage: (message) => messages.push(message) })(model());
+    mountConcurrencyView(document, { postMessage: (message) => messages.push(content(message)) })(model());
     const search = document.querySelector<HTMLInputElement>('input[type="search"]')!;
     search.value = "running";
     search.dispatchEvent(new window.Event("input"));
@@ -134,7 +161,7 @@ describe("concurrency webview DOM", () => {
       ],
     };
     mountConcurrencyView(document, {
-      postMessage: (message) => messages.push(message),
+      postMessage: (message) => messages.push(content(message)),
     })(model({}, inspection));
 
     assert.equal(document.querySelectorAll(".stack-frame").length, 2);
@@ -165,9 +192,8 @@ describe("concurrency webview DOM", () => {
       ?.click();
     assert.deepEqual(messages.at(-1), {
       type: "openSource",
-      path: "/workspace/main.go",
-      line: 42,
-      column: 3,
+      target: "frame",
+      frameId: 1,
     });
   });
 
@@ -223,7 +249,7 @@ describe("concurrency webview DOM", () => {
     );
     const messages: Record<string, unknown>[] = [];
     mountConcurrencyView(document, {
-      postMessage: (message) => messages.push(message),
+      postMessage: (message) => messages.push(content(message)),
     })(model());
     const first = document.querySelector<SVGGElement>('[data-goid="1"]')!;
     const second = document.querySelector<SVGGElement>('[data-goid="2"]')!;
@@ -501,6 +527,163 @@ describe("concurrency webview DOM", () => {
     );
     assert.equal(document.querySelector("img"), null);
     assert.match(document.body.textContent, /<img src=x/);
+  });
+});
+
+describe("creation source and bounded inspection DOM", () => {
+  it("renders the selected non-stopped node's parent and full creation/start identities", () => {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    const messages: Record<string, unknown>[] = [];
+    const created = {
+      file: "/workspace/supervisor.go",
+      line: 12,
+      function: "main.supervise",
+    };
+    const view = model({
+      selectedGoroutine: 2,
+      snapshot: snapshot([
+        goroutine(1, 0, { current: true }),
+        goroutine(2, 1, {
+          createdLoc: created,
+          startLoc: { file: "/workspace/worker.go", line: 30, function: "main.supervise.gowrap1" },
+        }),
+      ]),
+    }, {
+      ...emptyInspection(2),
+      stackStatus: "unavailable",
+      stackMessage: "Only the stopped goroutine's stack is available.",
+    }, {
+      status: "ready",
+      message: "Local file on disk, not verified against the binary.",
+      lines: [
+        { number: 11, text: "// create worker", highlighted: false },
+        { number: 12, text: "go worker(job)", highlighted: true },
+        { number: 13, text: "wait()", highlighted: false },
+      ],
+    });
+    mountConcurrencyView(document, { postMessage: (message) => messages.push(message) })(view, 7);
+    const inspector = document.querySelector(".inspector")!;
+    assert.match(inspector.textContent ?? "", /Parentg1/);
+    assert.match(inspector.textContent ?? "", /main.supervise.*\/workspace\/supervisor.go:12/);
+    assert.match(inspector.textContent ?? "", /main.supervise.gowrap1.*worker.go:30/);
+    assert.match(inspector.textContent ?? "", /compiler-generated wrapper/);
+    assert.match(inspector.textContent ?? "", /Only the stopped goroutine/);
+    assert.equal(document.querySelectorAll(".creation-line").length, 1);
+    assert.equal(document.querySelector(".creation-line")?.textContent, "12  go worker(job)\n");
+    assert.equal(document.querySelector(".creation-line")?.getAttribute("aria-current"), "location");
+    document.querySelector<HTMLButtonElement>(".spawn-source .source-link")!.click();
+    assert.deepEqual(decodeAction(messages.at(-1)), {
+      context: { generation: 7, revision: 1, debugSessionId: "debug", goroutineId: 2 },
+      action: { type: "openSource", target: "created", frameId: 0 },
+    });
+  });
+
+  for (const status of ["idle", "loading", "unavailable"] as const) {
+    it(`shows an honest ${status} source state without invented snippet`, () => {
+      const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+      mountConcurrencyView(document, { postMessage() {} })(model({}, undefined, {
+        status,
+        message: `${status}: source not read`,
+        lines: [],
+      }));
+      assert.match(document.querySelector(".spawn-source")?.textContent ?? "", /source not read/);
+      assert.equal(document.querySelectorAll(".source-snippet").length, 0);
+    });
+  }
+
+  it("keeps hostile source, function names and variable values inert", () => {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    const hostile = '<script>alert(1)</script><img src=x onerror="alert(1)">';
+    mountConcurrencyView(document, { postMessage() {} })(model({
+      snapshot: snapshot([goroutine(1, 0, {
+        current: true,
+        createdLoc: { file: "command:workbench.action.closeWindow", line: 1, function: hostile },
+      })]),
+    }, {
+      ...emptyInspection(1),
+      stackStatus: "ready",
+      localsStatus: "ready",
+      variables: [{ name: hostile, value: "javascript:alert(1)", type: hostile, variablesReference: 0 }],
+    }, {
+      status: "ready",
+      message: "Not verified against the binary.",
+      lines: [{ number: 1, text: hostile, highlighted: true }],
+    }));
+    assert.equal(document.querySelectorAll("script,img,a,iframe").length, 0);
+    assert.ok(document.querySelector(".creation-line")?.textContent?.includes(hostile));
+    assert.match(document.querySelector(".variable-value")?.textContent ?? "", /javascript:alert/);
+  });
+
+  it("retains old document action provenance even when numeric IDs are reused", () => {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    const messages: Record<string, unknown>[] = [];
+    const render = mountConcurrencyView(document, { postMessage: (message) => messages.push(message) });
+    render(model(), 1);
+    const old = document.querySelector<HTMLButtonElement>(".spawn-source .source-link")!;
+    const replacement = model();
+    render({
+      ...replacement,
+      revision: 2,
+      activeDebugSessionId: "replacement",
+      sessions: replacement.sessions.map((session) => ({ ...session, debugSessionId: "replacement" })),
+    }, 3);
+    old.click();
+    assert.deepEqual(decodeAction(messages.at(-1)).context,
+      { generation: 1, revision: 1, debugSessionId: "debug", goroutineId: 1 });
+  });
+
+  for (const count of [999, 1000, 1001, 10_000]) {
+    it(`bounds ${String(count)} root variables to 1000 displayed nodes`, () => {
+      const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+      mountConcurrencyView(document, { postMessage() {} })(model({}, {
+        ...emptyInspection(1), stackStatus: "ready", localsStatus: "ready",
+        variables: Array.from({ length: count }, (_, index) => ({
+          name: `v${String(index)}`, value: "1", type: "int", variablesReference: 0,
+        })),
+      }));
+      assert.equal(document.querySelectorAll(".variable").length, Math.min(count, 1000));
+      assert.equal(document.querySelector(".variable-tree")?.textContent?.includes("limit reached"), count > 1000);
+    });
+  }
+
+  it("renders a cyclic reference once and reports the cycle", () => {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    const variable = { name: "self", value: "*Node", type: "Node", variablesReference: 1 };
+    mountConcurrencyView(document, { postMessage() {} })(model({}, {
+      ...emptyInspection(1), stackStatus: "ready", localsStatus: "ready",
+      variables: [variable], variablesByReference: { "1": [variable] },
+    }));
+    assert.equal(document.querySelectorAll(".variable").length, 2);
+    assert.match(document.querySelector(".variable-tree")?.textContent ?? "", /Circular reference/);
+  });
+
+  it("does not multiply a shared subtree across a wide alias fanout", () => {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    const aliases = Array.from({ length: 500 }, (_, index) => ({
+      name: `alias${String(index)}`, value: "*Node", type: "Node", variablesReference: 1,
+    }));
+    mountConcurrencyView(document, { postMessage() {} })(model({}, {
+      ...emptyInspection(1), stackStatus: "ready", localsStatus: "ready",
+      variables: aliases,
+      variablesByReference: { "1": [{ name: "unique-leaf", value: "1", type: "int", variablesReference: 0 }] },
+    }));
+    assert.equal(document.querySelectorAll(".variable").length, 501);
+    assert.equal(document.querySelector(".variable-tree")?.textContent?.split("unique-leaf").length, 2);
+    assert.match(document.querySelector(".variable-tree")?.textContent ?? "", /Shared reference/);
+  });
+
+  it("stops rendering a 10000-reference chain at depth20", () => {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    const variables = Array.from({ length: 10_000 }, (_, index) => ({
+      name: `depth${String(index)}`, value: "*Node", type: "Node", variablesReference: index + 1,
+    }));
+    mountConcurrencyView(document, { postMessage() {} })(model({}, {
+      ...emptyInspection(1), stackStatus: "ready", localsStatus: "ready",
+      variables: variables.slice(0, 1),
+      variablesByReference: Object.fromEntries(variables.slice(1).map((variable, index) => [String(index + 1), [variable]])),
+    }));
+    assert.equal(document.querySelectorAll(".variable").length, 21);
+    assert.match(document.querySelector(".variable-tree")?.textContent ?? "", /depth or node limit/);
   });
 });
 

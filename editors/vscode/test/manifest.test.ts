@@ -12,7 +12,7 @@ const manifest = requireRecord(
 const contributes = requireRecord(manifest.contributes);
 const debuggers = requireArray(contributes.debuggers);
 const debuggerContribution = requireRecord(debuggers[0]);
-const expectedExtensionVersion = "0.5.0";
+const expectedExtensionVersion = "0.6.0";
 
 describe("extension manifest", () => {
   it("versions the managed-server runtime as an installable upgrade", () => {
@@ -68,6 +68,7 @@ describe("extension manifest", () => {
       .map(requireRecord)
       .map((command) => command.command);
     for (const command of [
+      "bingo.concurrency.openEditor",
       "bingo.concurrency.refresh",
       "bingo.concurrency.selectSession",
       "bingo.concurrency.fit",

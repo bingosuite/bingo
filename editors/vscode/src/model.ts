@@ -1,4 +1,5 @@
 import type { Snapshot } from "./telemetry.js";
+import { emptySource, type SourceSnippet } from "./sourceModel.js";
 import { layoutSpawnTree, type TreeLayout } from "./tree.js";
 
 export const maximumTimelineEntries = 100;
@@ -36,6 +37,7 @@ export interface SessionViewModel extends SessionModel {
   readonly tree: TreeLayout;
   readonly degraded: boolean;
   readonly inspection: DebugInspection;
+  readonly spawnSource: SourceSnippet;
 
   // What the SERVER left off the wire, kept deliberately separate from
   // tree.omitted (this view's own filter and render cap). Conflating them would
@@ -130,6 +132,7 @@ export function emptyInspection(targetGoroutine = 0): DebugInspection {
 export function toSessionViewModel(
   model: SessionModel,
   inspection: DebugInspection = emptyInspection(model.selectedGoroutine),
+  spawnSource: SourceSnippet = emptySource,
 ): SessionViewModel {
   const snapshot = model.snapshot;
   return {
@@ -140,6 +143,7 @@ export function toSessionViewModel(
     ]),
     degraded: snapshot === undefined ? false : isDegraded(snapshot),
     inspection,
+    spawnSource,
     serverTotals: serverTotals(snapshot),
   };
 }

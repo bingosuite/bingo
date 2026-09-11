@@ -2614,7 +2614,7 @@ target metadata, architecture, mode, and entitlements.
 The extension package version is the installed-runtime upgrade boundary:
 material shipped behavior changes must bump both `package.json` and the lockfile
 or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.5.0**) in source and VSIX
+and package verifier pin the current version (**0.6.0**) in source and VSIX
 metadata.
 The root Run and Debug dropdown exposes exactly two `"type":"bingo"` choices:
 launch one of five progressive examples through a `pickString`, and join a
@@ -2707,11 +2707,50 @@ which preserves stack/locals after cheap synthetic step stops even though the
 goroutine graph intentionally keeps its previous snapshot. No webview action
 sends Continue, Step, Pause, Kill, or any other run-control command.
 
-With `bingo.concurrency.autoReveal`, the extension reveals the session on its
-announcement and refocuses the Bingo view after that session's first DAP
-`stopped` event. The second focus is deliberately scheduled after VS Code handles
-the event; otherwise VS Code's normal stopped-event UI switch wins the race and
-returns the user to Run and Debug.
+With `bingo.concurrency.autoReveal`, a session announcement opens one reusable
+**editor WebviewPanel beside source**, using public `ViewColumn.Beside` and
+`preserveFocus`. Native Run and Debug remains available for Watch, Breakpoints,
+and standard controls; Debug Console stays native. The Activity Bar view remains
+manual access to the same model. Never compete with native debug UI via focus
+timers, private view-move commands, or user/global setting mutations. Stops and
+restart never open/refocus panels. A user-closed panel stays closed for that
+session until explicitly reopened; another session may auto-open it. Each surface
+owns its own delivery generation/listeners and shares the registry/renderer/CSP,
+so closing one never disposes the observer or other surface.
+
+Every graph node exposes parent goid, full `CreatedLoc`, and `StartLoc`; the
+creation statement and the possibly wrapped entry function are distinct.
+`SpawnSourceController` serializes reads, keeps only the newest selection, and
+binds results/cache to the exact session/snapshot/selection. Automatic previews
+require a trusted canonical workspace-local regular file, use no-follow
+descriptor opens and inode/canonical-path rechecks, and read at most 256 KiB
+(plus one overflow sentinel byte). Files over 10,000 lines are unavailable;
+the nine-line window caps each displayed line at 300 UTF-16 units including its
+clipping marker. Cache capacity is 16 per snapshot; Refresh invalidates it.
+Source on disk is never claimed to match the binary or unsaved editor content.
+These checks reject traversal/symlink escapes; they are not an atomic filesystem
+snapshot against an actor concurrently replacing trusted workspace directories.
+
+Webview actions carry document generation, rendered revision, debug session ID,
+and selected goid. Source actions name only a metadata location kind/frame ID,
+never a path; the host resolves the current authoritative location and opens a
+local file with native VS Code APIs in a source column. Stale actions from a
+closed/replaced document, frame/selection change, or replacement session are
+ignored. Tracee source and metadata remain textContent, never executable markup.
+Variable rendering caps total nodes at 1,000 and depth at 20, with one expansion
+per shared reference subtree and explicit circular/shared/limit messages.
+The inspector independently caps each frame generation at 2,000 variable nodes,
+256 KiB UTF-8 variable text, 256 references, and 128 requests. Response caps are
+200 frames, 32 scopes, 500 variables, 512 KiB text, 12,000 structural nodes,
+16 levels, 64 fields/object, and 16,384 bytes/string. The controller allows four
+wire requests in flight and applies five-second UI deadlines; expiry cancels the
+UI waiter but retains the wire slot until the underlying request settles.
+Stale scopes never fan out variables requests. Outgoing Continue/Next/StepIn/
+StepOut and incoming `continued` synchronously call `resumed`, invalidating
+inspection before lagging WebSocket state can authorize another read. A later
+`stopped` reopens inspection, including thread zero. Restart is not optimistically
+gated this way: a rejected restart need not produce another stop.
+
 `refresh()` is the manual recovery for EVERY terminal state — a fatal latch or an
 exhausted reconnect ladder — and redials whenever no socket is left, because
 re-sending a snapshot request over a socket that is gone silently strands the

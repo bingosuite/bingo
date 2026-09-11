@@ -22,9 +22,8 @@ export type WebviewMessage =
   | { readonly type: "refreshInspection" }
   | {
       readonly type: "openSource";
-      readonly path: string;
-      readonly line: number;
-      readonly column: number;
+      readonly target: "created" | "start" | "current" | "frame";
+      readonly frameId: number;
     }
   | { readonly type: "selectSession"; readonly id: string }
   | { readonly type: "refresh" }
@@ -77,19 +76,17 @@ export function decodeWebviewMessage(value: unknown): WebviewMessage {
         ),
       };
     case "openSource":
-      exactKeys(message, ["type", "path", "line", "column"]);
+      exactKeys(message, ["type", "target", "frameId"]);
       if (
-        typeof message.path !== "string" ||
-        message.path.length === 0 ||
-        message.path.length > 4096
+        message.target !== "created" && message.target !== "start" &&
+        message.target !== "current" && message.target !== "frame"
       ) {
-        throw new TypeError("source path must be a bounded non-empty string");
+        throw new TypeError("source target must name displayed metadata");
       }
       return {
         type: "openSource",
-        path: message.path,
-        line: safeInteger(message.line, "source line", 1),
-        column: safeInteger(message.column, "source column", 0),
+        target: message.target,
+        frameId: safeInteger(message.frameId, "frame id", message.target === "frame" ? 1 : 0),
       };
     case "selectSession":
       exactKeys(message, ["type", "id"]);
@@ -100,6 +97,7 @@ export function decodeWebviewMessage(value: unknown): WebviewMessage {
       ) {
         throw new TypeError("debug session id must be a bounded non-empty string");
       }
+
       return {
         type: "selectSession",
         id: message.id,
@@ -109,6 +107,41 @@ export function decodeWebviewMessage(value: unknown): WebviewMessage {
         `unknown webview message ${JSON.stringify(message.type)}`,
       );
   }
+}
+
+export interface ActionContext {
+  readonly generation: number;
+  readonly revision: number;
+  readonly debugSessionId: string;
+  readonly goroutineId: number;
+}
+
+export function decodeAction(value: unknown): {
+  readonly context: ActionContext;
+  readonly action: WebviewMessage;
+} {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError("action must be an object");
+  }
+  const envelope = value as Record<string, unknown>;
+  exactKeys(envelope, ["type", "generation", "revision", "debugSessionId", "goroutineId", "action"]);
+  if (envelope.type !== "action" || typeof envelope.debugSessionId !== "string" ||
+    envelope.debugSessionId.length > 256) {
+    throw new TypeError("action must name a bounded debug session");
+  }
+  const action = decodeWebviewMessage(envelope.action);
+  if (action.type === "ready" || action.type === "rendered") {
+    throw new TypeError("document lifecycle is not an action");
+  }
+  return {
+    context: {
+      generation: safeInteger(envelope.generation, "generation", 1),
+      revision: safeInteger(envelope.revision, "revision", 0),
+      debugSessionId: envelope.debugSessionId,
+      goroutineId: safeInteger(envelope.goroutineId, "goroutine", 0),
+    },
+    action,
+  };
 }
 
 function exactKeys(

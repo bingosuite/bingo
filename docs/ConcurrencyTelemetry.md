@@ -88,12 +88,20 @@ It is intentionally absent from the root Run and Debug dropdown.
    `build/examples/level5-workflow` and stops at entry.
 4. Set a breakpoint on `examples/level5-workflow/main.go:83` and **Continue** —
    the tracee stops with several workflow and stage goroutines alive.
-5. Open **Bingo Concurrency** in the Activity Bar. The DAP adapter publishes the
+5. **Bingo Concurrency** opens beside source, leaving native **Run and Debug**
+   and **Debug Console** available. The DAP adapter publishes the
    versioned `bingo/session/v1` custom event after session attachment, and the
    extension joins it automatically. No session-id copy is required.
-6. Search/select nodes, inspect current/start/creation locations and threads,
-   or use the title-bar Refresh/Fit actions. The first graphical session
-   auto-reveals unless `bingo.concurrency.autoReveal` is disabled.
+6. Select a node to see its parent, full creation/start locations, and bounded
+   local source around the recorded `go` statement. The highlight is not a
+   claim that local edits match the binary. Missing/outside-workspace/oversized
+   source is explicitly unavailable. Call stack, frame locals, and expansion
+   are available for the stopped goroutine; other selections still show their
+   own spawn metadata and source.
+7. **Open Concurrency Beside Source** reuses the editor panel. Closing it keeps
+   it closed for the session; stops/restart do not steal focus or reopen it.
+   Disable `bingo.concurrency.autoReveal` for manual-only access. The Activity
+   Bar remains an alternative view, using the same session model.
 
 No manual `just server` is required. The extension never kills the shared
 process. The default managed server exits only after its 30-second idle grace
