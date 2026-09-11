@@ -80,6 +80,8 @@ type Handler struct {
 	suspended   bool
 	stopOnEntry bool
 	attached    bool
+	terminating bool
+	terminated  bool
 
 	// joining marks a connection that joined an EXISTING bingo session (a DAP
 	// attach with a `session` argument and no pid) rather than launching or
@@ -360,22 +362,25 @@ func (h *Handler) Close() error {
 
 // --- outbound DAP writes -------------------------------------------------------
 
-func (h *Handler) send(m godap.Message) {
+func (h *Handler) send(messages ...godap.Message) {
 	h.writeMu.Lock()
 	defer h.writeMu.Unlock()
-	h.seq++
-	setSeqField(reflect.ValueOf(m).Elem(), h.seq)
 	// Bound the write so a DAP client that stops reading can't park this
 	// goroutine (and leak its fd) forever. On any write error the socket is
 	// wedged or gone, so tear the connection down: that unblocks Serve's read
 	// and makes the hub drop this client (WriteMessage always returns nil, so
 	// nothing else would).
 	_ = h.conn.SetWriteDeadline(time.Now().Add(dapWriteTimeout))
-	if err := godap.WriteProtocolMessage(h.conn, m); err != nil {
-		if !isClosedConn(err) {
-			h.log.Warn("dap: write error", "err", err)
+	for _, m := range messages {
+		h.seq++
+		setSeqField(reflect.ValueOf(m).Elem(), h.seq)
+		if err := godap.WriteProtocolMessage(h.conn, m); err != nil {
+			if !isClosedConn(err) {
+				h.log.Warn("dap: write error", "err", err)
+			}
+			_ = h.Close()
+			return
 		}
-		_ = h.Close()
 	}
 }
 

@@ -343,7 +343,11 @@ func newHarnessProvider(t *testing.T, prov Provider, rec *cmdRecorder) *harness 
 	serverConn := <-accepted
 
 	h := NewHandler(serverConn, prov, slog.New(slog.NewTextHandler(nopWriter{}, nil)))
-	go h.Serve()
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		h.Serve()
+	}()
 
 	codec := godap.NewCodec()
 	if err := codec.RegisterEvent(sessionEventName, func() godap.Message { return new(sessionEvent) }); err != nil {
@@ -353,6 +357,11 @@ func newHarnessProvider(t *testing.T, prov Provider, rec *cmdRecorder) *harness 
 	t.Cleanup(func() {
 		_ = client.Close()
 		_ = h.Close()
+		select {
+		case <-served:
+		case <-time.After(3 * time.Second):
+			t.Error("DAP Serve did not stop")
+		}
 	})
 
 	return &harness{t: t, handler: h, client: client, reader: bufio.NewReader(client), codec: codec, cmds: rec}

@@ -59,8 +59,9 @@ func (h *Handler) translateEvent(evt protocol.Event) {
 //
 // Outside that welcome, running clears the suspended view so an out-of-band
 // step cannot leave inspection enabled while the process executes. Idle and
-// exited clear it because the process is gone. Nothing is sent: steps do not map
-// to DAP continued, and process death is already reported by EventProcessExited.
+// exited clear it because the process is gone. An exited state also completes
+// the DAP lifecycle: explicit Kill/detach can close the engine's event channel
+// without an EventProcessExited or an exit code.
 func (h *Handler) onSessionState(evt protocol.Event) {
 	var p protocol.SessionStatePayload
 	if err := protocol.DecodeEventPayload(evt, &p); err != nil {
@@ -69,6 +70,19 @@ func (h *Handler) onSessionState(evt protocol.Event) {
 
 	h.mu.Lock()
 	h.sessionState = p.State
+	if p.State == protocol.StateExited {
+		messages := h.terminationMessagesLocked(nil)
+		h.mu.Unlock()
+		h.send(messages...)
+		return
+	}
+	finishIdle := p.State == protocol.StateIdle && h.terminating && !h.launching && !h.restarting
+	if finishIdle {
+		messages := h.terminationMessagesLocked(nil)
+		h.mu.Unlock()
+		h.send(messages...)
+		return
+	}
 	if !h.awaitingWelcome {
 		if p.State == protocol.StateRunning || h.sessionEndedLocked() {
 			h.suspended = false
@@ -84,10 +98,6 @@ func (h *Handler) onSessionState(evt protocol.Event) {
 		h.stopThreadUnknown = tid == 0
 		h.mu.Unlock()
 		h.sendStopped("pause", tid)
-	case protocol.StateExited:
-		h.suspended = false
-		h.mu.Unlock()
-		h.send(&godap.TerminatedEvent{Event: h.event("terminated")})
 	default:
 		h.suspended = false
 		h.mu.Unlock()
@@ -121,6 +131,10 @@ func (h *Handler) onStop(evt protocol.Event) {
 	tid := stoppedThreadID(stopGoroutine(evt).ID)
 
 	h.mu.Lock()
+	if h.terminated {
+		h.mu.Unlock()
+		return
+	}
 	// Every stop is a fresh memory snapshot; drop variable subtrees cached
 	// against the previous suspension so a stale child ref can't be expanded.
 	h.resetVarsLocked()
@@ -151,7 +165,7 @@ func (h *Handler) onStop(evt protocol.Event) {
 			return
 		}
 		h.restarting = false
-		if stopOnEntry {
+		if stopOnEntry || h.terminating {
 			h.suspended = true
 			h.mu.Unlock()
 			h.sendStopped("entry", tid)
@@ -173,6 +187,10 @@ func (h *Handler) onStop(evt protocol.Event) {
 
 func (h *Handler) onContinued() {
 	h.mu.Lock()
+	if h.terminated {
+		h.mu.Unlock()
+		return
+	}
 	tid := h.curThreadID
 	if h.pendingContinues > 0 {
 		// Our own resume — suppress; DAP already implied continuation via the
@@ -195,16 +213,11 @@ func (h *Handler) onContinued() {
 
 func (h *Handler) onProcessExited(evt protocol.Event) {
 	var p protocol.ProcessExitedPayload
-	_ = protocol.DecodeEventPayload(evt, &p)
-
-	h.mu.Lock()
-	h.suspended = false
-	h.sessionState = protocol.StateExited
-	h.stopThreadUnknown = false
-	h.mu.Unlock()
-
-	h.send(&godap.ExitedEvent{Event: h.event("exited"), Body: godap.ExitedEventBody{ExitCode: p.ExitCode}})
-	h.send(&godap.TerminatedEvent{Event: h.event("terminated")})
+	if err := protocol.DecodeEventPayload(evt, &p); err != nil {
+		h.log.Warn("dap: invalid process exit", "err", err)
+		return
+	}
+	h.finishTermination(&p.ExitCode)
 }
 
 func (h *Handler) onOutput(evt protocol.Event) {
@@ -438,6 +451,7 @@ func (h *Handler) onRestarted(evt protocol.Event) {
 	h.mu.Lock()
 	seq := h.restartReqSeq
 	h.restartReqSeq = 0
+	h.terminated = false
 	// The relaunch succeeded, so the captured pre-request view is obsolete: the
 	// new process reports its own state through its entry stop.
 	h.restartWasSuspended = false
@@ -584,6 +598,11 @@ func (h *Handler) onError(evt protocol.Event) {
 		}
 	case protocol.CmdRestart:
 		h.failRestart(p.Message)
+	case protocol.CmdKill:
+		h.mu.Lock()
+		h.terminating = false
+		h.mu.Unlock()
+		h.emitConsole("terminate failed: " + p.Message + "\n")
 	case protocol.CmdContinue, protocol.CmdStepOver, protocol.CmdStepInto, protocol.CmdStepOut:
 		h.failResume(p.Command, p.Message)
 	default:
@@ -699,6 +718,9 @@ func (h *Handler) failStart(msg string) {
 	seq := h.startReqSeq
 	cmd := h.startCmd
 	h.launching = false
+	if launching {
+		h.startReqSeq = 0
+	}
 	h.mu.Unlock()
 
 	if !launching {
@@ -708,7 +730,7 @@ func (h *Handler) failStart(msg string) {
 		cmd = "launch"
 	}
 	h.send(h.errorResponse(seq, cmd, msg))
-	h.send(&godap.TerminatedEvent{Event: h.event("terminated")})
+	h.finishTermination(nil)
 }
 
 // failBreakpointSet reports a rejected SetBreakpoint against the operation at the
