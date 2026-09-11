@@ -2,7 +2,7 @@
   "name": "bingo",
   "displayName": "bingo Debugger",
   "description": "Debug Go concurrency with bingo's DAP adapter and live goroutine visualization.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "bingosuite",
   "license": "MIT",
   "private": true,
@@ -42,6 +42,11 @@
   "contributes": {
     "commands": [
       {
+        "command": "bingo.concurrency.openEditor",
+        "title": "Bingo: Open Concurrency Beside Source",
+        "icon": "$(open-preview)"
+      },
+      {
         "command": "bingo.concurrency.refresh",
         "title": "Bingo: Refresh Concurrency Snapshot",
         "icon": "$(refresh)"
@@ -66,7 +71,7 @@
         "bingo.concurrency.autoReveal": {
           "type": "boolean",
           "default": true,
-          "description": "Keep Bingo Concurrency visible when a debug session starts and reaches its first stop."
+          "description": "Open a reusable Bingo editor beside source when a session starts, keeping native Run and Debug available. Closing the editor keeps it closed for that session."
         }
       }
     },

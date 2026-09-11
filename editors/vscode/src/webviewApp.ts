@@ -37,15 +37,27 @@ export function mountConcurrencyView(
       model.sessions.find(
         (item) => item.debugSessionId === model.activeDebugSessionId,
       ) ?? model.sessions[0];
+    const scopedHost: WebviewHost = {
+      postMessage(action) {
+        host.postMessage({
+          type: "action",
+          generation,
+          revision: model.revision,
+          debugSessionId: session?.debugSessionId ?? "",
+          goroutineId: session?.selectedGoroutine ?? 0,
+          action,
+        });
+      },
+    };
     root.append(
-      header(document, model, session, host),
+      header(document, model, session, scopedHost),
       session === undefined
         ? emptyState(
             document,
             "Start a bingo debug session",
             "Press F5 and choose a progressive example. This view joins automatically.",
           )
-        : renderSession(document, session, host, {
+        : renderSession(document, session, scopedHost, {
             query,
             setQuery(value) {
               query = value;
@@ -588,25 +600,29 @@ function renderInspector(
     string,
     string,
     Location | undefined,
+    "created" | "start" | "current" | undefined,
   ][] = [
-    ["Wait", goroutine.waitReason || "—", undefined],
+    ["Parent", goroutine.parentId > 0 ? `g${String(goroutine.parentId)}` : "unknown / root", undefined, undefined],
+    ["Wait", goroutine.waitReason || "—", undefined, undefined],
     [
       "Thread",
       goroutine.threadId > 0
         ? `t${String(goroutine.threadId)}`
         : "not scheduled",
       undefined,
+      undefined,
     ],
-    ["Current", locationText(goroutine.currentLoc), goroutine.currentLoc],
-    ["Started", locationText(goroutine.startLoc), goroutine.startLoc],
-    ["Created", locationText(goroutine.createdLoc), goroutine.createdLoc],
+    ["Created", locationText(goroutine.createdLoc), goroutine.createdLoc, "created"],
+    ["Entry", locationText(goroutine.startLoc), goroutine.startLoc, "start"],
+    ["Current", locationText(goroutine.currentLoc), goroutine.currentLoc, "current"],
   ];
-  for (const [term, value, location] of values) {
+  for (const [term, value, location, target] of values) {
     const dt = document.createElement("dt");
     dt.textContent = term;
     const dd = document.createElement("dd");
     if (
       location !== undefined &&
+      target !== undefined &&
       location.file.length > 0 &&
       location.line > 0
     ) {
@@ -618,6 +634,8 @@ function renderInspector(
           location.line,
           0,
           host,
+          target,
+          0,
         ),
       );
     } else {
@@ -625,7 +643,38 @@ function renderInspector(
     }
     list.append(dt, dd);
   }
-  panel.append(list, renderDebugInspection(document, session, host));
+  const explanation = document.createElement("p");
+  explanation.className = "muted";
+  explanation.textContent = "Created is the recorded go statement; entry is the goroutine's start function and may be a compiler-generated wrapper.";
+  const source = document.createElement("section");
+  source.className = "spawn-source";
+  source.setAttribute("aria-label", "Goroutine creation source");
+  const sourceHeading = document.createElement("h2");
+  sourceHeading.textContent = "Spawned here";
+  const sourceState = document.createElement("p");
+  sourceState.className = `inspection-state ${session.spawnSource.status}`;
+  sourceState.textContent = session.spawnSource.message;
+  source.append(sourceHeading, sourceState);
+  if (goroutine.createdLoc.file.length > 0 && goroutine.createdLoc.line > 0) {
+    source.append(sourceButton(document, "Open creation source", goroutine.createdLoc.file,
+      goroutine.createdLoc.line, 0, host, "created", 0));
+  }
+  if (session.spawnSource.status === "ready") {
+    const snippet = document.createElement("pre");
+    snippet.className = "source-snippet";
+    for (const line of session.spawnSource.lines) {
+      const row = document.createElement("span");
+      row.className = `source-line${line.highlighted ? " creation-line" : ""}`;
+      row.dataset.line = String(line.number);
+      if (line.highlighted) {
+        row.setAttribute("aria-current", "location");
+      }
+      row.textContent = `${String(line.number)}  ${line.text}\n`;
+      snippet.append(row);
+    }
+    source.append(snippet);
+  }
+  panel.append(list, explanation, source, renderDebugInspection(document, session, host));
   return panel;
 }
 
@@ -678,6 +727,9 @@ function renderDebugInspection(
     return section;
   }
 
+  if (inspection.stackMessage.length > 0) {
+    section.append(inspectionState(document, "unavailable", inspection.stackMessage, ""));
+  }
   const frames = document.createElement("ol");
   frames.className = "stack-list";
   if (inspection.targetGoroutine === 0) {
@@ -729,6 +781,7 @@ function renderStackFrame(
     host.postMessage({ type: "selectFrame", id: frame.id });
   });
   select.className = "frame-name";
+  select.dataset.frameId = String(frame.id);
   select.setAttribute(
     "aria-pressed",
     String(frame.id === inspection.selectedFrameId),
@@ -743,6 +796,8 @@ function renderStackFrame(
         frame.line,
         frame.column,
         host,
+        "frame",
+        frame.id,
       ),
     );
   } else {
@@ -773,7 +828,7 @@ function renderLocals(
     return inspectionState(
       document,
       "unavailable",
-      "No local variables are available for this frame.",
+      inspection.localsMessage || "No local variables are available for this frame.",
       "",
     );
   }
@@ -786,6 +841,7 @@ function renderLocals(
     inspection,
     host,
     new Set<number>(),
+    { remaining: 1000, expanded: new Set<number>() },
   );
   if (inspection.localsMessage.length === 0) {
     return tree;
@@ -811,8 +867,13 @@ function appendVariables(
   inspection: DebugInspection,
   host: WebviewHost,
   ancestors: ReadonlySet<number>,
+  budget: { remaining: number; readonly expanded: Set<number> },
 ): void {
   for (const variable of variables) {
+    if (budget.remaining-- <= 0) {
+      parent.append(inspectionState(document, "unavailable", "Variable display limit reached (1,000 nodes).", ""));
+      break;
+    }
     const item = document.createElement("li");
     item.className = "variable";
     const row = document.createElement("div");
@@ -834,6 +895,7 @@ function appendVariables(
         },
       );
       expand.className = "variable-expand";
+      expand.dataset.reference = String(reference);
       expand.disabled = loading || children !== undefined;
       expand.setAttribute(
         "aria-label",
@@ -865,11 +927,15 @@ function appendVariables(
       reference > 0 &&
       children !== undefined &&
       children.length > 0 &&
-      !ancestors.has(reference)
+      !ancestors.has(reference) &&
+      !budget.expanded.has(reference) &&
+      ancestors.size < 20 &&
+      budget.remaining > 0
     ) {
       const nested = document.createElement("ul");
       const nextAncestors = new Set(ancestors);
       nextAncestors.add(reference);
+      budget.expanded.add(reference);
       appendVariables(
         document,
         nested,
@@ -877,8 +943,14 @@ function appendVariables(
         inspection,
         host,
         nextAncestors,
+        budget,
       );
       item.append(nested);
+    } else if (children !== undefined && children.length > 0) {
+      item.append(inspectionState(document, "unavailable",
+        ancestors.has(reference) ? "Circular reference." :
+          budget.expanded.has(reference) ? "Shared reference (expanded above)." :
+            "Variable display depth or node limit reached.", ""));
     }
     parent.append(item);
   }
@@ -903,12 +975,15 @@ function sourceButton(
   line: number,
   column: number,
   host: WebviewHost,
+  target: "created" | "start" | "current" | "frame",
+  frameId: number,
 ): HTMLButtonElement {
   const source = button(document, label, () => {
-    host.postMessage({ type: "openSource", path, line, column });
+    host.postMessage({ type: "openSource", target, frameId });
   });
   source.className = "source-link";
   source.title = `${path}:${String(line)}`;
+  source.dataset.column = String(column);
   return source;
 }
 

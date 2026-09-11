@@ -5,6 +5,7 @@ import { describe, it } from "node:test";
 import type { ObserverDependencies, Socket } from "../src/observer.js";
 import { emptyInspection } from "../src/model.js";
 import { SessionRegistry } from "../src/registry.js";
+import { emptySource } from "../src/sourceModel.js";
 
 class SocketStub extends EventEmitter implements Socket {
   public readyState = 0;
@@ -28,6 +29,68 @@ class SocketStub extends EventEmitter implements Socket {
 }
 
 describe("session registry", () => {
+  it("keeps source context session-local and never revives removed source on ID reuse", () => {
+    const registry = new SessionRegistry({
+      createSocket: () => new SocketStub(),
+      delay: () => Promise.resolve(),
+      now: () => 0,
+    });
+    const base = {
+      debugSessionName: "source",
+      managementEndpoint: { host: "127.0.0.1", port: 6060 },
+    };
+    const a = { ...base, debugSessionId: "a", sessionId: "one" };
+    registry.add(a);
+    registry.add({ ...base, debugSessionId: "b", sessionId: "two" });
+    const source = {
+      status: "ready" as const,
+      message: "local source",
+      lines: [{ number: 5, text: "go worker()", highlighted: true }],
+    };
+    assert.equal(registry.updateSource("a", source), true);
+    assert.equal(registry.viewModel.sessions.find((s) => s.debugSessionId === "a")?.spawnSource, source);
+    assert.equal(registry.viewModel.sessions.find((s) => s.debugSessionId === "b")?.spawnSource, emptySource);
+    assert.equal(registry.viewModel.activeDebugSessionId, "b");
+    registry.select("a");
+    registry.remove("a");
+    const revision = registry.viewModel.revision;
+    assert.equal(registry.updateSource("a", source), false);
+    assert.equal(registry.viewModel.revision, revision);
+    registry.add({ ...a, sessionId: "replacement" });
+    assert.equal(registry.viewModel.sessions.find((s) => s.debugSessionId === "a")?.spawnSource, emptySource);
+    registry.dispose();
+    assert.equal(registry.updateSource("a", source), false);
+    assert.equal(registry.viewModel.sessions.length, 0);
+  });
+
+  it("publishes only the newest source when source initialization reenters notification", () => {
+    const registry = new SessionRegistry({
+      createSocket: () => new SocketStub(),
+      delay: () => Promise.resolve(),
+      now: () => 0,
+    });
+    registry.add({
+      debugSessionId: "a", debugSessionName: "source", sessionId: "one",
+      managementEndpoint: { host: "127.0.0.1", port: 6060 },
+    });
+    let initialize = true;
+    const stopUpdating = registry.onChange(() => {
+      if (initialize) {
+        initialize = false;
+        registry.updateSource("a", { status: "loading", message: "new selection", lines: [] });
+      }
+    });
+    const observed: string[] = [];
+    const stopObserving = registry.onChange((view) => {
+      observed.push(view.sessions[0]!.spawnSource.message);
+    });
+    registry.select("a");
+    assert.deepEqual(observed, ["new selection"]);
+    stopUpdating();
+    stopObserving();
+    registry.dispose();
+  });
+
   it("supports multiple debug sessions, active selection, deduplication, and teardown", () => {
     const sockets: SocketStub[] = [];
     const dependencies: ObserverDependencies = {

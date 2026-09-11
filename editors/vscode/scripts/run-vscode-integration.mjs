@@ -17,7 +17,9 @@ const scratch = join(
 const profile = join(
   repositoryRoot,
   "dist",
-  `.vu-${runID}`,
+  // VS Code places a Unix socket here; long worktree paths exhaust its 103-byte
+  // path limit. Exclusive mkdir below fails safely on a random-name collision.
+  runID.slice(0, 11),
 );
 const extensions = join(
   repositoryRoot,
@@ -26,7 +28,6 @@ const extensions = join(
 );
 rmSync(scratch, { force: true, recursive: true });
 mkdirSync(scratch, { recursive: true, mode: 0o700 });
-rmSync(profile, { force: true, recursive: true });
 rmSync(extensions, { force: true, recursive: true });
 mkdirSync(profile, { recursive: true, mode: 0o700 });
 mkdirSync(extensions, { recursive: true, mode: 0o700 });
@@ -37,7 +38,7 @@ process.env.TEMP = scratch; // NOSONAR
 
 try {
   await runTests({
-    version: "1.107.1",
+    version: process.env.VSCODE_TEST_VERSION ?? "1.107.1",
     cachePath: join(repositoryRoot, ".vscode-test"),
     extensionDevelopmentPath: extensionRoot,
     extensionTestsPath: join(

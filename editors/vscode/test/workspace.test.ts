@@ -195,6 +195,27 @@ describe("repository VS Code integration", () => {
     assert.match(workflow, /test "\$\(uname -m\)" = "\$\{\{ matrix\.unamearch \}\}"/);
     assert.match(workflow, /runner\.arch == 'ARM64'/);
   });
+
+  it("keeps floor/current Electron coverage unprivileged and runtime compatible with Node18", () => {
+    const workflow = readText(".github/workflows/vscode-extension.yml");
+    assert.match(workflow, /version: \["1\.85\.2", "1\.137\.0"\]/);
+    assert.match(workflow, /BINGO_VSCODE_TEST_VERSION: \$\{\{ matrix\.version \}\}/);
+    assert.match(workflow, /permissions:\s+contents: read/);
+    assert.doesNotMatch(workflow, /pull_request_target|contents: write|secrets\./);
+    const manifest = readJSON("editors/vscode/package.json");
+    assert.match(String(requireRecord(manifest.scripts).build), /--target=node18/);
+  });
+
+  it("uses supported editor layout without focus timers or mutating user debug settings", () => {
+    const extension = readText("editors/vscode/src/extension.ts");
+    const view = readText("editors/vscode/src/concurrencyView.ts");
+    assert.doesNotMatch(extension, /setTimeout|firstStop|ConfigurationTarget\.Global|\.update\(/);
+    assert.match(view, /createWebviewPanel\(/);
+    assert.match(view, /ViewColumn\.Beside/);
+    assert.match(view, /preserveFocus/);
+    assert.match(extension, /registerWebviewViewProvider\(/);
+    assert.doesNotMatch(extension + view, /moveView|moveActiveEditor|workbench\.action\.debug\.run/);
+  });
 });
 
 function assertLifecycleDefaults(record: JsonRecord): void {

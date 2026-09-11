@@ -26,9 +26,11 @@ reuse, and 0.3.2 added wire 1.3's honest unknown stopped-goroutine rendering;
 the concurrency view alive on highly concurrent targets. **0.4.1** adds
 bounded-family error classification, truthful omission states, and manual
 recovery after reconnect exhaustion. **0.4.2** rejects colliding management and
-DAP listeners before managed startup. **0.5.0** keeps the Bingo view visible
-through the initial stop and adds call stacks, frame locals, expandable
-variables, and source navigation to the goroutine inspector. 0.4.0 is the
+DAP listeners before managed startup. **0.5.0** adds call stacks, frame locals,
+expandable variables, and source navigation to the goroutine inspector.
+**0.6.0** keeps native Run and Debug alongside a reusable Bingo editor panel,
+adds bounded creation-source previews, and bounds aggregate inspector work.
+0.4.0 is the
 minimum supported version.
 Rerun the command to update, then run
 **Developer: Reload Window** once so the active extension host loads the new
@@ -83,7 +85,13 @@ path.
 
 ## Bingo Concurrency
 
-The Bingo Activity Bar icon opens a session-aware graphical observer. The
+By default, Bingo opens an editor panel **beside your source**, leaving the
+native **Run and Debug** sidebar available for Watch, Breakpoints, Call Stack,
+Variables, and the normal debug controls. Debug Console remains VS Code's native
+panel. These native views cannot all be embedded through supported extension
+APIs, so Bingo complements them rather than replacing or fighting their focus.
+The Bingo Activity Bar icon still opens the same observer as a manual sidebar.
+The
 extension host owns the WebSocket and validated model, so hiding or recreating
 the webview does not lose the latest snapshot. Multiple debug sessions appear
 in the selector; the status bar shows active goroutine/thread counts.
@@ -93,7 +101,13 @@ in the selector; the status bar shows active goroutine/thread counts.
   across updates, including missing-parent and cyclic runtime data. Search runs
   against the full validated snapshot before the 500-node rendering cap, then
   fits a bounded match/ancestor layout.
-- Selecting a goroutine now opens a real debugger inspector: runtime metadata,
+- Selecting any goroutine prominently shows its parent goid, the recorded
+  **Created** location (the `go` statement), and the **Entry** location (the start
+  function, which can be a compiler-generated wrapper). **Spawned here** displays
+  nearby local source with the recorded creation line highlighted and an explicit
+  **Open creation source** action. This works independently of stack inspection,
+  including for a goroutine that is not stopped.
+- The debugger inspector shows runtime metadata,
   clickable current/start/creation locations, the stopped goroutine's DAP call
   stack, frame selection, locals, and lazy variable expansion. Stack and locals
   are currently available only for the goroutine that is actually stopped;
@@ -109,13 +123,17 @@ in the selector; the status bar shows active goroutine/thread counts.
   keeps its last snapshot. The view never sends run-control commands.
 - **Bingo: Copy Concurrency Snapshot** copies validated JSON. **Select
   Concurrency Session**, **Refresh**, and **Fit** are available from the
-  Command Palette; the Activity Bar icon and status item focus the view through
-  VS Code's generated `bingo.concurrency.focus` command.
+  Command Palette. **Open Concurrency Beside Source** and the status item open
+  or reuse the editor panel; the Activity Bar icon and VS Code's generated
+  `bingo.concurrency.focus` command remain manual sidebar access.
 
-`bingo.concurrency.autoReveal` defaults to `true`. It reveals a new session and
-refocuses Bingo after that session's first DAP stop, after VS Code's normal
-debug-stop handling has had a chance to select Run and Debug. Disable it to keep
-the view in the background. A synthetic degraded snapshot now explicitly means
+`bingo.concurrency.autoReveal` defaults to `true`. A new session opens the editor
+panel once without taking focus away from source. Later stops and restarts do
+not create panels or steal focus. Closing the panel keeps it closed for that
+session; reopen it explicitly from the command or status item. Disable auto-reveal
+for manual-only access. Neither surface changes global debug settings, moves
+native views, or terminates the shared server when closed.
+A synthetic degraded snapshot explicitly means
 that rich Go runtime concurrency metadata was unavailable—commonly at the early
 entry stop—not that DAP stack frames and locals are necessarily unavailable.
 Connection, degraded, empty, sequence-gap, and error states remain visible.
@@ -124,6 +142,36 @@ tracee strings, VS Code theme/high-contrast colors, labelled controls, and
 keyboard selection.
 Treeitems expose hierarchy level, parent context, sibling position, selection,
 and synchronized keyboard focus to assistive technology.
+
+### Local creation source and inspector bounds
+
+Automatic source reads require a trusted workspace and a canonical local path
+inside one of its folders. Traversal and symlink escapes, non-regular files,
+missing/unreadable files, invalid UTF-8, and files above **256 KiB / 10,000 lines**
+produce an explicit unavailable state. Previews show at most **nine lines**, each
+at most **300 UTF-16 code units** including a clipping marker. Reads are serialized;
+rapid selection changes retain only the latest target. A **16-entry** cache belongs
+to one session/snapshot and is cleared by Refresh.
+
+The preview reads the file on disk, not unsaved edits. It is **not verified
+against the compiled binary**: edited source can move the recorded line, so the
+highlight does not prove that the displayed statement created this goroutine.
+Source links use native file navigation, never commands or URLs from target data.
+Messages identify the rendered document, revision, session, selection, and a
+metadata location kind/frame ID; the host chooses the authoritative path.
+Replaced documents and stale selections cannot navigate or inspect a newer stop.
+
+Variable rendering has a **1,000-node / 20-level** ceiling and expands each shared
+reference subtree only once, with explicit shared/circular/limit indications.
+The read-only inspector caps each frame generation at **2,000 variable nodes,
+256 KiB of UTF-8 variable text, 256 references, and 128 requests**. Individual
+responses retain at most 200 frames, 32 scopes, or 500 variables, with independent
+response shape/text/depth limits. At most four requests remain in flight, with
+five-second UI deadlines; timed-out wire requests retain their slot until they
+settle. Resume invalidates inspection immediately, even before WebSocket state
+catches up, and stale scopes cannot fan out more variable requests.
+Inspection remains read-only DAP; unused WebSocket Frames/Locals broadcasts are
+not consumed, and neither the graph nor its source preview drives execution.
 
 ### Large targets and the 1.4 telemetry contract
 
@@ -276,8 +324,10 @@ just server
 just vscode-dev       # build extension, native bundled server, and examples
 just vscode-check     # clean install, lint, typecheck, tests, bundle/list smoke
 just vscode-package   # native reproducible package + content verification
-npm --prefix editors/vscode run test:integration # isolated Electron view/event acknowledgement
-npm --prefix editors/vscode run e2e:packaged     # actual packaged server + DAP + WS graphical model
+npm --prefix editors/vscode run test:integration # isolated Electron + fake DAP + displayed DOM
+VSCODE_TEST_VERSION=1.85.2 npm --prefix editors/vscode run test:integration
+VSCODE_TEST_VERSION=1.137.0 npm --prefix editors/vscode run test:integration
+npm --prefix editors/vscode run e2e:packaged     # native packaged server + DAP + WS + DOM
 ```
 
 `just vscode-dev` restores the exact npm lockfile with lifecycle scripts
@@ -295,11 +345,19 @@ debugging instead uses the installed VSIX and runs only
 **bingo: build examples**, so F5 does not rebuild or codesign the
 extension-local server.
 
+Electron tests run in isolated profiles, not the user's installed editor. The
+default runner is pinned to 1.107.1; the compatibility matrix additionally pins
+the supported 1.85.2 floor and 1.137.0. The host bundle targets Node 18 for the
+floor's extension host. Fake DAP tests exercise the real editor/webview lifecycle;
+native packaged tests exercise the real debugger with a lightweight DOM renderer.
+These are complementary layers, not a claim that the native target ran inside
+Electron.
+
 The packaged E2E reserves unique loopback management/DAP ports, proves
 compatible-instance reuse without a competing spawn, drives levels 1–5 (with a
-nested level-5 tree), exercises select/filter/copy/refresh, and waits for the
-managed server to exit by its idle policy. It signals only its exact captured
-server PID, and only on failure.
+nested level-5 tree), exercises displayed source and read-only inspection as well
+as select/filter/copy/refresh, and waits for the managed server to exit by its idle
+policy. It signals only its exact captured server PID, and only on failure.
 
 ## Troubleshooting
 

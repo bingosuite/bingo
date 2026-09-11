@@ -9,6 +9,28 @@ permissions:
   contents: read
 
 jobs:
+  editor-compatibility:
+    name: Editor lifecycle ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ["1.85.2", "1.137.0"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: editors/vscode/.nvmrc
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm --prefix editors/vscode ci --ignore-scripts
+      - name: Exercise supported floor and current editor lifecycle
+        env:
+          BINGO_VSCODE_TEST_VERSION: ${{ matrix.version }}
+        run: xvfb-run -a npm --prefix editors/vscode run test:integration
+
   package:
     name: Package ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
@@ -62,7 +84,7 @@ jobs:
       - name: Validate extension source
         run: npm --prefix editors/vscode run check
 
-      - name: Exercise activation, view, and custom-event acknowledgement
+      - name: Exercise editor/sidebar lifecycle, actual source and locals DOM, and single Stop
         run: |
           if [ "${{ runner.os }}" = "Linux" ]; then
             xvfb-run -a npm --prefix editors/vscode run test:integration
