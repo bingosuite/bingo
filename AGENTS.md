@@ -2978,8 +2978,9 @@ reason=step; `EventBreakpointHit`→`stopped` reason=breakpoint;
 `EventPanic`→reason=exception; `EventPaused`→reason=pause;
 `EventProcessExited`→`exited`(code)+`terminated`; `EventOutput`→`output`;
 `EventRestarted`→delayed `restart` response; `EventEvaluate`→`evaluate` response
-(correlated via `evalQ`, NOT a stop — see below); `EventSessionState`→sends no
-DAP message on the launch/attach path, but records lifecycle state for
+(correlated via `evalQ`, NOT a stop — see below); `EventSessionState(exited)`→
+`terminated` if the current lifecycle has not already ended. Other states record
+lifecycle state for
 resume-rejection resync and clears the suspended view on `running` (the managed
 hub's propagation path for a successful out-of-band step, which emits no
 `EventContinued`); it is consumed **once** as the initial state on the join path
@@ -3048,9 +3049,9 @@ fed by `EventSessionState` on every connection plus `EventProcessExited`). The
 hub's relaunch-failure path kills the old process, broadcasts the error, *then*
 transitions the managed session to idle, and answers every later command with
 "no active debugger" — reporting a stop there would leave the client stopped on
-a process that no longer exists. Outside a joiner's welcome, `onSessionState`
-only records that state (and drops a stale `suspended` on idle/exited); it sends
-nothing, since process death is already reported by `EventProcessExited`.
+a process that no longer exists. An `exited` state also completes the DAP
+lifecycle when the engine closed its event channel without `EventProcessExited`;
+an unsolicited `idle` alone does not fabricate a terminal (see termination below).
 
 Further invariants: the `pendingContinues` debt of a rejected Continue
 is settled exactly once (its `EventContinued` never arrives); no second `stopped`
@@ -3072,6 +3073,42 @@ for a frame-root ref, or a synchronous cache hit for a child ref (see below);
 `restart`→Restart. Data requests (threads/stackTrace/variables/evaluate) are only
 enqueued while the Handler believes it is `suspended`; otherwise they return an
 empty (best-effort) result rather than blocking.
+
+**Termination acknowledgement is not cleanup completion.** `terminate`
+acknowledges the request and enqueues at most one pending `CmdKill`. The adapter
+emits `terminated` only after a real `EventProcessExited` or the hub's confirmed
+`EventSessionState(exited)`, which `handleDebuggerClosed` broadcasts after the
+engine's event channel closes. Explicit Kill/detach commonly takes the latter
+path: the engine has already entered `stateExited`, so its synthetic shutdown
+stop does not emit a process-exit payload. Waiting only for `EventProcessExited`
+left VS Code waiting until a second Stop forced a disconnect.
+
+Only a real `EventProcessExited` supplies `exited` and its code; detaching a
+foreign process is not process death. `terminationMessagesLocked` claims exactly
+one terminal lifecycle, and `send` batches a real `exited`/`terminated` pair
+under `writeMu`. Later exited/idle broadcasts or repeated Stop requests cannot
+duplicate it. Pending launch/configuration or restart responses are settled
+before the terminal. A confirmed `EventRestarted`, not merely a restart request,
+opens a replacement lifecycle, so delayed old exited/idle states cannot consume
+a restart requested after natural exit. Stop during a pending replacement still
+queues its Kill and prevents the replacement entry from auto-continuing.
+
+No-session and known idle/exited Stop requests complete without a redundant
+Kill, but stale idle/exited state during launch/restart is not cleanup evidence.
+An idle welcome can complete an already-requested idle-session Stop; an initial
+idle state without Stop never emits `terminated`. `CmdKill` errors clear the
+pending flag and surface the cause without claiming completion or changing the
+live suspended/running view, so `ErrAttachedDetachIncomplete` stays retryable.
+Duplicate terminate requests coalesce while the handler can receive their
+outcome. Disconnect skips Kill only after confirmed completion with no pending
+replacement: an unresolved Kill can still fail, so disconnect retains its own
+final cleanup attempt before its response/close and priority command drain.
+If that attempt also fails, the shared hub still owns the retryable debugger;
+another driver can retry, and last-client/server shutdown retains its normal
+cleanup retry obligation. Disconnect never kills the shared server.
+The deterministic termination suite and the
+native `dap-terminate` specs retain another observer throughout Stop, so
+last-client hub shutdown cannot mask missing lifecycle completion.
 
 `variablesReference = frameIndex+1`, `frameID = frameIndex+1` (both reversible
 via `frameIndexFromRef`, both non-zero since DAP reserves 0). threads =
@@ -3370,7 +3407,11 @@ translator keeps DAP entirely outside the hub — a strictly additive package.
   breakpoint, cross-source independence, restart re-identification with an
   in-flight operation, a discarded line abandoning its operation (later set,
   already-satisfied removal, late stale success), no-drop/in-order command
-  delivery, exactly-once responses). Run with the normal
+  delivery, exactly-once responses).
+  [internal/dap/termination_test.go](internal/dap/termination_test.go) pins the
+  startup/idle/restart/exit matrix, retryable cleanup, and disconnect overlap;
+  real-hub loopback cases retain an observer and delay both Kill outcomes and
+  engine event-channel closure independently. Run with the normal
   `go test -tags bingonative ./internal/dap/...`.
 - E2E: label `dap` in [test/integration](test/integration/) — a real go-dap
   client over TCP through the WHOLE stack (client → TCP →
@@ -3383,7 +3424,11 @@ translator keeps DAP entirely outside the hub — a strictly additive package.
   `BINGO_E2E_DAP_OBSERVERS`, default 3), and `declareDAPJoinSpec` (**a SECOND DAP
   client joins an already-suspended session by id — the `onJoin` path — inspects
   it, then DRIVES a continue that the original DAP driver and a WebSocket observer
-  both witness out of band** — the many-DAP-drivers-per-session proof). All four
+  both witness out of band** — the many-DAP-drivers-per-session proof).
+  `declareDAPTerminateSpec` (`dap-terminate`) sends one terminate against running
+  and breakpoint-stopped native targets, retains a WebSocket observer through
+  confirmed exited/idle, and requires exactly one terminal without an invented
+  exit code or shared-server shutdown. All DAP specs
   run in BOTH the linux and darwin containers (the translator is platform-
   agnostic; only the backend differs). CI: the `dap` label runs in the
   `fullstack-*` jobs of

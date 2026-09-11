@@ -280,7 +280,12 @@ func (h *Handler) onConfigurationDone(req *godap.ConfigurationDoneRequest) {
 	h.send(&godap.ConfigurationDoneResponse{Response: h.response(req.Seq, "configurationDone")})
 
 	h.mu.Lock()
+	if h.terminated || h.terminating || h.startReqSeq == 0 {
+		h.mu.Unlock()
+		return
+	}
 	startSeq := h.startReqSeq
+	h.startReqSeq = 0
 	startCmd := h.startCmd
 	stopOnEntry := h.stopOnEntry
 	joining := h.joining
@@ -492,6 +497,7 @@ func (h *Handler) onDisconnect(req *godap.DisconnectRequest) {
 	h.mu.Lock()
 	attached := h.attached
 	hasSession := h.session != nil
+	killComplete := h.terminated && !h.restarting
 	h.mu.Unlock()
 
 	// Launch sessions terminate the debuggee by default; attach sessions leave
@@ -501,7 +507,7 @@ func (h *Handler) onDisconnect(req *godap.DisconnectRequest) {
 		terminate = true
 	}
 
-	if terminate && hasSession {
+	if terminate && hasSession && !killComplete {
 		if cmd, err := marshalCommand(protocol.CmdKill, nil); err == nil {
 			h.enqueue(cmd) // drained by ReadMessage's priority path before EOF
 		}
@@ -513,18 +519,33 @@ func (h *Handler) onDisconnect(req *godap.DisconnectRequest) {
 func (h *Handler) onTerminate(req *godap.TerminateRequest) {
 	h.mu.Lock()
 	hasSession := h.session != nil
+	complete := !hasSession || (!h.launching && !h.restarting && h.sessionEndedLocked())
+	kill := hasSession && !complete && !h.terminating && (!h.terminated || h.restarting)
+	var messages []godap.Message
+	if complete {
+		messages = h.terminationMessagesLocked(nil)
+	}
+	if kill {
+		h.terminating = true
+	}
 	h.mu.Unlock()
 
-	if hasSession {
+	if kill {
 		if cmd, err := marshalCommand(protocol.CmdKill, nil); err == nil {
 			h.enqueue(cmd)
 		}
 	}
 	h.send(&godap.TerminateResponse{Response: h.response(req.Seq, "terminate")})
+	h.send(messages...)
 }
 
 func (h *Handler) onRestart(req *godap.RestartRequest) {
 	h.mu.Lock()
+	if h.terminating {
+		h.mu.Unlock()
+		h.send(h.errorResponse(req.Seq, "restart", "termination already in progress"))
+		return
+	}
 	// restartReqSeq gates only the unanswered DAP request. restarting stays set
 	// longer so the subsequent entry EventStepped is still recognized.
 	if h.restartReqSeq != 0 {
