@@ -1,11 +1,13 @@
+local config = require("bingo.config")
+local http = require("bingo.http")
 local M = {}
 
 M.service = "bingo"
 M.management_api_version = 1
-M.wire_protocol_version = "1.2"
+M.wire_protocol_version = "1.4"
 M.session_event_version = 1
 
-local maximum_response_bytes = 64 * 1024
+local maximum_response_bytes = http.maximum_response_bytes
 
 local function record(value)
   return type(value) == "table"
@@ -25,7 +27,7 @@ local function parse_address(value)
   if value:sub(1, 1) == "[" then
     host, port_text = value:match("^%[([^]]+)%]:(%d+)$")
   else
-    host, port_text = value:match("^(.*):(%d+)$")
+    host, port_text = value:match("^([^:]*):(%d+)$")
   end
   local port = tonumber(port_text)
   if host == nil or host == "" or port == nil or port % 1 ~= 0 or port < 1 or port > 65535 then
@@ -72,7 +74,7 @@ function M.validate(status_code, decoded, expected_dap)
       )
     )
   end
-  if type(decoded.instanceId) ~= "string" or decoded.instanceId == "" then
+  if type(decoded.instanceId) ~= "string" or decoded.instanceId:match("^%s*$") then
     return incompatible("health response has no instanceId")
   end
   if not record(decoded.dap) or decoded.dap.enabled ~= true then
@@ -122,16 +124,8 @@ function M.validate(status_code, decoded, expected_dap)
   }
 end
 
-function M.parse_http_response(raw)
-  local headers, body = raw:match("^(.-)\r\n\r\n(.*)$")
-  if headers == nil then
-    return nil, "health endpoint returned an incomplete HTTP response"
-  end
-  local status = tonumber(headers:match("^HTTP/%d+%.%d+%s+(%d%d%d)"))
-  if status == nil then
-    return nil, "health endpoint returned an invalid HTTP status line"
-  end
-  return { status = status, body = body }
+function M.parse_http_response(raw, eof)
+  return http.parse(raw, eof == nil or eof)
 end
 
 local function default_dependencies()
@@ -167,8 +161,8 @@ end
 function M.probe(endpoint, expected_dap, timeout_ms, callback, dependencies)
   local deps = dependencies or default_dependencies()
   local uv = deps.uv
-  local tcp = uv.new_tcp()
-  local timer = uv.new_timer()
+  local tcp
+  local timer
   local chunks = {}
   local size = 0
   local finished = false
@@ -194,10 +188,16 @@ function M.probe(endpoint, expected_dap, timeout_ms, callback, dependencies)
     end)
   end
 
-  local function finish_response()
-    local response, parse_error = M.parse_http_response(table.concat(chunks))
+  local function finish_response(eof)
+    local response, parse_error = M.parse_http_response(table.concat(chunks), eof)
     if response == nil then
-      finish({ kind = "transportError", error = parse_error })
+      if parse_error then
+        finish({ kind = "transportError", error = parse_error })
+      end
+      return
+    end
+    if response.status ~= 200 then
+      finish(M.validate(response.status, nil, expected_dap))
       return
     end
 
@@ -212,14 +212,68 @@ function M.probe(endpoint, expected_dap, timeout_ms, callback, dependencies)
     finish(M.validate(response.status, decoded, expected_dap))
   end
 
-  timer:start(timeout_ms, 0, function()
+  local function invoke(operation, callback, ...)
+    local ok, result, err = pcall(callback, ...)
+    if not ok or err ~= nil then
+      finish({ kind = "transportError", error = operation .. ": " .. tostring(ok and err or result) })
+      return nil
+    end
+    return result
+  end
+
+  tcp = invoke("create health TCP socket", function()
+    local handle, err = uv.new_tcp()
+    return handle, err or (not handle and "no TCP handle" or nil)
+  end)
+  if not finished then
+    timer = invoke("create health timer", function()
+      local handle, err = uv.new_timer()
+      return handle, err or (not handle and "no timer handle" or nil)
+    end)
+  end
+  local function on_timeout()
     finish({
       kind = "transportError",
       error = string.format("health request timed out after %dms", timeout_ms),
     })
-  end)
+  end
 
-  tcp:connect(endpoint.host, endpoint.port, function(connect_error)
+  local function on_read(read_error, chunk)
+    if finished then
+      return
+    end
+    if read_error ~= nil then
+      finish({ kind = "transportError", error = tostring(read_error) })
+      return
+    end
+    if chunk == nil then
+      finish_response(true)
+      return
+    end
+    size = size + #chunk
+    if size > maximum_response_bytes then
+      finish({
+        kind = "transportError",
+        error = "bingo health response exceeded 64 KiB",
+      })
+      return
+    end
+    chunks[#chunks + 1] = chunk
+    finish_response(false)
+  end
+
+  local function on_write(write_error)
+    if finished then
+      return
+    end
+    if write_error ~= nil then
+      finish({ kind = "transportError", error = tostring(write_error) })
+      return
+    end
+    invoke("read health response", tcp.read_start, tcp, on_read)
+  end
+
+  local function on_connect(connect_error)
     if finished then
       return
     end
@@ -235,46 +289,24 @@ function M.probe(endpoint, expected_dap, timeout_ms, callback, dependencies)
     local request = table.concat({
       "GET /api/health HTTP/1.1\r\n",
       "Host: ",
-      endpoint.host,
-      ":",
-      tostring(endpoint.port),
+      config.endpoint(endpoint),
       "\r\n",
       "Accept: application/json\r\n",
       "Cache-Control: no-cache\r\n",
       "Connection: close\r\n\r\n",
     })
-    tcp:write(request, function(write_error)
-      if finished then
-        return
-      end
-      if write_error ~= nil then
-        finish({ kind = "transportError", error = tostring(write_error) })
-        return
-      end
-      tcp:read_start(function(read_error, chunk)
-        if finished then
-          return
-        end
-        if read_error ~= nil then
-          finish({ kind = "transportError", error = tostring(read_error) })
-          return
-        end
-        if chunk == nil then
-          finish_response()
-          return
-        end
-        size = size + #chunk
-        if size > maximum_response_bytes then
-          finish({
-            kind = "transportError",
-            error = "bingo health response exceeded 64 KiB",
-          })
-          return
-        end
-        chunks[#chunks + 1] = chunk
-      end)
-    end)
-  end)
+    invoke("write health request", tcp.write, tcp, request, on_write)
+  end
+
+  if not finished then
+    invoke("start health timer", timer.start, timer, timeout_ms, 0, on_timeout)
+  end
+  if not finished then
+    invoke("connect health socket", tcp.connect, tcp, endpoint.host, endpoint.port, on_connect)
+  end
+  return function()
+    finish({ kind = "transportError", error = "health request cancelled" })
+  end
 end
 
 return M

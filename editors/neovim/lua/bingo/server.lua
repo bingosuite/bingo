@@ -81,6 +81,19 @@ function Manager:_complete(key, error_message, endpoint, attempt)
     return
   end
   self.in_flight[key] = nil
+  if waiters.probe and waiters.probe.cancel then
+    waiters.probe.cancel()
+  end
+  waiters.probe = nil
+  if waiters.timer then
+    local timer = waiters.timer
+    self.timers[timer] = nil
+    if not timer:is_closing() then
+      timer:stop()
+      timer:close()
+    end
+    waiters.timer = nil
+  end
   for _, callback in ipairs(waiters) do
     local ok, callback_error = pcall(callback, error_message, endpoint)
     if not ok then
@@ -114,15 +127,43 @@ function Manager:_guard(key, attempt, callback)
   end
 end
 
-function Manager:_later(delay_ms, callback)
-  local timer = self.deps.uv.new_timer()
+function Manager:_probe(key, attempt, resolved, timeout, callback)
+  local probe = {}
+  attempt.probe = probe
+  local cancel = self.deps.probe(resolved.management, resolved.dap, timeout, function(result)
+    if self.in_flight[key] ~= attempt or attempt.probe ~= probe then
+      return
+    end
+    attempt.probe = nil
+    callback(result)
+  end)
+  if attempt.probe == probe then
+    probe.cancel = cancel
+  elseif cancel then
+    cancel()
+  end
+end
+
+function Manager:_later(delay_ms, callback, attempt)
+  local timer, timer_error = self.deps.uv.new_timer()
+  if timer == nil then
+    return "cannot allocate readiness timer: " .. tostring(timer_error)
+  end
   self.timers[timer] = true
-  timer:start(delay_ms, 0, function()
+  attempt.timer = timer
+  local started, start_error = timer:start(delay_ms, 0, function()
+    if self.timers[timer] == nil then
+      return
+    end
     timer:stop()
     timer:close()
     self.timers[timer] = nil
+    attempt.timer = nil
     self.deps.schedule(callback)
   end)
+  if started == nil and start_error ~= nil then
+    return "cannot start readiness timer: " .. tostring(start_error)
+  end
 end
 
 function Manager:_resolve_binary(resolved)
@@ -159,6 +200,9 @@ end
 
 function Manager:_spawn(resolved)
   local binary, binary_error = self:_resolve_binary(resolved)
+  if self.disposed then
+    return nil, "bingo server startup was cancelled"
+  end
   if binary == nil then
     return nil, binary_error
   end
@@ -172,9 +216,19 @@ function Manager:_spawn(resolved)
         .. ": "
         .. tostring(mkdir_error)
   end
+  if self.disposed then
+    return nil, "bingo server startup was cancelled"
+  end
   local log_fd, open_error = self.deps.uv.fs_open(log_path, "a", 420)
   if log_fd == nil then
     return nil, "cannot open bingo server log " .. log_path .. ": " .. tostring(open_error)
+  end
+  if self.disposed then
+    local closed, close_error = self.deps.uv.fs_close(log_fd)
+    if closed == nil and close_error then
+      return nil, "cannot close bingo server log: " .. tostring(close_error)
+    end
+    return nil, "bingo server startup was cancelled"
   end
 
   local args = {
@@ -202,14 +256,16 @@ function Manager:_spawn(resolved)
       end
       self.deps.schedule(function()
         self.processes[pid] = nil
-        self:_log(
-          string.format(
-            "managed bingo server %s exited with code %d signal %d",
-            tostring(pid),
-            code,
-            signal
+        if not self.disposed then
+          self:_log(
+            string.format(
+              "managed bingo server %s exited with code %d signal %d",
+              tostring(pid),
+              code,
+              signal
+            )
           )
-        )
+        end
       end)
     end
   )
@@ -217,7 +273,13 @@ function Manager:_spawn(resolved)
     spawn_error = handle
     handle = nil
   end
-  self.deps.uv.fs_close(log_fd)
+  local closed, close_error = self.deps.uv.fs_close(log_fd)
+  if closed == nil and close_error then
+    if handle and not handle:is_closing() then
+      handle:close()
+    end
+    return nil, "cannot close bingo server log: " .. tostring(close_error)
+  end
   if handle == nil then
     return nil,
       "cannot start bingo server: "
@@ -227,6 +289,12 @@ function Manager:_spawn(resolved)
   end
 
   handle:unref()
+  if self.disposed then
+    if not handle:is_closing() then
+      handle:close()
+    end
+    return nil, "bingo server startup was cancelled"
+  end
   self.processes[pid] = handle
   self:_log("starting managed bingo server; logs: " .. log_path)
   return { pid = pid, log_path = log_path }
@@ -255,13 +323,18 @@ function Manager:_poll_ready(key, resolved, child, deadline_ms, last_result, att
     return
   end
 
-  self.deps.probe(
-    resolved.management,
-    resolved.dap,
+  self:_probe(
+    key,
+    attempt,
+    resolved,
     math.min(probe_timeout_ms, math.max(1, math.floor(remaining))),
     function(result)
       self:_guard(key, attempt, function()
         if self.disposed or self.in_flight[key] ~= attempt then
+          return
+        end
+        if self.deps.uv.hrtime() / 1000000 >= deadline_ms then
+          self:_poll_ready(key, resolved, child, deadline_ms, result, attempt)
           return
         end
         if result.kind == "compatible" then
@@ -282,11 +355,14 @@ function Manager:_poll_ready(key, resolved, child, deadline_ms, last_result, att
           return
         end
         local poll_remaining = deadline_ms - self.deps.uv.hrtime() / 1000000
-        self:_later(math.max(1, math.min(poll_interval_ms, poll_remaining)), function()
+        local timer_error = self:_later(math.max(1, math.min(poll_interval_ms, poll_remaining)), function()
           self:_guard(key, attempt, function()
             self:_poll_ready(key, resolved, child, deadline_ms, result, attempt)
           end)
-        end)
+        end, attempt)
+        if timer_error then
+          self:_complete(key, timer_error, nil, attempt)
+        end
       end)
     end
   )
@@ -312,9 +388,10 @@ function Manager:_ensure_auto(key, resolved, attempt)
     return
   end
 
-  self.deps.probe(
-    resolved.management,
-    resolved.dap,
+  self:_probe(
+    key,
+    attempt,
+    resolved,
     math.min(probe_timeout_ms, resolved.ready_timeout_ms),
     function(result)
       self:_guard(key, attempt, function()
@@ -351,6 +428,10 @@ function Manager:_ensure_auto(key, resolved, attempt)
           )
           return
         end
+        if result.kind ~= "absent" then
+          self:_complete(key, "unexpected health result: " .. tostring(result.kind), nil, attempt)
+          return
+        end
 
         local child, spawn_error = self:_spawn(resolved)
         if child == nil then
@@ -381,7 +462,11 @@ function Manager:ensure(debug_config, callback)
   end
   if resolved.mode == "connectOnly" then
     self.deps.schedule(function()
-      callback(nil, resolved.dap)
+      if self.disposed then
+        callback("bingo server startup was cancelled")
+      else
+        callback(nil, resolved.dap)
+      end
     end)
     return
   end
@@ -412,6 +497,12 @@ function Manager:dispose()
   self.timers = {}
   for key in pairs(self.in_flight) do
     self:_complete(key, "bingo server startup was cancelled")
+  end
+  for pid, handle in pairs(self.processes) do
+    if not handle:is_closing() then
+      handle:close()
+    end
+    self.processes[pid] = nil
   end
 end
 

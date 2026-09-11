@@ -125,7 +125,7 @@ neovim-prepare: (build os_name arch_name)
 
 # Parse all plugin files and run the contract tests in Neovim's Lua runtime.
 neovim-check:
-	nvim --headless -u NONE -l ./editors/neovim/tests/run.lua
+	nvim --headless -u NONE -i NONE -l ./editors/neovim/tests/run.lua
 
 # Run unit tests on the PKG (defaults to ./...)
 test PKG="./...":
