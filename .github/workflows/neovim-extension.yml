@@ -37,7 +37,7 @@ jobs:
           EXPECTED_ARCH: ${{ matrix.arch }}
         run: |
           test "$(uname -m)" = "$EXPECTED_ARCH"
-          curl --fail --location --retry 3 \
+          curl --fail --location --retry 3 --proto '=https' --proto-redir '=https' \
             "https://github.com/neovim/neovim/releases/download/v0.11.7/$ARCHIVE.tar.gz" \
             --output "$RUNNER_TEMP/$ARCHIVE.tar.gz"
           echo "$SHA256  $RUNNER_TEMP/$ARCHIVE.tar.gz" | shasum -a 256 -c -

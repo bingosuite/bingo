@@ -8,7 +8,8 @@ import type {
   SessionViewModel,
 } from "./model.js";
 import { formatServerCount } from "./model.js";
-import type { Location } from "./telemetry.js";
+import type { SourceSnippet } from "./sourceModel.js";
+import type { Goroutine, Location } from "./telemetry.js";
 import { filterFullTree, type TreeNode } from "./tree.js";
 
 export interface WebviewHost {
@@ -595,6 +596,23 @@ function renderInspector(
       ? "Stopped goroutine · identity unresolved"
       : `g${String(goroutine.id)} · ${goroutine.status}`;
   panel.append(title);
+  const explanation = document.createElement("p");
+  explanation.className = "muted";
+  explanation.textContent = "Created is the recorded go statement; entry is the goroutine's start function and may be a compiler-generated wrapper.";
+  panel.append(
+    renderGoroutineMetadata(document, goroutine, host),
+    explanation,
+    renderSpawnSource(document, session.spawnSource, goroutine.createdLoc, host),
+    renderDebugInspection(document, session, host),
+  );
+  return panel;
+}
+
+function renderGoroutineMetadata(
+  document: Document,
+  goroutine: Goroutine,
+  host: WebviewHost,
+): HTMLElement {
   const list = document.createElement("dl");
   const values: readonly [
     string,
@@ -630,9 +648,7 @@ function renderInspector(
         sourceButton(
           document,
           value,
-          location.file,
-          location.line,
-          0,
+          location,
           host,
           target,
           0,
@@ -643,26 +659,31 @@ function renderInspector(
     }
     list.append(dt, dd);
   }
-  const explanation = document.createElement("p");
-  explanation.className = "muted";
-  explanation.textContent = "Created is the recorded go statement; entry is the goroutine's start function and may be a compiler-generated wrapper.";
+  return list;
+}
+
+function renderSpawnSource(
+  document: Document,
+  preview: SourceSnippet,
+  location: Location,
+  host: WebviewHost,
+): HTMLElement {
   const source = document.createElement("section");
   source.className = "spawn-source";
   source.setAttribute("aria-label", "Goroutine creation source");
   const sourceHeading = document.createElement("h2");
   sourceHeading.textContent = "Spawned here";
   const sourceState = document.createElement("p");
-  sourceState.className = `inspection-state ${session.spawnSource.status}`;
-  sourceState.textContent = session.spawnSource.message;
+  sourceState.className = `inspection-state ${preview.status}`;
+  sourceState.textContent = preview.message;
   source.append(sourceHeading, sourceState);
-  if (goroutine.createdLoc.file.length > 0 && goroutine.createdLoc.line > 0) {
-    source.append(sourceButton(document, "Open creation source", goroutine.createdLoc.file,
-      goroutine.createdLoc.line, 0, host, "created", 0));
+  if (location.file.length > 0 && location.line > 0) {
+    source.append(sourceButton(document, "Open creation source", location, host, "created", 0));
   }
-  if (session.spawnSource.status === "ready") {
+  if (preview.status === "ready") {
     const snippet = document.createElement("pre");
     snippet.className = "source-snippet";
-    for (const line of session.spawnSource.lines) {
+    for (const line of preview.lines) {
       const row = document.createElement("span");
       row.className = `source-line${line.highlighted ? " creation-line" : ""}`;
       row.dataset.line = String(line.number);
@@ -674,8 +695,7 @@ function renderInspector(
     }
     source.append(snippet);
   }
-  panel.append(list, explanation, source, renderDebugInspection(document, session, host));
-  return panel;
+  return source;
 }
 
 function renderDebugInspection(
@@ -792,9 +812,7 @@ function renderStackFrame(
       sourceButton(
         document,
         compactSource(frame.file, frame.line),
-        frame.file,
-        frame.line,
-        frame.column,
+        frame,
         host,
         "frame",
         frame.id,
@@ -948,12 +966,24 @@ function appendVariables(
       item.append(nested);
     } else if (children !== undefined && children.length > 0) {
       item.append(inspectionState(document, "unavailable",
-        ancestors.has(reference) ? "Circular reference." :
-          budget.expanded.has(reference) ? "Shared reference (expanded above)." :
-            "Variable display depth or node limit reached.", ""));
+        variableExpansionMessage(reference, ancestors, budget.expanded), ""));
     }
     parent.append(item);
   }
+}
+
+function variableExpansionMessage(
+  reference: number,
+  ancestors: ReadonlySet<number>,
+  expanded: ReadonlySet<number>,
+): string {
+  if (ancestors.has(reference)) {
+    return "Circular reference.";
+  }
+  if (expanded.has(reference)) {
+    return "Shared reference (expanded above).";
+  }
+  return "Variable display depth or node limit reached.";
 }
 
 function inspectionState(
@@ -971,9 +1001,7 @@ function inspectionState(
 function sourceButton(
   document: Document,
   label: string,
-  path: string,
-  line: number,
-  column: number,
+  location: { readonly file: string; readonly line: number; readonly column?: number },
   host: WebviewHost,
   target: "created" | "start" | "current" | "frame",
   frameId: number,
@@ -982,8 +1010,8 @@ function sourceButton(
     host.postMessage({ type: "openSource", target, frameId });
   });
   source.className = "source-link";
-  source.title = `${path}:${String(line)}`;
-  source.dataset.column = String(column);
+  source.title = `${location.file}:${String(location.line)}`;
+  source.dataset.column = String(location.column ?? 0);
   return source;
 }
 

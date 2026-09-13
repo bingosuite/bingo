@@ -1,7 +1,7 @@
 return function(test, equal, T)
   local health = require("bingo.health")
   local uv = vim.uv
-  local function serve(on_request)
+  local function serve(on_request, backlog, listen)
     local handles, requests, failures = {}, {}, {}
     local function guard(callback)
       return function(...)
@@ -28,7 +28,7 @@ return function(test, equal, T)
     end)
     local listener = own(uv.new_tcp())
     assert(listener:bind("127.0.0.1", 0))
-    assert(listener:listen(16, guard(function(err)
+    assert((listen or uv.listen)(listener, backlog or 16, guard(function(err)
       assert(not err, err)
       local peer = own(uv.new_tcp())
       assert(listener:accept(peer))
@@ -143,13 +143,27 @@ return function(test, equal, T)
     T.contains(await(run_probe(endpoint, 1000)).error, "incomplete HTTP body")
   end)
   test("real libuv concurrent health probes remain independent and release all client handles", function()
+    local concurrency = 30
+    local listener_backlog
     local body = vim.json.encode(T.health())
+    -- All connects precede the first event-loop turn. A smaller accept queue
+    -- can drop Linux handshakes; TCP's retry then outlives the probe deadline.
     local endpoint, requests = serve(function(peer)
       assert(peer:write("HTTP/1.1 200 OK\r\nContent-Length: " .. #body .. "\r\n\r\n" .. body))
+    end, concurrency, function(listener, backlog, callback)
+      listener_backlog = backlog
+      return uv.listen(listener, backlog, callback)
     end)
     local probes = {}
-    for i = 1, 30 do probes[i] = run_probe(endpoint, 1000) end
-    for _, results in ipairs(probes) do equal(await(results).kind, "compatible") end
-    equal(#requests, 30)
+    for i = 1, concurrency do probes[i] = run_probe(endpoint, 1000) end
+    assert(listener_backlog and listener_backlog >= #probes,
+      "fixture listener backlog is smaller than the pre-yield probe burst")
+    equal(#requests, 0, "all probes must start before the first event-loop turn")
+    for i, results in ipairs(probes) do
+      local result = await(results)
+      equal(result.kind, "compatible", string.format("probe %d/%d; requests received=%d; %s",
+        i, concurrency, #requests, vim.inspect(result)))
+    end
+    equal(#requests, concurrency)
   end)
 end

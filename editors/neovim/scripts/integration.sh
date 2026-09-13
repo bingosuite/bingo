@@ -59,7 +59,7 @@ if [[ ! -f "$archive" ]]; then
     echo "ERROR: requested offline archive does not exist: $archive" >&2
     exit 1
   fi
-  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+  curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
     --connect-timeout 10 --max-time 120 \
     "https://codeload.github.com/mfussenegger/nvim-dap/tar.gz/$revision" \
     -o "$work/nvim-dap.tar.gz"

@@ -3,9 +3,10 @@ import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 
 import { WebviewDeliveryState } from "./documentGeneration.js";
-import type { ConcurrencyViewModel } from "./model.js";
-import { decodeAction, decodeWebviewMessage } from "./messages.js";
+import type { ConcurrencyViewModel, DebugStackFrame } from "./model.js";
+import { decodeAction, decodeWebviewMessage, type WebviewMessage } from "./messages.js";
 import { validSourcePath } from "./source.js";
+import type { Goroutine, Location } from "./telemetry.js";
 import type { DisplayedState, TestOperation } from "./webviewTest.js";
 import type { SessionRegistry } from "./registry.js";
 
@@ -17,6 +18,23 @@ export interface ConcurrencyViewActions {
   refreshInspection(): void;
   refreshSource?(): void;
   openSource(path: string, line: number, column: number, isCurrent: () => boolean): void;
+}
+
+function sourceLocation(
+  target: Extract<WebviewMessage, { type: "openSource" }>["target"],
+  goroutine: Goroutine | undefined,
+  frame: DebugStackFrame | undefined,
+): Location | DebugStackFrame | undefined {
+  switch (target) {
+    case "frame":
+      return frame;
+    case "created":
+      return goroutine?.createdLoc;
+    case "start":
+      return goroutine?.startLoc;
+    case "current":
+      return goroutine?.currentLoc;
+  }
 }
 
 export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
@@ -158,33 +176,11 @@ export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
   }
 
   #receive(value: unknown): void {
-    if (this.testing && typeof value === "object" && value !== null &&
-      "type" in value && value.type === "testResult" && "id" in value &&
-      typeof value.id === "number" && "state" in value) {
-      const probe = this.#probes.get(value.id);
-      if (probe !== undefined && this.#delivery.isCurrent(probe.generation)) {
-        // Diagnostic data never drives source access, model mutations or commands.
-        probe.resolve(value.state as DisplayedState);
-      }
+    if (this.#receiveProbe(value)) {
       return;
     }
-    let message;
-    try {
-      if (typeof value === "object" && value !== null && "type" in value &&
-        (value.type === "ready" || value.type === "rendered")) {
-        message = decodeWebviewMessage(value);
-      } else {
-        const { context, action } = decodeAction(value);
-        const active = this.registry.activeModel();
-        if (!this.#delivery.isCurrent(context.generation) ||
-          context.revision !== this.#model.revision ||
-          context.debugSessionId !== (active?.debugSessionId ?? "") ||
-          context.goroutineId !== (active?.selectedGoroutine ?? 0)) {
-          return;
-        }
-        message = action;
-      }
-    } catch {
+    const message = this.#currentMessage(value);
+    if (message === undefined) {
       return;
     }
     switch (message.type) {
@@ -223,31 +219,7 @@ export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
         this.actions.refreshInspection();
         break;
       case "openSource":
-        {
-          const model = this.registry.activeModel();
-          const inspection = model === undefined ? undefined : this.registry.inspectionFor(model.debugSessionId);
-          const generation = this.#delivery.captureGeneration();
-          const isCurrent = (): boolean => {
-            const active = this.registry.activeModel();
-            return !this.#disposed && this.#view !== undefined &&
-              this.#delivery.isCurrent(generation) && model !== undefined &&
-              active?.debugSessionId === model.debugSessionId &&
-              active.snapshot === model.snapshot &&
-              active.selectedGoroutine === model.selectedGoroutine &&
-              this.registry.inspectionFor(model.debugSessionId) === inspection;
-          };
-          const goroutine = model?.snapshot?.goroutines.find((g) => g.id === model.selectedGoroutine);
-          const frame = model === undefined ? undefined :
-            this.registry.inspectionFor(model.debugSessionId)?.frames.find((f) => f.id === message.frameId);
-          const location = message.target === "frame" ? frame :
-            message.target === "created" ? goroutine?.createdLoc :
-              message.target === "start" ? goroutine?.startLoc : goroutine?.currentLoc;
-          if (location !== undefined && validSourcePath(location.file) && location.line > 0) {
-            this.actions.openSource(location.file, location.line, "column" in location ? location.column : 0, isCurrent);
-          } else {
-            void vscode.window.showInformationMessage("No valid local source location is available.");
-          }
-        }
+        this.#openSource(message);
         break;
       case "fit":
         this.fit();
@@ -255,6 +227,63 @@ export class ConcurrencyViewProvider implements vscode.WebviewViewProvider {
       case "copySnapshot":
         void copySnapshot(this.registry);
         break;
+    }
+  }
+
+  #receiveProbe(value: unknown): boolean {
+    if (this.testing && typeof value === "object" && value !== null &&
+      "type" in value && value.type === "testResult" && "id" in value &&
+      typeof value.id === "number" && "state" in value) {
+      const probe = this.#probes.get(value.id);
+      if (probe !== undefined && this.#delivery.isCurrent(probe.generation)) {
+        // Diagnostic data never drives source access, model mutations or commands.
+        probe.resolve(value.state as DisplayedState);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  #currentMessage(value: unknown): WebviewMessage | undefined {
+    try {
+      if (typeof value === "object" && value !== null && "type" in value &&
+        (value.type === "ready" || value.type === "rendered")) {
+        return decodeWebviewMessage(value);
+      }
+      const { context, action } = decodeAction(value);
+      const active = this.registry.activeModel();
+      if (!this.#delivery.isCurrent(context.generation) ||
+        context.revision !== this.#model.revision ||
+        context.debugSessionId !== (active?.debugSessionId ?? "") ||
+        context.goroutineId !== (active?.selectedGoroutine ?? 0)) {
+        return undefined;
+      }
+      return action;
+    } catch {
+      return undefined;
+    }
+  }
+
+  #openSource(message: Extract<WebviewMessage, { type: "openSource" }>): void {
+    const model = this.registry.activeModel();
+    const inspection = model === undefined ? undefined : this.registry.inspectionFor(model.debugSessionId);
+    const generation = this.#delivery.captureGeneration();
+    const isCurrent = (): boolean => {
+      const active = this.registry.activeModel();
+      return !this.#disposed && this.#view !== undefined &&
+        this.#delivery.isCurrent(generation) && model !== undefined &&
+        active?.debugSessionId === model.debugSessionId &&
+        active.snapshot === model.snapshot &&
+        active.selectedGoroutine === model.selectedGoroutine &&
+        this.registry.inspectionFor(model.debugSessionId) === inspection;
+    };
+    const goroutine = model?.snapshot?.goroutines.find((g) => g.id === model.selectedGoroutine);
+    const frame = inspection?.frames.find((f) => f.id === message.frameId);
+    const location = sourceLocation(message.target, goroutine, frame);
+    if (location !== undefined && validSourcePath(location.file) && location.line > 0) {
+      this.actions.openSource(location.file, location.line, "column" in location ? location.column : 0, isCurrent);
+    } else {
+      void vscode.window.showInformationMessage("No valid local source location is available.");
     }
   }
 
@@ -353,10 +382,15 @@ export class ConcurrencyEditor {
   public constructor(private readonly provider: ConcurrencyViewProvider) {}
 
   public get sourceColumn(): vscode.ViewColumn {
-    return vscode.window.visibleTextEditors.find((editor) =>
-      editor.viewColumn !== this.#panel?.viewColumn)?.viewColumn ??
-      (this.#sourceColumn !== this.#panel?.viewColumn ? this.#sourceColumn :
-        this.#panel.viewColumn === vscode.ViewColumn.One ? vscode.ViewColumn.Two : vscode.ViewColumn.One);
+    const visible = vscode.window.visibleTextEditors.find((editor) =>
+      editor.viewColumn !== this.#panel?.viewColumn)?.viewColumn;
+    if (visible !== undefined) {
+      return visible;
+    }
+    if (this.#sourceColumn !== this.#panel?.viewColumn) {
+      return this.#sourceColumn;
+    }
+    return this.#panel.viewColumn === vscode.ViewColumn.One ? vscode.ViewColumn.Two : vscode.ViewColumn.One;
   }
 
   public sessionStarted(id: string, autoReveal: boolean): void {

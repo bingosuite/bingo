@@ -898,12 +898,12 @@ func clearReidentifiedBreakpoint(t *testing.T, hh *harness, source godap.Source)
 		Breakpoints: []godap.SourceBreakpoint{{Line: 20}},
 	}})
 	clearCommands := hh.cmds.waitForCommands(t, protocol.CmdClearBreakpoint, 1)
-	var clear protocol.ClearBreakpointPayload
-	if err := protocol.DecodeCommandPayload(clearCommands[0], &clear); err != nil {
+	var clearPayload protocol.ClearBreakpointPayload
+	if err := protocol.DecodeCommandPayload(clearCommands[0], &clearPayload); err != nil {
 		t.Fatal(err)
 	}
-	if clear.ID != 101 {
-		t.Fatalf("clear breakpoint id = %d, want fresh debugger id 101", clear.ID)
+	if clearPayload.ID != 101 {
+		t.Fatalf("clear breakpoint id = %d, want fresh debugger id 101", clearPayload.ID)
 	}
 	hh.inject(protocol.EventBreakpointCleared, protocol.BreakpointClearedPayload{ID: 101})
 	_ = recvType[*godap.SetBreakpointsResponse](hh)

@@ -63,10 +63,13 @@ return function(test, equal, T)
     T.contains(workflow, "ubuntu-24.04")
     T.contains(workflow, "macos-15")
     T.contains(workflow, "/download/v0.11.7/")
+    T.contains(workflow, "--proto '=https' --proto-redir '=https'")
     T.contains(workflow, "shasum -a 256 -c -")
     T.contains(workflow, 'test "$(uname -m)" = "$EXPECTED_ARCH"')
     T.contains(workflow, "run: bash editors/neovim/scripts/integration.sh")
     T.contains(workflow, 'BINGO_NVIM_SMOKE_RETAIN_OBSERVER: "1"')
+    T.contains(T.read(T.root .. "/scripts/integration.sh"),
+      "--proto '=https' --proto-redir '=https'")
     T.contains(T.read(T.root .. "/tests/integration.lua"),
       'vim.env.BINGO_NVIM_SMOKE_RETAIN_OBSERVER ~= "0"')
     equal(workflow:find("pull_request_target", 1, true), nil)
