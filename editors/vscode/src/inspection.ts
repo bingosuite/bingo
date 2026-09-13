@@ -390,21 +390,8 @@ export class DebugInspectionController {
       for (const reference of references) {
         frame.references.add(reference);
       }
-      const variables: DebugVariable[] = [];
-      for (const variablesReference of references) {
-        if (!this.#isCurrentFrame(frame)) {
-          return;
-        }
-        if (frame.truncated !== "") {
-          break;
-        }
-        const group = await this.#variables(frame, variablesReference);
-        if (!this.#isCurrentFrame(frame)) {
-          return;
-        }
-        variables.push(...group);
-      }
-      if (!this.#isCurrentFrame(frame)) {
+      const variables = await this.#scopeVariables(frame, references);
+      if (variables === undefined || !this.#isCurrentFrame(frame)) {
         return;
       }
       const inspection = this.registry.inspectionFor(target.debugSessionId);
@@ -436,6 +423,27 @@ export class DebugInspectionController {
         localsMessage: `Cannot load locals: ${errorMessage(error)}`,
       });
     }
+  }
+
+  async #scopeVariables(
+    frame: FrameGeneration,
+    references: readonly number[],
+  ): Promise<DebugVariable[] | undefined> {
+    const variables: DebugVariable[] = [];
+    for (const reference of references) {
+      if (!this.#isCurrentFrame(frame)) {
+        return undefined;
+      }
+      if (frame.truncated !== "") {
+        break;
+      }
+      const group = await this.#variables(frame, reference);
+      if (!this.#isCurrentFrame(frame)) {
+        return undefined;
+      }
+      variables.push(...group);
+    }
+    return variables;
   }
 
   async #loadVariableChildren(
@@ -718,20 +726,25 @@ export class DebugInspectionController {
           value,
         );
       };
-      try {
-        void Promise.resolve(session.customRequest(command, args)).then(
-          (value) => {
-            complete(undefined, value);
-          },
-          (error: unknown) => {
-            complete(error ?? new Error("The debug adapter request failed."));
-          },
-        );
-      } catch (error: unknown) {
-        complete(error ?? new Error("The debug adapter request failed."));
-      }
+      void completeRequest(session, command, args, complete);
     });
   }
+}
+
+async function completeRequest(
+  session: DebugSessionClient,
+  command: string,
+  args: unknown,
+  complete: (error: unknown, value?: unknown) => void,
+): Promise<void> {
+  let value: unknown;
+  try {
+    value = await session.customRequest(command, args);
+  } catch (error: unknown) {
+    complete(error ?? new Error("The debug adapter request failed."));
+    return;
+  }
+  complete(undefined, value);
 }
 
 function inspectionGoroutine(target: InspectionTarget): number {
@@ -883,8 +896,12 @@ function errorMessage(error: unknown): string {
   const descriptor = error instanceof Error
     ? Object.getOwnPropertyDescriptor(error, "message")
     : undefined;
-  const message: string = typeof descriptor?.value === "string" ? descriptor.value :
-    typeof error === "string" ? error : "The debug adapter request failed.";
+  let message = "The debug adapter request failed.";
+  if (typeof descriptor?.value === "string") {
+    message = descriptor.value;
+  } else if (typeof error === "string") {
+    message = error;
+  }
   return message.length > 512 ? `${message.slice(0, 511)}…` : message;
 }
 
@@ -921,6 +938,40 @@ function validateResponse(
       throw new RangeError("inspection response exceeds the UTF-8 byte limit");
     }
   };
+  const visitArray = (value: readonly unknown[], depth: number): void => {
+    if (value.length > inspectionLimits.responseNodes - nodes) {
+      throw new RangeError("inspection response exceeds the node limit");
+    }
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, index);
+      if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
+        throw new TypeError("inspection response arrays must contain JSON values");
+      }
+      visit(descriptor.value, depth + 1);
+    }
+  };
+  const visitObject = (value: object, depth: number): void => {
+    const prototype: unknown = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      throw new TypeError("inspection response must contain plain JSON objects");
+    }
+    let fields = 0;
+    for (const key in value) {
+      if (!Object.hasOwn(value, key)) {
+        continue;
+      }
+      fields += 1;
+      if (fields > inspectionLimits.objectFields) {
+        throw new RangeError("inspection response exceeds the object field limit");
+      }
+      chargeText(key);
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
+        throw new TypeError("inspection response must not contain accessors");
+      }
+      visit(descriptor.value, depth + 1);
+    }
+  };
   const visit = (value: unknown, depth: number): void => {
     nodes += 1;
     if (
@@ -945,37 +996,9 @@ function validateResponse(
     }
     active.add(value);
     if (Array.isArray(value)) {
-      if (value.length > inspectionLimits.responseNodes - nodes) {
-        throw new RangeError("inspection response exceeds the node limit");
-      }
-      for (let index = 0; index < value.length; index += 1) {
-        const descriptor = Object.getOwnPropertyDescriptor(value, index);
-        if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
-          throw new TypeError("inspection response arrays must contain JSON values");
-        }
-        visit(descriptor.value, depth + 1);
-      }
+      visitArray(value, depth);
     } else {
-      const prototype: unknown = Object.getPrototypeOf(value);
-      if (prototype !== Object.prototype && prototype !== null) {
-        throw new TypeError("inspection response must contain plain JSON objects");
-      }
-      let fields = 0;
-      for (const key in value) {
-        if (!Object.hasOwn(value, key)) {
-          continue;
-        }
-        fields += 1;
-        if (fields > inspectionLimits.objectFields) {
-          throw new RangeError("inspection response exceeds the object field limit");
-        }
-        chargeText(key);
-        const descriptor = Object.getOwnPropertyDescriptor(value, key);
-        if (descriptor === undefined || !Object.hasOwn(descriptor, "value")) {
-          throw new TypeError("inspection response must not contain accessors");
-        }
-        visit(descriptor.value, depth + 1);
-      }
+      visitObject(value, depth);
     }
     active.delete(value);
   };

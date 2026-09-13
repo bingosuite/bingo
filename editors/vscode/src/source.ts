@@ -30,7 +30,10 @@ function within(root: string, path: string): boolean {
 
 export function validSourcePath(path: string): boolean {
   return path.length > 0 && path.length <= 4096 && isAbsolute(path) &&
-    ![...path].some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127) &&
+    ![...path].some((char) => {
+      const code = char.codePointAt(0);
+      return code !== undefined && (code < 32 || code === 127);
+    }) &&
     !path.startsWith("//");
 }
 
@@ -89,33 +92,37 @@ export async function readSourceContext(
         return unavailable("Creation source grew or changed during preview; refresh to retry.");
       }
       const text = new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, length));
-      const lines = text.split(/\r?\n/u);
-      if (lines.length > sourceLimits.lines) {
-        return unavailable("Creation source exceeds the source preview line limit.");
-      }
-      if (location.line > lines.length) {
-        return unavailable("Creation line is absent from the local file; it may differ from the compiled source.");
-      }
-      const first = Math.max(1, location.line - sourceLimits.radius);
-      const last = Math.min(lines.length, location.line + sourceLimits.radius);
-      const clipped = " [line clipped]";
-      return {
-        status: "ready",
-        message: "Local file on disk, not verified against the binary; unsaved edits are not shown. Highlight marks the recorded creation line, which may have moved.",
-        lines: lines.slice(first - 1, last).map((line, index) => ({
-          number: first + index,
-          text: line.length > sourceLimits.lineLength
-            ? `${line.slice(0, sourceLimits.lineLength - clipped.length)}${clipped}`
-            : line,
-          highlighted: first + index === location.line,
-        })),
-      };
+      return sourceSnippet(text, location.line);
     } finally {
       await file.close();
     }
   } catch (error: unknown) {
     return unavailable(`Cannot preview creation source: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+function sourceSnippet(text: string, creationLine: number): SourceSnippet {
+  const lines = text.split(/\r?\n/u);
+  if (lines.length > sourceLimits.lines) {
+    return unavailable("Creation source exceeds the source preview line limit.");
+  }
+  if (creationLine > lines.length) {
+    return unavailable("Creation line is absent from the local file; it may differ from the compiled source.");
+  }
+  const first = Math.max(1, creationLine - sourceLimits.radius);
+  const last = Math.min(lines.length, creationLine + sourceLimits.radius);
+  const clipped = " [line clipped]";
+  return {
+    status: "ready",
+    message: "Local file on disk, not verified against the binary; unsaved edits are not shown. Highlight marks the recorded creation line, which may have moved.",
+    lines: lines.slice(first - 1, last).map((line, index) => ({
+      number: first + index,
+      text: line.length > sourceLimits.lineLength
+        ? `${line.slice(0, sourceLimits.lineLength - clipped.length)}${clipped}`
+        : line,
+      highlighted: first + index === creationLine,
+    })),
+  };
 }
 
 export interface SourceRegistry {
@@ -209,11 +216,9 @@ export class SpawnSourceController {
       const location = target.location;
       const key = JSON.stringify(location);
       let result = this.#cache.get(key);
-      if (result === undefined) {
-        result = location === undefined
-          ? unavailable("No creation location is available for this goroutine.")
-          : await this.read(location);
-      }
+      result ??= location === undefined
+        ? unavailable("No creation location is available for this goroutine.")
+        : await this.read(location);
       if (!this.#disposed && this.#version === version) {
         if (this.#cache.size >= sourceLimits.cacheEntries) {
           this.#cache.delete(this.#cache.keys().next().value ?? "");

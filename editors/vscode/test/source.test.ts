@@ -73,6 +73,7 @@ describe("source path validation", () => {
     for (const file of [
       "/workspace/main.go",
       "/workspace/a b/日本語.go",
+      "/workspace/\u{1f600}.go",
       "/workspace/a#b?c.go",
       "/workspace/<script>.go",
       `/${"a".repeat(4095)}`,
@@ -94,6 +95,11 @@ describe("source path validation", () => {
     ]) {
       assert.equal(validSourcePath(file), false, JSON.stringify(file));
     }
+  });
+
+  it("measures astral source paths in UTF-16 units", () => {
+    assert.equal(validSourcePath(`/${"\u{1f600}".repeat(2047)}a`), true);
+    assert.equal(validSourcePath(`/${"\u{1f600}".repeat(2048)}`), false);
   });
 
   it("rejects every C0 control character and DEL, not just newlines and NUL", () => {

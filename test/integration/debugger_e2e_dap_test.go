@@ -241,7 +241,14 @@ func declareDAPTerminateSpec() {
 			name = "at a breakpoint"
 		}
 		It("completes one DAP terminate "+name+" while a WebSocket observer stays connected", Label("dap", "dap-terminate"), func() {
-			const source = `package main
+			checkDAPTerminate(suspended)
+		})
+	}
+}
+
+func checkDAPTerminate(suspended bool) {
+	GinkgoHelper()
+	const source = `package main
 import "time"
 func main() {
 	for {
@@ -249,76 +256,75 @@ func main() {
 	}
 }
 `
-			bin := buildTarget("dap_terminate_target", source)
-			srv, wsAddr, dapAddr := startTestServerWithDAP()
-			dc := dialDAP(dapAddr)
-			dc.initialize()
-			launchSeq := dc.launch(bin, false)
-			dc.waitEvent(20*time.Second, "initialized")
-			sessionID := waitForSession(wsAddr)
-			obs, err := client.Join(wsAddr, sessionID)
-			Expect(err).NotTo(HaveOccurred())
-			DeferCleanup(func() { Expect(obs.Close()).To(Succeed()) })
+	bin := buildTarget("dap_terminate_target", source)
+	srv, wsAddr, dapAddr := startTestServerWithDAP()
+	dc := dialDAP(dapAddr)
+	dc.initialize()
+	launchSeq := dc.launch(bin, false)
+	dc.waitEvent(20*time.Second, "initialized")
+	sessionID := waitForSession(wsAddr)
+	obs, err := client.Join(wsAddr, sessionID)
+	Expect(err).NotTo(HaveOccurred())
+	DeferCleanup(func() { Expect(obs.Close()).To(Succeed()) })
 
-			waitState := func(want protocol.SessionState) {
-				GinkgoHelper()
-				deadline := time.After(20 * time.Second)
-				for {
-					select {
-					case evt, ok := <-obs.Events():
-						Expect(ok).To(BeTrue(), "observer must stay connected")
-						Expect(evt.Kind).NotTo(Equal(protocol.EventProcessExited), "Kill must not fabricate an exit code")
-						Expect(evt.Kind).NotTo(Equal(protocol.EventError), "debugger error: %s", evt.Payload)
-						if evt.Kind == protocol.EventSessionState {
-							var p protocol.SessionStatePayload
-							Expect(protocol.DecodeEventPayload(evt, &p)).To(Succeed())
-							if p.State == want {
-								return
-							}
-						}
-					case <-deadline:
-						Fail(fmt.Sprintf("observer did not receive state %s", want))
-					}
+	Expect(obs.State()).To(Equal(protocol.StateSuspended), "Join consumes the suspended welcome")
+	if suspended {
+		bps := dc.setBreakpoints("dap_terminate_target.go", markerLine(source, "// BP"))
+		Expect(bps.Body.Breakpoints).To(HaveLen(1))
+		Expect(bps.Body.Breakpoints[0].Verified).To(BeTrue())
+	}
+	dc.configurationDone()
+	Expect(dc.await(launchSeq).(godap.ResponseMessage).GetResponse().Success).To(BeTrue())
+	waitDAPTerminateState(obs, protocol.StateRunning)
+	if suspended {
+		Expect(dc.waitStopped(20 * time.Second).Body.Reason).To(Equal("breakpoint"))
+		waitDAPTerminateState(obs, protocol.StateSuspended)
+	}
+
+	response := dc.request("terminate", &godap.TerminateRequest{}).(godap.ResponseMessage)
+	Expect(response.GetResponse().Success).To(BeTrue())
+	end := dc.waitEvent(20*time.Second, "terminated", "exited")
+	Expect(end.GetEvent().Event).To(Equal("terminated"), "explicit Kill has no authoritative exit code")
+	waitDAPTerminateState(obs, protocol.StateExited)
+	waitDAPTerminateState(obs, protocol.StateIdle)
+	sessions, err := client.ListSessions(wsAddr)
+	Expect(err).NotTo(HaveOccurred(), "the shared server must stay responsive")
+	Expect(sessions).To(HaveLen(1), "the observer keeps its session alive")
+	Expect(sessions[0].ID).To(Equal(sessionID))
+	select {
+	case <-srv.Done():
+		Fail("Stop shut down the shared server")
+	default:
+	}
+
+	dc.disconnect()
+	Eventually(dc.done, 5*time.Second).Should(BeClosed())
+	for len(dc.events) > 0 {
+		event := (<-dc.events).(godap.EventMessage).GetEvent().Event
+		Expect(event).NotTo(Equal("terminated"), "one Stop emits exactly one terminal")
+		Expect(event).NotTo(Equal("exited"), "disconnect must not fabricate an exit code")
+	}
+}
+
+func waitDAPTerminateState(obs client.Client, want protocol.SessionState) {
+	GinkgoHelper()
+	deadline := time.After(20 * time.Second)
+	for {
+		select {
+		case evt, ok := <-obs.Events():
+			Expect(ok).To(BeTrue(), "observer must stay connected")
+			Expect(evt.Kind).NotTo(Equal(protocol.EventProcessExited), "Kill must not fabricate an exit code")
+			Expect(evt.Kind).NotTo(Equal(protocol.EventError), "debugger error: %s", evt.Payload)
+			if evt.Kind == protocol.EventSessionState {
+				var p protocol.SessionStatePayload
+				Expect(protocol.DecodeEventPayload(evt, &p)).To(Succeed())
+				if p.State == want {
+					return
 				}
 			}
-			Expect(obs.State()).To(Equal(protocol.StateSuspended), "Join consumes the suspended welcome")
-			if suspended {
-				bps := dc.setBreakpoints("dap_terminate_target.go", markerLine(source, "// BP"))
-				Expect(bps.Body.Breakpoints).To(HaveLen(1))
-				Expect(bps.Body.Breakpoints[0].Verified).To(BeTrue())
-			}
-			dc.configurationDone()
-			Expect(dc.await(launchSeq).(godap.ResponseMessage).GetResponse().Success).To(BeTrue())
-			waitState(protocol.StateRunning)
-			if suspended {
-				Expect(dc.waitStopped(20 * time.Second).Body.Reason).To(Equal("breakpoint"))
-				waitState(protocol.StateSuspended)
-			}
-
-			response := dc.request("terminate", &godap.TerminateRequest{}).(godap.ResponseMessage)
-			Expect(response.GetResponse().Success).To(BeTrue())
-			end := dc.waitEvent(20*time.Second, "terminated", "exited")
-			Expect(end.GetEvent().Event).To(Equal("terminated"), "explicit Kill has no authoritative exit code")
-			waitState(protocol.StateExited)
-			waitState(protocol.StateIdle)
-			sessions, err := client.ListSessions(wsAddr)
-			Expect(err).NotTo(HaveOccurred(), "the shared server must stay responsive")
-			Expect(sessions).To(HaveLen(1), "the observer keeps its session alive")
-			Expect(sessions[0].ID).To(Equal(sessionID))
-			select {
-			case <-srv.Done():
-				Fail("Stop shut down the shared server")
-			default:
-			}
-
-			dc.disconnect()
-			Eventually(dc.done, 5*time.Second).Should(BeClosed())
-			for len(dc.events) > 0 {
-				event := (<-dc.events).(godap.EventMessage).GetEvent().Event
-				Expect(event).NotTo(Equal("terminated"), "one Stop emits exactly one terminal")
-				Expect(event).NotTo(Equal("exited"), "disconnect must not fabricate an exit code")
-			}
-		})
+		case <-deadline:
+			Fail(fmt.Sprintf("observer did not receive state %s", want))
+		}
 	}
 }
 

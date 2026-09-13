@@ -122,38 +122,7 @@ async function main(): Promise<void> {
     );
     assert.equal(reusedHealth.instanceId, firstHealth.instanceId);
 
-    const observedDepths: number[] = [];
-    let creationSnippets = 0;
-    let expandedVariables = 0;
-    for (const [index, example] of examples.entries()) {
-      const result = await runExample(
-        config,
-        example,
-        `debug-${String(index + 1)}`,
-      );
-      observedDepths.push(result.depth);
-      creationSnippets += result.creationSnippet ? 1 : 0;
-      expandedVariables += result.expandedVariable ? 1 : 0;
-      assert.ok(
-        result.depth >= example.minimumDepth,
-        `${example.name} hierarchy depth ${String(result.depth)} is below ${String(example.minimumDepth)}`,
-      );
-      assert.ok(
-        result.threads > 0,
-        `${example.name} snapshot has no runtime threads`,
-      );
-      process.stdout.write(
-        `[snapshot] ${example.name}: session=${result.sessionId} goroutines=${String(result.goroutines)} threads=${String(result.threads)} depth=${String(result.depth)} seq=${String(result.seq)} source=${String(result.creationSnippet)} expanded=${String(result.expandedVariable)}\n`,
-      );
-    }
-    const firstDepth = observedDepths[0];
-    const lastDepth = observedDepths.at(-1);
-    if (firstDepth === undefined || lastDepth === undefined) {
-      throw new Error("progressive examples produced no hierarchy results");
-    }
-    assert.ok(firstDepth <= lastDepth);
-    assert.ok(creationSnippets > 0, "must render a real application's recorded go statement");
-    assert.ok(expandedVariables > 0, "must expand at least one real structured local");
+    await assertExampleCoverage(config);
 
     manager.dispose();
     if (child === undefined) {
@@ -200,6 +169,34 @@ async function main(): Promise<void> {
     }
   }
   throwFailures(failures, "packaged native E2E");
+}
+
+async function assertExampleCoverage(config: BingoServerConfiguration): Promise<void> {
+  const observedDepths: number[] = [];
+  let creationSnippets = 0;
+  let expandedVariables = 0;
+  for (const [index, example] of examples.entries()) {
+    const result = await runExample(config, example, `debug-${String(index + 1)}`);
+    observedDepths.push(result.depth);
+    creationSnippets += result.creationSnippet ? 1 : 0;
+    expandedVariables += result.expandedVariable ? 1 : 0;
+    assert.ok(
+      result.depth >= example.minimumDepth,
+      `${example.name} hierarchy depth ${String(result.depth)} is below ${String(example.minimumDepth)}`,
+    );
+    assert.ok(result.threads > 0, `${example.name} snapshot has no runtime threads`);
+    process.stdout.write(
+      `[snapshot] ${example.name}: session=${result.sessionId} goroutines=${String(result.goroutines)} threads=${String(result.threads)} depth=${String(result.depth)} seq=${String(result.seq)} source=${String(result.creationSnippet)} expanded=${String(result.expandedVariable)}\n`,
+    );
+  }
+  const firstDepth = observedDepths[0];
+  const lastDepth = observedDepths.at(-1);
+  if (firstDepth === undefined || lastDepth === undefined) {
+    throw new Error("progressive examples produced no hierarchy results");
+  }
+  assert.ok(firstDepth <= lastDepth);
+  assert.ok(creationSnippets > 0, "must render a real application's recorded go statement");
+  assert.ok(expandedVariables > 0, "must expand at least one real structured local");
 }
 
 interface ExampleResult {
@@ -464,9 +461,9 @@ async function runExample(
       const recordedLine = readFileSync(sourceFile, "utf8").split(/\r?\n/u)[created.createdLoc.line - 1];
       assert.equal(highlighted[0]?.text, recordedLine);
       assert.match(recordedLine ?? "", /\bgo\s+/u, "creation source must highlight the real go statement");
-      const rendered = document.querySelectorAll(".spawn-source .creation-line");
+      const rendered = document.querySelectorAll<HTMLElement>(".spawn-source .creation-line");
       assert.equal(rendered.length, 1);
-      assert.equal(rendered[0]?.getAttribute("data-line"), String(created.createdLoc.line));
+      assert.equal(rendered[0]?.dataset.line, String(created.createdLoc.line));
       assert.equal(rendered[0]?.getAttribute("aria-current"), "location");
       assert.equal(rendered[0]?.textContent, `${String(created.createdLoc.line)}  ${recordedLine}\n`);
       if (stackThreadId > 0) {
@@ -789,7 +786,7 @@ class DAPClient implements DebugSessionClient {
   public async settleRequests(): Promise<void> {
     // The controller can cancel an obsolete generation without canceling its
     // request on the wire. Retire that reply before allowing run control.
-    await Promise.all([...this.#pendingRequests]);
+    await Promise.all(this.#pendingRequests);
   }
 
   public async response(requestSeq: number): Promise<DAPMessage> {
