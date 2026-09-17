@@ -266,11 +266,28 @@ push answer the request, or let a timed-out request's reply debt swallow an
 automatic push (issue #187). It registers no pending entry at all.
 
 `Kill` is fire-and-forget only at the client transport boundary; the hub still
-receives its synchronous debugger result. On Linux attached teardown,
-`ErrAttachedDetachIncomplete` means the engine/tracer deliberately retained the
+receives its synchronous debugger result. On attached teardown,
+`ErrAttachedDetachIncomplete` means the engine/platform deliberately retained the
 foreign process for a checked retry, so hub/server shutdown must keep that
 debugger rather than log-and-drop it. `ErrAttachedOwnershipLost` is terminal:
 the engine is already gone and retrying cannot recover ownership.
+
+Darwin retains displaced exception tuples, original patched bytes (including
+failed writes outside the breakpoint table), unsent replies, suspension holds,
+rendezvous phases, and exact waiter ownership across failed or timed-out detach.
+A patch/cache failure also latches cleanup-only admission. A shutdown wake is
+not a Pause, and sending it is not completion: the actual waiter and diagnostic
+reader must acknowledge return before release. A distinct-class native
+rendezvous retires potentially pre-selection debug exceptions before restoring
+the old handler; no-senders plus an empty queue acknowledges the remaining
+old-port RPCs. Timeouts retain these obligations, not a success-shaped fallback;
+an acknowledged rendezvous retries restoration without executing again.
+Unsupported foreign thread routing/debug state also fails retained. The
+exclusive-control assumption and non-interruptible Mach-call limit are detailed
+in [AGENTS.md](../AGENTS.md#darwin-attached-restoration-and-the-complete-boundary).
+Mach namespace cleanup must
+consult `canReleaseMachNamespace` and the outstanding-detach registry; neither
+an error log nor a sent wake permits discarding an owned foreign target.
 
 ## 8. Propagating errors to clients: typed `EventError`
 

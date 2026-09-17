@@ -17,12 +17,12 @@ var (
 	ErrAlreadyRunning = errors.New("debugger: process already running")
 	ErrNoProcess      = errors.New("debugger: no process")
 	ErrNotRunning     = errors.New("debugger: process is not running")
-	// ErrAttachedDetachIncomplete means bingo still owns at least one ptraced
-	// thread or has not restored every instruction it patched. The debugger is
-	// retained so Kill can be retried; callers must not discard it as exited.
+	// ErrAttachedDetachIncomplete means foreign-process restoration or waiter
+	// retirement is unfinished. The debugger still owns ptrace threads or Mach
+	// cleanup obligations and must be retained so Kill can retry.
 	ErrAttachedDetachIncomplete = errors.New("debugger: attached detach incomplete")
 	// ErrAttachedOwnershipLost means the engine stopped before it could release
-	// a foreign process. Retrying cannot help because the tracer thread is gone.
+	// a foreign process. Retrying cannot recreate the lost control loop.
 	ErrAttachedOwnershipLost = errors.New("debugger: attached ownership lost")
 
 	// ErrSessionInvalidated marks a backend failure after which the tracee can
@@ -57,7 +57,9 @@ type Debugger interface {
 	// required for breakpoints/locals/frames (DWARF source).
 	Attach(pid int, binaryPath string) error
 
-	// Kill terminates the tracee. Idempotent.
+	// Kill terminates a launched tracee or restores and detaches an attached one.
+	// It is idempotent; ErrAttachedDetachIncomplete requires retaining the
+	// debugger and retrying Kill rather than treating cleanup as complete.
 	Kill() error
 
 	SetBreakpoint(file string, line int) (protocol.Breakpoint, error)

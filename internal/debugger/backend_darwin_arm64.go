@@ -32,6 +32,7 @@ package debugger
 import "C"
 
 import (
+	"context"
 	"debug/macho"
 	"errors"
 	"fmt"
@@ -68,6 +69,14 @@ type darwinBackend struct {
 	ctrlPort C.mach_port_t
 	portsOK  bool
 
+	teardown         atomic.Bool
+	waitAcknowledged atomic.Bool
+	targetGone       atomic.Bool
+	targetReleased   atomic.Bool
+	attachOwned      atomic.Bool
+	attachState      darwinAttachedState
+	waitHooks        darwinWaitHooks
+
 	// taskPort caches the Mach task port obtained from task_for_pid. It is
 	// acquired once at launch/attach (past the fork/exec race) and reused for the
 	// process's lifetime. Re-calling task_for_pid on every memory/thread op — as
@@ -86,6 +95,7 @@ type darwinBackend struct {
 	// given thread keeps a stable port name across enumerations.
 	threadMu    sync.Mutex
 	threadPorts map[C.mach_port_t]struct{}
+	threadHolds map[int]int
 
 	// Step bookkeeping. stepping/stepTID drive the ablation-only plain
 	// SingleStep; the sob* fields drive the atomic step-over-breakpoint retire
@@ -117,7 +127,7 @@ type darwinBackend struct {
 	// the thread frozen at the faulting instruction with a stable PC. At most one
 	// reply is pending per thread (a suspended thread cannot fault again).
 	replyMu        sync.Mutex
-	pendingReplies map[int]replyInfo
+	pendingReplies map[int][]replyInfo
 
 	// Diagnostic-only (BINGO_DARWIN_SUSPEND_PROBE): waitStartNanos records when
 	// Wait() blocked in mach_msg (0 = not blocked). A watchdog goroutine, started
@@ -127,6 +137,10 @@ type darwinBackend struct {
 	waitStartNanos int64
 	probeOnce      sync.Once
 	suspendProbeOn bool
+	probeMu        sync.Mutex
+	probeStop      chan struct{}
+	probeDone      chan struct{}
+	probeStopped   bool
 }
 
 // darwinPauseSignal is the sentinel PauseSignal the engine matches a manual-stop
@@ -267,7 +281,7 @@ func (b *darwinBackend) acquirePorts(pid int) error {
 		return fmt.Errorf("setup exception ports: %s", machErrString(kr))
 	}
 	b.portsOK = true
-	return nil
+	return b.installExceptionHandler(task)
 }
 
 // withDarwinAsyncPreemptOff merges GODEBUG=asyncpreemptoff=1 into the tracee's
@@ -316,14 +330,10 @@ func attachToProcess(b Backend, pid int) error {
 	if err := db.acquirePorts(pid); err != nil {
 		return err
 	}
-	// The attached process is running; bring it to resting state (all threads
-	// Mach-suspended) so the engine can inspect and set breakpoints.
-	task, err := db.task()
-	if err != nil {
-		return err
-	}
-	if cls := C.bingo_stop_the_world(task, db.portSet); cls == C.BINGO_MSG_ERROR {
-		return fmt.Errorf("attach: stop the world failed")
+	if died, err := db.stopTheWorld(); err != nil {
+		return fmt.Errorf("%w: stop attached target: %w", ErrAttachedDetachIncomplete, err)
+	} else if died {
+		return fmt.Errorf("%w: target exited during attach", ErrAttachedDetachIncomplete)
 	}
 	return nil
 }
@@ -337,11 +347,7 @@ func killProcess(b Backend, pid int, _ *exec.Cmd, _ bool) error {
 	// Attached (not launched): we don't own the process. Resume its threads so it
 	// keeps running after we stop intercepting, but never kill it.
 	if db != nil && !db.launched {
-		db.flushAllReplies()
-		if task, err := db.task(); err == nil {
-			C.bingo_resume_all_threads(task)
-		}
-		return nil
+		return db.detachAttached()
 	}
 
 	// Launched: a Mach-suspended thread never runs the SIGKILL AST, so resume
@@ -349,31 +355,57 @@ func killProcess(b Backend, pid int, _ *exec.Cmd, _ bool) error {
 	// this it has already cleared breakpoints and torn down any in-flight
 	// single-step (Kill → endThreadStep → bps.clearAll → proc.kill), so resuming
 	// runs clean code straight into the fatal signal.
-	if db != nil {
-		db.flushAllReplies()
-		if task, err := db.task(); err == nil {
-			C.bingo_resume_all_threads(task)
+	// A death notification may beat the shutdown wake. Do not signal a PID
+	// after the cached task is known dead; only its remaining reap is ours.
+	var replyErr error
+	if db == nil || !db.targetGone.Load() {
+		if db != nil {
+			replyErr = db.flushAllReplies()
+			if task, err := db.task(); err == nil {
+				C.bingo_resume_all_threads(task)
+			}
 		}
-	}
-	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return fmt.Errorf("kill: SIGKILL: %w", err)
+		if err := syscall.Kill(pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+			return errors.Join(replyErr, fmt.Errorf("kill: SIGKILL: %w", err))
+		}
 	}
 	for {
 		var ws syscall.WaitStatus
 		_, err := syscall.Wait4(pid, &ws, 0, nil)
 		if err == nil || isNoChildProcess(err) {
-			return nil
+			if db != nil {
+				db.targetGone.Store(true)
+				db.targetReleased.Store(true)
+			}
+			return replyErr
 		}
 		if errors.Is(err, syscall.EINTR) {
 			continue
 		}
-		return fmt.Errorf("kill: reap: %w", err)
+		return errors.Join(replyErr, fmt.Errorf("kill: reap: %w", err))
 	}
 }
 
 func (b *darwinBackend) ContinueProcess() error {
+	if err := b.requireActive(); err != nil {
+		return err
+	}
 	b.clearStep()
-	b.flushAllReplies()
+	if err := b.flushAllReplies(); err != nil {
+		return err
+	}
+	if b.attachOwned.Load() {
+		threads, err := b.Threads()
+		if err != nil {
+			return err
+		}
+		for _, tid := range threads {
+			if err := b.resumeThread(tid); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	task, err := b.task()
 	if err != nil {
 		return err
@@ -388,6 +420,9 @@ func (b *darwinBackend) ContinueProcess() error {
 // arm hardware single-step on tid and resume just that thread, with no retire
 // loop. singleStepThread is the production path.
 func (b *darwinBackend) SingleStep(tid int) error {
+	if err := b.requireActive(); err != nil {
+		return err
+	}
 	b.stepMu.Lock()
 	b.stepping = true
 	b.stepTID = tid
@@ -397,11 +432,13 @@ func (b *darwinBackend) SingleStep(tid int) error {
 		b.clearStep()
 		return fmt.Errorf("SingleStep arm tid %d: %w", tid, err)
 	}
-	b.flushReply(tid)
-	if kr := C.bingo_resume_one_thread(C.mach_port_t(tid)); kr != C.KERN_SUCCESS {
+	if err := b.flushReply(tid); err != nil {
+		return err
+	}
+	if err := b.resumeThread(tid); err != nil {
 		_ = b.setSingleStep(tid, false)
 		b.clearStep()
-		return fmt.Errorf("SingleStep resume tid %d: %s", tid, machErrString(kr))
+		return fmt.Errorf("SingleStep resume tid %d: %w", tid, err)
 	}
 	return nil
 }
@@ -420,6 +457,9 @@ func (b *darwinBackend) SingleStep(tid int) error {
 // stepped through by the retire loop. endThreadStep disarms single-step once the
 // step trap is reported.
 func (b *darwinBackend) singleStepThread(tid int, addr uint64) error {
+	if err := b.requireActive(); err != nil {
+		return err
+	}
 	if !darwinAtomicStepOverEnabled() {
 		return b.SingleStep(tid)
 	}
@@ -434,14 +474,16 @@ func (b *darwinBackend) singleStepThread(tid int, addr uint64) error {
 	b.sobBranch = branch
 	b.sobSteps = 0
 	b.stepMu.Unlock()
-	b.flushReply(tid)
-	if kr := C.bingo_resume_one_thread(C.mach_port_t(tid)); kr != C.KERN_SUCCESS {
+	if err := b.flushReply(tid); err != nil {
+		return err
+	}
+	if err := b.resumeThread(tid); err != nil {
 		_ = b.setSingleStep(tid, false)
 		b.stepMu.Lock()
 		b.stepThreadPort = 0
 		b.sobActive = false
 		b.stepMu.Unlock()
-		return fmt.Errorf("single step thread: resume tid %d: %s", tid, machErrString(kr))
+		return fmt.Errorf("single step thread: resume tid %d: %w", tid, err)
 	}
 	return nil
 }
@@ -507,7 +549,7 @@ func (b *darwinBackend) clearStepOver() {
 // preemption signals are generated. sobActive may be cleared concurrently by
 // endThreadStep (Kill); we re-check it under stepMu and treat teardown as
 // completion.
-func (b *darwinBackend) advanceStepOver() (StopEvent, bool) {
+func (b *darwinBackend) advanceStepOver() (StopEvent, bool, error) {
 	b.stepMu.Lock()
 	active := b.sobActive
 	tid := b.stepThreadPort
@@ -515,7 +557,7 @@ func (b *darwinBackend) advanceStepOver() (StopEvent, bool) {
 	branch := b.sobBranch
 	b.stepMu.Unlock()
 	if !active {
-		return StopEvent{Reason: StopSingleStep, TID: tid}, true
+		return StopEvent{Reason: StopSingleStep, TID: tid}, true, nil
 	}
 
 	retired := false
@@ -538,18 +580,18 @@ func (b *darwinBackend) advanceStepOver() (StopEvent, bool) {
 	b.stepMu.Lock()
 	if !b.sobActive {
 		b.stepMu.Unlock()
-		return StopEvent{Reason: StopSingleStep, TID: tid}, true
+		return StopEvent{Reason: StopSingleStep, TID: tid}, true, nil
 	}
 	if retired {
 		b.sobActive = false
 		b.stepMu.Unlock()
-		return StopEvent{Reason: StopSingleStep, TID: tid}, true
+		return StopEvent{Reason: StopSingleStep, TID: tid}, true, nil
 	}
 	b.sobSteps++
 	if b.sobSteps > sobStepCap {
 		b.sobActive = false
 		b.stepMu.Unlock()
-		return StopEvent{Reason: StopSingleStep, TID: tid}, true
+		return StopEvent{Reason: StopSingleStep, TID: tid}, true, nil
 	}
 	b.stepMu.Unlock()
 
@@ -559,16 +601,18 @@ func (b *darwinBackend) advanceStepOver() (StopEvent, bool) {
 		b.stepMu.Lock()
 		b.sobActive = false
 		b.stepMu.Unlock()
-		return StopEvent{Reason: StopSingleStep, TID: tid}, true
+		return StopEvent{Reason: StopSingleStep, TID: tid}, true, nil
 	}
-	b.flushReply(tid)
-	if kr := C.bingo_resume_one_thread(C.mach_port_t(tid)); kr != C.KERN_SUCCESS {
+	if err := b.flushReply(tid); err != nil {
+		return StopEvent{}, false, err
+	}
+	if err := b.resumeThread(tid); err != nil {
 		b.stepMu.Lock()
 		b.sobActive = false
 		b.stepMu.Unlock()
-		return StopEvent{Reason: StopSingleStep, TID: tid}, true
+		return StopEvent{}, false, err
 	}
-	return StopEvent{}, false
+	return StopEvent{}, false, nil
 }
 
 // endThreadStep tears down the critical section opened by singleStepThread:
@@ -583,6 +627,12 @@ func (b *darwinBackend) endThreadStep() {
 	port := b.stepThreadPort
 	b.stepThreadPort = 0
 	b.stepMu.Unlock()
+	if b.attachOwned.Load() && b.teardown.Load() {
+		if port != 0 {
+			b.attachState.stepOwner = port
+		}
+		return
+	}
 	if port != 0 {
 		_ = b.setSingleStep(port, false)
 	}
@@ -609,6 +659,9 @@ func (b *darwinBackend) setSingleStep(tid int, on bool) error {
 // means a prior wake is still queued — one pending Pause is enough, so that is a
 // no-op success.
 func (b *darwinBackend) StopProcess() error {
+	if err := b.requireActive(); err != nil {
+		return err
+	}
 	if !b.portsOK {
 		return fmt.Errorf("StopProcess: no exception ports")
 	}
@@ -681,6 +734,12 @@ func (b *darwinBackend) WriteMemory(addr uint64, src []byte) error {
 	if len(src) == 0 {
 		return nil
 	}
+	if b.teardown.Load() && b.attachOwned.Load() {
+		return b.restoreAttachedMemory(addr, src)
+	}
+	if b.attachOwned.Load() {
+		return b.writeAttachedMemory(addr, src)
+	}
 	task, err := b.task()
 	if err != nil {
 		return err
@@ -731,8 +790,14 @@ func (b *darwinBackend) Threads() ([]int, error) {
 	}
 	for p := range b.threadPorts {
 		if _, ok := seen[p]; !ok {
+			// The detach ledger names these exact capabilities until its
+			// rendezvous acknowledges them or a dead name proves retirement.
+			if b.attachOwned.Load() && b.teardown.Load() {
+				continue
+			}
 			C.bingo_port_deallocate(p)
 			delete(b.threadPorts, p)
+			delete(b.threadHolds, int(p))
 		}
 	}
 	b.threadMu.Unlock()
@@ -784,33 +849,54 @@ func (b *darwinBackend) TaskPortSendRefs() (int, bool) {
 // is the pure-Mach replacement for the old wait4 loop: EXC_BREAKPOINT messages
 // (software BRK and hardware single-step) drive breakpoint/step detection, the
 // dead-name notification signals process exit, and the control port carries
-// Pause. The faulting thread is suspended and the exception acknowledged inside
-// bingo_mach_recv before this returns, so a returned stop already holds that
-// thread; a real breakpoint additionally stops the rest of the world here.
+// Pause. Receive itself must not suspend: teardown can latch while mach_msg is
+// blocked, and its wake must return without acting on the foreign target.
 //
 //nolint:gocognit // The receive loop is one serialized Mach stop state machine.
-func (b *darwinBackend) Wait() (StopEvent, error) {
+func (b *darwinBackend) Wait() (stop StopEvent, waitErr error) {
+	defer func() {
+		if err := b.waitHooks.at("before-return"); err != nil {
+			waitErr = errors.Join(waitErr, err)
+		}
+	}()
+	b.waitAcknowledged.Store(false)
 	b.probeOnce.Do(func() {
-		if darwinSuspendProbeEnabled() {
+		b.probeMu.Lock()
+		defer b.probeMu.Unlock()
+		if !b.teardown.Load() && darwinSuspendProbeEnabled() {
 			b.suspendProbeOn = true
+			b.probeStop = make(chan struct{})
+			b.probeDone = make(chan struct{})
 			go b.suspendProbeWatchdog()
 		}
 	})
 	for {
-		var thread C.mach_port_t
-		var exc C.int
-		var code0 C.int64_t
-		var id C.int
-		var replyPort C.mach_port_t
-		var replyBits C.uint
-		var replyID C.int
+		if b.teardown.Load() {
+			return StopEvent{}, context.Canceled
+		}
+		if err := b.waitHooks.at("before-receive"); err != nil {
+			return StopEvent{}, err
+		}
+		if b.teardown.Load() {
+			return StopEvent{}, context.Canceled
+		}
 		if b.suspendProbeOn {
 			atomic.StoreInt64(&b.waitStartNanos, time.Now().UnixNano())
 		}
-		cls := C.bingo_mach_recv(b.portSet, -1, &thread, &exc, &code0, &id, 1, 0,
-			&replyPort, &replyBits, &replyID)
+		cls, tid, err := b.receiveMachMessage(-1)
 		if b.suspendProbeOn {
 			atomic.StoreInt64(&b.waitStartNanos, 0)
+		}
+		if err != nil {
+			return StopEvent{}, err
+		}
+		if cls == C.BINGO_MSG_EXC {
+			if err := b.waitHooks.afterReceive(tid); err != nil {
+				return StopEvent{}, err
+			}
+		}
+		if b.teardown.Load() {
+			return StopEvent{}, context.Canceled
 		}
 
 		switch cls {
@@ -819,6 +905,8 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 
 		case C.BINGO_MSG_ERROR:
 			return StopEvent{}, fmt.Errorf("mach_msg recv failed")
+		case C.BINGO_MSG_SHUTDOWN:
+			return StopEvent{}, fmt.Errorf("shutdown wake without teardown latch")
 
 		case C.BINGO_MSG_DEATH:
 			b.clearStepOver()
@@ -839,16 +927,9 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 			return StopEvent{Reason: StopSignal, Signal: b.PauseSignal()}, nil
 
 		case C.BINGO_MSG_EXC:
-			tid := int(thread)
-			// The exception message carried a fresh send right to the faulting
-			// thread (see bingo_mach_recv). Fold it into the retained per-thread
-			// set: release the redundant right if we already track this thread,
-			// otherwise adopt it. Skipping this leaks one thread send right per
-			// stop (unbounded on a long-lived thread hitting a hot breakpoint,
-			// and one leaked dead name per exited thread under churn).
-			b.adoptExcThreadPort(thread)
-			// Defer the reply until this thread is resumed; see pendingReplies.
-			b.stashReply(tid, replyInfo{port: replyPort, bits: replyBits, id: replyID})
+			if err := b.holdThread(tid); err != nil {
+				return StopEvent{}, err
+			}
 			// Step-over in flight: ONLY the stepped thread's own single-step trap
 			// advances it. A sibling/newly-created thread whose real-breakpoint
 			// exception was still in flight when stop-the-world ran can surface
@@ -863,8 +944,8 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 			// thread" guard in singleStep.
 			if b.stepOverActive() {
 				if b.isStepThread(tid) {
-					if ev, done := b.advanceStepOver(); done {
-						return ev, nil
+					if ev, done, err := b.advanceStepOver(); done || err != nil {
+						return ev, err
 					}
 				}
 				continue
@@ -895,6 +976,9 @@ func (b *darwinBackend) Wait() (StopEvent, error) {
 // exceptions so the process reaches bingo's resting state with nothing pending.
 // Returns died=true if the tracee exited during the stop.
 func (b *darwinBackend) stopTheWorld() (died bool, err error) {
+	if !b.launched {
+		return b.stopAttachedWorld()
+	}
 	task, err := b.task()
 	if err != nil {
 		return false, err
@@ -913,6 +997,10 @@ func (b *darwinBackend) stopTheWorld() (died bool, err error) {
 // concurrent kill path may have already reaped it (ECHILD), which is treated as
 // a normal exit.
 func (b *darwinBackend) reap() (StopEvent, error) {
+	b.targetGone.Store(true)
+	if !b.attachOwned.Load() {
+		b.targetReleased.Store(true)
+	}
 	var ws syscall.WaitStatus
 	for {
 		_, err := syscall.Wait4(b.pid, &ws, 0, nil)
@@ -937,10 +1025,20 @@ func (b *darwinBackend) reap() (StopEvent, error) {
 // has been blocked for longer than probeWedgeThreshold, dumps the tracee's
 // TASK-level suspend_count and per-thread state once per stall episode.
 func (b *darwinBackend) suspendProbeWatchdog() {
+	defer close(b.probeDone)
 	const probeWedgeThreshold = 9 * time.Second
 	var lastDumped int64
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
 	for {
-		time.Sleep(1 * time.Second)
+		select {
+		case <-b.probeStop:
+			return
+		case <-ticker.C:
+		}
+		if b.teardown.Load() {
+			return
+		}
 		start := atomic.LoadInt64(&b.waitStartNanos)
 		if start == 0 || start == lastDumped {
 			continue
@@ -1042,49 +1140,42 @@ type replyInfo struct {
 	id   C.int
 }
 
-// stashReply records the deferred reply for a faulting thread. If one is somehow
-// already pending for that thread (should be impossible — a suspended thread
-// can't fault again), the stale reply is flushed first so its exception isn't
-// left un-acknowledged forever.
-func (b *darwinBackend) stashReply(tid int, r replyInfo) {
+// A duplicate reply is an invariant failure, but both obligations must survive
+// it: dropping either would strand its kernel exception RPC during teardown.
+func (b *darwinBackend) stashReply(tid int, r replyInfo) error {
 	b.replyMu.Lock()
+	defer b.replyMu.Unlock()
 	if b.pendingReplies == nil {
-		b.pendingReplies = make(map[int]replyInfo)
+		b.pendingReplies = make(map[int][]replyInfo)
 	}
-	old, ok := b.pendingReplies[tid]
-	b.pendingReplies[tid] = r
-	b.replyMu.Unlock()
-	if ok {
-		C.bingo_reply_exception(old.port, old.bits, old.id)
+	b.pendingReplies[tid] = append(b.pendingReplies[tid], r)
+	if len(b.pendingReplies[tid]) > 1 {
+		return fmt.Errorf("multiple outstanding exception replies for thread %d; retaining both for teardown", tid)
 	}
+	return nil
 }
 
 // flushReply acknowledges and clears any deferred exception for tid. It MUST be
 // called before resuming tid: until the exception is replied the thread stays
 // blocked on it and thread_resume alone will not run it.
-func (b *darwinBackend) flushReply(tid int) {
+func (b *darwinBackend) flushReply(tid int) error {
 	b.replyMu.Lock()
-	r, ok := b.pendingReplies[tid]
-	if ok {
-		delete(b.pendingReplies, tid)
-	}
-	b.replyMu.Unlock()
-	if ok {
-		C.bingo_reply_exception(r.port, r.bits, r.id)
-	}
+	defer b.replyMu.Unlock()
+	return b.flushReplyLocked(tid)
 }
 
 // flushAllReplies acknowledges and clears every deferred exception. Called
 // before a resume-all (ContinueProcess / kill) so no thread is left blocked on
 // an un-acknowledged exception.
-func (b *darwinBackend) flushAllReplies() {
+func (b *darwinBackend) flushAllReplies() error {
 	b.replyMu.Lock()
-	pending := b.pendingReplies
-	b.pendingReplies = nil
-	b.replyMu.Unlock()
-	for _, r := range pending {
-		C.bingo_reply_exception(r.port, r.bits, r.id)
+	defer b.replyMu.Unlock()
+	for tid := range b.pendingReplies {
+		if err := b.flushReplyLocked(tid); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 func (b *darwinBackend) setPID(pid int) { b.pid = pid }
@@ -1165,6 +1256,9 @@ var _ Backend = (*darwinBackend)(nil)
 // cached thereafter. See the taskPort field comment for why re-acquiring per
 // call is unsafe (it intermittently hangs task_for_pid in the kernel).
 func (b *darwinBackend) task() (C.mach_port_t, error) {
+	if b.targetReleased.Load() {
+		return 0, ErrProcessExited
+	}
 	b.taskMu.Lock()
 	defer b.taskMu.Unlock()
 	if b.taskOK {

@@ -68,11 +68,9 @@ type engine struct {
 	// pending sends to stopCh.
 	done chan struct{}
 
-	// waitActive/waitCancel are loop-thread-owned. Every backend Wait starts
-	// through startWait; attached teardown cancels and joins that exact waiter
-	// before consuming the Linux wait owner's queue synchronously.
-	waitActive bool
-	waitCancel context.CancelFunc
+	// The result send is not a join: teardown must also observe this exact
+	// goroutine's completion before taking over the backend's receive queue.
+	wait *engineWait
 
 	detachPending bool
 
@@ -174,6 +172,12 @@ type contextWaiter interface {
 	wait(context.Context) (StopEvent, error)
 }
 
+type backendTeardown interface {
+	beginTeardown() error
+	teardownLatched() bool
+	acknowledgeWait(context.Context) error
+}
+
 type attachedProcessDetacher interface {
 	retainsAttachedOwnership() bool
 	quiesceAttached(context.Context) (bool, error)
@@ -226,8 +230,15 @@ func (e *engine) activeTID() (int, error) {
 }
 
 type stopResult struct {
-	evt StopEvent
-	err error
+	evt  StopEvent
+	err  error
+	wait *engineWait
+}
+
+type engineWait struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	result stopResult
 }
 
 func newEngine(b Backend, log *slog.Logger) *engine {
@@ -302,6 +313,11 @@ func (e *engine) Kill() error {
 		if _, ok := e.backend.(attachedProcessDetacher); e.proc.attached() && ok {
 			return e.killAttachedProcess()
 		}
+		if _, ok := e.backend.(backendTeardown); ok {
+			if err := e.joinBackendTeardown(); err != nil {
+				return err
+			}
+		}
 		// A running tracee has an in-flight waitLoop consuming its broker-owned
 		// status queue; a suspended one needs killProcess to drain that queue.
 		// Capture the state before endThreadStep/clearAll touch anything.
@@ -325,16 +341,8 @@ func (e *engine) killAttachedProcess() error {
 	wasRunning := e.getState() == stateRunning
 	e.detachPending = true
 
-	if result, ok := e.cancelAndJoinWait(); ok {
-		switch {
-		case result.err == nil:
-			// The backend recorded the exact stop before handing it to the
-			// waiter; quiesce adopts that state without normal stop handling.
-		case errors.Is(result.err, context.Canceled), errors.Is(result.err, ErrProcessExited):
-		default:
-			e.log.Warn("attached detach joined a waiter that had already failed",
-				"err", result.err)
-		}
+	if err := e.joinBackendTeardown(); err != nil {
+		return e.holdAttachedDetachFailure(detacher, wasRunning, StopEvent{}, err)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), attachedDetachTimeout)
@@ -800,6 +808,9 @@ func (e *engine) loop() {
 	// and this lock is merely belt-and-braces.
 	runtime.LockOSThread()
 	defer func() {
+		if e.wait != nil {
+			e.wait.cancel()
+		}
 		close(e.done)
 		close(e.events)
 		// Release the linux tracer thread now that no more ptrace ops can be
@@ -812,10 +823,17 @@ func (e *engine) loop() {
 	for {
 		select {
 		case cmd := <-e.cmdCh:
-			cmd.err <- cmd.fn()
+			err := cmd.fn()
+			e.retainAttachedTeardown()
+			cmd.err <- err
 
 		case result := <-e.stopCh:
 			if e.handleWaitResult(result) {
+				if _, ok := e.backend.(backendTeardown); ok {
+					if err := e.joinBackendTeardown(); err != nil {
+						e.log.Error("backend teardown remains incomplete", "err", err)
+					}
+				}
 				e.drainCmds()
 				return
 			}
@@ -824,17 +842,44 @@ func (e *engine) loop() {
 }
 
 func (e *engine) handleWaitResult(result stopResult) bool {
-	e.finishWait()
-	if result.err != nil {
-		return e.handleWaitError(result.err)
-	}
+	e.finishWait(result.wait)
 	// Kill may have already moved us to stateExited while a real non-exit stop
 	// was buffered in stopCh and its synthetic wake was dropped.
 	if e.getState() == stateExited {
 		return true
 	}
+	// A timed-out detach still owns the target. A late cancellation/stop only
+	// retires its waiter; it must never restart ordinary stop handling.
+	if e.detachPending {
+		return false
+	}
+	if result.err != nil {
+		return e.handleWaitError(result.err)
+	}
+	if _, native := e.backend.(backendTeardown); native && e.proc.attached() &&
+		(result.evt.Reason == StopExited || result.evt.Reason == StopKilled) {
+		if err := e.killAttachedProcess(); err != nil {
+			e.emitError(protocol.CmdNone, err)
+			return false
+		}
+		code := result.evt.ExitCode
+		if result.evt.Reason == StopKilled {
+			code = -1
+		}
+		e.emitProcessExited(code)
+		return true
+	}
 	e.handleStop(result.evt)
+	e.retainAttachedTeardown()
 	return e.getState() == stateExited
+}
+
+// A failed patch can be reported by an internal step fallback rather than a
+// command result. Cleanup-only admission follows its durable backend latch.
+func (e *engine) retainAttachedTeardown() {
+	if teardown, ok := e.backend.(backendTeardown); ok && e.proc.attached() && teardown.teardownLatched() {
+		e.detachPending = true
+	}
 }
 
 func (e *engine) handleWaitError(waitErr error) bool {
@@ -876,37 +921,94 @@ func (e *engine) handleWaitError(waitErr error) bool {
 }
 
 func (e *engine) startWait() {
-	if e.waitActive {
+	if e.wait != nil {
 		e.log.Error("refusing to start a second backend waiter")
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	e.waitActive = true
-	e.waitCancel = cancel
-	go e.waitLoop(ctx)
+	wait := &engineWait{cancel: cancel, done: make(chan struct{})}
+	e.wait = wait
+	go e.waitLoop(ctx, wait)
 }
 
-func (e *engine) finishWait() {
-	if e.waitCancel != nil {
-		e.waitCancel()
+func (e *engine) finishWait(wait *engineWait) {
+	if wait != nil {
+		<-wait.done
 	}
-	e.waitCancel = nil
-	e.waitActive = false
+	if e.wait != nil && (wait == nil || e.wait == wait) {
+		e.wait.cancel()
+		if wait != nil {
+			e.wait = nil
+		}
+	}
 }
 
-func (e *engine) cancelAndJoinWait() (stopResult, bool) {
-	if !e.waitActive {
-		return stopResult{}, false
+func (e *engine) cancelAndJoinWait(ctx context.Context) (stopResult, bool, error) {
+	wait := e.wait
+	if wait == nil {
+		return stopResult{}, false, nil
 	}
-	if e.waitCancel != nil {
-		e.waitCancel()
+	wait.cancel()
+	for {
+		select {
+		case <-wait.done:
+			e.wait = nil
+			// Only this waiter can publish a real stop here. Drain its send
+			// even when completion won the select before the result did.
+			for {
+				select {
+				case <-e.stopCh:
+				default:
+					return wait.result, true, nil
+				}
+			}
+		default:
+		}
+		select {
+		case <-e.stopCh:
+			// Joining before draining can deadlock a waiter whose result is
+			// blocked behind a synthetic stop in the one-slot channel.
+		case <-wait.done:
+		case <-ctx.Done():
+			return stopResult{}, false, fmt.Errorf("join backend waiter: %w", ctx.Err())
+		}
 	}
-	result := <-e.stopCh
-	e.finishWait()
-	return result, true
 }
 
-func (e *engine) waitLoop(ctx context.Context) {
+func (e *engine) joinBackendTeardown() error {
+	teardown, native := e.backend.(backendTeardown)
+	ctx := context.Background()
+	if native {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, attachedDetachTimeout)
+		defer cancel()
+		if err := teardown.beginTeardown(); err != nil {
+			return err
+		}
+	}
+	result, joined, err := e.cancelAndJoinWait(ctx)
+	if err != nil {
+		return err
+	}
+	if native && joined && !e.proc.attached() &&
+		((result.err == nil && (result.evt.Reason == StopExited || result.evt.Reason == StopKilled)) ||
+			errors.Is(result.err, ErrProcessExited)) {
+		// The Mach waiter reaps before returning a terminal. Kill must not
+		// signal or wait on that recyclable PID after joining its result.
+		e.proc.markExited()
+	}
+	if joined && result.err != nil && !errors.Is(result.err, context.Canceled) &&
+		!errors.Is(result.err, ErrProcessExited) {
+		e.log.Warn("teardown joined a waiter that had already failed", "err", result.err)
+	}
+	if native {
+		return teardown.acknowledgeWait(ctx)
+	}
+	return nil
+}
+
+func (e *engine) waitLoop(ctx context.Context, wait *engineWait) {
+	defer close(wait.done)
 	// Backends may have thread-affine wait primitives even though Linux status
 	// collection now routes through a process-global broker.
 	runtime.LockOSThread()
@@ -918,8 +1020,9 @@ func (e *engine) waitLoop(ctx context.Context) {
 	} else {
 		evt, err = e.backend.Wait()
 	}
+	wait.result = stopResult{evt: evt, err: err, wait: wait}
 	select {
-	case e.stopCh <- stopResult{evt: evt, err: err}:
+	case e.stopCh <- wait.result:
 	case <-e.done:
 	}
 }
@@ -963,6 +1066,10 @@ func (e *engine) discardTracee(restore bool) error {
 
 func (e *engine) discardAttachedTracee(detacher attachedProcessDetacher, restore bool) error {
 	e.detachPending = true
+	if err := e.joinBackendTeardown(); err != nil {
+		e.setAttachedCleanupState(detacher)
+		return fmt.Errorf("%w: %w", ErrAttachedDetachIncomplete, err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), attachedDetachTimeout)
 	defer cancel()
 	gone, err := detacher.quiesceAttached(ctx)
