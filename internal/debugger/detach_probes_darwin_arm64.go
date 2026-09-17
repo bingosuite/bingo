@@ -193,11 +193,17 @@ func DarwinInspectDetach(d Debugger) (DarwinDetachProbe, error) {
 	if err != nil {
 		return DarwinDetachProbe{}, err
 	}
+	b.namespace.mu.Lock()
+	defer b.namespace.mu.Unlock()
 	var status C.mach_port_status_t
-	count := C.mach_msg_type_number_t(C.MACH_PORT_RECEIVE_STATUS_COUNT)
-	if kr := C.mach_port_get_attributes(C.mach_task_self_, b.excPort,
-		C.MACH_PORT_RECEIVE_STATUS, C.mach_port_info_t(unsafe.Pointer(&status)), &count); kr != C.KERN_SUCCESS {
-		return DarwinDetachProbe{}, fmt.Errorf("inspect native exception queue: %s", machErrString(kr))
+	if b.excPort != C.MACH_PORT_NULL {
+		count := C.mach_msg_type_number_t(C.MACH_PORT_RECEIVE_STATUS_COUNT)
+		if kr := C.mach_port_get_attributes(C.mach_task_self_, b.excPort,
+			C.MACH_PORT_RECEIVE_STATUS, C.mach_port_info_t(unsafe.Pointer(&status)), &count); kr != C.KERN_SUCCESS {
+			return DarwinDetachProbe{}, fmt.Errorf("inspect native exception queue: %s", machErrString(kr))
+		}
+	} else if !b.canReleaseMachNamespace() {
+		return DarwinDetachProbe{}, fmt.Errorf("exception receiver is absent before COMPLETE")
 	}
 	_, retained := outstandingDarwinDetaches.Load(b)
 	b.waitHooks.rendezvousMu.Lock()

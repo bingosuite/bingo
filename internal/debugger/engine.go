@@ -72,7 +72,8 @@ type engine struct {
 	// goroutine's completion before taking over the backend's receive queue.
 	wait *engineWait
 
-	detachPending bool
+	detachPending    bool
+	resourcesPending error
 
 	seq   uint64
 	state engineState
@@ -140,8 +141,9 @@ type engine struct {
 }
 
 type engineCmd struct {
-	fn  func() error
-	err chan error
+	fn      func() error
+	err     chan error
+	cleanup bool
 }
 
 // threadStepper is implemented by backends (currently darwin/arm64) that can
@@ -176,6 +178,10 @@ type backendTeardown interface {
 	beginTeardown() error
 	teardownLatched() bool
 	acknowledgeWait(context.Context) error
+}
+
+type backendResourceReleaser interface {
+	releaseBackendResources() error
 }
 
 type attachedProcessDetacher interface {
@@ -302,19 +308,33 @@ func (e *engine) Kill() error {
 		return nil
 	default:
 	}
-	return e.dispatch(func() error {
+	return e.dispatchCommand(func() error {
+		if e.resourcesPending != nil {
+			if err := e.releaseBackendResources(); err != nil {
+				return err
+			}
+			e.proc.markExited()
+			e.finishKill()
+			return nil
+		}
 		if e.getState() == stateExited {
 			if _, ok := e.backend.(attachedProcessDetacher); e.proc.attached() && ok {
 				return fmt.Errorf("%w: engine exited while attached ownership remains",
 					ErrAttachedOwnershipLost)
 			}
-			return nil
+			return e.releaseBackendResources()
 		}
 		if _, ok := e.backend.(attachedProcessDetacher); e.proc.attached() && ok {
-			return e.killAttachedProcess()
+			if err := e.killAttachedProcess(); err != nil {
+				return err
+			}
+			return e.releaseBackendResources()
 		}
 		if _, ok := e.backend.(backendTeardown); ok {
 			if err := e.joinBackendTeardown(); err != nil {
+				if _, ok := e.backend.(backendResourceReleaser); ok {
+					return e.retainBackendResources(err)
+				}
 				return err
 			}
 		}
@@ -328,8 +348,28 @@ func (e *engine) Kill() error {
 		_ = e.clearAllBreakpoints()
 		killErr := e.proc.kill(e.backend, running)
 		e.finishKill()
-		return killErr
-	})
+		return errors.Join(killErr, e.releaseBackendResources())
+	}, true)
+}
+
+func (e *engine) retainBackendResources(err error) error {
+	e.resourcesPending = fmt.Errorf("%w: retry Kill: %w", ErrBackendCleanupIncomplete, err)
+	return e.resourcesPending
+}
+
+func (e *engine) releaseBackendResources() error {
+	releaser, ok := e.backend.(backendResourceReleaser)
+	if !ok {
+		return nil
+	}
+	if err := e.joinBackendTeardown(); err != nil {
+		return e.retainBackendResources(err)
+	}
+	if err := releaser.releaseBackendResources(); err != nil {
+		return e.retainBackendResources(err)
+	}
+	e.resourcesPending = nil
+	return nil
 }
 
 func (e *engine) killAttachedProcess() error {
@@ -823,13 +863,27 @@ func (e *engine) loop() {
 	for {
 		select {
 		case cmd := <-e.cmdCh:
-			err := cmd.fn()
+			err := e.resourcesPending
+			if err == nil || cmd.cleanup {
+				err = cmd.fn()
+			}
+			if errors.Is(err, ErrBackendCleanupIncomplete) {
+				e.resourcesPending = err
+			}
 			e.retainAttachedTeardown()
 			cmd.err <- err
 
 		case result := <-e.stopCh:
 			if e.handleWaitResult(result) {
-				if _, ok := e.backend.(backendTeardown); ok {
+				if e.resourcesPending != nil {
+					continue
+				}
+				if _, ok := e.backend.(backendResourceReleaser); ok {
+					if err := e.releaseBackendResources(); err != nil {
+						e.emitError(protocol.CmdNone, err)
+						continue
+					}
+				} else if _, ok := e.backend.(backendTeardown); ok {
 					if err := e.joinBackendTeardown(); err != nil {
 						e.log.Error("backend teardown remains incomplete", "err", err)
 					}
@@ -848,9 +902,9 @@ func (e *engine) handleWaitResult(result stopResult) bool {
 	if e.getState() == stateExited {
 		return true
 	}
-	// A timed-out detach still owns the target. A late cancellation/stop only
-	// retires its waiter; it must never restart ordinary stop handling.
-	if e.detachPending {
+	// A timed-out detach or native retirement still owns its waiter. A late
+	// cancellation/stop must not re-enter a partially retired backend.
+	if e.detachPending || e.resourcesPending != nil {
 		return false
 	}
 	if result.err != nil {
@@ -2172,9 +2226,13 @@ func (e *engine) requireSuspended() error {
 // dispatch sends fn to the loop and waits for its result. Returns
 // ErrProcessExited if the loop has already exited.
 func (e *engine) dispatch(fn func() error) error {
+	return e.dispatchCommand(fn, false)
+}
+
+func (e *engine) dispatchCommand(fn func() error, cleanup bool) error {
 	ch := make(chan error, 1)
 	select {
-	case e.cmdCh <- engineCmd{fn: fn, err: ch}:
+	case e.cmdCh <- engineCmd{fn: fn, err: ch, cleanup: cleanup}:
 	case <-e.done:
 		return ErrProcessExited
 	}

@@ -183,16 +183,20 @@ func (b *darwinBackend) attachedQuiesced() bool         { return b.attachState.q
 func (b *darwinBackend) attachedImageReplaced() bool    { return false }
 
 func (b *darwinBackend) receiveMachMessage(timeout C.int) (C.int, int, error) {
+	return b.receiveMachMessageFrom(b.portSet, timeout)
+}
+
+func (b *darwinBackend) receiveMachMessageFrom(port C.mach_port_t, timeout C.int) (C.int, int, error) {
 	var thread C.mach_port_t
 	var exc C.int
 	var code C.int64_t
 	var id C.int
 	var reply replyInfo
-	cls := C.bingo_mach_recv(b.portSet, timeout, &thread, &exc, &code, &id, 0, 0,
+	cls := C.bingo_mach_recv(port, timeout, &thread, &exc, &code, &id, 0, 0,
 		&reply.port, &reply.bits, &reply.id)
 	if cls == C.BINGO_MSG_EXC {
-		b.adoptExcThreadPort(thread)
-		if err := b.stashReply(int(thread), reply); err != nil {
+		err := b.adoptExcThreadPort(thread)
+		if err := errors.Join(err, b.stashReply(int(thread), reply)); err != nil {
 			return cls, int(thread), err
 		}
 		b.waitHooks.received(b.teardown.Load())
@@ -517,6 +521,9 @@ func (b *darwinBackend) retireAttachedRPCs(ctx context.Context) error {
 			return fmt.Errorf("release old exception-port send reference: %s", machErrString(kr))
 		}
 		state.sendDropped = true
+		b.namespace.mu.Lock()
+		b.namespace.excSend = false
+		b.namespace.mu.Unlock()
 	}
 	for {
 		if err := ctx.Err(); err != nil {
