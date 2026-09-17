@@ -391,16 +391,19 @@ anything in [internal/debugger/](internal/debugger/).
    finished, and its OS-thread lock was released. Consuming a result is not that
    acknowledgement: `cancelAndJoinWait` drains `stopCh` while awaiting completion
    so a full one-slot channel cannot deadlock the join. A timeout retains the
-   same owner for retry; a late result during `detachPending` retires ownership
-   without re-entering ordinary stop handling. Linux cancellation does not
+   same owner for retry; a late result during `detachPending` or
+   `resourcesPending` retires ownership without re-entering ordinary stop
+   handling. Linux cancellation does not
    dequeue a routed status, so quiescence loses nothing and joining preserves
    the step queue's no-concurrent-owner proof.
 
 3. **Shutdown sequence.** When `StopExited` / `StopKilled` / `ErrProcessExited`
-   arrives, the loop sets `stateExited`, calls `drainCmds` (answers queued
-   commands with `ErrProcessExited` so blocked dispatchers unblock), then
-   returns. The `defer` closes `done` (signals waitLoop to abandon pending
-   sends) and then `events` (signals hub no more events coming). On Linux,
+   arrives, the loop sets `stateExited`, retires any backend resources, calls
+   `drainCmds` (answers queued commands with `ErrProcessExited` so blocked
+   dispatchers unblock), then returns. Darwin's checked namespace retirement
+   can withhold that completion for a retry even after a real exit event has
+   reported the target's death. The `defer` closes `done` (signals waitLoop to
+   abandon pending sends) and then `events` (signals hub no more events coming). On Linux,
    closing the backend's wait owner drops consumer-facing queued stops but does
    not unregister live TIDs: the process-global broker keeps exact ownership
    until it reaps each final status. This is what lets a running Kill return
@@ -412,11 +415,13 @@ anything in [internal/debugger/](internal/debugger/).
    `Kill` can retry; closing the loop there would implicitly detach and resume
    the foreign target.
 
-4. **`Kill` is idempotent and ownership-aware.** Launched targets retain the
-   existing one-way shutdown: even if SIGKILL/reaping reports an error, the
-   engine injects synthetic `StopExited` and closes. Attached targets do
-   not: `Kill` returns `ErrAttachedDetachIncomplete`, keeps `process.live` and
-   the engine/control resources alive, and rejects every command except a
+4. **`Kill` is idempotent and ownership-aware.** Launched targets are terminated
+   rather than detached. Linux retains one-way shutdown even if SIGKILL/reaping
+   reports an error. Darwin additionally requires acknowledged waiter retirement
+   and checked namespace release: `ErrBackendCleanupIncomplete` retains the
+   engine in cleanup-only mode until a retrying `Kill` releases every owned
+   right. Attached teardown returns `ErrAttachedDetachIncomplete`, keeps
+   `process.live` and the engine/control resources alive, and rejects every command except a
    retrying `Kill` until restoration and platform release complete. On Darwin
    that includes the displaced exception handler, old exception RPCs, owned
    suspension counts, and acknowledged waiter/diagnostic-reader retirement.
@@ -1606,14 +1611,14 @@ state, and permit retrying Kill. A join timeout never claims a quiesced target;
 the eventual waiter result cannot produce a new breakpoint or Pause event.
 The hub's existing retained-debugger shutdown transaction owns those retries.
 
-**`canReleaseMachNamespace` is the next layer's mandatory guard.** COMPLETE
+**`canReleaseMachNamespace` is the mandatory namespace-release guard.** COMPLETE
 requires the durable teardown latch, waiter/diagnostic acknowledgement, target
 release, no attached ownership, and absence from the outstanding-detach registry.
-It is only a guard: #234 does not destroy receive rights, port sets, notification
-ports, or the remaining Mach namespace. A failed attach before the swap has no
-victim restoration obligation but still requires acknowledged teardown.
-Namespace destruction/census belongs to #233 and must not reclaim any right
-while this guard is false.
+Victim restoration and namespace retirement remain separate transactions: the
+former establishes COMPLETE; the latter may only reclaim rights after this guard
+succeeds. A failed attach before the swap has no victim restoration obligation
+but still requires acknowledged teardown. Neither a timeout nor removal of a
+registry entry merely to permit destruction can substitute for COMPLETE.
 
 Regression coverage: deterministic tuple/null/empty/retry/guard tests and the
 shared full-channel/timeout/exact-waiter tests; native `attach-restoration`
@@ -1630,6 +1635,93 @@ received/queued/wait-return boundaries; they do not instrument XNU's internal
 pre-selection window, whose exclusion proof is source-based. The gates and
 emergency task termination are e2e-only, bounded, and restricted to the exact
 test-owned target; never use them in production.
+
+#### Darwin namespace retirement
+
+Source: [namespace_darwin_arm64.go](internal/debugger/namespace_darwin_arm64.go).
+Every Darwin backend lifetime ends with explicit, checked retirement, including
+launched Kill, natural exit, successful attached detach, and partial startup.
+No finalizer, garbage collection, `portsOK`-only cleanup, or log-and-forget path
+owns this responsibility.
+
+`setupMachNamespace` records each receive right immediately after acquisition,
+each inserted send uref separately, the dead-name notification request and any
+returned send-once right, and the port set before membership operations.
+`portsOK` means the receive path is usable, not that it is the only state needing
+cleanup. `acquirePorts` also owns the cached `task_for_pid` uref before namespace
+setup. Failed startup unwinds these same recorded obligations; a launched child
+that never reached `process.live` remains backend-owned until exact-PID reaping.
+A backend whose teardown has begun cannot be reused for a new launch/attach.
+
+`releaseMachNamespace` checks COMPLETE before any namespace operation, then:
+
+1. Cancels/reconciles the owned dead-name notification and releases both returned
+   previous/cancelled send-once rights before destroying their receiver.
+2. Drains the exception receiver directly and checks every deferred reply.
+   Receiving from the individual port also works when setup never acquired a
+   complete port set. Attached cleanup has already established old-RPC
+   retirement; this drain does not replace that proof.
+3. Releases each owned send uref and receive right separately, then the port set,
+   retained thread urefs in deterministic name order, and the cached task urefs.
+   The attached transaction's earlier exception-port SEND drop is recorded so
+   it is never repeated; saved prior-handler rights remain solely owned by that
+   transaction and are not released again here.
+
+**Right type and owned uref count are separate facts.** `task_for_pid`,
+`task_threads`, and exception descriptors can coalesce with rights owned
+elsewhere in this process. Release only the backend's counted credits, never
+all refs returned by `mach_port_get_refs`. Thread enumeration and exception
+adoption normally retain one credit per thread; a failed duplicate release keeps
+the extra credits recorded for retry. Both steady-state and final release check
+actual SEND/SEND_ONCE/DEAD_NAME type and tolerate one observed SEND-to-DEAD
+transition. Missing, insufficient, unexpected, or saturated refs are explicit
+errors, not evidence that cleanup succeeded.
+
+A fired dead-name notification adds **one extra task dead-name uref**, even if
+Wait already consumed the notification. XNU adds it when converting the watched
+namespace entry, not when userspace receives the message. Cancellation returning
+a send-once right proves cancellation won; an empty return plus a proven dead
+name proves the notification fired. Conversion can occur inside cancellation,
+requiring one checked retry against the now-dead name. The cached task therefore
+owns one credit plus that fired-notification credit, while any independently held
+credits survive. `MACH_PORT_DEAD` itself owns no namespace uref. This relies on
+the same exclusive controller/notification ownership as attached teardown; it
+does not compose independent notification policies on one coalesced task name.
+
+The namespace mutex serializes setup, release and diagnostic reads; release
+takes the thread and task ledgers only after all target readers have acknowledged
+retirement. Each successful decrement clears only its own obligation. A failed
+operation leaves its name/count/phase intact, so retry resumes partial release
+without touching an already-destroyed name. Full success alone sets `released`;
+idempotent calls still check COMPLETE and then issue no Mach operation.
+
+The engine's optional `backendResourceReleaser` is Darwin-only. A failed native
+join or namespace release sets loop-owned `resourcesPending` and returns
+`ErrBackendCleanupIncomplete`; asynchronous terminal cleanup also emits
+`EventError(CmdNone)`. Only Kill is admitted while pending. A late canceled waiter
+retires without ordinary stop handling; a retry enters resource retirement
+without replaying ordinary step disarming or attached restoration through a
+partially destroyed namespace. Real process-exit status remains truthful,
+but `done`/`events` stay open until retirement succeeds. Hub disposal retains and
+retries the exact debugger for this sentinel just as for incomplete attached
+restoration. Linux's tracer/wait-owner lifetime is unchanged.
+
+Regression gates: deterministic acquisition/release-failure and COMPLETE-guard
+tests, exact-waiter/cleanup-only engine tests, and hub candidate/shutdown retention.
+The native `namespace` label uses `mach_port_names` in **one long-lived process**
+through 20 launches (10 Kill, 10 natural exit) and 10 live attach/detaches (5
+custom handlers, 5 null handlers; running and breakpoint-stopped). It requires
+port-set and dead-name counts to return to baseline after every cycle and checks
+individual owned names disappear. Total names are diagnostic only because Go
+runtime threads can change them. A deliberately allocated port-set/dead-name leak
+must be detected and actually released; separately omitting the production
+port-set release or the notification's dead-name credit fails the first measured
+launch cycle. Native partial-setup, retained unwind,
+post-COMPLETE release failure, outstanding-RPC refusal, and independently held
+coalesced-reference controls cover the failure boundaries. Attached victims must
+retain exact prior handlers/bytes, genuine post-detach traps, heartbeat/worker
+progress, and normal exit. The existing `hygiene` per-stop uref gate is separate
+and remains required.
 
 ### Linux / amd64 ([backend_linux_amd64.go](internal/debugger/backend_linux_amd64.go))
 
@@ -2346,13 +2438,15 @@ obligation was registered before factory construction, and shutdown cannot close
 remain independently owned, and a concurrent successful cleanup satisfies only
 its own obligation once.
 
-**Shutdown completion is withheld while an attached detach is retryable.**
+**Shutdown completion is withheld while debugger cleanup is retryable.**
 `ErrAttachedDetachIncomplete` means the engine and platform resources still own
-the foreign target, so `discardDebugger` retains that exact debugger and retries `Kill`
-instead of logging-and-dropping it. This applies to explicit server shutdown,
-idle shutdown, last-client disconnect, DAP disconnect, and failed startup whose
-partial attach still owns TIDs or Mach restoration obligations. Registry
-admission closes first, but
+the foreign target. `ErrBackendCleanupIncomplete` retains Darwin namespace
+obligations even after that victim has been restored/released or a launched
+target has died. For either sentinel, `discardDebugger` retains that exact
+debugger and retries `Kill` instead of logging-and-dropping it. This applies to
+explicit server shutdown, idle shutdown, last-client disconnect, DAP disconnect,
+and failed startup whose partial setup still owns TIDs, Mach restoration, or
+namespace obligations. Registry admission closes first, but
 `shutdownCh`, `Hub.Done`, session removal, and `Server.Done` do not complete
 until cleanup succeeds. A caller waiting on `Server.Shutdown(timeout)` receives
 `ErrShutdownIncomplete` at its deadline while cleanup continues in the
@@ -3737,15 +3831,18 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   The `hygiene` spec (`declarePortHygieneSpec`) is **darwin-only** — it asserts
   the Mach exception path does not leak task/thread send rights across many
   breakpoint stops (reads the `debugger.DarwinTaskPortSendRefs` hook), a check
-  meaningless on the ptrace backend.
+  meaningless on the ptrace backend. The separate Darwin `namespace` label
+  checks per-session retirement with an in-process census and exact owned names
+  across repeated launch/Kill, natural exit and live attach/detach, including
+  partial acquisition/release failures and a deliberate-leak self-check.
 
   **Platform scoping — both containers run the shared set.** The darwin container
   wires the same shared specs as linux: `basic`, `stepping`, `breakpoints`, `churn`,
   `kill`, `exit`, `attach`, `concurrency`, `current-goroutine`, `pause`, `inspect`, `restart`,
   `fullstack`, and `dap`. Linux additionally runs `signals` and `overlap`;
   darwin additionally runs the
-  `hygiene` Mach exception port-right leak regression. This was NOT
-  always so:
+  `hygiene` per-stop and `namespace` per-session Mach port-right regressions.
+  This was NOT always so:
   under the old darwin wait4/ptrace model the step-off-an-armed-trap specs
   (`basic`, `stepping`, `breakpoints`, `churn`) and `kill` (kill-while-running)
   were LINUX-ONLY, because single-stepping off a software breakpoint could be

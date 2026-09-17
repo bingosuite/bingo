@@ -292,8 +292,8 @@ func (h *Hub) discardDebugger(dbg debugger.Debugger, reason string) bool {
 	if err == nil {
 		return true
 	}
-	if errors.Is(err, debugger.ErrAttachedDetachIncomplete) {
-		h.log.Warn("retaining debugger ownership after incomplete attached detach",
+	if errors.Is(err, debugger.ErrAttachedDetachIncomplete) || errors.Is(err, debugger.ErrBackendCleanupIncomplete) {
+		h.log.Warn("retaining debugger ownership after incomplete cleanup",
 			"reason", reason, "err", err)
 		return false
 	}

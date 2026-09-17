@@ -24,6 +24,9 @@ var (
 	// ErrAttachedOwnershipLost means the engine stopped before it could release
 	// a foreign process. Retrying cannot recreate the lost control loop.
 	ErrAttachedOwnershipLost = errors.New("debugger: attached ownership lost")
+	// ErrBackendCleanupIncomplete retains a backend's control loop for a Kill
+	// retry, even after the target itself has been released or has exited.
+	ErrBackendCleanupIncomplete = errors.New("debugger: backend cleanup incomplete")
 
 	// ErrSessionInvalidated marks a backend failure after which the tracee can
 	// no longer be described, let alone debugged — the process image was
@@ -58,8 +61,8 @@ type Debugger interface {
 	Attach(pid int, binaryPath string) error
 
 	// Kill terminates a launched tracee or restores and detaches an attached one.
-	// It is idempotent; ErrAttachedDetachIncomplete requires retaining the
-	// debugger and retrying Kill rather than treating cleanup as complete.
+	// It is idempotent; ErrAttachedDetachIncomplete and ErrBackendCleanupIncomplete
+	// require retaining the debugger and retrying Kill, not dropping ownership.
 	Kill() error
 
 	SetBreakpoint(file string, line int) (protocol.Breakpoint, error)

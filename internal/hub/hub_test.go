@@ -948,9 +948,9 @@ var _ = Describe("Hub", func() {
 	})
 
 	Describe("retained shutdown ownership", func() {
-		It("retries an incomplete attached detach before reporting the hub done", func() {
-			fd.setKillError(fmt.Errorf("%w: injected detach failure",
-				debugger.ErrAttachedDetachIncomplete))
+		DescribeTable("retries incomplete cleanup before reporting the hub done", func(incomplete error) {
+			fd.setKillError(fmt.Errorf("%w: injected cleanup failure", incomplete))
+			defer fd.setKillError(nil)
 			h := hub.New(fd, nil)
 			ctx, cancel := context.WithCancel(context.Background())
 			go h.Run(ctx)
@@ -960,11 +960,14 @@ var _ = Describe("Hub", func() {
 				return countCalls(fd.recordedCalls(), "Kill")
 			}, "1s", "10ms").Should(BeNumerically(">=", 2))
 			Consistently(h.Done(), "100ms", "10ms").ShouldNot(BeClosed(),
-				"hub completion would discard the only owner of the attached process")
+				"hub completion would discard the only cleanup owner")
 
 			fd.setKillError(nil)
 			Eventually(h.Done(), "1s", "10ms").Should(BeClosed())
-		})
+		},
+			Entry("attached victim restoration", debugger.ErrAttachedDetachIncomplete),
+			Entry("post-COMPLETE backend namespace", debugger.ErrBackendCleanupIncomplete),
+		)
 
 		It("does not retry after the engine has already lost attached ownership", func() {
 			fd.setKillError(debugger.ErrAttachedOwnershipLost)
@@ -980,11 +983,10 @@ var _ = Describe("Hub", func() {
 	})
 
 	Describe("failed startup ownership retention", func() {
-		It("keeps failed Attach cleanup owned through hub cancellation", func() {
+		DescribeTable("keeps failed Attach cleanup owned through hub cancellation", func(incomplete error) {
 			fd := newFakeDebugger()
 			fd.attachErr = errors.New("attach failed")
-			fd.setKillError(fmt.Errorf("%w: retained partial attach",
-				debugger.ErrAttachedDetachIncomplete))
+			fd.setKillError(fmt.Errorf("%w: retained partial attach", incomplete))
 			h := hub.NewSession("session", func() debugger.Debugger { return fd }, nil)
 			ctx, cancel := context.WithCancel(context.Background())
 			go h.Run(ctx)
@@ -1010,7 +1012,10 @@ var _ = Describe("Hub", func() {
 			fd.setKillError(nil)
 			Eventually(h.ExportedShutdownCh(), "1s", "10ms").Should(BeClosed())
 			Eventually(h.Done(), "1s", "10ms").Should(BeClosed())
-		})
+		},
+			Entry("victim restoration", debugger.ErrAttachedDetachIncomplete),
+			Entry("pre-swap namespace acquisitions", debugger.ErrBackendCleanupIncomplete),
+		)
 
 		It("waits for every failed startup candidate before completing shutdown", func() {
 			first := newFakeDebugger()
