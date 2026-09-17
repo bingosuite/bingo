@@ -285,9 +285,32 @@ an acknowledged rendezvous retries restoration without executing again.
 Unsupported foreign thread routing/debug state also fails retained. The
 exclusive-control assumption and non-interruptible Mach-call limit are detailed
 in [AGENTS.md](../AGENTS.md#darwin-attached-restoration-and-the-complete-boundary).
-Mach namespace cleanup must
-consult `canReleaseMachNamespace` and the outstanding-detach registry; neither
-an error log nor a sent wake permits discarding an owned foreign target.
+Mach namespace cleanup must consult `canReleaseMachNamespace` and the
+outstanding-detach registry; neither an error log nor a sent wake permits
+discarding an owned foreign target.
+
+`ErrBackendCleanupIncomplete` is distinct from incomplete attached restoration:
+the victim may already be safely released, but native waiter acknowledgement or
+namespace retirement still needs a checked retry. Darwin records every partial
+acquisition and every owned uref independently of `portsOK`, including the
+notification's extra dead-name credit. Failed cancellation, reply, reference, or
+receiver release preserves the exact remaining name/count/phase. Unexpected,
+missing, insufficient, or saturated right counts are errors, never an
+idempotent-success shortcut or permission to release another owner's credits.
+
+The engine retains cleanup-only admission and keeps `done`/`events` open for
+this sentinel; only a retrying Kill may finish retirement. A late canceled
+waiter's result does not re-enter ordinary stop handling. Retry starts at
+resource retirement, not at victim step disarming/detach through names that may
+already have been destroyed. A real natural exit event still reports its actual
+code once; it is not a promise that every native resource is already gone.
+Asynchronous terminal cleanup failures use `EventError(CmdNone)`. Synchronous
+failures return wrapped errors for the hub's normal command reporting, and hub
+disposal retains/retries the debugger rather than logging and abandoning it.
+Server shutdown therefore remains incomplete until the retained release
+succeeds, including failed startup before a process/session was fully installed.
+See [Darwin namespace retirement](../AGENTS.md#darwin-namespace-retirement) for
+the release order and ownership proof.
 
 ## 8. Propagating errors to clients: typed `EventError`
 

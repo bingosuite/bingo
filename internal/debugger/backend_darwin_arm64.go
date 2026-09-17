@@ -63,11 +63,12 @@ type darwinBackend struct {
 	// single-step both raise it); notePort receives the dead-name notification
 	// when the tracee exits; ctrlPort is a private port Pause posts to so it can
 	// wake a blocked mach_msg (task/thread_suspend cannot wake a receive).
-	portSet  C.mach_port_t
-	excPort  C.mach_port_t
-	notePort C.mach_port_t
-	ctrlPort C.mach_port_t
-	portsOK  bool
+	portSet   C.mach_port_t
+	excPort   C.mach_port_t
+	notePort  C.mach_port_t
+	ctrlPort  C.mach_port_t
+	portsOK   bool
+	namespace darwinNamespace
 
 	teardown         atomic.Bool
 	waitAcknowledged atomic.Bool
@@ -92,9 +93,10 @@ type darwinBackend struct {
 	// task_threads hands out a fresh send-right per thread on every call; we keep
 	// exactly one and deallocate the rest (and the rights of threads that have
 	// exited) so the debugger doesn't leak ports under thread churn and so a
-	// given thread keeps a stable port name across enumerations.
+	// given thread keeps a stable port name across enumerations. Failed duplicate
+	// releases remain counted until a checked retry removes those extra urefs.
 	threadMu    sync.Mutex
-	threadPorts map[C.mach_port_t]struct{}
+	threadPorts map[uint32]uint32
 	threadHolds map[int]int
 
 	// Step bookkeeping. stepping/stepTID drive the ablation-only plain
@@ -201,6 +203,9 @@ func startTracedProcess(b Backend, binaryPath string, args []string, env []strin
 	if db == nil {
 		return 0, nil, fmt.Errorf("darwin startTracedProcess: nil backend")
 	}
+	if err := db.requireActive(); err != nil {
+		return 0, nil, err
+	}
 
 	cpath := C.CString(binaryPath)
 	defer C.free(unsafe.Pointer(cpath))
@@ -235,26 +240,32 @@ func startTracedProcess(b Backend, binaryPath string, args []string, env []strin
 	db.launched = true
 
 	if err := db.acquirePorts(pid); err != nil {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
 		return 0, nil, err
 	}
 
 	task, err := db.task()
 	if err != nil {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
-		return 0, nil, err
+		return 0, nil, errors.Join(err, db.unwindMachSetup())
 	}
 	if kr := C.bingo_freeze_at_launch(task); kr != C.KERN_SUCCESS {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
-		return 0, nil, fmt.Errorf("freeze at launch: %s", machErrString(kr))
+		return 0, nil, errors.Join(fmt.Errorf("freeze at launch: %s", machErrString(kr)),
+			db.unwindMachSetup())
 	}
 	return pid, nil, nil
 }
 
 // acquirePorts records the pid, obtains the Mach task port (retrying the brief
 // spawn/task race) and installs the exception/notification/control port set.
-func (b *darwinBackend) acquirePorts(pid int) error {
+func (b *darwinBackend) acquirePorts(pid int) (err error) {
+	if err := b.requireActive(); err != nil {
+		return err
+	}
 	b.pid = pid
+	defer func() {
+		if err != nil {
+			err = errors.Join(err, b.unwindMachSetup())
+		}
+	}()
 
 	var task C.mach_port_t
 	var kr C.kern_return_t
@@ -277,10 +288,9 @@ func (b *darwinBackend) acquirePorts(pid int) error {
 	b.taskOK = true
 	b.taskMu.Unlock()
 
-	if kr := C.bingo_setup_exception_ports(task, &b.portSet, &b.excPort, &b.notePort, &b.ctrlPort); kr != C.KERN_SUCCESS {
-		return fmt.Errorf("setup exception ports: %s", machErrString(kr))
+	if err := b.setupMachNamespace(task); err != nil {
+		return fmt.Errorf("setup exception ports: %w", err)
 	}
-	b.portsOK = true
 	return b.installExceptionHandler(task)
 }
 
@@ -325,6 +335,9 @@ func attachToProcess(b Backend, pid int) error {
 	db, _ := b.(*darwinBackend)
 	if db == nil {
 		return fmt.Errorf("darwin attach: nil backend")
+	}
+	if err := db.requireActive(); err != nil {
+		return err
 	}
 	db.launched = false
 	if err := db.acquirePorts(pid); err != nil {
@@ -775,18 +788,22 @@ func (b *darwinBackend) Threads() ([]int, error) {
 	// Threads() runs on nearly every step/suspend/register operation.
 	b.threadMu.Lock()
 	if b.threadPorts == nil {
-		b.threadPorts = make(map[C.mach_port_t]struct{})
+		b.threadPorts = make(map[uint32]uint32)
 	}
-	seen := make(map[C.mach_port_t]struct{}, len(ports))
-	tids := make([]int, len(ports))
-	for i, p := range ports {
-		seen[p] = struct{}{}
-		if _, ok := b.threadPorts[p]; ok {
-			C.bingo_port_deallocate(p)
-		} else {
-			b.threadPorts[p] = struct{}{}
+	seen := make(map[uint32]struct{}, len(ports))
+	tids := make([]int, 0, len(ports))
+	for _, p := range ports {
+		if p == C.MACH_PORT_DEAD {
+			continue
 		}
-		tids[i] = int(p)
+		if p == C.MACH_PORT_NULL {
+			err = errors.Join(err, fmt.Errorf("task_threads returned a null thread capability"))
+			continue
+		}
+		seen[uint32(p)] = struct{}{}
+		b.threadPorts[uint32(p)]++
+		err = errors.Join(err, b.releaseThreadRefs(uint32(p), 1))
+		tids = append(tids, int(p))
 	}
 	for p := range b.threadPorts {
 		if _, ok := seen[p]; !ok {
@@ -795,9 +812,12 @@ func (b *darwinBackend) Threads() ([]int, error) {
 			if b.attachOwned.Load() && b.teardown.Load() {
 				continue
 			}
-			C.bingo_port_deallocate(p)
-			delete(b.threadPorts, p)
-			delete(b.threadHolds, int(p))
+			if releaseErr := b.releaseThreadRefs(p, 0); releaseErr != nil {
+				err = errors.Join(err, releaseErr)
+			} else {
+				delete(b.threadPorts, p)
+				delete(b.threadHolds, int(p))
+			}
 		}
 	}
 	b.threadMu.Unlock()
@@ -807,7 +827,20 @@ func (b *darwinBackend) Threads() ([]int, error) {
 		C.vm_address_t(uintptr(unsafe.Pointer(threads))),
 		C.vm_size_t(uintptr(count)*unsafe.Sizeof(C.mach_port_t(0))),
 	)
+	if err != nil {
+		return nil, err
+	}
 	return tids, nil
+}
+
+func (b *darwinBackend) releaseThreadRefs(port uint32, keep uint32) error {
+	if owned := b.threadPorts[port]; owned > keep {
+		if err := releaseMachSendRefs(nativeDarwinMachCalls{}, port, owned-keep, false); err != nil {
+			return fmt.Errorf("release thread %#x send/dead-name references: %w", port, err)
+		}
+		b.threadPorts[port] = keep
+	}
+	return nil
 }
 
 // adoptExcThreadPort reconciles the send right the kernel inserted for the
@@ -818,17 +851,20 @@ func (b *darwinBackend) Threads() ([]int, error) {
 // (engine goroutine), so it takes threadMu. The name always ends with uref >= 1,
 // so the tid stays valid for the subsequent GetRegisters/suspend/step this stop
 // performs. Mirrors the adopt/dedup accounting in Threads().
-func (b *darwinBackend) adoptExcThreadPort(thread C.mach_port_t) {
+func (b *darwinBackend) adoptExcThreadPort(thread C.mach_port_t) error {
+	if thread == C.MACH_PORT_DEAD {
+		return nil
+	}
+	if thread == C.MACH_PORT_NULL {
+		return fmt.Errorf("exception message has a null thread capability")
+	}
 	b.threadMu.Lock()
 	defer b.threadMu.Unlock()
 	if b.threadPorts == nil {
-		b.threadPorts = make(map[C.mach_port_t]struct{})
+		b.threadPorts = make(map[uint32]uint32)
 	}
-	if _, ok := b.threadPorts[thread]; ok {
-		C.bingo_port_deallocate(thread)
-	} else {
-		b.threadPorts[thread] = struct{}{}
-	}
+	b.threadPorts[uint32(thread)]++
+	return b.releaseThreadRefs(uint32(thread), 1)
 }
 
 // TaskPortSendRefs reports the Mach send-right user-reference count on the cached

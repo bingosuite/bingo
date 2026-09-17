@@ -337,42 +337,6 @@ static inline kern_return_t bingo_thread_exception_ports(
         ports->masks, &ports->count, ports->ports, ports->behaviors, ports->flavors);
 }
 
-// Allocate the entire receive path before changing the victim's handler. A
-// failed allocation must not leave the victim pointing at an unserviceable port.
-static inline kern_return_t bingo_setup_exception_ports(
-    task_t task, mach_port_t *port_set, mach_port_t *exc_port,
-    mach_port_t *note_port, mach_port_t *ctrl_port)
-{
-    kern_return_t kr;
-    mach_port_t self = mach_task_self();
-    mach_port_t prev_not;
-
-    kr = mach_port_allocate(self, MACH_PORT_RIGHT_RECEIVE, exc_port);
-    if (kr != KERN_SUCCESS) return kr;
-    kr = mach_port_insert_right(self, *exc_port, *exc_port, MACH_MSG_TYPE_MAKE_SEND);
-    if (kr != KERN_SUCCESS) return kr;
-    kr = mach_port_allocate(self, MACH_PORT_RIGHT_RECEIVE, note_port);
-    if (kr != KERN_SUCCESS) return kr;
-    kr = mach_port_insert_right(self, *note_port, *note_port, MACH_MSG_TYPE_MAKE_SEND);
-    if (kr != KERN_SUCCESS) return kr;
-    kr = mach_port_request_notification(self, task, MACH_NOTIFY_DEAD_NAME, 0,
-            *note_port, MACH_MSG_TYPE_MAKE_SEND_ONCE, &prev_not);
-    if (kr != KERN_SUCCESS) return kr;
-
-    kr = mach_port_allocate(self, MACH_PORT_RIGHT_RECEIVE, ctrl_port);
-    if (kr != KERN_SUCCESS) return kr;
-    kr = mach_port_insert_right(self, *ctrl_port, *ctrl_port, MACH_MSG_TYPE_MAKE_SEND);
-    if (kr != KERN_SUCCESS) return kr;
-
-    kr = mach_port_allocate(self, MACH_PORT_RIGHT_PORT_SET, port_set);
-    if (kr != KERN_SUCCESS) return kr;
-    kr = mach_port_move_member(self, *exc_port, *port_set);
-    if (kr != KERN_SUCCESS) return kr;
-    kr = mach_port_move_member(self, *note_port, *port_set);
-    if (kr != KERN_SUCCESS) return kr;
-    return mach_port_move_member(self, *ctrl_port, *port_set);
-}
-
 // bingo_freeze_at_launch converts the POSIX_SPAWN_START_SUSPENDED task-level
 // suspension into bingo's resting state: every thread individually Mach-suspended
 // (suspend_count 1) with the task itself resumed. After this nothing runs but the
