@@ -874,25 +874,31 @@ func (e *engine) loop() {
 			cmd.err <- err
 
 		case result := <-e.stopCh:
-			if e.handleWaitResult(result) {
-				if e.resourcesPending != nil {
-					continue
-				}
-				if _, ok := e.backend.(backendResourceReleaser); ok {
-					if err := e.releaseBackendResources(); err != nil {
-						e.emitError(protocol.CmdNone, err)
-						continue
-					}
-				} else if _, ok := e.backend.(backendTeardown); ok {
-					if err := e.joinBackendTeardown(); err != nil {
-						e.log.Error("backend teardown remains incomplete", "err", err)
-					}
-				}
+			if e.handleWaitResult(result) && e.finishBackendTeardown() {
 				e.drainCmds()
 				return
 			}
 		}
 	}
+}
+
+// A terminal wait result can precede namespace retirement; failed cleanup must
+// retain the loop that owns its retry rather than close done/events.
+func (e *engine) finishBackendTeardown() bool {
+	if e.resourcesPending != nil {
+		return false
+	}
+	if _, ok := e.backend.(backendResourceReleaser); ok {
+		if err := e.releaseBackendResources(); err != nil {
+			e.emitError(protocol.CmdNone, err)
+			return false
+		}
+	} else if _, ok := e.backend.(backendTeardown); ok {
+		if err := e.joinBackendTeardown(); err != nil {
+			e.log.Error("backend teardown remains incomplete", "err", err)
+		}
+	}
+	return true
 }
 
 func (e *engine) handleWaitResult(result stopResult) bool {

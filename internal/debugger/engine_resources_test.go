@@ -168,81 +168,95 @@ func TestBackendResourcesWaitForAcknowledgementBeforeAnyRelease(t *testing.T) {
 }
 
 func TestBackendResourcesRetireNaturalExitAndOrdinaryWaitFailure(t *testing.T) {
-	for _, failWait := range []bool{false, true} {
-		for _, failRelease := range []bool{false, true} {
-			t.Run(fmt.Sprintf("wait-error=%v release-error=%v", failWait, failRelease), func(t *testing.T) {
-				b := &resourceTestBackend{stop: make(chan struct{})}
-				if failWait {
-					b.waitErr = errors.New("native receive failure")
+	for _, tc := range []struct {
+		failWait, failRelease bool
+	}{
+		{false, false},
+		{false, true},
+		{true, false},
+		{true, true},
+	} {
+		t.Run(fmt.Sprintf("wait-error=%v release-error=%v", tc.failWait, tc.failRelease), func(t *testing.T) {
+			b := &resourceTestBackend{stop: make(chan struct{})}
+			if tc.failWait {
+				b.waitErr = errors.New("native receive failure")
+			}
+			b.failClose.Store(tc.failRelease)
+			e := newResourceTestEngine(t, b)
+			if err := e.dispatch(func() error {
+				e.setState(stateRunning)
+				e.startWait()
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			close(b.stop)
+			events := awaitResourceRetirementEvents(t, e, tc.failRelease)
+			if tc.failRelease {
+				select {
+				case <-e.done:
+					t.Fatal("natural-exit cleanup failure closed its owner")
+				default:
 				}
-				b.failClose.Store(failRelease)
-				e := newResourceTestEngine(t, b)
-				if err := e.dispatch(func() error {
-					e.setState(stateRunning)
-					e.startWait()
-					return nil
-				}); err != nil {
+				b.failClose.Store(false)
+				if err := e.Kill(); err != nil {
 					t.Fatal(err)
 				}
-				close(b.stop)
-				var events []protocol.Event
-				deadline := time.After(time.Second)
-			read:
-				for {
-					select {
-					case evt, ok := <-e.events:
-						if !ok {
-							break read
-						}
-						events = append(events, evt)
-						if failRelease && evt.Kind == protocol.EventError {
-							var payload protocol.ErrorPayload
-							if err := protocol.DecodeEventPayload(evt, &payload); err != nil {
-								t.Fatal(err)
-							}
-							if strings.Contains(payload.Message, ErrBackendCleanupIncomplete.Error()) {
-								break read
-							}
-						}
-					case <-deadline:
-						t.Fatal("native terminal did not retire or report retained cleanup")
-					}
+				awaitResourceEngineClosed(t, e)
+				for evt := range e.events {
+					events = append(events, evt)
 				}
-				if failRelease {
-					select {
-					case <-e.done:
-						t.Fatal("natural-exit cleanup failure closed its owner")
-					default:
-					}
-					b.failClose.Store(false)
-					if err := e.Kill(); err != nil {
-						t.Fatal(err)
-					}
-					awaitResourceEngineClosed(t, e)
-					for evt := range e.events {
-						events = append(events, evt)
-					}
+			}
+			want := 1
+			if tc.failWait {
+				want = 0
+			}
+			assertResourceRetirement(t, b, events, want)
+		})
+	}
+}
+
+func awaitResourceRetirementEvents(t *testing.T, e *engine, failRelease bool) []protocol.Event {
+	t.Helper()
+	var events []protocol.Event
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case evt, ok := <-e.events:
+			if !ok {
+				return events
+			}
+			events = append(events, evt)
+			if failRelease && evt.Kind == protocol.EventError {
+				var payload protocol.ErrorPayload
+				if err := protocol.DecodeEventPayload(evt, &payload); err != nil {
+					t.Fatal(err)
 				}
-				exits := 0
-				for _, evt := range events {
-					if evt.Kind == protocol.EventProcessExited {
-						exits++
-						var payload protocol.ProcessExitedPayload
-						if err := protocol.DecodeEventPayload(evt, &payload); err != nil || payload.ExitCode != 23 {
-							t.Fatalf("real exit status lost: %+v %v", payload, err)
-						}
-					}
+				if strings.Contains(payload.Message, ErrBackendCleanupIncomplete.Error()) {
+					return events
 				}
-				want := 1
-				if failWait {
-					want = 0
-				}
-				if exits != want || !b.released.Load() || !b.waitDone.Load() {
-					t.Fatalf("exits=%d want=%d, released=%v waiter=%v",
-						exits, want, b.released.Load(), b.waitDone.Load())
-				}
-			})
+			}
+		case <-deadline:
+			t.Fatal("native terminal did not retire or report retained cleanup")
 		}
+	}
+}
+
+func assertResourceRetirement(t *testing.T, b *resourceTestBackend, events []protocol.Event, wantExits int) {
+	t.Helper()
+	exits := 0
+	for _, evt := range events {
+		if evt.Kind == protocol.EventProcessExited {
+			exits++
+			var payload protocol.ProcessExitedPayload
+			if err := protocol.DecodeEventPayload(evt, &payload); err != nil || payload.ExitCode != 23 {
+				t.Fatalf("real exit status lost: %+v %v", payload, err)
+			}
+		}
+	}
+	if exits != wantExits || !b.released.Load() || !b.waitDone.Load() {
+		t.Fatalf("exits=%d want=%d, released=%v waiter=%v",
+			exits, wantExits, b.released.Load(), b.waitDone.Load())
 	}
 }
 
