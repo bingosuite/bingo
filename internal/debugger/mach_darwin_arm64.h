@@ -8,6 +8,45 @@
 #include <mach/mach_vm.h>
 #include <mach/arm/thread_status.h>
 #include <stdint.h>
+#include <sys/sysctl.h>
+#include <errno.h>
+
+static inline kern_return_t bingo_get_debug_state(
+    thread_t thread, arm_debug_state64_t *state)
+{
+    mach_msg_type_number_t count = ARM_DEBUG_STATE64_COUNT;
+    return thread_get_state(thread, ARM_DEBUG_STATE64, (thread_state_t)state, &count);
+}
+
+static inline kern_return_t bingo_get_task_debug_state(
+    task_t task, arm_debug_state64_t *state)
+{
+    mach_msg_type_number_t count = ARM_DEBUG_STATE64_COUNT;
+    return task_get_state(task, ARM_DEBUG_STATE64, (thread_state_t)state, &count);
+}
+
+static inline kern_return_t bingo_set_debug_state(
+    thread_t thread, arm_debug_state64_t *state)
+{
+    return thread_set_state(thread, ARM_DEBUG_STATE64,
+        (thread_state_t)state, ARM_DEBUG_STATE64_COUNT);
+}
+
+static inline kern_return_t bingo_exception_class(thread_t thread, uint32_t *ec) {
+    arm_exception_state64_t state;
+    mach_msg_type_number_t count = ARM_EXCEPTION_STATE64_COUNT;
+    kern_return_t kr = thread_get_state(thread, ARM_EXCEPTION_STATE64,
+        (thread_state_t)&state, &count);
+    if (kr == KERN_SUCCESS) *ec = state.__esr >> 26;
+    return kr;
+}
+
+static inline int bingo_hardware_breakpoints(int *count) {
+    size_t size = sizeof(*count);
+    if (sysctlbyname("hw.optional.breakpoint", count, &size, NULL, 0) != 0)
+        return errno;
+    return 0;
+}
 
 // bingo_task_for_pid obtains the Mach task port for the given PID.
 // Requires the com.apple.security.cs.debugger entitlement or SIP disabled.
@@ -63,8 +102,9 @@ static inline kern_return_t bingo_read_memory(
     void *dst, mach_vm_size_t n)
 {
     mach_vm_size_t out_size = 0;
-    return mach_vm_read_overwrite(task, addr, n,
+    kern_return_t kr = mach_vm_read_overwrite(task, addr, n,
         (mach_vm_address_t)dst, &out_size);
+    return kr == KERN_SUCCESS && out_size != n ? KERN_FAILURE : kr;
 }
 
 // bingo_write_memory writes n bytes from src into the task's address space.
@@ -93,47 +133,36 @@ static inline kern_return_t bingo_read_memory(
 // KERN_NOT_SUPPORTED; that was wrong, verified empirically on M-series). It
 // cleans the data cache and invalidates the instruction cache for the patched
 // range in the TARGET task, which is exactly the cross-task SMC synchronization
-// the CPU needs. We issue it on every write; a failure is non-fatal (best
-// effort) but must not mask the underlying write's own error.
-//
-// Suspend-count accounting: Mach maintains a SINGLE task-level suspend_count
-// per task. The suspend/resume here are strictly balanced (every exit path
-// below calls task_resume) and this function only ever runs on the engine's
-// single locked OS thread (see AGENTS.md — all ptrace/Mach calls are serialized
-// there), so the pair can never interleave with itself and the count returns to
-// its baseline before we return.
+// the CPU needs. Launched patches retain the existing best-effort flush result.
+// Attached writes check it: releasing a foreign task with a stale cached BRK
+// would defeat successful byte restoration.
+static inline kern_return_t bingo_write_memory_held(
+    mach_port_t task, mach_vm_address_t addr,
+    const void *src, mach_vm_size_t n, kern_return_t *flush_result)
+{
+    *flush_result = KERN_SUCCESS;
+    kern_return_t kr = mach_vm_protect(task, addr, n, FALSE,
+        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) return kr;
+    kr = mach_vm_write(task, addr,
+        (vm_offset_t)src, (mach_msg_type_number_t)n);
+    if (kr != KERN_SUCCESS) return kr;
+    kr = mach_vm_protect(task, addr, n, FALSE,
+        VM_PROT_READ | VM_PROT_EXECUTE);
+    int flush = MATTR_VAL_CACHE_FLUSH;
+    *flush_result = mach_vm_machine_attribute(task, addr, n, MATTR_CACHE, &flush);
+    return kr;
+}
+
+// The ordinary patch's temporary hold must not release the durable hold used by
+// attached restoration. That path calls bingo_write_memory_held directly.
 static inline kern_return_t bingo_write_memory(
     mach_port_t task, mach_vm_address_t addr,
     const void *src, mach_vm_size_t n)
 {
-    // Suspend the task so all threads are quiesced while we patch memory.
-    // This also causes task_resume to flush the instruction pipeline.
     task_suspend(task);
-
-    kern_return_t kr = mach_vm_protect(task, addr, n, FALSE,
-        VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) {
-        task_resume(task);
-        return kr;
-    }
-    kr = mach_vm_write(task, addr,
-        (vm_offset_t)src, (mach_msg_type_number_t)n);
-    if (kr != KERN_SUCCESS) {
-        task_resume(task);
-        return kr;
-    }
-    kr = mach_vm_protect(task, addr, n, FALSE,
-        VM_PROT_READ | VM_PROT_EXECUTE);
-
-    // Invalidate the target's instruction cache for the patched range so a
-    // near-immediate re-execution of the address sees the new bytes rather than
-    // a stale I-cache line (see the SMC coherency note above). Best effort: the
-    // write itself already succeeded, so a flush failure must not clobber kr.
-    int flush = MATTR_VAL_CACHE_FLUSH;
-    mach_vm_machine_attribute(task, addr, n, MATTR_CACHE, &flush);
-
-    // Resume lifts the task suspension and flushes the instruction pipeline
-    // for all threads, ensuring the CPU fetches the new bytes on next execute.
+    kern_return_t flush_result;
+    kern_return_t kr = bingo_write_memory_held(task, addr, src, n, &flush_result);
     task_resume(task);
     return kr;
 }
@@ -283,12 +312,33 @@ static inline int bingo_posix_spawn(
     return 0;
 }
 
-// bingo_setup_exception_ports registers a task-level EXC_MASK_BREAKPOINT
-// exception port, a dead-name notification port (fires when the tracee exits),
-// and a control port used to wake a blocked receive for Pause — all moved into
-// one port set the receive loop waits on. THREAD_STATE_NONE keeps the exception
-// message small (no register state inline); the engine reads registers via
-// thread_get_state when it needs them.
+typedef struct {
+    exception_mask_t masks[EXC_TYPES_COUNT];
+    mach_port_t ports[EXC_TYPES_COUNT];
+    exception_behavior_t behaviors[EXC_TYPES_COUNT];
+    thread_state_flavor_t flavors[EXC_TYPES_COUNT];
+    mach_msg_type_number_t count;
+} bingo_exception_ports;
+
+static inline kern_return_t bingo_swap_exception_ports(
+    task_t task, mach_port_t port, bingo_exception_ports *saved)
+{
+    saved->count = EXC_TYPES_COUNT;
+    return task_swap_exception_ports(task, EXC_MASK_BREAKPOINT, port,
+        EXCEPTION_DEFAULT, THREAD_STATE_NONE, saved->masks, &saved->count,
+        saved->ports, saved->behaviors, saved->flavors);
+}
+
+static inline kern_return_t bingo_thread_exception_ports(
+    thread_t thread, bingo_exception_ports *ports)
+{
+    ports->count = EXC_TYPES_COUNT;
+    return thread_get_exception_ports(thread, EXC_MASK_BREAKPOINT,
+        ports->masks, &ports->count, ports->ports, ports->behaviors, ports->flavors);
+}
+
+// Allocate the entire receive path before changing the victim's handler. A
+// failed allocation must not leave the victim pointing at an unserviceable port.
 static inline kern_return_t bingo_setup_exception_ports(
     task_t task, mach_port_t *port_set, mach_port_t *exc_port,
     mach_port_t *note_port, mach_port_t *ctrl_port)
@@ -301,10 +351,6 @@ static inline kern_return_t bingo_setup_exception_ports(
     if (kr != KERN_SUCCESS) return kr;
     kr = mach_port_insert_right(self, *exc_port, *exc_port, MACH_MSG_TYPE_MAKE_SEND);
     if (kr != KERN_SUCCESS) return kr;
-    kr = task_set_exception_ports(task, EXC_MASK_BREAKPOINT, *exc_port,
-            EXCEPTION_DEFAULT, THREAD_STATE_NONE);
-    if (kr != KERN_SUCCESS) return kr;
-
     kr = mach_port_allocate(self, MACH_PORT_RIGHT_RECEIVE, note_port);
     if (kr != KERN_SUCCESS) return kr;
     kr = mach_port_insert_right(self, *note_port, *note_port, MACH_MSG_TYPE_MAKE_SEND);
@@ -420,11 +466,13 @@ static inline kern_return_t bingo__send_reply(mach_msg_header_t *hdr) {
 #define BINGO_MSG_EXC    1  // exception (thread halted at BRK / single-step trap)
 #define BINGO_MSG_DEATH  2  // dead-name notification: the tracee exited
 #define BINGO_MSG_PAUSE  3  // control-port wake (Pause requested)
+#define BINGO_MSG_SHUTDOWN 4
 #define BINGO_MSG_ERROR  (-1)
 
 // Sentinel msgh_id for the Pause wake sent to the control port. Chosen well clear
 // of the exception (2401) and dead-name (72) ids.
 #define BINGO_CTRL_MSG_ID 0x42420
+#define BINGO_SHUTDOWN_MSG_ID 0x42421
 
 // bingo_reply_exception acknowledges a previously-received exception with
 // KERN_SUCCESS, using the reply header fields captured by bingo_mach_recv. It is
@@ -453,6 +501,30 @@ static inline kern_return_t bingo_reply_exception(
     reply.RetCode = KERN_SUCCESS;
     return mach_msg(&reply.Head, MACH_SEND_MSG | MACH_SEND_INTERRUPT,
         rh->msgh_size, 0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
+}
+
+// Failed sends can pseudo-receive the message back into our IPC space under a
+// different name. Retain that returned header, not the consumed original name.
+static inline kern_return_t bingo_reply_exception_checked(
+    mach_port_t *remote_port, unsigned int *remote_bits, int id)
+{
+    mig_reply_error_t reply = {0};
+    reply.Head.msgh_bits = MACH_MSGH_BITS(*remote_bits, 0);
+    reply.Head.msgh_remote_port = *remote_port;
+    reply.Head.msgh_size = sizeof(reply);
+    reply.Head.msgh_id = id + 100;
+    reply.NDR = NDR_record;
+    reply.RetCode = KERN_SUCCESS;
+    kern_return_t kr = mach_msg(&reply.Head,
+        MACH_SEND_MSG | MACH_SEND_TIMEOUT | MACH_SEND_INTERRUPT,
+        sizeof(reply), 0, MACH_PORT_NULL, 0, MACH_PORT_NULL);
+    if (kr == MACH_MSG_SUCCESS) {
+        *remote_port = MACH_PORT_NULL;
+    } else {
+        *remote_port = reply.Head.msgh_remote_port;
+        *remote_bits = MACH_MSGH_BITS_REMOTE(reply.Head.msgh_bits);
+    }
+    return kr;
 }
 
 // bingo_mach_recv receives one message from the port set. timeout_ms < 0 blocks
@@ -516,6 +588,8 @@ static inline int bingo_mach_recv(
         return BINGO_MSG_DEATH;
     case BINGO_CTRL_MSG_ID:
         return BINGO_MSG_PAUSE;
+    case BINGO_SHUTDOWN_MSG_ID:
+        return BINGO_MSG_SHUTDOWN;
     default:
         return BINGO_MSG_NONE;
     }
@@ -569,16 +643,35 @@ static inline int bingo_stop_the_world(task_t task, mach_port_t port_set) {
 // sentinel message to the control port. Non-blocking (MACH_SEND_TIMEOUT 0): if a
 // prior wake is still queued the send is dropped, which is fine — one pending
 // Pause is enough.
-static inline kern_return_t bingo_send_ctrl(mach_port_t ctrl_port) {
+static inline kern_return_t bingo_send_wake(mach_port_t ctrl_port, int id) {
     mach_msg_header_t h;
     h.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, 0);
     h.msgh_size = sizeof(h);
     h.msgh_remote_port = ctrl_port;
     h.msgh_local_port = MACH_PORT_NULL;
     h.msgh_voucher_port = MACH_PORT_NULL;
-    h.msgh_id = BINGO_CTRL_MSG_ID;
+    h.msgh_id = id;
     return mach_msg(&h, MACH_SEND_MSG | MACH_SEND_TIMEOUT, sizeof(h), 0,
                     MACH_PORT_NULL, 0, MACH_PORT_NULL);
+}
+
+static inline kern_return_t bingo_send_ctrl(mach_port_t ctrl_port) {
+    return bingo_send_wake(ctrl_port, BINGO_CTRL_MSG_ID);
+}
+
+static inline kern_return_t bingo_send_shutdown(mach_port_t ctrl_port) {
+    return bingo_send_wake(ctrl_port, BINGO_SHUTDOWN_MSG_ID);
+}
+
+static inline kern_return_t bingo_thread_suspend_count(
+    mach_port_t thread, int *suspend_count)
+{
+    thread_basic_info_data_t info;
+    mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+    kern_return_t kr = thread_info(thread, THREAD_BASIC_INFO,
+        (thread_info_t)&info, &count);
+    if (kr == KERN_SUCCESS) *suspend_count = info.suspend_count;
+    return kr;
 }
 
 // --- Diagnostic-only helpers (gated behind BINGO_DARWIN_SUSPEND_PROBE) --------

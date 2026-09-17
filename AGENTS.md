@@ -385,9 +385,16 @@ anything in [internal/debugger/](internal/debugger/).
    `Backend.Wait()` exactly once (also `LockOSThread`'d) and sends the result to
    `stopCh`; the loop clears ownership when it consumes that result. Linux
    attached teardown cancels and **joins that exact waiter** before the engine
-   goroutine consumes `linuxWaitOwner` itself. Cancellation does not dequeue a
-   routed status, so the synchronous quiesce pass loses nothing, and joining
-   preserves the step queue's no-concurrent-owner proof.
+   goroutine consumes `linuxWaitOwner` itself. Darwin latches teardown and sends
+   a distinct shutdown wake before joining. Each `engineWait` has a private
+   completion channel, closed only after the backend returned, its result send
+   finished, and its OS-thread lock was released. Consuming a result is not that
+   acknowledgement: `cancelAndJoinWait` drains `stopCh` while awaiting completion
+   so a full one-slot channel cannot deadlock the join. A timeout retains the
+   same owner for retry; a late result during `detachPending` retires ownership
+   without re-entering ordinary stop handling. Linux cancellation does not
+   dequeue a routed status, so quiescence loses nothing and joining preserves
+   the step queue's no-concurrent-owner proof.
 
 3. **Shutdown sequence.** When `StopExited` / `StopKilled` / `ErrProcessExited`
    arrives, the loop sets `stateExited`, calls `drainCmds` (answers queued
@@ -407,10 +414,12 @@ anything in [internal/debugger/](internal/debugger/).
 
 4. **`Kill` is idempotent and ownership-aware.** Launched targets retain the
    existing one-way shutdown: even if SIGKILL/reaping reports an error, the
-   engine injects synthetic `StopExited` and closes. Linux attached targets do
+   engine injects synthetic `StopExited` and closes. Attached targets do
    not: `Kill` returns `ErrAttachedDetachIncomplete`, keeps `process.live` and
-   the engine/tracer alive, and rejects every command except a retrying `Kill`
-   until all patched bytes are restored and every owned TID is detached.
+   the engine/control resources alive, and rejects every command except a
+   retrying `Kill` until restoration and platform release complete. On Darwin
+   that includes the displaced exception handler, old exception RPCs, owned
+   suspension counts, and acknowledged waiter/diagnostic-reader retirement.
    `ErrAttachedOwnershipLost` is terminal and non-retryable: it means the engine
    already stopped, so retrying cannot recreate the tracer thread.
 
@@ -1476,10 +1485,151 @@ are detected by a `mach_msg` receive loop.
   every thread, `SIGKILL`s, and reaps via `wait4` — it does not block the engine
   loop in `cmd.Wait`, so kill-while-running no longer deadlocks (the old
   wait4/ptrace failure). `launched` distinguishes a spawned tracee (SIGKILL) from
-  an attached one (detach).
+  an attached one (detach). Native Kill joins the Mach waiter first; if that
+  waiter already reaped a launched terminal, it retires the process handle
+  before Kill can signal or wait on the recyclable PID.
 - **ASLR slide** is computed in `TextSlide` by scanning the VM map for the first
   exec region with the 64-bit Mach-O magic. Do NOT use `TASK_DYLD_INFO` — its
   image array is unpopulated at the very first stop.
+
+#### Darwin attached restoration and the COMPLETE boundary
+
+Source: [attach_darwin_arm64.go](internal/debugger/attach_darwin_arm64.go).
+`task_swap_exception_ports` displaces **only `EXC_MASK_BREAKPOINT`**, preserving
+every returned mask/port/behavior/flavor tuple, including `MACH_PORT_NULL`.
+Restoration replays every tuple exactly; a zero-count snapshot explicitly clears
+the mask with a null port rather than leaving Bingo installed. Saved non-null
+send rights remain owned until all tuples are restored, then are deallocated
+exactly once. Per-entry completion survives a partial failure and retry.
+
+Teardown is latched before sending `BINGO_SHUTDOWN_MSG_ID` to `ctrlPort`.
+This is **not Pause**: consuming a shutdown wake never calls `stopTheWorld`.
+The Go waiter's receive call itself never suspends; it checks
+the latch before its ordinary target operations. The engine joins that exact
+waiter and the optional diagnostic reader before acknowledging retirement.
+Consequently no old waiter or watchdog can suspend, read, or resume the victim
+after detach completion. A wake send, cancellation request, or dequeued stop
+alone is not acknowledgement.
+
+After joining, attached cleanup takes a durable task hold and restores every
+patched instruction, including the target's instruction cache. ARM64 PC is
+already on BRK; this path must not replay a sampled GPR context or call the
+ordinary full-register hardware-step disarm helper. Suspension does not make a
+kernel-side signal/context transition impossible. The backend retains the
+in-flight step's exact owner for the rendezvous below instead.
+
+Attached writes have a separate original-byte ledger, established **before**
+the first patch at an address. A write can change text and then fail protection
+or cache restoration before the engine has a table entry; a failed reinstall
+can likewise be table-less. Such failures retain the task hold, latch teardown,
+and return `ErrAttachedDetachIncomplete`. The engine adopts the backend's
+durable latch after both command and stop handling, including asynchronous step
+fallbacks; it admits only cleanup even when no waiter was active. Detach
+restores the ledger as well as the engine's table. No obligation is deleted
+before its checked byte/cache restoration.
+
+**The pre-handler-selection window needs a distinct-class rendezvous.**
+[rendezvous_darwin_arm64.go](internal/debugger/rendezvous_darwin_arm64.go)
+samples `ARM_EXCEPTION_STATE64` after software restoration under the task hold.
+XNU's ARM64 EL0 entry stores ESR in the user PCB before its interruptible
+exception-handler selection; nested EL1 exceptions use separate stack frames,
+and the getter returns that saved user ESR, not the CPU's current ESR. A
+non-debug entry class therefore excludes an already-taken debug exception.
+The value can otherwise be stale: it is an exclusion test, **not** evidence
+that an exception RPC exists.
+
+For a saved BRK (EC `0x3c`), step (EC `0x32`), or any known in-flight Bingo step,
+cleanup programs a hardware execution breakpoint (EC `0x30`) at that thread's
+sampled PC. An EC `0x30` baseline instead uses debug-state-only single-step
+(EC `0x32`). Only that candidate is released; all other existing threads remain
+individually held. An actual received exception RPC from the **same retained
+thread**, of the **different expected class**, acknowledges a new user boundary
+after the old exception path. The execution case additionally requires the
+exact armed PC. Mach exception code0 is 1 for all three classes and is not a
+discriminator. An older-class RPC is replied and the marker rearmed at its now
+RPC-stable context; a same-class quiet queue or elapsed delay never substitutes
+for acknowledgement. The execution marker normally executes no instruction;
+the EC `0x30` fallback executes one real instruction, which may branch or enter
+a syscall. Do not promise PC+4 or unconditional convergence.
+
+Rendezvous state retains **armed, acknowledged, and complete** separately.
+Before retrying an armed marker, check its already-stashed RPC; after
+acknowledgement, retry only the remaining hold/debug-state restoration, never
+execute the instruction again. Restore only supported empty debug state;
+reject private non-null thread breakpoint handlers, foreign debug registers,
+and nonempty inherited task debug state. XNU's disabled BCR/WCR user-mode bits
+are accepted only for Bingo's retained step owner. The temporary thread debug
+state is not inherited by children, and a final task-held enumeration includes
+any child created by the one stepped instruction. A missing retained thread
+capability is not death evidence; only a positive dead name retires it.
+
+The source basis is XNU
+[`f6217f8`](https://github.com/apple-oss-distributions/xnu/tree/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea):
+[`locore.s` EL0 entry](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/arm64/locore.s#L727-L795),
+[`exception_asm.h` ESR spill](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/arm64/exception_asm.h#L264-L278),
+and [`status.c` exception-state getter](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/arm64/status.c#L1289-L1308)
+and debug-state setter. The proof requires **exclusive debugger, exception-RPC,
+and control ownership**: no other controller may abort those RPCs or mutate
+routing, registers, or lifecycle during teardown. Initial guards detect
+unsupported state, not later concurrent interference. A kernel-blocked,
+externally suspended, signal-diverted, or interdependent candidate can miss the
+deadline; keep its ownership rather than declare a false success. Deadlines
+bound polling and joins, not a synchronous Mach call already hung in the kernel.
+
+Only after the rendezvous does cleanup restore the task's prior handler and
+retire exception replies. Attached suspensions have an exact ownership ledger:
+final release removes only Bingo's thread holds, then its task hold last, never
+normalizes an externally-owned suspension count to zero.
+
+**An empty exception queue is not RPC retirement.** XNU copies the selected
+handler's send right before issuing `exception_raise` and releases it only when
+that synchronous RPC returns. Once the prior task handler is restored, Bingo
+drops its own exception-port send reference and drains/replies until
+`MACH_PORT_RECEIVE_STATUS` reports both no senders and no queued messages.
+`mps_srights` is boolean, not a refcount; never subtract a baseline or substitute
+a quiet period for the kernel acknowledgement. The receive right and port set
+remain intact. This retires RPCs that selected Bingo; it is not a claim that
+`task_suspend` itself drains kernel execution. The preceding rendezvous covers
+the exception that has been taken but has not selected its handler yet.
+
+Checked reply sends retain failed obligations, including the header returned
+by Mach pseudo-receive (which may rename the right). An invalid destination is
+retired only after proving it is a dead name or the received `MACH_PORT_DEAD`
+sentinel. The sentinel owns no namespace uref; a null right is not equivalent
+death evidence. Other failures remain explicit.
+Stashed and queued-unread exceptions take the same checked reply path.
+
+`outstandingDarwinDetaches` retains every successful swap through restoration,
+waiter acknowledgement, RPC retirement, and victim release. Failures return
+`ErrAttachedDetachIncomplete`, retain the engine and all remaining restoration
+state, and permit retrying Kill. A join timeout never claims a quiesced target;
+the eventual waiter result cannot produce a new breakpoint or Pause event.
+The hub's existing retained-debugger shutdown transaction owns those retries.
+
+**`canReleaseMachNamespace` is the next layer's mandatory guard.** COMPLETE
+requires the durable teardown latch, waiter/diagnostic acknowledgement, target
+release, no attached ownership, and absence from the outstanding-detach registry.
+It is only a guard: #234 does not destroy receive rights, port sets, notification
+ports, or the remaining Mach namespace. A failed attach before the swap has no
+victim restoration obligation but still requires acknowledged teardown.
+Namespace destruction/census belongs to #233 and must not reclaim any right
+while this guard is false.
+
+Regression coverage: deterministic tuple/null/empty/retry/guard tests and the
+shared full-channel/timeout/exact-waiter tests; native `attach-restoration`
+specs run both custom and no-handler targets through running and stopped detach,
+real queued/unread and stashed exceptions, held waiter return, and real
+no-senders/join timeout retries. They also require genuine EC `0x32` to EC `0x30`
+and EC `0x30` to EC `0x32` transactions, exact-TID acknowledgements, no second
+arm after a retained acknowledgement, external-suspend timeout/recovery, and
+restoration of actually written table-less BRKs after failed Set and asynchronous
+reinstall. All require the exact prior
+tuple, original instruction bytes, genuine post-detach trap delivery,
+worker/heartbeat progress, and normal exit. Native gates observe real
+received/queued/wait-return boundaries; they do not instrument XNU's internal
+pre-selection window, whose exclusion proof is source-based. The gates and
+emergency task termination are e2e-only, bounded, and restricted to the exact
+test-owned target; never use them in production.
 
 ### Linux / amd64 ([backend_linux_amd64.go](internal/debugger/backend_linux_amd64.go))
 
@@ -2197,11 +2347,12 @@ remain independently owned, and a concurrent successful cleanup satisfies only
 its own obligation once.
 
 **Shutdown completion is withheld while an attached detach is retryable.**
-`ErrAttachedDetachIncomplete` means the engine and tracer still own the foreign
-target, so `discardDebugger` retains that exact debugger and retries `Kill`
+`ErrAttachedDetachIncomplete` means the engine and platform resources still own
+the foreign target, so `discardDebugger` retains that exact debugger and retries `Kill`
 instead of logging-and-dropping it. This applies to explicit server shutdown,
 idle shutdown, last-client disconnect, DAP disconnect, and failed startup whose
-partial attach still owns TIDs. Registry admission closes first, but
+partial attach still owns TIDs or Mach restoration obligations. Registry
+admission closes first, but
 `shutdownCh`, `Hub.Done`, session removal, and `Server.Done` do not complete
 until cleanup succeeds. A caller waiting on `Server.Shutdown(timeout)` receives
 `ErrShutdownIncomplete` at its deadline while cleanup continues in the
