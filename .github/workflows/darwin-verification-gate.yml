@@ -23,10 +23,13 @@ name: Darwin verification gate
 # event's actual base is main. GitHub runs ultimate-base CI for every native
 # stack layer while pull_request.base still names the immediate parent:
 # https://docs.github.com/en/pull-requests/get-started/about-stacked-prs
-# The policy accepts that shape only with an immutable event stack.base SHA
-# matching POLICY_SHA, authoritative same-repository ordered membership, and
-# checked refs/ancestry. It revalidates that proof before success and evaluates
-# the cumulative main-to-head diff, never only the immediate-parent diff.
+# The actual parent, immutable event stack.base SHA, and trusted POLICY_SHA are
+# distinct: the recorded stack main snapshot may be historical. It must equal
+# or be a proven ancestor of POLICY_SHA, while live main must still equal
+# POLICY_SHA. Authoritative same-repository ordered membership and checked
+# refs/ancestry are revalidated before success. Scope stays the cumulative
+# event-anchor-to-head diff, never only the immediate-parent diff or a live-main
+# replacement for a missing event anchor.
 # Missing event evidence, standalone alternate bases, and other stack roots fail
 # closed. Never broaden this filter or load code from an event/stack-owned ref.
 #

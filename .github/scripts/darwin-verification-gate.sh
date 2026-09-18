@@ -89,10 +89,11 @@ fail_closed() {
 }
 
 # The webhook, not a later REST read, owns the effective-base generation.
-# workflow_sha independently pins the main policy being executed; disagreement
-# requires a new event rather than silently evaluating a different main.
+# That snapshot may precede workflow_sha, which independently pins trusted
+# policy/live main. capture_native_stack_proof must prove that lineage.
 require_native_stack_event() {
-  if ! jq -e --arg repository "$GITHUB_REPOSITORY" \
+  local invalid_fields
+  invalid_fields=$(trap - ERR; jq -r --arg repository "$GITHUB_REPOSITORY" \
     --arg policy_sha "${POLICY_SHA:-}" '
       def positive:
         type == "number" and . > 0 and . == floor and . <= 9007199254740991;
@@ -100,31 +101,38 @@ require_native_stack_event() {
         type == "string" and test("^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$");
       def branch:
         type == "string" and test("^[A-Za-z0-9._/-]+$");
+      def require($field; valid):
+        try (
+          getpath($field | split(".")) as $value
+          | if $value == null then "\($field): missing"
+            elif $value | valid then empty
+            else "\($field): invalid" end
+        ) catch "\($field): invalid";
       .repository as $repo
-      | .pull_request as $pr
-      | $pr.stack as $stack
-      | $repo.full_name == $repository
-        and ($repo.id | positive)
-        and ($pr.base.repo.id == $repo.id)
-        and ($pr.head.repo.id == $repo.id)
-        and ($pr.base.repo.full_name == $repository)
-        and ($pr.head.repo.full_name == $repository)
-        and ($pr.head.ref | branch)
-        and ($pr.base.ref | branch)
-        and ($pr.head.sha | oid)
-        and ($pr.base.sha | oid)
-        and ($stack | type == "object")
-        and ($stack.id | positive)
-        and ($stack.number | positive)
-        and ($stack.size | positive)
-        and ($stack.size <= 100)
-        and ($stack.position | positive)
-        and ($stack.position <= $stack.size)
-        and ($stack.base.ref == "main")
-        and ($stack.base.sha | oid)
-        and ($stack.base.sha == $policy_sha)
-    ' "$GITHUB_EVENT_PATH" >/dev/null; then
-    echo "Native stack event lacks a same-repository, trusted-main generation; refusing to infer it from live metadata." >&2
+      | .pull_request.stack as $stack
+      | [
+          require("repository.full_name"; . == $repository),
+          require("repository.id"; positive),
+          require("pull_request.base.repo.id"; . == $repo.id),
+          require("pull_request.head.repo.id"; . == $repo.id),
+          require("pull_request.base.repo.full_name"; . == $repository),
+          require("pull_request.head.repo.full_name"; . == $repository),
+          require("pull_request.head.ref"; branch),
+          require("pull_request.base.ref"; branch),
+          require("pull_request.head.sha"; oid),
+          require("pull_request.base.sha"; oid),
+          require("pull_request.stack"; type == "object"),
+          require("pull_request.stack.id"; positive),
+          require("pull_request.stack.number"; positive),
+          require("pull_request.stack.size"; positive and . <= 100),
+          require("pull_request.stack.position"; positive and . <= $stack.size),
+          require("pull_request.stack.base.ref"; . == "main"),
+          require("pull_request.stack.base.sha"; oid),
+          ({"POLICY_SHA": $policy_sha} | require("POLICY_SHA"; oid))
+        ] | join(", ")
+    ' "$GITHUB_EVENT_PATH")
+  if [ -n "$invalid_fields" ]; then
+    printf 'Native stack event has missing or invalid evidence: %s; refusing to infer it from live metadata.\n' "$invalid_fields" >&2
     return 1
   fi
 
@@ -135,8 +143,14 @@ require_native_stack_event() {
   stack_number=$(trap - ERR; jq -r '.pull_request.stack.number' "$GITHUB_EVENT_PATH")
   stack_repository_id=$(trap - ERR; jq -r '.repository.id' "$GITHUB_EVENT_PATH")
   event_head_ref=$(trap - ERR; jq -r '.pull_request.head.ref' "$GITHUB_EVENT_PATH")
-  git check-ref-format --branch "$base_ref" >/dev/null
-  git check-ref-format --branch "$event_head_ref" >/dev/null
+  if ! git check-ref-format --branch "$base_ref" >/dev/null 2>&1; then
+    echo "Native stack event pull_request.base.ref: invalid Git ref syntax." >&2
+    return 1
+  fi
+  if ! git check-ref-format --branch "$event_head_ref" >/dev/null 2>&1; then
+    echo "Native stack event pull_request.head.ref: invalid Git ref syntax." >&2
+    return 1
+  fi
   stacked=true
 }
 
@@ -157,13 +171,16 @@ require_stack_ref() {
 require_stack_ancestor() {
   local ancestor=$1 descendant=$2
 
-  gh api "repos/$GITHUB_REPOSITORY/compare/$ancestor...$descendant" > "$stack_ancestry_json"
-  if ! jq -se --arg ancestor "$ancestor" '
+  if ! gh api "repos/$GITHUB_REPOSITORY/compare/$ancestor...$descendant" > "$stack_ancestry_json"; then
+    echo "Native stack ancestry API unavailable: $ancestor -> $descendant" >&2
+    return 1
+  fi
+  if ! jq -se --arg ancestor "$ancestor" --arg descendant "$descendant" '
     length == 1 and (.[0]
       | .base_commit.sha == $ancestor
         and .merge_base_commit.sha == $ancestor
-        and (.status == "ahead" or .status == "identical"))
-  ' "$stack_ancestry_json" >/dev/null; then
+        and .status == (if $ancestor == $descendant then "identical" else "ahead" end))
+  ' "$stack_ancestry_json" >/dev/null 2>&1; then
     echo "Native stack commit ancestry is not proven: $ancestor -> $descendant" >&2
     return 1
   fi
@@ -280,10 +297,11 @@ capture_native_stack_proof() {
     expected_sha=$member_head_sha
   done < "$stack_rows"
 
-  # Main may have advanced beyond the stack's fork point: the cumulative diff
-  # uses its merge base, just like an ordinary PR. Its tip must still equal the
-  # event anchor, not an opportunistic live replacement for that anchor.
-  require_stack_ref "$required_base_ref" "$effective_base_sha"
+  # The event's recorded main snapshot may be historical, but only checked
+  # lineage to the trusted policy permits it. Live main must still name that
+  # policy generation; neither proof replaces the cumulative diff's anchor.
+  require_stack_ancestor "$effective_base_sha" "$POLICY_SHA"
+  require_stack_ref "$required_base_ref" "$POLICY_SHA"
   jq -Sc --slurpfile merged "$stack_merged_json" '
     {id, number, open, base: {ref: .base.ref}, merged_prefix: $merged,
       pull_requests: [.pull_requests[] | {
@@ -577,7 +595,7 @@ fi
 
 if [ "$stacked" = "true" ]; then
   require_current_generation
-  echo "Cumulative native stack comparison: main@$effective_base_sha...$head_sha (actual base $base_ref@$base_sha)."
+  echo "Cumulative native stack comparison: main@$effective_base_sha...$head_sha (actual base $base_ref@$base_sha; trusted main $POLICY_SHA)."
 fi
 
 merge_base_sha=$(trap - ERR; gh api \
