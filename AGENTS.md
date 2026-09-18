@@ -3705,7 +3705,7 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   This deliberately over-gates Linux/cross-platform constraints rather than
   guessing an incomplete tag universe.
 
-  **Native stacks have two different bases.** GitHub
+  **Native stacks bind three separate identities.** GitHub
   [runs ultimate-base CI for every native stack layer](https://docs.github.com/en/pull-requests/get-started/about-stacked-prs#rules-and-ci-enforcement),
   including this `branches: [main]` workflow, while the event/REST
   `pull_request.base` still identifies the immediate parent. Thus a non-main
@@ -3713,9 +3713,15 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   [webhook's `pull_request.stack`](https://docs.github.com/en/pull-requests/reference/stacked-pull-requests-apis-and-webhooks)
   supplies the immutable effective-base anchor: `base.ref == main`,
   `base.sha`, stack `id`/`number`, and candidate `position`/`size`. All are
-  required, and its main SHA must equal the trusted `POLICY_SHA`; disagreement
-  needs a new event. Do not reconstruct a missing event anchor from a live PR,
-  stack, branch, or Actions run's candidate `head_sha`. Ordinary standalone
+  required. Keep the actual immediate PR base snapshot, this recorded stack
+  main snapshot, and the trusted workflow execution generation (`POLICY_SHA`)
+  distinct. The stack anchor may be historical: an immutable compare must prove
+  it equals or is an ancestor of `POLICY_SHA`, and live main must still resolve
+  to `POLICY_SHA`. Unrelated, newer, or unverifiable anchors fail closed.
+  Recheck both lineage and live main with the membership proof before either
+  success path. Do not reconstruct a missing event anchor from a live PR, stack,
+  branch, or Actions run's candidate `head_sha`. Invalid event diagnostics name
+  missing/invalid fields, never their untrusted values. Ordinary standalone
   main-target PRs retain their event base SHA and existing fork support.
 
   `GET /stacks?pull_request=N` must yield exactly one membership across all
@@ -3723,11 +3729,12 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   the event's identity, size and position, contain unique PR numbers and head
   refs, and identify same-repository head/base repository IDs throughout.
   The proof is bounded to 100 members. For the candidate's open prefix, the
-  first open member must target pinned main; each subsequent actual base must
-  equal the preceding member's exact head ref/SHA, and immutable compares must
-  prove that parent commit is an ancestor. Live head refs and main must still
-  resolve to those recorded SHAs. The stack-detail endpoint's `base` contains
-  only a ref, not an immutable main SHA; it is never an anchor source.
+  first open member must target event-pinned main; each subsequent actual base
+  must equal the preceding member's exact head ref/SHA, and immutable compares
+  must prove that parent commit is an ancestor. Live head refs must still resolve
+  to their recorded SHAs; live main is pinned separately to `POLICY_SHA`.
+  The stack-detail endpoint's `base` contains only a ref, not an immutable main
+  SHA; it is never an anchor source.
 
   **Scope is cumulative, not per layer.** Tree comparison uses the merge base of
   event-pinned main and candidate head, so a documentation-only upper layer
@@ -3738,7 +3745,7 @@ side `chan error` — every debugger outcome, failures included, rides the singl
 
   **Partial merges require positive evidence.** A retained merged prefix is
   accepted only when each closed member's PR resource confirms `merged:true`
-  and its immutable `merge_commit_sha` is an ancestor of pinned main. This
+  and its immutable `merge_commit_sha` is an ancestor of event-pinned main. This
   accommodates squash/rebase merges without pretending the old head must be
   retained. Deleted merged-prefix refs need not exist. The open suffix must
   already be actually retargeted to pinned main and then chain normally;
@@ -3866,8 +3873,10 @@ side `chan error` — every debugger outcome, failures included, rides the singl
 
   **Deployment is main-owned.** A proposed policy PR cannot repair an existing
   failing stack run. After review and merge into main, a new authorized
-  verification-label event must select the new trusted policy and fresh event
-  anchor. Rerunning an old run retains its old pinned workflow/policy SHA.
+  verification-label event must select the new trusted policy. That fresh
+  event's stack anchor may remain historical and must pass the lineage proof;
+  a new event does not imply that GitHub refreshes the recorded stack base.
+  Rerunning an old run retains its old pinned workflow/policy SHA.
 
   Relevant runs
   post `pending` before evaluation, serialize per PR, and post failure on

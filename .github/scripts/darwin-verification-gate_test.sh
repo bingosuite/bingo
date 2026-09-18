@@ -137,7 +137,7 @@ if [ -n "${MOCK_STACK_FIXTURE:-}" ]; then
     "repos/bingosuite/bingo/issues/$MOCK_STACK_PR/labels?per_page=100") resource=labels ;;
     repos/bingosuite/bingo/compare/*)
       key=${api_path#repos/bingosuite/bingo/compare/}
-      if [ "$key" != "$MOCK_STACK_MAIN...$MOCK_HEAD_SHA" ]; then
+      if [ "$key" != "$MOCK_STACK_ANCHOR...$MOCK_HEAD_SHA" ]; then
         resource=ancestors
       fi
       ;;
@@ -316,7 +316,10 @@ case_id=0
 
 # Matches the preview's actual #262/#263/stack-264 REST shapes: the detail base
 # has no SHA, compact member repositories carry IDs, and only the event/PR
-# summary supplies the immutable main anchor. Partial merges retain membership.
+# summary supplies the immutable main anchor. After #265 merged, REST still
+# reported 7fd8c48 as that anchor while workflow/main had advanced to 1ce9655.
+# This reconstructs that observed shape, not an uncaptured webhook payload.
+# Partial merges retain membership.
 make_stack_fixture() {
   local event=$1 shape=$2 destination=$3
   jq --arg shape "$shape" --argjson labels "$4" '
@@ -324,6 +327,8 @@ make_stack_fixture() {
     | "7fd8c480c86eb8a615b789ad1ceb70635fe1bdfc" as $old_main
     | (if $shape == "partial" then "8888888888888888888888888888888888888888"
         else $old_main end) as $main
+    | (if $shape | startswith("historical-") then "1ce9655553525b84650659604b2e585a2be20625"
+        else $main end) as $policy
     | {id: 1108771893, name: "bingo", url: "https://api.github.com/repos/bingosuite/bingo"} as $repo
     | {id: 1232070, number: 264, base: {ref: "main"}, open: true, pull_requests: [
         {id: 4563277526, number: 262, state: "open", merged_at: null, draft: false,
@@ -346,7 +351,7 @@ make_stack_fixture() {
           | .pull_requests[1].head.sha = "9999999999999999999999999999999999999999"
           | .pull_requests[1].base = {ref: "main", sha: $main, repo: $repo}
         else . end) as $detail
-    | (if $shape == "bottom" then 1 else 2 end) as $position
+    | (if $shape == "bottom" or $shape == "historical-bottom" then 1 else 2 end) as $position
     | {id: 1232070, number: 264, size: 2, position: $position,
         base: {ref: "main", sha: $main}} as $anchor
     | ($detail.pull_requests[$position - 1]
@@ -363,15 +368,18 @@ make_stack_fixture() {
           key: .head.ref, value: {ref: ("refs/heads/" + .head.ref),
             object: {type: "commit", sha: .head.sha}}
         }) | from_entries
-      | .main = {ref: "refs/heads/main", object: {type: "commit", sha: $main}}) as $refs
+      | .main = {ref: "refs/heads/main", object: {type: "commit", sha: $policy}}) as $refs
     | ($detail.pull_requests
       | map(select(.state == "open" and .base.ref != "main") | {
           key: (.base.sha + "..." + .head.sha),
           value: {status: "ahead", base_commit: {sha: .base.sha}, merge_base_commit: {sha: .base.sha}}
-        }) | from_entries) as $ancestors
+        }) | from_entries
+      | .[$main + "..." + $policy] = {
+          status: (if $main == $policy then "identical" else "ahead" end),
+          base_commit: {sha: $main}, merge_base_commit: {sha: $main}}) as $ancestors
     | {event: ($event | .repository = {id: $repo.id, full_name: "bingosuite/bingo"}
         | .pull_request = $candidate),
-       policy_sha: $main,
+       policy_sha: $policy, anchor_sha: $main,
        initial: {candidate: $candidate, membership: [$membership], detail: $detail,
          refs: $refs, ancestors: $ancestors, merged_prs: {}, failures: [],
          additional_pages: [], labels: $labels}}
@@ -586,7 +594,7 @@ run_case() {
       head: {sha: $head_sha, repo: {full_name: $head_repo}}
     }')
 
-  local stack_fixture='' stack_main=''
+  local stack_fixture='' stack_anchor=''
   if [ -n "$stack_shape" ]; then
     stack_fixture="$work/stack.json"
     if ! make_stack_fixture "$event" "$stack_shape" "$work/stack-original.json" "$labels_json" ||
@@ -597,8 +605,8 @@ run_case() {
     jq '.event' "$stack_fixture" > "$event"
     head_sha=$(jq -r '.event.pull_request.head.sha' "$stack_fixture")
     pr_number=$(jq -r '.event.pull_request.number' "$stack_fixture")
-    stack_main=$(jq -r '.policy_sha' "$stack_fixture")
-    [ -n "$stack_policy_sha" ] || stack_policy_sha=$stack_main
+    stack_anchor=$(jq -r '.anchor_sha' "$stack_fixture")
+    [ -n "$stack_policy_sha" ] || stack_policy_sha=$(jq -r '.policy_sha' "$stack_fixture")
   fi
 
   local permission_json
@@ -625,7 +633,7 @@ run_case() {
     MOCK_STACK_FIXTURE="$stack_fixture" \
     MOCK_STACK_PASS="$work/stack-pass" \
     MOCK_STACK_PR="$pr_number" \
-    MOCK_STACK_MAIN="$stack_main" \
+    MOCK_STACK_ANCHOR="$stack_anchor" \
     MOCK_GH_LOG="$work/gh.log" \
     MOCK_STATE_LOG="$work/states.log" \
     MOCK_STATUS_LOG="$work/statuses.log" \
@@ -742,15 +750,20 @@ run_case() {
     fail "$name: gate consumed untrusted pull request content"
     ok=0
   fi
+  if [ -n "$stack_shape" ] && grep -Fq "$untrusted_token" "$out"; then
+    fail "$name: native diagnostics echoed untrusted pull request content"
+    ok=0
+  fi
 
   if [ -n "$stack_shape" ] && [ "$actual_states" = "pending,success" ]; then
     if [ "$(cat "$work/stack-pass")" != "2" ] ||
       [ "$(grep -Fc 'api repos/bingosuite/bingo/stacks/264' "$work/gh.log")" != "2" ] ||
-      [ "$(grep -Fc 'api repos/bingosuite/bingo/git/ref/heads/main' "$work/gh.log")" != "2" ]; then
+      [ "$(grep -Fc 'api repos/bingosuite/bingo/git/ref/heads/main' "$work/gh.log")" != "2" ] ||
+      [ "$(grep -Fxc "api repos/bingosuite/bingo/compare/$stack_anchor...$stack_policy_sha" "$work/gh.log")" != "2" ]; then
       fail "$name: successful native attestation did not revalidate its proof"
       ok=0
     fi
-    if ! grep -Fq "compare/$stack_main...$head_sha --jq .merge_base_commit.sha" "$work/gh.log"; then
+    if ! grep -Fq "compare/$stack_anchor...$head_sha --jq .merge_base_commit.sha" "$work/gh.log"; then
       fail "$name: native diff did not use the immutable cumulative main comparison"
       ok=0
     fi
@@ -936,7 +949,7 @@ run_case "a delayed verified label cannot green a retargeted pull request" \
 # Native stacks: immutable main anchor, ordered proof, cumulative scope
 # ---------------------------------------------------------------------------
 
-run_case "the real upper-layer shape accepts authorized verification against main" \
+run_case "a native upper layer accepts verification when the anchor equals trusted main" \
   stack=upper action=labeled has_label=true \
   expect_states='pending,success' expect_decision=success expect_label_query=true \
   expect_output='Cumulative native stack comparison: main@7fd8c480c86eb8a615b789ad1ceb70635fe1bdfc'
@@ -944,6 +957,30 @@ run_case "the real upper-layer shape accepts authorized verification against mai
 run_case "a native bottom layer retains main-target verification" \
   stack=bottom action=labeled has_label=true \
   expect_states='pending,success' expect_decision=success
+
+for layer in bottom upper; do
+  run_case "the observed historical $layer anchor permits authorized verification" \
+    stack="historical-$layer" action=labeled has_label=true \
+    expect_states='pending,success' expect_decision=success expect_label_query=true \
+    expect_output='trusted main 1ce9655553525b84650659604b2e585a2be20625' \
+    gh_missing='compare/1ce9655553525b84650659604b2e585a2be20625...4b6c7c520d5a088dd6a6c8d5117c11c4dfb00205'
+
+  run_case "a historical $layer documentation-only stack needs no native label" \
+    stack="historical-$layer" action=opened head_entries='["README.md"]' \
+    expect_states='pending,success' expect_decision=success expect_label_query=false
+
+  run_case "a historical $layer stack cannot borrow a missing event anchor from live main" \
+    stack="historical-$layer" action=labeled has_label=true \
+    stack_transform='del(.event.pull_request.stack.base.sha)' \
+    expect_exit=1 expect_states=failure expect_decision=failure \
+    expect_output='pull_request.stack.base.sha: missing' gh_missing='/stacks'
+done
+
+run_case "historical-main scope retains native changes inherited by a documentation-only upper layer" \
+  stack=historical-upper action=opened head_entries='["internal/debugger/engine.go","README.md"]' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_description='Darwin E2E verification is required for this head.' \
+  gh_expect='compare/7fd8c480c86eb8a615b789ad1ceb70635fe1bdfc...ed3f7aa116b5ee0111dc76c66905cf8c76f7fbb2 --jq .merge_base_commit.sha'
 
 run_case "a proven merged prefix permits a freshly retargeted open suffix" \
   stack=partial action=labeled has_label=true \
@@ -971,7 +1008,7 @@ for field in id number size position base; do
     stack=upper action=labeled has_label=true \
     stack_transform="del(.event.pull_request.stack.$field)" \
     expect_exit=1 expect_states=failure expect_decision=failure \
-    gh_missing='/stacks'
+    expect_output="pull_request.stack.$field" gh_missing='/stacks'
 done
 
 for mutation in \
@@ -1000,12 +1037,115 @@ done
 run_case "native event refs also have to satisfy Git ref syntax" \
   stack=upper action=labeled has_label=true \
   stack_transform='.event.pull_request.head.ref = "PRTEXTPOISON9f3a/../escape"' \
-  expect_exit=128 expect_states=failure expect_decision=failure gh_missing='/stacks'
-
-run_case "a live main snapshot cannot replace an event anchor from a different policy generation" \
-  stack=upper action=labeled has_label=true stack_policy_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
   expect_exit=1 expect_states=failure expect_decision=failure \
-  expect_output='refusing to infer it from live metadata' gh_missing='/stacks'
+  expect_output='pull_request.head.ref: invalid Git ref syntax' gh_missing='/stacks'
+
+run_case "a different policy generation needs positive lineage evidence, not a live replacement anchor" \
+  stack=upper action=labeled has_label=true stack_policy_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_output='Native stack ancestry API unavailable' gh_missing='/git/trees/'
+
+for diagnostic in \
+  'del(.event.repository.id)|repository.id: missing' \
+  '.event.repository.full_name = "PRTEXTPOISON9f3a"|repository.full_name: invalid' \
+  '.event.pull_request.head.repo.id = 999|pull_request.head.repo.id: invalid' \
+  '.event.pull_request.base.repo.full_name = "PRTEXTPOISON9f3a"|pull_request.base.repo.full_name: invalid' \
+  '.event.pull_request.head.ref = "PRTEXTPOISON9f3a;bad"|pull_request.head.ref: invalid' \
+  '.event.pull_request.base.ref = "PRTEXTPOISON9f3a?bad"|pull_request.base.ref: invalid' \
+  '.event.pull_request.stack = "PRTEXTPOISON9f3a"|pull_request.stack: invalid' \
+  'del(.event.pull_request.stack.id)|pull_request.stack.id: missing' \
+  '.event.pull_request.stack.number = "PRTEXTPOISON9f3a"|pull_request.stack.number: invalid' \
+  '.event.pull_request.stack.size = 101|pull_request.stack.size: invalid' \
+  '.event.pull_request.stack.position = 3|pull_request.stack.position: invalid' \
+  '.event.pull_request.stack.base.ref = "PRTEXTPOISON9f3a"|pull_request.stack.base.ref: invalid' \
+  'del(.event.pull_request.stack.base.sha)|pull_request.stack.base.sha: missing' \
+  '.event.pull_request.stack.base.sha = "PRTEXTPOISON9f3a"|pull_request.stack.base.sha: invalid'; do
+  run_case "native event diagnoses ${diagnostic#*|} without echoing its value" \
+    stack=historical-upper action=labeled has_label=true \
+    stack_transform="${diagnostic%%|*}" \
+    expect_exit=1 expect_states=failure expect_decision=failure \
+    expect_output="${diagnostic#*|}" gh_missing='/stacks'
+done
+
+run_case "native event diagnoses malformed trusted policy SHAs before API interpolation" \
+  stack=historical-upper action=labeled has_label=true stack_policy_sha=PRTEXTPOISON9f3a \
+  expect_exit=1 expect_states=failure expect_decision=failure \
+  expect_output='POLICY_SHA: invalid' gh_missing='/stacks'
+
+for phase in initial next; do
+  for mutation in \
+    '.status = "diverged" | .merge_base_commit.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+    '.status = "behind" | .merge_base_commit.sha = "1ce9655553525b84650659604b2e585a2be20625"' \
+    '.status = "identical"' \
+    'del(.status)' \
+    '.base_commit.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+    'del(.base_commit)' \
+    '.merge_base_commit.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+    'del(.merge_base_commit)' \
+    '{}' \
+    '[., .]' \
+    '"PRTEXTPOISON9f3a"'; do
+    run_case "historical anchor $phase lineage must be proven: $mutation" \
+      stack=historical-upper action=labeled has_label=true \
+      stack_transform=".$phase.ancestors[.anchor_sha + \"...\" + .policy_sha] |= ($mutation)" \
+      expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+      expect_output='commit ancestry is not proven'
+  done
+
+  for head_entries in '["internal/debugger/engine.go"]' '["README.md"]'; do
+    run_case "historical anchor $phase lineage API failure blocks $head_entries success" \
+      stack=historical-upper action=labeled has_label=true head_entries="$head_entries" \
+      stack_transform=".$phase.failures = [\"repos/bingosuite/bingo/compare/\" + .anchor_sha + \"...\" + .policy_sha]" \
+      expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+      expect_output='Native stack ancestry API unavailable'
+  done
+done
+
+run_case "an equal main anchor requires an identical immutable comparison" \
+  stack=upper action=labeled has_label=true \
+  stack_transform='.initial.ancestors[.anchor_sha + "..." + .policy_sha].status = "ahead"' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_output='commit ancestry is not proven'
+
+run_case "documentation-only success rechecks historical anchor lineage" \
+  stack=historical-upper action=opened head_entries='["README.md"]' \
+  stack_transform='.next.ancestors[.anchor_sha + "..." + .policy_sha].status = "diverged"' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_output='commit ancestry is not proven'
+
+for head_entries in '["internal/debugger/engine.go"]' '["README.md"]'; do
+  for mutation in \
+    '.next.refs.main.object.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+    '.next.candidate.stack.base.sha = "1ce9655553525b84650659604b2e585a2be20625"' \
+    '.next.detail.pull_requests[0].number = 260 | .next.membership[0].pull_requests[0].number = 260' \
+    '.next.refs["xsachax-darwin-attach-restoration"].object.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+    '.next.refs["xsachax-darwin-port-cleanup"].object.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+    '.next.detail.pull_requests[0].base.sha = "1ce9655553525b84650659604b2e585a2be20625"' \
+    '.next.candidate.base.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'; do
+    run_case "historical $head_entries success rejects a moved generation: $mutation" \
+      stack=historical-upper action=labeled has_label=true head_entries="$head_entries" \
+      stack_transform="$mutation" \
+      expect_exit=1 expect_states='pending,failure' expect_decision=failure
+  done
+done
+
+for permission in write maintain; do
+  run_case "historical-main native verification accepts an authorized $permission collaborator" \
+    stack=historical-upper action=labeled has_label=true \
+    perm_permission="$permission" perm_role="$permission" \
+    expect_states='pending,success' expect_decision=success expect_label_query=true
+done
+
+for rejection in actor_type=Bot perm_permission=read perm_login=stranger perm_status=1 has_label=false; do
+  run_case "historical-main native verification preserves authorization rejection: $rejection" \
+    stack=historical-upper action=labeled has_label=true "$rejection" \
+    expect_exit=1 expect_states='pending,failure' expect_decision=failure
+done
+
+run_case "historical-main verification rechecks label presence after its final proof" \
+  stack=historical-upper action=labeled has_label=true stack_transform='.next.labels = []' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_description='label is not currently present'
 
 for field in head base; do
   run_case "an invalid $field object ID cannot reach even the status API" \
