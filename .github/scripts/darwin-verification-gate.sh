@@ -21,11 +21,12 @@ readonly darwin_native_exts='swigcxx|swig|f90|for|syso|cpp|cxx|hpp|hxx|cc|hh|sx|
 readonly darwin_native_regex="^(internal/debugger/.*|test/integration/.*|justfile|entitlements\\.plist|go\\.(mod|sum)|(.*/)?[^/]*_(darwin|arm64)(_[^/.]+)*\\.(go|$darwin_native_exts)|(.*/)?[^/]*\\.($darwin_native_exts))\$"
 
 event_action=$(jq -er '.action' "$GITHUB_EVENT_PATH")
-pr_number=$(jq -er '.pull_request.number | select(type == "number" and . > 0 and . == floor) | tostring' "$GITHUB_EVENT_PATH")
-head_sha=$(jq -er '.pull_request.head.sha | select(test("^[0-9a-fA-F]{40,64}$"))' "$GITHUB_EVENT_PATH")
-base_sha=$(jq -er '.pull_request.base.sha | select(test("^[0-9a-fA-F]{40,64}$"))' "$GITHUB_EVENT_PATH")
+pr_number=$(jq -er '.pull_request.number | select(type == "number" and . > 0 and . == floor and . <= 9007199254740991) | tostring' "$GITHUB_EVENT_PATH")
+head_sha=$(jq -er '.pull_request.head.sha | select(type == "string" and test("^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$"))' "$GITHUB_EVENT_PATH")
+base_sha=$(jq -er '.pull_request.base.sha | select(type == "string" and test("^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$"))' "$GITHUB_EVENT_PATH")
 base_ref=$(jq -er '.pull_request.base.ref // ""' "$GITHUB_EVENT_PATH")
 head_repository=$(jq -er '.pull_request.head.repo.full_name // ""' "$GITHUB_EVENT_PATH")
+event_stack=$(jq -c '.pull_request.stack' "$GITHUB_EVENT_PATH")
 event_label=$(jq -er '.label.name // ""' "$GITHUB_EVENT_PATH")
 actor_login=$(jq -er '.sender.login // ""' "$GITHUB_EVENT_PATH")
 actor_type=$(jq -er '.sender.type // ""' "$GITHUB_EVENT_PATH")
@@ -33,6 +34,9 @@ base_changed=$(jq -r '(.changes.base // null) != null' "$GITHUB_EVENT_PATH")
 run_url="${GITHUB_SERVER_URL:-https://github.com}/$GITHUB_REPOSITORY/actions/runs/${GITHUB_RUN_ID:-0}"
 final_status_posted=false
 decision_file=${DARWIN_GATE_DECISION_FILE:-}
+effective_base_sha=$base_sha
+stacked=false
+stack_proof_initialized=false
 
 # --- ERR-trap guarded region -------------------------------------------------
 #
@@ -84,6 +88,212 @@ fail_closed() {
   exit "$exit_code"
 }
 
+# The webhook, not a later REST read, owns the effective-base generation.
+# workflow_sha independently pins the main policy being executed; disagreement
+# requires a new event rather than silently evaluating a different main.
+require_native_stack_event() {
+  if ! jq -e --arg repository "$GITHUB_REPOSITORY" \
+    --arg policy_sha "${POLICY_SHA:-}" '
+      def positive:
+        type == "number" and . > 0 and . == floor and . <= 9007199254740991;
+      def oid:
+        type == "string" and test("^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$");
+      def branch:
+        type == "string" and test("^[A-Za-z0-9._/-]+$");
+      .repository as $repo
+      | .pull_request as $pr
+      | $pr.stack as $stack
+      | $repo.full_name == $repository
+        and ($repo.id | positive)
+        and ($pr.base.repo.id == $repo.id)
+        and ($pr.head.repo.id == $repo.id)
+        and ($pr.base.repo.full_name == $repository)
+        and ($pr.head.repo.full_name == $repository)
+        and ($pr.head.ref | branch)
+        and ($pr.base.ref | branch)
+        and ($pr.head.sha | oid)
+        and ($pr.base.sha | oid)
+        and ($stack | type == "object")
+        and ($stack.id | positive)
+        and ($stack.number | positive)
+        and ($stack.size | positive)
+        and ($stack.size <= 100)
+        and ($stack.position | positive)
+        and ($stack.position <= $stack.size)
+        and ($stack.base.ref == "main")
+        and ($stack.base.sha | oid)
+        and ($stack.base.sha == $policy_sha)
+    ' "$GITHUB_EVENT_PATH" >/dev/null; then
+    echo "Native stack event lacks a same-repository, trusted-main generation; refusing to infer it from live metadata." >&2
+    return 1
+  fi
+
+  event_stack=$(trap - ERR; jq -c '
+    .pull_request.stack | {id, number, size, position, base: {ref: .base.ref, sha: .base.sha}}
+  ' "$GITHUB_EVENT_PATH")
+  effective_base_sha=$(trap - ERR; jq -r '.pull_request.stack.base.sha' "$GITHUB_EVENT_PATH")
+  stack_number=$(trap - ERR; jq -r '.pull_request.stack.number' "$GITHUB_EVENT_PATH")
+  stack_repository_id=$(trap - ERR; jq -r '.repository.id' "$GITHUB_EVENT_PATH")
+  event_head_ref=$(trap - ERR; jq -r '.pull_request.head.ref' "$GITHUB_EVENT_PATH")
+  git check-ref-format --branch "$base_ref" >/dev/null
+  git check-ref-format --branch "$event_head_ref" >/dev/null
+  stacked=true
+}
+
+require_stack_ref() {
+  local ref=$1 sha=$2
+
+  git check-ref-format --branch "$ref" >/dev/null
+  gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/$ref" > "$stack_ref_json"
+  if ! jq -se --arg ref "refs/heads/$ref" --arg sha "$sha" '
+    length == 1 and (.[0]
+      | .ref == $ref and .object.type == "commit" and .object.sha == $sha)
+  ' "$stack_ref_json" >/dev/null; then
+    echo "Native stack ref no longer names the recorded commit: $ref@$sha" >&2
+    return 1
+  fi
+}
+
+require_stack_ancestor() {
+  local ancestor=$1 descendant=$2
+
+  gh api "repos/$GITHUB_REPOSITORY/compare/$ancestor...$descendant" > "$stack_ancestry_json"
+  if ! jq -se --arg ancestor "$ancestor" '
+    length == 1 and (.[0]
+      | .base_commit.sha == $ancestor
+        and .merge_base_commit.sha == $ancestor
+        and (.status == "ahead" or .status == "identical"))
+  ' "$stack_ancestry_json" >/dev/null; then
+    echo "Native stack commit ancestry is not proven: $ancestor -> $descendant" >&2
+    return 1
+  fi
+}
+
+# Stack summaries in events contain no historical member list. Bind their
+# identity/size/position to the authoritative ordered list, then retain that
+# structural proof across evaluation. Ref reads never replace event SHAs.
+capture_native_stack_proof() {
+  local destination=$1
+  local number state head_ref member_head_sha parent_ref parent_sha merge_sha
+  local expected_ref=$required_base_ref expected_sha=$effective_base_sha
+
+  gh api --paginate "repos/$GITHUB_REPOSITORY/stacks?pull_request=$pr_number&per_page=100" \
+    > "$stack_list_json"
+  if ! jq -se '
+    select(length > 0 and all(.[]; type == "array"))
+    | add | select(length == 1) | .[0]
+  ' "$stack_list_json" > "$stack_membership_json"; then
+    echo "Native stack membership is missing, ambiguous, or malformed." >&2
+    return 1
+  fi
+  gh api "repos/$GITHUB_REPOSITORY/stacks/$stack_number" > "$stack_detail_json"
+
+  if ! jq -se --argjson anchor "$event_stack" \
+    --argjson repository_id "$stack_repository_id" --argjson number "$pr_number" \
+    --arg head_ref "$event_head_ref" --arg head_sha "$head_sha" \
+    --arg base_ref "$base_ref" --arg base_sha "$base_sha" \
+    --slurpfile membership "$stack_membership_json" '
+      def positive:
+        type == "number" and . > 0 and . == floor and . <= 9007199254740991;
+      def oid:
+        type == "string" and test("^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$");
+      def branch:
+        type == "string" and test("^[A-Za-z0-9._/-]+$");
+      def summary:
+        {id, number, open, base: {ref: .base.ref}, pull_requests:
+          [.pull_requests[] | {number, state, merged_at, head: (.head | {ref, sha})}]};
+      if length == 1 then .[0] else error("ambiguous stack detail response") end
+      | type == "object"
+      and .id == $anchor.id and .number == $anchor.number
+      and .open == true and .base.ref == "main"
+      and (.pull_requests | type == "array")
+      and (.pull_requests | length == $anchor.size)
+      and ([.pull_requests[].number] | unique | length == $anchor.size)
+      and ([.pull_requests[].head.ref] | unique | length == $anchor.size)
+      and all(.pull_requests[];
+        (.number | positive)
+        and (.head.ref | branch) and .head.ref != "main"
+        and (.base.ref | branch)
+        and (.head.sha | oid) and (.base.sha | oid)
+        and .head.repo.id == $repository_id and .base.repo.id == $repository_id
+        and (
+          (.state == "open" and .merged_at == null)
+          or (.state == "closed" and (.merged_at | type == "string" and length > 0))
+        ))
+      and ([.pull_requests[].state] | map(if . == "closed" then "m" else "o" end)
+        | join("") | test("^m*o+$"))
+      and (.pull_requests[$anchor.position - 1]
+        | .number == $number and .state == "open"
+          and .head.ref == $head_ref and .head.sha == $head_sha
+          and .base.ref == $base_ref and .base.sha == $base_sha)
+      and ($membership | length == 1)
+      and ($membership[0] | type == "object")
+      and (($membership[0] | summary) == summary)
+    ' "$stack_detail_json" >/dev/null; then
+    echo "Native stack identity, ordered membership, or repository evidence disagrees with the event." >&2
+    return 1
+  fi
+
+  jq -r --argjson anchor "$event_stack" '
+    .pull_requests[:$anchor.position][]
+    | [.number, .state, .head.ref, .head.sha, .base.ref, .base.sha] | @tsv
+  ' "$stack_detail_json" > "$stack_rows"
+  : > "$stack_merged_json"
+
+  while IFS=$'\t' read -r number state head_ref member_head_sha parent_ref parent_sha; do
+    git check-ref-format --branch "$head_ref" >/dev/null
+    git check-ref-format --branch "$parent_ref" >/dev/null
+    if [ "$state" = "closed" ]; then
+      # Squash/rebase merges need not retain the old head as an ancestor. The
+      # actual merge commit must be in the pinned main, and deleted merged
+      # branch refs are not evidence against an otherwise intact native stack.
+      gh api "repos/$GITHUB_REPOSITORY/pulls/$number" > "$stack_merged_pr_json"
+      if ! jq -se --argjson number "$number" --argjson repository_id "$stack_repository_id" \
+        --arg head_ref "$head_ref" --arg head_sha "$member_head_sha" \
+        --arg base_ref "$parent_ref" --arg base_sha "$parent_sha" '
+          length == 1 and (.[0]
+            | .number == $number and .state == "closed" and .merged == true
+              and .head.repo.id == $repository_id and .base.repo.id == $repository_id
+              and .head.ref == $head_ref and .head.sha == $head_sha
+              and .base.ref == $base_ref and .base.sha == $base_sha
+              and (.merge_commit_sha | type == "string"
+                and test("^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")))
+        ' "$stack_merged_pr_json" >/dev/null; then
+        echo "Native stack prefix does not prove a completed same-repository merge." >&2
+        return 1
+      fi
+      merge_sha=$(trap - ERR; jq -r '.merge_commit_sha' "$stack_merged_pr_json")
+      require_stack_ancestor "$merge_sha" "$effective_base_sha"
+      jq -c '{number, merge_commit_sha}' "$stack_merged_pr_json" >> "$stack_merged_json"
+      continue
+    fi
+
+    if [ "$parent_ref" != "$expected_ref" ] || [ "$parent_sha" != "$expected_sha" ]; then
+      echo "Native stack parent chain is moved or not yet retargeted after a partial merge." >&2
+      return 1
+    fi
+    if [ "$expected_ref" != "$required_base_ref" ]; then
+      require_stack_ancestor "$expected_sha" "$member_head_sha"
+    fi
+    require_stack_ref "$head_ref" "$member_head_sha"
+    expected_ref=$head_ref
+    expected_sha=$member_head_sha
+  done < "$stack_rows"
+
+  # Main may have advanced beyond the stack's fork point: the cumulative diff
+  # uses its merge base, just like an ordinary PR. Its tip must still equal the
+  # event anchor, not an opportunistic live replacement for that anchor.
+  require_stack_ref "$required_base_ref" "$effective_base_sha"
+  jq -Sc --slurpfile merged "$stack_merged_json" '
+    {id, number, open, base: {ref: .base.ref}, merged_prefix: $merged,
+      pull_requests: [.pull_requests[] | {
+        number, state, merged_at,
+        head: {ref: .head.ref, sha: .head.sha, repository_id: .head.repo.id},
+        base: {ref: .base.ref, sha: .base.sha, repository_id: .base.repo.id}
+      }]}
+  ' "$stack_detail_json" > "$destination"
+}
+
 # Commit statuses are SHA-global: the same head SHA can belong to several pull
 # requests, and a queued event can reach the runner long after the pull request
 # it described was force-pushed, retargeted or closed. Publishing success is the
@@ -102,15 +312,24 @@ require_current_generation() {
   ' "$live_pr_json")
 
   live_ok=$(trap - ERR; jq -r \
-    --arg base_ref "$required_base_ref" \
+    --arg base_ref "$base_ref" \
     --arg base_sha "$base_sha" \
     --arg head_sha "$head_sha" \
-    --arg head_repository "$head_repository" '
+    --arg head_repository "$head_repository" \
+    --arg stacked "$stacked" --argjson stack "$event_stack" \
+    --argjson number "$pr_number" --argjson repository_id "${stack_repository_id:-null}" \
+    --arg head_ref "${event_head_ref:-}" '
       ((.state // "") == "open")
       and ((.base.ref // "") == $base_ref)
       and ((.base.sha // "") == $base_sha)
       and ((.head.sha // "") == $head_sha)
       and ((.head.repo.full_name // "") == $head_repository)
+      and ($stacked != "true" or (
+        (.stack | {id, number, size, position, base: {ref: .base.ref, sha: .base.sha}}) == $stack
+        and .number == $number and .head.ref == $head_ref
+        and .head.repo.id == $repository_id and .base.repo.id == $repository_id
+        and .base.repo.full_name == $head_repository
+      ))
     ' "$live_pr_json")
 
   if [ "$live_ok" != "true" ]; then
@@ -120,7 +339,36 @@ require_current_generation() {
     exit 1
   fi
 
+  if [ "$stacked" = "true" ]; then
+    capture_native_stack_proof "$stack_current_proof"
+    if [ "$stack_proof_initialized" = "true" ]; then
+      if ! cmp -s "$stack_initial_proof" "$stack_current_proof"; then
+        echo "Native stack generation moved while the Darwin gate was evaluating." >&2
+        return 1
+      fi
+    else
+      cp "$stack_current_proof" "$stack_initial_proof"
+      stack_proof_initialized=true
+    fi
+    if [ "${1:-}" = "labeled" ]; then
+      require_live_label
+    fi
+  fi
+
   echo "Live pull request generation confirmed: $live_summary"
+}
+
+require_live_label() {
+  local live_labels
+  live_labels=$(trap - ERR; gh api --paginate \
+    "repos/$GITHUB_REPOSITORY/issues/$pr_number/labels?per_page=100" \
+    --jq '.[].name')
+  if ! grep -Fxq "$verified_label" <<< "$live_labels"; then
+    post_status failure 'Darwin verification label is not currently present.'
+    echo "::error title=Darwin E2E verification required::The '$verified_label' label is not currently present on this PR."
+    trap - ERR
+    exit 1
+  fi
 }
 
 deny_label() {
@@ -274,10 +522,11 @@ if [ "$event_action" = "edited" ] && [ "$base_changed" != "true" ]; then
   exit 0
 fi
 
-# The workflow trigger is already restricted to `main`, but statuses are
-# SHA-global and this script is fetched by SHA, so it re-asserts the scope
-# itself rather than trusting the trigger it was invoked from.
-if [ "$base_ref" != "$required_base_ref" ]; then
+# Native stack CI targets the ultimate base even when the event's actual base
+# is its immediate parent. A standalone alternate base remains out of scope.
+if [ "$event_stack" != "null" ]; then
+  require_native_stack_event
+elif [ "$base_ref" != "$required_base_ref" ]; then
   echo "This gate only governs pull requests targeting '$required_base_ref'; refusing to decide for base '$base_ref'." >&2
   false
 fi
@@ -292,7 +541,17 @@ blob_scan=$(trap - ERR; mktemp)
 bom_probe=$(trap - ERR; mktemp)
 live_pr_json=$(trap - ERR; mktemp)
 permission_json=$(trap - ERR; mktemp)
-trap 'rm -f "$base_tree_json" "$head_tree_json" "$changed_paths_json" "$go_blobs_tsv" "$blob_json" "$blob_raw" "$blob_scan" "$bom_probe" "$live_pr_json" "$permission_json"' EXIT
+stack_list_json=$(trap - ERR; mktemp)
+stack_membership_json=$(trap - ERR; mktemp)
+stack_detail_json=$(trap - ERR; mktemp)
+stack_ref_json=$(trap - ERR; mktemp)
+stack_ancestry_json=$(trap - ERR; mktemp)
+stack_rows=$(trap - ERR; mktemp)
+stack_merged_json=$(trap - ERR; mktemp)
+stack_merged_pr_json=$(trap - ERR; mktemp)
+stack_initial_proof=$(trap - ERR; mktemp)
+stack_current_proof=$(trap - ERR; mktemp)
+trap 'rm -f "$base_tree_json" "$head_tree_json" "$changed_paths_json" "$go_blobs_tsv" "$blob_json" "$blob_raw" "$blob_scan" "$bom_probe" "$live_pr_json" "$permission_json" "$stack_list_json" "$stack_membership_json" "$stack_detail_json" "$stack_ref_json" "$stack_ancestry_json" "$stack_rows" "$stack_merged_json" "$stack_merged_pr_json" "$stack_initial_proof" "$stack_current_proof"' EXIT
 
 post_status pending 'Evaluating Darwin verification policy.'
 
@@ -316,8 +575,13 @@ if [ "$event_action" = "synchronize" ] ||
   fi
 fi
 
+if [ "$stacked" = "true" ]; then
+  require_current_generation
+  echo "Cumulative native stack comparison: main@$effective_base_sha...$head_sha (actual base $base_ref@$base_sha)."
+fi
+
 merge_base_sha=$(trap - ERR; gh api \
-  "repos/$GITHUB_REPOSITORY/compare/$base_sha...$head_sha" \
+  "repos/$GITHUB_REPOSITORY/compare/$effective_base_sha...$head_sha" \
   --jq '.merge_base_commit.sha')
 case "$merge_base_sha" in
   '' | *[!0-9a-fA-F]*)
@@ -493,9 +757,9 @@ echo
 case "$event_action" in
   synchronize | reopened | edited)
     if [ "$label_cleanup" = "failed" ]; then
-      echo "::error title=Darwin E2E re-verification required::The stale '$verified_label' label could not be removed. Using the trusted base branch's justfile, run the e2e-darwin recipe against this head on Apple Silicon; then remove or toggle the stale label and re-add it."
+      echo "::error title=Darwin E2E re-verification required::The stale '$verified_label' label could not be removed. Using the trusted main branch's justfile, run the e2e-darwin recipe against this head on Apple Silicon; then remove or toggle the stale label and re-add it."
     else
-      echo "::error title=Darwin E2E re-verification required::Using the trusted base branch's justfile, run the e2e-darwin recipe against this head on Apple Silicon, review any PR changes to the recipe, confirm it passes, then add the '$verified_label' label."
+      echo "::error title=Darwin E2E re-verification required::Using the trusted main branch's justfile, run the e2e-darwin recipe against this head on Apple Silicon, review any PR changes to the recipe, confirm it passes, then add the '$verified_label' label."
     fi
     post_status failure 'New commits or reopening require Darwin re-verification.'
     trap - ERR
@@ -503,7 +767,7 @@ case "$event_action" in
     ;;
   opened)
     post_status failure 'Darwin E2E verification is required for this head.'
-    echo "::error title=Darwin E2E verification required::Using the trusted base branch's justfile, run the e2e-darwin recipe against this head on Apple Silicon, review any PR changes to the recipe, confirm it passes, then add the '$verified_label' label."
+    echo "::error title=Darwin E2E verification required::Using the trusted main branch's justfile, run the e2e-darwin recipe against this head on Apple Silicon, review any PR changes to the recipe, confirm it passes, then add the '$verified_label' label."
     trap - ERR
     exit 1
     ;;
@@ -519,18 +783,9 @@ case "$event_action" in
       exit 1
     fi
 
-    live_labels=$(trap - ERR; gh api --paginate \
-      "repos/$GITHUB_REPOSITORY/issues/$pr_number/labels?per_page=100" \
-      --jq '.[].name')
-    if ! grep -Fxq "$verified_label" <<< "$live_labels"; then
-      post_status failure 'Darwin verification label is not currently present.'
-      echo "::error title=Darwin E2E verification required::The '$verified_label' label is not currently present on this PR."
-      trap - ERR
-      exit 1
-    fi
-
+    require_live_label
     require_authorized_labeler
-    require_current_generation
+    require_current_generation labeled
     post_status success 'Darwin E2E verified for this head SHA.'
     echo "'$verified_label' label added by $actor_login; darwin backend verified locally for $head_sha."
     exit 0

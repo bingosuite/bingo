@@ -2,11 +2,12 @@ name: Darwin verification gate
 
 # This workflow is the trusted evaluation path for darwin/arm64 changes that
 # cannot execute on GitHub-hosted runners. `pull_request_target` loads this YAML
-# from the base branch. It performs NO repository checkout at all: it fetches the
+# from the repository's trusted default branch, main. It performs NO repository
+# checkout at all: it fetches the
 # single policy script from `github.workflow_sha` through the contents API, so
 # there is no working tree that could ever hold PR head or merge content. It then
 # posts the "Darwin E2E verified" status explicitly to the PR head SHA. The
-# workflow's own check belongs to the base SHA and is not the enforcement signal.
+# workflow's own check is not a PR-head attestation.
 #
 # ADVISORY STATUS, NOT AN AUTHENTICATED ONE. Every workflow in this repository
 # runs as the same `github-actions[bot]` identity, and the repository's default
@@ -18,17 +19,22 @@ name: Darwin verification gate
 # enforcement needs either a distinct trusted GitHub App as the status source or
 # native required-review/CODEOWNERS approval, which IS attributable to a human.
 #
-# The trigger is restricted to `main` because the policy is fetched by SHA and
-# statuses are SHA-global: without the filter, a writer could open a pull request
-# against an unprotected branch they control and have this privileged job execute
-# a policy script of their choosing. The policy re-asserts the same scope itself
-# as defense in depth, but under this filter that check is unreachable.
+# The main-only filter constrains attestation scope; it does NOT imply that the
+# event's actual base is main. GitHub runs ultimate-base CI for every native
+# stack layer while pull_request.base still names the immediate parent:
+# https://docs.github.com/en/pull-requests/get-started/about-stacked-prs
+# The policy accepts that shape only with an immutable event stack.base SHA
+# matching POLICY_SHA, authoritative same-repository ordered membership, and
+# checked refs/ancestry. It revalidates that proof before success and evaluates
+# the cumulative main-to-head diff, never only the immediate-parent diff.
+# Missing event evidence, standalone alternate bases, and other stack roots fail
+# closed. Never broaden this filter or load code from an event/stack-owned ref.
 #
 # A consequence of the filter: this status asserts "verified relative to `main`"
 # about a HEAD COMMIT, not about a pull request. A success is therefore inherited
-# by any other pull request sharing that head SHA — including one on a different
-# base whose diff was never evaluated, since the gate never runs there. Do not
-# consume this context as verification on any base other than `main`.
+# by any other pull request sharing that head SHA — including an unrelated base
+# whose diff was never evaluated. Native stacks must be proven rooted in main;
+# do not consume this context as verification on an unrelated base.
 #
 # A separate unprivileged `pull_request` workflow runs the proposed HEAD policy
 # tests. Those tests are useful review feedback but are not enforcement because
@@ -65,12 +71,11 @@ jobs:
     steps:
       # No checkout: the only code this privileged job runs is the policy script
       # read from `github.workflow_sha` — the commit this very workflow file was
-      # loaded from, which for `pull_request_target` is a base-branch commit and
-      # which a pull request cannot influence. The event's `base.sha` is NOT used
-      # as the policy ref: it is whatever branch the PR targets, and only the
-      # `branches: [main]` filter plus this trusted ref keep an attacker-chosen
-      # base out of the privileged execution path. Fetching through the contents
-      # API keeps the workspace empty, so head or merge content never hits disk.
+      # loaded from. The event's actual base and effective stack base are data,
+      # NEVER policy-code refs. Fetching through the contents API keeps the
+      # workspace empty, so head or merge content never hits disk. A proposed
+      # fix is not deployed until it lands on main and a new event selects it;
+      # rerunning an old run retains that run's pinned policy.
       - name: Evaluate and publish Darwin verification
         env:
           GH_TOKEN: ${{ github.token }}

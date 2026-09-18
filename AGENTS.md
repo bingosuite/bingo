@@ -3635,7 +3635,7 @@ side `chan error` — every debugger outcome, failures included, rides the singl
 - **Darwin verification gate**
   ([.github/workflows/darwin-verification-gate.yml](.github/workflows/darwin-verification-gate.yml)):
   because the darwin backend can't be executed in CI, this human-in-the-loop
-  check requires a maintainer to run the **trusted base branch's**
+  check requires a maintainer to run the **trusted main branch's**
   `e2e-darwin` recipe against the PR head on Apple Silicon, review any PR changes
   to that recipe, and add the `darwin-e2e-verified` label. The conservative
   coverage floor includes all `internal/debugger/` and `test/integration/`
@@ -3673,22 +3673,22 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   **Trigger scope and policy source are both pinned to trusted refs.** The
   trigger is filtered to `branches: [main]`, and the policy script is fetched at
   **`${{ github.workflow_sha }}`** — the SHA of the commit the running workflow
-  file came from — *not* at `github.event.pull_request.base.sha`. Without both,
-  a same-repo writer could push an unprotected branch carrying a malicious
-  `.github/scripts/darwin-verification-gate.sh`, open a PR against it, and have
-  that attacker-authored policy executed with `pull-requests: write` +
-  `statuses: write`. Never reintroduce an event-derived policy ref, and never
-  widen the branch filter.
+  file came from on the repository's trusted default branch, main — *not* at
+  `github.event.pull_request.base.sha` or any stack-provided ref. The filter
+  constrains attestation scope; the workflow SHA independently selects trusted
+  executable policy. Never reintroduce an event-derived policy-code ref, and
+  never widen the branch filter.
 
-  The `pull_request_target` workflow and its own job run against the
-  base SHA, so that job is deliberately NOT the merge gate. The trusted workflow
+  The `pull_request_target` workflow's own job is deliberately NOT the
+  PR-head attestation. The trusted workflow
   performs **no checkout at all**: it reads the single policy script from the
   trusted workflow SHA through the contents API, so no working tree exists that
   could hold PR head or merge content, and it reads PR metadata/labels through
   GitHub APIs. Do
   not add `actions/checkout`, or any step that executes head code, consumes head
   artifacts, or builds a shell command from PR content, to this privileged
-  workflow. Changed paths are computed from the immutable event base/head SHAs:
+  workflow. Changed paths are computed from immutable event effective-base/head
+  SHAs:
   the compare API resolves their merge base, then recursive Git-tree snapshots
   are structurally diffed by path/mode/type/blob SHA. Never return to the live
   PR-files endpoint — a force-push can change that response while the run still
@@ -3705,15 +3705,57 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   This deliberately over-gates Linux/cross-platform constraints rather than
   guessing an incomplete tag universe.
 
-  **PR-authored text is never consumed.** The gate reads only structural fields
-  from the event (numbers, SHAs, refs, the sender login, the label name) and
-  never the title, body, head branch name, or head label — all of which an
-  attacker sets freely and any of which could otherwise reach a shell word or an
-  API path. The contract suite injects a poison token into every one of those
-  fields on **every** synthetic event and fails the case if the token appears in
-  any `gh` invocation. A separate static contract asserts the harness still
-  injects it and still asserts on it, because an earlier revision gated that
-  check behind a per-case variable no case ever set — making it silently vacuous.
+  **Native stacks have two different bases.** GitHub
+  [runs ultimate-base CI for every native stack layer](https://docs.github.com/en/pull-requests/get-started/about-stacked-prs#rules-and-ci-enforcement),
+  including this `branches: [main]` workflow, while the event/REST
+  `pull_request.base` still identifies the immediate parent. Thus a non-main
+  actual base is reachable, not a trigger bypass. The
+  [webhook's `pull_request.stack`](https://docs.github.com/en/pull-requests/reference/stacked-pull-requests-apis-and-webhooks)
+  supplies the immutable effective-base anchor: `base.ref == main`,
+  `base.sha`, stack `id`/`number`, and candidate `position`/`size`. All are
+  required, and its main SHA must equal the trusted `POLICY_SHA`; disagreement
+  needs a new event. Do not reconstruct a missing event anchor from a live PR,
+  stack, branch, or Actions run's candidate `head_sha`. Ordinary standalone
+  main-target PRs retain their event base SHA and existing fork support.
+
+  `GET /stacks?pull_request=N` must yield exactly one membership across all
+  pages, agreeing with `GET /stacks/NUMBER`. The ordered member list must match
+  the event's identity, size and position, contain unique PR numbers and head
+  refs, and identify same-repository head/base repository IDs throughout.
+  The proof is bounded to 100 members. For the candidate's open prefix, the
+  first open member must target pinned main; each subsequent actual base must
+  equal the preceding member's exact head ref/SHA, and immutable compares must
+  prove that parent commit is an ancestor. Live head refs and main must still
+  resolve to those recorded SHAs. The stack-detail endpoint's `base` contains
+  only a ref, not an immutable main SHA; it is never an anchor source.
+
+  **Scope is cumulative, not per layer.** Tree comparison uses the merge base of
+  event-pinned main and candidate head, so a documentation-only upper layer
+  cannot hide inherited native changes. Main need not itself be an ancestor of
+  the bottom head: unrelated main advances are ordinary PR divergence, including
+  deployment of this policy. Neither the immediate parent nor a newly read main
+  tip may replace the event's effective evaluation base.
+
+  **Partial merges require positive evidence.** A retained merged prefix is
+  accepted only when each closed member's PR resource confirms `merged:true`
+  and its immutable `merge_commit_sha` is an ancestor of pinned main. This
+  accommodates squash/rebase merges without pretending the old head must be
+  retained. Deleted merged-prefix refs need not exist. The open suffix must
+  already be actually retargeted to pinned main and then chain normally;
+  closed-unmerged/interleaved members, transitional retargets, missing merge
+  evidence or inconsistent size/position semantics fail closed. The gate never
+  creates, recreates, rebases, merges or otherwise modifies stack identity.
+
+  **PR prose and head labels are never consumed.** Only structural fields
+  (numbers, SHAs, refs, sender login and label name) enter policy decisions.
+  Native stack proofs additionally need branch refs: they must first pass an
+  ASCII path-character allowlist and `git check-ref-format`, and are then used
+  only in quoted, fixed-repository API paths. Never use API-provided URLs or
+  evaluate a field as shell code. Titles, bodies and head labels remain poisoned
+  in every synthetic event; standalone head refs remain poisoned too. Native
+  fixtures replace only structural refs and separately exercise hostile refs.
+  Every case rejects poison reaching any `gh` invocation; the static
+  non-vacuity contract preserves both injection and assertion.
 
   **Only `.go` blobs are content-scanned, so everything else must be caught by
   name.** The native-source extension list covers every extension `go/build`
@@ -3770,7 +3812,9 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   event **sender** is a `User` (not a bot/app) whose login passes a shape check
   before it is interpolated into an API path; and
   `GET /repos/{owner}/{repo}/collaborators/{login}/permission` reports
-  `admin`, `maintain`, or `write` for that exact login. The gate **never** reads
+  `admin`, `maintain`, or `write` for that exact login. Native attestation
+  rechecks label presence after its longer final stack proof as well. The gate
+  **never** reads
   prior commit statuses as a readiness signal — the previous `approval_ready`
   handshake was removed because any same-repo workflow can seed the status it
   was reading, which made it a self-signed approval. An `unlabeled` event for
@@ -3789,15 +3833,22 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   SHA-global: two PRs can share one head commit, and a status published for one
   is visible to the other. So immediately before **each** `post_status success`
   the gate re-reads live PR metadata and requires that the PR is still `open`,
-  its base ref is still exactly `main`, its live base SHA and head SHA still
-  equal the event's, and the head repo is unchanged. A retarget mid-run, a
-  force-push (including head ABA), a close, or a delayed run from an older event
-  therefore fails closed instead of greening a commit whose context has moved.
-  The policy also re-asserts `base.ref == main` itself rather than trusting the
-  trigger filter — defense in depth for a future misconfiguration, and the only
-  thing that would refuse an alternate-base run before it posted `pending`.
-  Under the deployed `branches: [main]` filter that path is unreachable, because
-  such a run is never dispatched at all.
+  its **actual** base ref/SHA and head SHA equal the event's, and the head repo
+  is unchanged. Standalone actual bases must be main. A native candidate must
+  also retain its exact event stack summary, head ref and repository IDs.
+  Before evaluation and again before success, the gate reconstructs the complete
+  structural membership proof, including relevant ref/ancestry/merged-prefix
+  checks and pinned main, and requires identical structural snapshots. Observed
+  retargets, force-pushes, closes, main movement, membership/parent changes,
+  and failed or malformed API evidence fail closed, including on docs-only
+  success. Prose changes are not generation changes.
+
+  These are optimistic API checks, not an atomic GitHub transaction. The event
+  summary contains no historical full member list; the gate binds its immutable
+  candidate/actual-parent/main/stack tuple to authoritative before/after
+  membership proofs. It cannot detect every ABA completed between reads or
+  prevent a change after its final read. Do not claim stronger historical or
+  atomic guarantees than those available fields provide.
 
   **Residual, by design: this status is main-only and is inherited, not
   scoped.** A commit status belongs to a SHA, not to a pull request, so a
@@ -3805,11 +3856,18 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   PR that shares that head commit — including one targeting a different base,
   whose diff against a different merge base may contain Darwin changes that were
   never verified. No PR-scoped decision can revoke a SHA-scoped signal, and the
-  `branches: [main]` filter means the gate never runs (and so never re-evaluates
-  or overwrites) on those PRs. Therefore: read `Darwin E2E verified` as an
+  `branches: [main]` filter does not give unrelated-base PRs their own
+  evaluation. A native stack is accepted only through the main-root proof
+  above, not a general alternate-base exemption. Therefore: read `Darwin E2E
+  verified` as an
   assertion about a **head commit relative to `main`**, and do not consume it as
   verification on any other base. Cross-base assurance needs a PR-scoped
   mechanism (a trusted App check, or human review), not this status.
+
+  **Deployment is main-owned.** A proposed policy PR cannot repair an existing
+  failing stack run. After review and merge into main, a new authorized
+  verification-label event must select the new trusted policy and fresh event
+  anchor. Rerunning an old run retains its old pinned workflow/policy SHA.
 
   Relevant runs
   post `pending` before evaluation, serialize per PR, and post failure on
@@ -3871,9 +3929,12 @@ side `chan error` — every debugger outcome, failures included, rides the singl
   The policy's adversarial contract suite lives in
   [.github/scripts/darwin-verification-gate_test.sh](.github/scripts/darwin-verification-gate_test.sh)
   and must stay runnable on both macOS bash 3.2 and Linux bash 5 with no new
-  tooling. It mocks `gh` end to end (compare/tree/blob/PR/permission/status
-  APIs) and poisons the commit-status *read* endpoint so any regression that
-  reintroduces status-as-readiness fails loudly.
+  tooling. It mocks `gh` end to end (compare/tree/blob/PR/stack/ref/permission/
+  status APIs), uses realistic native membership shapes, and changes API
+  generations between initial and final proof. It poisons the commit-status
+  *read* endpoint so any regression that reintroduces status-as-readiness fails
+  loudly. Its mock subprocesses and policy use the same Bash as the suite,
+  rather than silently falling back to a different `bash` earlier on PATH.
 
 Build/test commands:
 

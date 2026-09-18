@@ -16,8 +16,8 @@ policy_test_workflow="$repo_root/.github/workflows/darwin-verification-policy-te
 
 tmpdir=$(mktemp -d)
 
-# Injected into every attacker-controlled field of the synthetic event.
-# A `gh` invocation carrying it means the gate consumed PR-authored text.
+# Injected into PR prose/head labels and standalone head refs. Native proofs
+# separately exercise validated structural refs, including hostile negatives.
 untrusted_token='PRTEXTPOISON9f3a'
 trap 'rm -rf "$tmpdir"' EXIT
 
@@ -44,6 +44,7 @@ pass() {
 
 mock_bin="$tmpdir/bin"
 mkdir -p "$mock_bin"
+ln -s "$BASH" "$mock_bin/bash"
 
 cat > "$mock_bin/gh" <<'MOCK'
 #!/usr/bin/env bash
@@ -89,6 +90,71 @@ case "$*" in
     exit 91
     ;;
 esac
+
+if [ -n "${MOCK_STACK_FIXTURE:-}" ]; then
+  api_path=''
+  for arg in "$@"; do
+    case "$arg" in repos/*) api_path=$arg ;; esac
+  done
+  phase=initial
+  proof_pass=0
+  [ -f "$MOCK_STACK_PASS" ] && proof_pass=$(cat "$MOCK_STACK_PASS")
+  if [ "$api_path" = "repos/bingosuite/bingo/pulls/$MOCK_STACK_PR" ]; then
+    proof_pass=$((proof_pass + 1))
+    printf '%s\n' "$proof_pass" > "$MOCK_STACK_PASS"
+  fi
+  [ "$proof_pass" -gt 1 ] && phase=next
+  if jq -e --arg phase "$phase" --arg path "$api_path" \
+    '.[$phase].failures | index($path) != null' "$MOCK_STACK_FIXTURE" >/dev/null; then
+    echo "mock: native stack API unavailable: $api_path" >&2
+    exit 1
+  fi
+
+  resource=''
+  key=''
+  case "$api_path" in
+    "repos/bingosuite/bingo/pulls/$MOCK_STACK_PR") resource=candidate ;;
+    "repos/bingosuite/bingo/stacks?pull_request=$MOCK_STACK_PR&per_page=100")
+      case "$*" in
+        *--paginate*) ;;
+        *) echo "mock: stack membership must exhaust pagination" >&2; exit 94 ;;
+      esac
+      resource=membership
+      ;;
+    "repos/bingosuite/bingo/stacks/264") resource=detail ;;
+    repos/bingosuite/bingo/stacks/*)
+      echo "mock: unknown native stack identity" >&2
+      exit 94
+      ;;
+    repos/bingosuite/bingo/git/ref/heads/*)
+      resource=refs
+      key=${api_path#repos/bingosuite/bingo/git/ref/heads/}
+      ;;
+    repos/bingosuite/bingo/pulls/*)
+      resource=merged_prs
+      key=${api_path#repos/bingosuite/bingo/pulls/}
+      ;;
+    "repos/bingosuite/bingo/issues/$MOCK_STACK_PR/labels?per_page=100") resource=labels ;;
+    repos/bingosuite/bingo/compare/*)
+      key=${api_path#repos/bingosuite/bingo/compare/}
+      if [ "$key" != "$MOCK_STACK_MAIN...$MOCK_HEAD_SHA" ]; then
+        resource=ancestors
+      fi
+      ;;
+  esac
+  if [ -n "$resource" ]; then
+    if ! jq -e --arg phase "$phase" --arg resource "$resource" --arg key "$key" '
+      .[$phase][$resource] | if $key == "" then . else .[$key] end
+      | if . == null then error("unexpected native stack endpoint") else . end
+    ' "$MOCK_STACK_FIXTURE" | emit; then
+      exit 94
+    fi
+    if [ "$resource" = "membership" ]; then
+      jq -c --arg phase "$phase" '.[$phase].additional_pages[]' "$MOCK_STACK_FIXTURE"
+    fi
+    exit 0
+  fi
+fi
 
 case "$*" in
   *--method\ POST*"/statuses/"*)
@@ -248,6 +314,78 @@ chmod +x "$mock_bin/gh"
 
 case_id=0
 
+# Matches the preview's actual #262/#263/stack-264 REST shapes: the detail base
+# has no SHA, compact member repositories carry IDs, and only the event/PR
+# summary supplies the immutable main anchor. Partial merges retain membership.
+make_stack_fixture() {
+  local event=$1 shape=$2 destination=$3
+  jq --arg shape "$shape" --argjson labels "$4" '
+    . as $event
+    | "7fd8c480c86eb8a615b789ad1ceb70635fe1bdfc" as $old_main
+    | (if $shape == "partial" then "8888888888888888888888888888888888888888"
+        else $old_main end) as $main
+    | {id: 1108771893, name: "bingo", url: "https://api.github.com/repos/bingosuite/bingo"} as $repo
+    | {id: 1232070, number: 264, base: {ref: "main"}, open: true, pull_requests: [
+        {id: 4563277526, number: 262, state: "open", merged_at: null, draft: false,
+          title: $event.pull_request.title,
+          head: {ref: "xsachax-darwin-attach-restoration",
+            sha: "4b6c7c520d5a088dd6a6c8d5117c11c4dfb00205", repo: $repo},
+          base: {ref: "main", sha: $main, repo: $repo}},
+        {id: 4563571641, number: 263, state: "open", merged_at: null, draft: false,
+          title: $event.pull_request.title,
+          head: {ref: "xsachax-darwin-port-cleanup",
+            sha: "ed3f7aa116b5ee0111dc76c66905cf8c76f7fbb2", repo: $repo},
+          base: {ref: "xsachax-darwin-attach-restoration",
+            sha: "4b6c7c520d5a088dd6a6c8d5117c11c4dfb00205", repo: $repo}}
+      ]} as $original
+    | ($original
+      | if $shape == "partial" then
+          .pull_requests[0].state = "closed"
+          | .pull_requests[0].merged_at = "2026-09-18T00:00:00Z"
+          | .pull_requests[0].base.sha = $old_main
+          | .pull_requests[1].head.sha = "9999999999999999999999999999999999999999"
+          | .pull_requests[1].base = {ref: "main", sha: $main, repo: $repo}
+        else . end) as $detail
+    | (if $shape == "bottom" then 1 else 2 end) as $position
+    | {id: 1232070, number: 264, size: 2, position: $position,
+        base: {ref: "main", sha: $main}} as $anchor
+    | ($detail.pull_requests[$position - 1]
+      | .stack = $anchor
+      | .head.repo.full_name = "bingosuite/bingo"
+      | .base.repo.full_name = "bingosuite/bingo"
+      | .head.label = $event.pull_request.head.label
+      | .body = $event.pull_request.body) as $candidate
+    | ($detail | .pull_requests |= map({
+        number, state, merged_at, draft, head: (.head | {ref, sha})
+      })) as $membership
+    | ($detail.pull_requests
+      | map(select(.state == "open") | {
+          key: .head.ref, value: {ref: ("refs/heads/" + .head.ref),
+            object: {type: "commit", sha: .head.sha}}
+        }) | from_entries
+      | .main = {ref: "refs/heads/main", object: {type: "commit", sha: $main}}) as $refs
+    | ($detail.pull_requests
+      | map(select(.state == "open" and .base.ref != "main") | {
+          key: (.base.sha + "..." + .head.sha),
+          value: {status: "ahead", base_commit: {sha: .base.sha}, merge_base_commit: {sha: .base.sha}}
+        }) | from_entries) as $ancestors
+    | {event: ($event | .repository = {id: $repo.id, full_name: "bingosuite/bingo"}
+        | .pull_request = $candidate),
+       policy_sha: $main,
+       initial: {candidate: $candidate, membership: [$membership], detail: $detail,
+         refs: $refs, ancestors: $ancestors, merged_prs: {}, failures: [],
+         additional_pages: [], labels: $labels}}
+    | if $shape == "partial" then
+        "6666666666666666666666666666666666666666" as $merge
+        | .initial.merged_prs["262"] = ($detail.pull_requests[0]
+          | .merged = true | .merge_commit_sha = $merge)
+        | .initial.ancestors[$merge + "..." + $main] = {
+            status: "ahead", base_commit: {sha: $merge}, merge_base_commit: {sha: $merge}}
+      else . end
+    | .next = .initial
+  ' "$event" > "$destination"
+}
+
 # run_case <name> [key=value ...]
 run_case() {
   local name=$1
@@ -302,6 +440,9 @@ run_case() {
   local expect_label_query=''
   local pr_number=17
   local head_tree_sha_override=''
+  local stack_shape=''
+  local stack_transform='.'
+  local stack_policy_sha=''
 
   local kv key value
   for kv in "$@"; do
@@ -352,6 +493,9 @@ run_case() {
       expect_label_query) expect_label_query=$value ;;
       pr_number) pr_number=$value ;;
       head_tree_sha_override) head_tree_sha_override=$value ;;
+      stack) stack_shape=$value ;;
+      stack_transform) stack_transform=$value ;;
+      stack_policy_sha) stack_policy_sha=$value ;;
       *)
         fail "$name: unknown harness key '$key'"
         return
@@ -442,6 +586,21 @@ run_case() {
       head: {sha: $head_sha, repo: {full_name: $head_repo}}
     }')
 
+  local stack_fixture='' stack_main=''
+  if [ -n "$stack_shape" ]; then
+    stack_fixture="$work/stack.json"
+    if ! make_stack_fixture "$event" "$stack_shape" "$work/stack-original.json" "$labels_json" ||
+      ! jq "$stack_transform" "$work/stack-original.json" > "$stack_fixture"; then
+      fail "$name: invalid native stack fixture"
+      return
+    fi
+    jq '.event' "$stack_fixture" > "$event"
+    head_sha=$(jq -r '.event.pull_request.head.sha' "$stack_fixture")
+    pr_number=$(jq -r '.event.pull_request.number' "$stack_fixture")
+    stack_main=$(jq -r '.policy_sha' "$stack_fixture")
+    [ -n "$stack_policy_sha" ] || stack_policy_sha=$stack_main
+  fi
+
   local permission_json
   permission_json=$(jq -n \
     --arg permission "$perm_permission" \
@@ -462,6 +621,11 @@ run_case() {
     GITHUB_SERVER_URL=https://github.com \
     GITHUB_RUN_ID=4242 \
     DARWIN_GATE_DECISION_FILE="$decision" \
+    POLICY_SHA="$stack_policy_sha" \
+    MOCK_STACK_FIXTURE="$stack_fixture" \
+    MOCK_STACK_PASS="$work/stack-pass" \
+    MOCK_STACK_PR="$pr_number" \
+    MOCK_STACK_MAIN="$stack_main" \
     MOCK_GH_LOG="$work/gh.log" \
     MOCK_STATE_LOG="$work/states.log" \
     MOCK_STATUS_LOG="$work/statuses.log" \
@@ -547,7 +711,7 @@ run_case() {
   fi
 
   if [ -n "$expect_label_query" ]; then
-    if grep -Fq "/issues/17/labels" "$work/gh.log"; then
+    if grep -Fq "/issues/$pr_number/labels" "$work/gh.log"; then
       if [ "$expect_label_query" != "true" ]; then
         fail "$name: gate queried live labels but should not have"
         ok=0
@@ -566,18 +730,30 @@ run_case() {
     ok=0
   fi
 
-  # No `gh` invocation may carry pull-request-authored text. Titles, branch
-  # names and bodies are attacker-controlled; only fixed paths, the numeric PR
-  # id and hex SHAs may ever reach the API surface.
+  # Native proofs may use validated structural branch refs, never prose or
+  # shell syntax. Standalone head refs are still deliberately poisoned.
   if grep -Eq '(^| )(-f|-F|--jq|--field)?[^ ]*(<script|; *rm |\$\(|`)' "$work/gh.log"; then
     fail "$name: gate passed shell metacharacters to gh"
     ok=0
   fi
-  # Every synthetic event carries this token in its title, body, head ref and
-  # head label — all attacker-controlled. None may ever reach the API surface.
+  # Native fixtures preserve title/body/head-label poison while replacing only
+  # the structural ref; hostile ref fixtures must fail before reaching gh.
   if grep -Fq "$untrusted_token" "$work/gh.log"; then
     fail "$name: gate consumed untrusted pull request content"
     ok=0
+  fi
+
+  if [ -n "$stack_shape" ] && [ "$actual_states" = "pending,success" ]; then
+    if [ "$(cat "$work/stack-pass")" != "2" ] ||
+      [ "$(grep -Fc 'api repos/bingosuite/bingo/stacks/264' "$work/gh.log")" != "2" ] ||
+      [ "$(grep -Fc 'api repos/bingosuite/bingo/git/ref/heads/main' "$work/gh.log")" != "2" ]; then
+      fail "$name: successful native attestation did not revalidate its proof"
+      ok=0
+    fi
+    if ! grep -Fq "compare/$stack_main...$head_sha --jq .merge_base_commit.sha" "$work/gh.log"; then
+      fail "$name: native diff did not use the immutable cumulative main comparison"
+      ok=0
+    fi
   fi
 
   if [ -f "$work/targets.log" ] && [ -s "$work/targets.log" ]; then
@@ -594,7 +770,11 @@ run_case() {
     fi
   fi
 
-  [ "$ok" = "1" ] && pass "$name"
+  if [ "$ok" = "1" ]; then
+    pass "$name"
+  else
+    tail -20 "$out" >&2
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -751,6 +931,311 @@ run_case "a delayed verified label cannot green a retargeted pull request" \
   action=labeled has_label=true live_base_ref=release-1.x \
   expect_exit=1 expect_states='pending,failure' expect_decision=failure \
   expect_description='moved while the Darwin gate was evaluating'
+
+# ---------------------------------------------------------------------------
+# Native stacks: immutable main anchor, ordered proof, cumulative scope
+# ---------------------------------------------------------------------------
+
+run_case "the real upper-layer shape accepts authorized verification against main" \
+  stack=upper action=labeled has_label=true \
+  expect_states='pending,success' expect_decision=success expect_label_query=true \
+  expect_output='Cumulative native stack comparison: main@7fd8c480c86eb8a615b789ad1ceb70635fe1bdfc'
+
+run_case "a native bottom layer retains main-target verification" \
+  stack=bottom action=labeled has_label=true \
+  expect_states='pending,success' expect_decision=success
+
+run_case "a proven merged prefix permits a freshly retargeted open suffix" \
+  stack=partial action=labeled has_label=true \
+  expect_states='pending,success' expect_decision=success \
+  gh_missing='/git/ref/heads/xsachax-darwin-attach-restoration'
+
+run_case "a cumulatively documentation-only stack needs no native label" \
+  stack=upper action=opened head_entries='["README.md","docs/ErrorHandling.md"]' \
+  expect_states='pending,success' expect_decision=success expect_label_query=false
+
+run_case "an upper documentation layer cannot hide inherited native changes" \
+  stack=upper action=opened head_entries='["internal/debugger/engine.go","README.md"]' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_description='Darwin E2E verification is required for this head.' \
+  gh_expect='compare/7fd8c480c86eb8a615b789ad1ceb70635fe1bdfc...ed3f7aa116b5ee0111dc76c66905cf8c76f7fbb2 --jq .merge_base_commit.sha'
+
+run_case "a stack-shaped branch without immutable event membership remains out of scope" \
+  stack=upper action=labeled has_label=true \
+  stack_transform='del(.event.pull_request.stack)' \
+  expect_exit=1 expect_states=failure expect_decision=failure \
+  gh_missing='/stacks'
+
+for field in id number size position base; do
+  run_case "native event requires its immutable stack $field" \
+    stack=upper action=labeled has_label=true \
+    stack_transform="del(.event.pull_request.stack.$field)" \
+    expect_exit=1 expect_states=failure expect_decision=failure \
+    gh_missing='/stacks'
+done
+
+for mutation in \
+  '.event.pull_request.stack = false' \
+  '.event.pull_request.stack.base.ref = "release"' \
+  'del(.event.pull_request.stack.base.sha)' \
+  '.event.pull_request.stack.base.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  '.event.pull_request.stack.id = "1232070"' \
+  '.event.pull_request.stack.number = "264/../../evil"' \
+  '.event.pull_request.stack.size = 101' \
+  '.event.pull_request.stack.size = 0' \
+  '.event.pull_request.stack.position = 1.5' \
+  '.event.pull_request.stack.position = 3' \
+  '.event.repository.id = null' \
+  '.event.repository.full_name = "attacker/bingo"' \
+  '.event.pull_request.head.repo.id = 999' \
+  '.event.pull_request.base.repo.id = 999' \
+  '.event.pull_request.head.repo.full_name = "attacker/fork"' \
+  '.event.pull_request.head.ref = "PRTEXTPOISON9f3a;bad"' \
+  '.event.pull_request.base.ref = "PRTEXTPOISON9f3a\nbad"'; do
+  run_case "native event rejects invalid structural evidence: $mutation" \
+    stack=upper action=labeled has_label=true stack_transform="$mutation" \
+    expect_exit=1 expect_states=failure expect_decision=failure gh_missing='/stacks'
+done
+
+run_case "native event refs also have to satisfy Git ref syntax" \
+  stack=upper action=labeled has_label=true \
+  stack_transform='.event.pull_request.head.ref = "PRTEXTPOISON9f3a/../escape"' \
+  expect_exit=128 expect_states=failure expect_decision=failure gh_missing='/stacks'
+
+run_case "a live main snapshot cannot replace an event anchor from a different policy generation" \
+  stack=upper action=labeled has_label=true stack_policy_sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  expect_exit=1 expect_states=failure expect_decision=failure \
+  expect_output='refusing to infer it from live metadata' gh_missing='/stacks'
+
+for field in head base; do
+  run_case "an invalid $field object ID cannot reach even the status API" \
+    stack=upper action=labeled has_label=true \
+    stack_transform=".event.pull_request.$field.sha = \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"" \
+    expect_exit=4 expect_states='' expect_decision='' gh_missing='api'
+done
+
+for mutation in \
+  '.initial.membership = []' \
+  '.initial.membership += .initial.membership' \
+  '.initial.membership = {}' \
+  '.initial.additional_pages = [.initial.membership]' \
+  '.initial.additional_pages = [{"error":"not a page"}]' \
+  '.initial.membership[0].id = 999' \
+  '.initial.membership[0].number = 999' \
+  '.initial.detail.id = 999' \
+  '.initial.detail.base.ref = "release"' \
+  '.initial.detail.open = false' \
+  '.initial.detail.pull_requests = []' \
+  '.initial.detail.pull_requests[0].number = 263' \
+  '.initial.detail.pull_requests[0].number = "262"' \
+  '.initial.detail.pull_requests[0].head.ref = "xsachax-darwin-port-cleanup"' \
+  '.initial.detail.pull_requests[0].head.sha = "bad-sha"' \
+  '.initial.detail.pull_requests[0].base.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  '.initial.detail.pull_requests[0].head.repo.id = 999' \
+  '.initial.detail.pull_requests[0].base.repo.id = 999' \
+  '.initial.detail.pull_requests[0].head.ref = "PRTEXTPOISON9f3a?injected=true"' \
+  '.initial.membership[0].pull_requests |= reverse' \
+  '.initial.detail.pull_requests |= reverse'; do
+  run_case "native membership rejects missing or inconsistent evidence: $mutation" \
+    stack=upper action=labeled has_label=true stack_transform="$mutation" \
+    expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+    gh_missing='/git/trees/'
+done
+
+run_case "a claimed main stack still needs its bottom open member to target main" \
+  stack=upper action=labeled has_label=true \
+  stack_transform='.initial.detail.pull_requests[0].base.ref = "release"' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_output='parent chain is moved'
+
+run_case "consistent but reversed order does not prove a main-rooted chain" \
+  stack=upper action=labeled has_label=true \
+  stack_transform='.event.pull_request.stack.position = 1
+    | .initial.candidate.stack.position = 1
+    | .initial.detail.pull_requests |= reverse
+    | .initial.membership[0].pull_requests |= reverse' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_output='parent chain is moved'
+
+run_case "an actual base outside the proven ordered chain cannot borrow its root" \
+  stack=upper action=labeled has_label=true \
+  stack_transform='.event.pull_request.base.ref = "unrelated"
+    | .initial.candidate.base.ref = "unrelated"
+    | .initial.detail.pull_requests[1].base.ref = "unrelated"' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_output='parent chain is moved' gh_missing='/git/ref/heads/unrelated'
+
+run_case "an upper head must contain its exact recorded parent commit" \
+  stack=upper action=labeled has_label=true \
+  stack_transform='.initial.ancestors |= map_values(.merge_base_commit.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_output='commit ancestry is not proven'
+
+for mutation in \
+  '.initial.refs.main.object.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  '.initial.refs.main.object.type = "blob"' \
+  '.initial.refs.main.ref = "refs/heads/release"' \
+  '.initial.refs["xsachax-darwin-attach-restoration"].object.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  '.initial.refs["xsachax-darwin-port-cleanup"].object.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'; do
+  run_case "native refs must still name event-bound commits: $mutation" \
+    stack=upper action=labeled has_label=true stack_transform="$mutation" \
+    expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+    expect_output='ref no longer names the recorded commit' gh_missing='/git/trees/'
+done
+
+for mutation in \
+  '.next.candidate.number = 262' \
+  '.next.candidate.head.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  '.next.candidate.head.ref = "replacement"' \
+  '.next.candidate.head.repo.id = 999' \
+  '.next.candidate.head.repo.id = "1108771893"' \
+  '.next.candidate.base.ref = "replacement"' \
+  '.next.candidate.base.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  '.next.candidate.base.repo.id = 999' \
+  '.next.candidate.base.repo.id = "1108771893"' \
+  '.next.candidate.base.repo.full_name = "attacker/fork"' \
+  '.next.candidate.state = "closed"' \
+  '.next.candidate.stack.id = 999' \
+  '.next.candidate.stack.number = 999' \
+  '.next.candidate.stack.size = 3' \
+  '.next.candidate.stack.position = 1' \
+  '.next.candidate.stack.base.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  '.next.candidate.stack = null'; do
+  run_case "an old native label cannot attest a moved candidate generation: $mutation" \
+    stack=upper action=labeled has_label=true stack_transform="$mutation" \
+    expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+    expect_description='moved while the Darwin gate was evaluating'
+done
+
+for mutation in \
+  '.next.refs.main.object.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  '.next.refs["xsachax-darwin-attach-restoration"].object.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  '.next.refs["xsachax-darwin-port-cleanup"].object.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  '.next.membership = []' \
+  '.next.membership += .next.membership' \
+  '.next.detail.pull_requests[0].head.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  '.next.detail.pull_requests[0].base.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"'; do
+  run_case "native proof is revalidated after cumulative evaluation: $mutation" \
+    stack=upper action=labeled has_label=true stack_transform="$mutation" \
+    expect_exit=1 expect_states='pending,failure' expect_decision=failure
+done
+
+run_case "replacing a parent PR with identical refs still changes native membership identity" \
+  stack=upper action=labeled has_label=true \
+  stack_transform='.next.detail.pull_requests[0].number = 260
+    | .next.membership[0].pull_requests[0].number = 260' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_output='Native stack generation moved'
+
+run_case "documentation-only success also revalidates the native main generation" \
+  stack=upper action=opened head_entries='["README.md"]' \
+  stack_transform='.next.refs.main.object.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_output='ref no longer names the recorded commit'
+
+run_case "metadata prose changes cannot invalidate an otherwise identical structural proof" \
+  stack=upper action=labeled has_label=true \
+  stack_transform='.next.detail.pull_requests[].title = "PRTEXTPOISON9f3a-changed-title"
+    | .next.detail.pull_requests[].head.repo.url = "https://PRTEXTPOISON9f3a.invalid/"' \
+  expect_states='pending,success' expect_decision=success
+
+for phase in initial next; do
+  for path in \
+    'pulls/263' \
+    'stacks?pull_request=263&per_page=100' \
+    'stacks/264' \
+    'git/ref/heads/main' \
+    'git/ref/heads/xsachax-darwin-attach-restoration' \
+    'git/ref/heads/xsachax-darwin-port-cleanup' \
+    'issues/263/labels?per_page=100' \
+    'compare/4b6c7c520d5a088dd6a6c8d5117c11c4dfb00205...ed3f7aa116b5ee0111dc76c66905cf8c76f7fbb2'; do
+    run_case "native $phase proof fails closed on API failure: $path" \
+      stack=upper action=labeled has_label=true \
+      stack_transform=".$phase.failures = [\"repos/bingosuite/bingo/$path\"]" \
+      expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+      expect_output='native stack API unavailable'
+  done
+done
+
+run_case "a native verified-label event must still come from an authorized human" \
+  stack=upper action=labeled has_label=true actor_type=Bot \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  gh_missing='/permission'
+
+run_case "a native verified-label event cannot borrow repository read permission" \
+  stack=upper action=labeled has_label=true perm_permission=read perm_role=read \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure
+
+run_case "a native label no longer present cannot authorize verification" \
+  stack=upper action=labeled has_label=false \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_description='label is not currently present'
+
+run_case "label withdrawal during the longer native proof is checked again before success" \
+  stack=upper action=labeled has_label=true stack_transform='.next.labels = []' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_description='label is not currently present'
+
+run_case "a native unlabel cannot be turned into approval by a racing re-add" \
+  stack=upper action=unlabeled has_label=true \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_description='verification was withdrawn' expect_label_query=false
+
+run_case "native synchronize invalidates verification even when label cleanup is denied" \
+  stack=upper action=synchronize has_label=true label_remove_status=1 \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_output='stale' gh_expect='pr edit 263'
+
+run_case "a delayed native label is rejected before evaluation when its parent already moved" \
+  stack=upper action=labeled has_label=true \
+  stack_transform='.initial.candidate.base.sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_description='moved while the Darwin gate was evaluating' gh_missing='/stacks'
+
+run_case "a closed-unmerged native prefix cannot be treated as a partial merge" \
+  stack=partial action=labeled has_label=true \
+  stack_transform='.initial.detail.pull_requests[0].merged_at = null
+    | .initial.membership[0].pull_requests[0].merged_at = null' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure
+
+for mutation in \
+  '.initial.merged_prs["262"].merged = false' \
+  '.initial.merged_prs["262"].head.repo.id = 999' \
+  '.initial.merged_prs["262"].number = 261' \
+  '.initial.merged_prs["262"].merge_commit_sha = null' \
+  '.initial.ancestors |= map_values(.status = "diverged")'; do
+  run_case "partial merges require immutable merge-to-main evidence: $mutation" \
+    stack=partial action=labeled has_label=true stack_transform="$mutation" \
+    expect_exit=1 expect_states='pending,failure' expect_decision=failure
+done
+
+run_case "a partial merge in transition must wait for an actually main-retargeted suffix" \
+  stack=partial action=labeled has_label=true \
+  stack_transform='.initial.detail.pull_requests[0].head as $parent
+    | .event.pull_request.base = ($parent | .repo.full_name = "bingosuite/bingo")
+    | .initial.candidate.base = .event.pull_request.base
+    | .initial.detail.pull_requests[1].base = $parent' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure \
+  expect_output='not yet retargeted after a partial merge'
+
+run_case "a merged member above an open member is not a supported merged prefix" \
+  stack=bottom action=labeled has_label=true \
+  stack_transform='.initial.detail.pull_requests[1].state = "closed"
+    | .initial.detail.pull_requests[1].merged_at = "2026-09-18T00:00:00Z"
+    | .initial.membership[0].pull_requests[1].state = "closed"
+    | .initial.membership[0].pull_requests[1].merged_at = "2026-09-18T00:00:00Z"' \
+  expect_exit=1 expect_states='pending,failure' expect_decision=failure
+
+for phase in initial next; do
+  for path in \
+    'pulls/262' \
+    'compare/6666666666666666666666666666666666666666...8888888888888888888888888888888888888888'; do
+    run_case "partial merge $phase evidence must remain available: $path" \
+      stack=partial action=labeled has_label=true \
+      stack_transform=".$phase.failures = [\"repos/bingosuite/bingo/$path\"]" \
+      expect_exit=1 expect_states='pending,failure' expect_decision=failure
+  done
+done
 
 # ---------------------------------------------------------------------------
 # Darwin scope detection
@@ -1610,17 +2095,23 @@ gate_uses_immutable_diff() {
     ! grep -Eq 'pulls/[^"]*/files' "$gate"
 }
 
-# The "gate never consumes PR-authored text" invariant is only meaningful while
-# the synthetic event actually carries the poison token in every field an
-# attacker controls. An earlier revision gated that check behind a per-case
-# variable no case ever set, making it silently vacuous.
+# Every event retains prose/head-label poison. Standalone head refs are poisoned
+# too; native refs instead need realistic and deliberately hostile fixtures.
 harness_poisons_every_attacker_controlled_field() {
   local field
   for field in title body ref label; do
     grep -Eq "$field: \(\\\$poison \+" "$0" || return 1
   done
   grep -q '\--arg poison "\$untrusted_token"' "$0" &&
-    grep -q 'grep -Fq "\$untrusted_token" "\$work/gh.log"' "$0"
+    grep -q 'grep -Fq "\$untrusted_token" "\$work/gh.log"' "$0" || return 1
+  awk '
+    /^make_stack_fixture\(\)/ {inside = 1}
+    inside && /title: \$event.pull_request.title/ {title = 1}
+    inside && /\.head.label = \$event.pull_request.head.label/ {label = 1}
+    inside && /\.body = \$event.pull_request.body/ {body = 1}
+    inside && /^}/ {inside = 0}
+    END {exit (title && label && body) ? 0 : 1}
+  ' "$0"
 }
 
 gate_enforces_the_required_base_ref() {
