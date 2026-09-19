@@ -2935,6 +2935,10 @@ VSIXes are platform-specific: `linux-x64` contains only linux/amd64 bingo;
 [entitlements.plist](entitlements.plist). Runtime resolves only
 `bin/bingo` + `bin/target.json` inside the installed/development extension,
 checks the target, and repairs executable mode if extraction lost it.
+`prepare-binary.mjs` delegates native build/sign/version metadata to
+`scripts/build-binary.sh` with `BINGO_REPRODUCIBLE=1`, then writes the VSIX target
+marker. Package builders are native linux/amd64 or darwin/arm64; Apple Silicon
+may also cross-build the Linux package, never execute its debugger.
 Packaging rebuilds/signs twice and requires identical binary and VSIX hashes;
 tests drift-check service/API/wire constants against Go source and inspect exact
 archive contents (one native binary plus the two bundles and original icon),

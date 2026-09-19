@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, it } from "node:test";
+import { pathToFileURL } from "node:url";
 
 type JsonRecord = Record<string, unknown>;
 
@@ -185,23 +187,66 @@ describe("repository VS Code integration", () => {
     const prepareScript = readText(
       "editors/vscode/scripts/prepare-binary.mjs",
     );
+    const buildScript = readText("scripts/build-binary.sh");
     const workflow = readText(".github/workflows/vscode-extension.yml");
 
     assert.match(platform, /"linux-x64"/);
     assert.match(platform, /"darwin-arm64"/);
     assert.doesNotMatch(platform, /win32|ia32|linux-arm64|darwin-x64/);
     assert.match(platform, /BINGO_VSCODE_TARGET/);
-    assert.match(platform, /darwinCrossBuild/);
+    assert.doesNotMatch(platform, /darwinCrossBuild/);
     assert.match(platform, /linuxCrossBuild/);
     assert.match(packageScript, /"--target"/);
-    assert.match(prepareScript, /"bingonative"/);
-    assert.match(prepareScript, /"codesign"/);
-    assert.match(prepareScript, /normalizeMachOUUID/);
+    assert.match(prepareScript, /run\("bash", \[/);
+    assert.match(prepareScript, /"scripts", "build-binary\.sh"/);
+    assert.match(prepareScript, /target\.goos,\s+target\.goarch/);
+    assert.match(prepareScript, /BINGO_REPRODUCIBLE: "1"/);
+    assert.doesNotMatch(prepareScript, /run\("go"|normalizeMachOUUID/);
+    assert.match(buildScript, /bingonative/);
+    assert.match(buildScript, /codesign/);
+    assert.match(buildScript, /normalizeMachOUUID/);
+    assert.ok(buildScript.indexOf("normalizeMachOUUID") < buildScript.indexOf("codesign"));
     assert.match(workflow, /BINGO_VSCODE_TARGET: \$\{\{ matrix\.target \}\}/);
     assert.match(workflow, /runner: macos-15/);
     assert.doesNotMatch(workflow, /runner: macos-14(?:\s|$)/);
     assert.match(workflow, /test "\$\(uname -m\)" = "\$\{\{ matrix\.unamearch \}\}"/);
     assert.match(workflow, /runner\.arch == 'ARM64'/);
+  });
+
+  it("rejects unsupported package builders before preparation while keeping Linux cross-builds", () => {
+    const platformModule = pathToFileURL(
+      resolve(repositoryRoot, "editors/vscode/scripts/platform.mjs"),
+    ).href;
+    for (const [platform, arch, target, allowed] of [
+      ["darwin", "arm64", "darwin-arm64", true],
+      ["linux", "x64", "linux-x64", true],
+      ["darwin", "arm64", "linux-x64", true],
+      ["darwin", "x64", "darwin-arm64", false],
+      ["darwin", "x64", "linux-x64", false],
+      ["linux", "x64", "darwin-arm64", false],
+      ["linux", "arm64", "linux-x64", false],
+      ["win32", "x64", "linux-x64", false],
+    ] as const) {
+      const result = spawnSync(process.execPath, ["--input-type=module", "-e", `
+        Object.defineProperty(process, "platform", { value: ${JSON.stringify(platform)} });
+        Object.defineProperty(process, "arch", { value: ${JSON.stringify(arch)} });
+        const { targetDetails } = await import(${JSON.stringify(platformModule)});
+        console.log(JSON.stringify(targetDetails()));
+      `], {
+        encoding: "utf8",
+        env: { ...process.env, BINGO_VSCODE_TARGET: target },
+      });
+      assert.ifError(result.error);
+      assert.equal(result.status === 0, allowed, `${platform}/${arch} -> ${target}: ${result.stderr}`);
+      if (allowed) {
+        const details = requireRecord(JSON.parse(result.stdout) as unknown);
+        assert.equal(details.name, target);
+        assert.equal(details.goos, target === "linux-x64" ? "linux" : "darwin");
+        assert.equal(details.goarch, target === "linux-x64" ? "amd64" : "arm64");
+      } else {
+        assert.match(result.stderr, /cannot be packaged/);
+      }
+    }
   });
 
   it("keeps floor/current Electron coverage unprivileged and runtime compatible with Node18", () => {

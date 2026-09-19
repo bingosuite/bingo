@@ -12,7 +12,6 @@ import process from "node:process";
 import { fileURLToPath, URL } from "node:url";
 import { spawnSync } from "node:child_process";
 
-import { normalizeMachOUUID } from "./normalize-mach-o-uuid.mjs";
 import { targetDetails } from "./platform.mjs";
 
 const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
@@ -25,42 +24,16 @@ const target = targetDetails(requestedTarget);
 rmSync(binDirectory, { force: true, recursive: true });
 mkdirSync(binDirectory, { recursive: true });
 
-const buildArguments = ["build"];
-if (target.name === "darwin-arm64") {
-  buildArguments.push("-tags", "bingonative");
-}
-buildArguments.push(
-  "-trimpath",
-  "-buildvcs=false",
-  "-ldflags=-buildid=",
-  "-o",
+run("bash", [
+  join(repositoryRoot, "scripts", "build-binary.sh"),
+  "bingo",
   binaryPath,
-  "./cmd/bingo",
-);
-run("go", buildArguments, {
+  target.goos,
+  target.goarch,
+], {
   ...process.env,
-  CGO_ENABLED: target.name === "darwin-arm64" ? "1" : "0",
-  GOOS: target.goos,
-  GOARCH: target.goarch,
+  BINGO_REPRODUCIBLE: "1",
 });
-
-if (target.name === "darwin-arm64") {
-  normalizeMachOUUID(binaryPath);
-  run(
-    "codesign",
-    [
-      "--sign",
-      "-",
-      "--entitlements",
-      "entitlements.plist",
-      "--force",
-      "--timestamp=none",
-      binaryPath,
-    ],
-    process.env,
-  );
-  run("codesign", ["--verify", "--strict", binaryPath], process.env);
-}
 
 chmodSync(binaryPath, 0o755);
 writeFileSync(
