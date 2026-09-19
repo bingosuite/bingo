@@ -21,6 +21,7 @@ type DAPHealth struct {
 	Enabled             bool   `json:"enabled"`
 	Address             string `json:"address"`
 	SessionEventVersion int    `json:"sessionEventVersion"`
+	SourceLaunchVersion int    `json:"sourceLaunchVersion"`
 }
 
 type ManagedIdleShutdownHealth struct {
@@ -81,6 +82,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			Enabled:             dapAddress != "",
 			Address:             dapAddress,
 			SessionEventVersion: protocol.DAPSessionEventVersion,
+			SourceLaunchVersion: protocol.DAPSourceLaunchVersion,
 		},
 		ManagedIdleShutdown: ManagedIdleShutdownHealth{
 			Enabled:   idleTimeout > 0,

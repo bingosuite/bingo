@@ -104,6 +104,7 @@ func TestHealthDiscovery(t *testing.T) {
 	g.Expect(uuid.Validate(health.InstanceID)).To(Succeed())
 	g.Expect(health.DAP).To(Equal(DAPHealth{
 		SessionEventVersion: protocol.DAPSessionEventVersion,
+		SourceLaunchVersion: protocol.DAPSourceLaunchVersion,
 	}))
 	g.Expect(health.ManagedIdleShutdown).To(Equal(ManagedIdleShutdownHealth{}))
 	g.Expect(health.SessionCount).To(Equal(0))
@@ -124,6 +125,11 @@ func TestHealthDiscovery(t *testing.T) {
 	} {
 		g.Expect(fields).To(HaveKey(field))
 	}
+	var dapFields map[string]json.RawMessage
+	g.Expect(json.Unmarshal(fields["dap"], &dapFields)).To(Succeed())
+	g.Expect(dapFields).To(HaveLen(4))
+	g.Expect(string(dapFields["sourceLaunchVersion"])).To(Equal("1"))
+	g.Expect(protocol.DAPSourceLaunchVersion).To(Equal(1))
 
 	_, repeated := getHealth(t, srv.httpServer.Handler)
 	g.Expect(repeated.InstanceID).To(Equal(health.InstanceID))
@@ -154,6 +160,7 @@ func TestHealthReportsResolvedDAPAddress(t *testing.T) {
 
 	_, health := getHealth(t, srv.httpServer.Handler)
 	g.Expect(health.DAP.Enabled).To(BeTrue())
+	g.Expect(health.DAP.SourceLaunchVersion).To(Equal(protocol.DAPSourceLaunchVersion))
 	g.Expect(health.DAP.Address).To(MatchRegexp(`^127\.0\.0\.1:\d+$`))
 	g.Expect(health.DAP.Address).NotTo(HaveSuffix(":0"))
 	g.Expect(health.ManagedIdleShutdown).To(Equal(ManagedIdleShutdownHealth{

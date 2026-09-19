@@ -5,4 +5,8 @@ const (
 	// richer transports to the exact managed session created by DAP.
 	DAPSessionEventName    = "bingo/session/v1"
 	DAPSessionEventVersion = 1
+
+	// DAPSourceLaunchVersion distinguishes servers that build local Go packages
+	// from older adapters that silently ignore the launch mode argument.
+	DAPSourceLaunchVersion = 1
 )
