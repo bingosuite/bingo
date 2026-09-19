@@ -1,6 +1,6 @@
 // Command bingo starts the bingo debug server.
 //
-//	bingo [-addr host:port] [-dap-addr host:port] [-idle-timeout duration] [-v]
+//	bingo [-addr host:port] [-dap-addr host:port] [-idle-timeout duration] [-v] [-version]
 package main
 
 import (
@@ -11,10 +11,17 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
 	"github.com/bingosuite/bingo/internal/server"
+	"github.com/bingosuite/bingo/pkg/protocol"
+)
+
+var (
+	buildVersion = "dev"
+	buildCommit  = "unknown"
 )
 
 type config struct {
@@ -22,6 +29,7 @@ type config struct {
 	dapAddr     string
 	idleTimeout time.Duration
 	verbose     bool
+	showVersion bool
 }
 
 func main() {
@@ -32,6 +40,11 @@ func main() {
 	if err != nil {
 		_, _ = fmt.Fprintln(os.Stderr, "bingo:", err)
 		os.Exit(2)
+	}
+	if cfg.showVersion {
+		_, _ = fmt.Fprintf(os.Stdout, "bingo %s (commit %s; %s/%s; %s; wire %s)\n",
+			buildVersion, buildCommit, runtime.GOOS, runtime.GOARCH, runtime.Version(), protocol.Version)
+		return
 	}
 
 	level := slog.LevelInfo
@@ -105,8 +118,12 @@ func parseConfig(args []string, output io.Writer) (config, error) {
 	flags.StringVar(&cfg.dapAddr, "dap-addr", "", "DAP listen address (host:port); empty disables the DAP server")
 	flags.DurationVar(&cfg.idleTimeout, "idle-timeout", 0, "exit after no managed sessions for this duration; 0 disables")
 	flags.BoolVar(&cfg.verbose, "v", false, "enable verbose (debug) logging")
+	flags.BoolVar(&cfg.showVersion, "version", false, "print build and wire protocol versions without starting the server")
 	if err := flags.Parse(args); err != nil {
 		return config{}, err
+	}
+	if flags.NArg() != 0 {
+		return config{}, fmt.Errorf("unexpected positional arguments: %q", flags.Args())
 	}
 	if err := server.ValidateIdleTimeout(cfg.idleTimeout); err != nil {
 		return config{}, err
