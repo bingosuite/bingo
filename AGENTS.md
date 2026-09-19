@@ -71,6 +71,26 @@ follow them so reviews stay about substance, not style.
 - Only run linters/builds/tests that already exist; don't introduce new
   tooling for a change unless the task is specifically about that.
 
+### Native binary builds
+
+[`scripts/build-binary.sh`](scripts/build-binary.sh) is the shared build/sign
+entry point: `{bingo|cli|dapcli|wsmon} OUTPUT [GOOS GOARCH]`. It checks the
+supported host, the minimum Go version from `go.mod`, and Darwin's Command Line
+Tools before building. Ordinary server/Neovim builds need no Node or `just`.
+The output is replaced only after build and signature verification succeed.
+Darwin server builds use `bingonative` and the debugger entitlement; the
+ad-hoc signature is **not notarization**. Explicit linux/amd64 cross-compilation
+from Apple Silicon is allowed, but never counts as native runtime verification.
+
+`BINGO_REPRODUCIBLE=1` reuses the VS Code Mach-O UUID normalizer before signing
+(Node from `.nvmrc` is needed only for reproducible Darwin builds). Never remove
+the UUID or normalize an already-signed output. `BINGO_VERSION` accepts `dev` or
+a `vMAJOR.MINOR.PATCH` tag with optional prerelease; `BINGO_COMMIT` accepts a full
+Git SHA, an explicitly dirty SHA, or `unknown`. Only the server embeds them.
+`bingo -version` reports build identity, platform, toolchain and the independent
+wire version without entering the server lifecycle; help and invalid arguments
+also return before creating listeners. Positional arguments are rejected.
+
 ### Platform scope
 
 - Supported platforms are **linux/amd64** and **darwin/arm64** only. Do not add

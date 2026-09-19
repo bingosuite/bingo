@@ -9,15 +9,13 @@ tool (
 
 require (
 	github.com/chzyer/readline v1.5.1
+	github.com/google/go-dap v0.12.0
 	github.com/gorilla/websocket v1.5.3
 	github.com/onsi/ginkgo/v2 v2.27.5
 	github.com/onsi/gomega v1.39.0
 )
 
-require (
-	github.com/google/go-dap v0.12.0 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
-)
+require gopkg.in/yaml.v3 v3.0.1 // indirect
 
 require (
 	github.com/MakeNowJust/heredoc v1.0.0 // indirect
