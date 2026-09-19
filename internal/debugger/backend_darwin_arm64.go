@@ -44,6 +44,8 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
+
+	"github.com/bingosuite/bingo/internal/launch"
 )
 
 func newBackend() Backend {
@@ -198,7 +200,7 @@ func darwinSuspendProbeEnabled() bool {
 // resting state (every thread individually Mach-suspended, task resumed). It
 // returns no *exec.Cmd — posix_spawn owns no exec.Cmd — so the caller relies on
 // the pid and the backend's launched flag.
-func startTracedProcess(b Backend, binaryPath string, args []string, env []string) (int, *exec.Cmd, error) {
+func startTracedProcess(b Backend, binaryPath string, args []string, env []string, cwd string) (int, *exec.Cmd, error) {
 	db, _ := b.(*darwinBackend)
 	if db == nil {
 		return 0, nil, fmt.Errorf("darwin startTracedProcess: nil backend")
@@ -209,6 +211,8 @@ func startTracedProcess(b Backend, binaryPath string, args []string, env []strin
 
 	cpath := C.CString(binaryPath)
 	defer C.free(unsafe.Pointer(cpath))
+	ccwd := C.CString(cwd)
+	defer C.free(unsafe.Pointer(ccwd))
 
 	argv := make([]*C.char, 0, len(args)+2)
 	argv = append(argv, cpath)
@@ -219,7 +223,7 @@ func startTracedProcess(b Backend, binaryPath string, args []string, env []strin
 	}
 	argv = append(argv, nil)
 
-	fullEnv := append(os.Environ(), env...)
+	fullEnv := launch.Environment(cwd, env)
 	if darwinAsyncPreemptOffEnabled() {
 		fullEnv = withDarwinAsyncPreemptOff(fullEnv)
 	}
@@ -232,7 +236,7 @@ func startTracedProcess(b Backend, binaryPath string, args []string, env []strin
 	envp = append(envp, nil)
 
 	var cpid C.int
-	rc := C.bingo_posix_spawn(cpath, &argv[0], &envp[0], &cpid)
+	rc := C.bingo_posix_spawn(cpath, ccwd, &argv[0], &envp[0], &cpid)
 	if rc != 0 {
 		return 0, nil, fmt.Errorf("posix_spawn %q: %s", binaryPath, C.GoString(C.strerror(rc)))
 	}

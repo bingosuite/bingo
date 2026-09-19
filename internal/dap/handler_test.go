@@ -123,9 +123,11 @@ type fakeSession struct {
 	addStarted chan struct{}
 	allowAdd   <-chan struct{}
 	addOnce    sync.Once
+	done       chan struct{}
 }
 
-func (s *fakeSession) SessionID() string { return s.id }
+func (s *fakeSession) SessionID() string     { return s.id }
+func (s *fakeSession) Done() <-chan struct{} { return s.done }
 
 // AddClient mirrors the hub: it optionally delivers a welcome EventSessionState
 // (as the real hub's sendStateTo does) and starts a read pump draining the
@@ -319,7 +321,7 @@ func newHarnessWelcome(t *testing.T, welcome protocol.SessionState) *harness {
 	return newHarnessProvider(t, prov, rec)
 }
 
-func newHarnessProvider(t *testing.T, prov Provider, rec *cmdRecorder) *harness {
+func newHarnessProvider(t *testing.T, prov Provider, rec *cmdRecorder, configure ...func(*Handler)) *harness {
 	t.Helper()
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -343,6 +345,9 @@ func newHarnessProvider(t *testing.T, prov Provider, rec *cmdRecorder) *harness 
 	serverConn := <-accepted
 
 	h := NewHandler(serverConn, prov, slog.New(slog.NewTextHandler(nopWriter{}, nil)))
+	for _, option := range configure {
+		option(h)
+	}
 	served := make(chan struct{})
 	go func() {
 		defer close(served)

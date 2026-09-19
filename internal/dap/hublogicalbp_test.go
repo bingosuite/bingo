@@ -232,7 +232,8 @@ type hubSession struct {
 	gate *gatingConn
 }
 
-func (s *hubSession) SessionID() string { return "race-session" }
+func (s *hubSession) SessionID() string     { return "race-session" }
+func (s *hubSession) Done() <-chan struct{} { return s.hb.Done() }
 
 func (s *hubSession) AddClient(conn hub.WSConn, log *slog.Logger) (*hub.Client, error) {
 	s.gate.WSConn = conn

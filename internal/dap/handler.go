@@ -2,6 +2,7 @@ package dap
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -51,18 +52,26 @@ type Handler struct {
 	// Kill on disconnect) is still delivered.
 	cmdOut chan []byte
 
-	done      chan struct{}
-	closeOnce sync.Once
+	done        chan struct{}
+	closeOnce   sync.Once
+	ctx         context.Context
+	cancel      context.CancelFunc
+	builds      sync.WaitGroup
+	artifacts   *sourceArtifacts
+	buildSource func(context.Context, launchConfig) (*sourceArtifact, error)
 
-	// writeMu serialises DAP writes to conn — two writers race here: the DAP
-	// read loop (request responses) and the hub write pump (event
-	// translations via WriteMessage). It also guards seq.
+	// writeMu serialises DAP writes from the read loop, hub write pump, and
+	// source-build worker. It also guards seq.
 	writeMu sync.Mutex
 	seq     int
 
 	// flushMu serialises outbox drains so staged commands are handed to the hub
 	// in staging order. Never taken while holding mu.
 	flushMu sync.Mutex
+
+	// A canceled builder can finish immediately. Its failure/Close must not
+	// overtake the terminate/disconnect response that requested cancellation.
+	startReplyMu sync.Mutex
 
 	// mu guards all coordination state below. Never held across a socket
 	// write (release mu, then take writeMu) or a cmdOut enqueue.
@@ -73,6 +82,7 @@ type Handler struct {
 
 	sessionStarting  bool
 	sessionAnnounced bool
+	sourceBuild      *sourceBuild
 
 	// Handshake / lifecycle flags.
 	launching   bool
@@ -140,6 +150,8 @@ type Handler struct {
 	// the DAP read loop (a new setBreakpoints) and the hub write pump (a
 	// confirmation that advances a line) — and the FIFOs are only meaningful
 	// if the wire order matches the reservation order. See flushCommands.
+	// It also orders asynchronous source Launch admission against Kill, so a
+	// cancellation after submission cannot reach the hub ahead of its Launch.
 	outbox [][]byte
 
 	// Data-request correlation FIFOs, one per bingo confirmation event kind.
@@ -249,13 +261,15 @@ type varsReq struct {
 // JSON).
 type launchConfig struct {
 	Program     string   `json:"program"`
+	Mode        string   `json:"mode,omitempty"`
+	Cwd         string   `json:"cwd,omitempty"`
 	Args        []string `json:"args,omitempty"`
 	Env         []string `json:"env,omitempty"`
 	StopOnEntry bool     `json:"stopOnEntry,omitempty"`
 	NoDebug     bool     `json:"noDebug,omitempty"`
 
 	// Attach.
-	PID        int    `json:"pid,omitempty"`
+	PID        *int   `json:"pid,omitempty"`
 	BinaryPath string `json:"binaryPath,omitempty"`
 
 	// Session, when set, joins an existing managed session as its driver
@@ -268,22 +282,30 @@ func NewHandler(conn net.Conn, provider Provider, log *slog.Logger) *Handler {
 	if log == nil {
 		log = slog.Default()
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Handler{
-		conn:     conn,
-		reader:   bufio.NewReader(conn),
-		provider: provider,
-		log:      log,
-		cmdOut:   make(chan []byte, cmdBufferSize),
-		done:     make(chan struct{}),
-		bpByFile: make(map[string]map[int]*bpLine),
-		varCache: make(map[int][]godap.Variable),
+		conn:        conn,
+		reader:      bufio.NewReader(conn),
+		provider:    provider,
+		log:         log,
+		cmdOut:      make(chan []byte, cmdBufferSize),
+		done:        make(chan struct{}),
+		ctx:         ctx,
+		cancel:      cancel,
+		artifacts:   &sourceArtifacts{},
+		buildSource: (sourceBuilder{}).build,
+		bpByFile:    make(map[string]map[int]*bpLine),
+		varCache:    make(map[int][]godap.Variable),
 	}
 }
 
 // Serve runs the DAP read loop until the connection closes. Blocking; the
 // server's accept loop runs it in its own goroutine.
 func (h *Handler) Serve() {
-	defer func() { _ = h.Close() }()
+	defer func() {
+		_ = h.Close()
+		h.builds.Wait()
+	}()
 	for {
 		msg, err := godap.ReadProtocolMessage(h.reader)
 		if err != nil {
@@ -354,7 +376,12 @@ func (h *Handler) SetPongHandler(func(appData string) error) {}
 // the socket. The hub reacts to the EOF by removing this client.
 func (h *Handler) Close() error {
 	h.closeOnce.Do(func() {
+		h.mu.Lock()
+		if h.cancel != nil {
+			h.cancel()
+		}
 		close(h.done)
+		h.mu.Unlock()
 		_ = h.conn.Close()
 	})
 	return nil
@@ -459,7 +486,7 @@ func (h *Handler) enqueue(cmd []byte) {
 	}
 }
 
-// queueCommandLocked stages a breakpoint command for the hub. Staging (rather
+// queueCommandLocked stages a command for the hub. Staging (rather
 // than enqueuing directly) is what keeps the wire order equal to the setQ/clearQ
 // reservation order: the reservation happens under mu, but the enqueue cannot
 // (it may block), so two producers could otherwise interleave and correlate a

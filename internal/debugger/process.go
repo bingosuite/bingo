@@ -2,6 +2,7 @@ package debugger
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 )
@@ -19,7 +20,7 @@ type attachedBackendDetacher interface {
 	detachAttached() error
 }
 
-func (p *process) launch(b Backend, binaryPath string, args []string, env []string) error {
+func (p *process) launch(b Backend, binaryPath string, args []string, env []string, cwd string) error {
 	if p.live {
 		return ErrAlreadyRunning
 	}
@@ -28,7 +29,7 @@ func (p *process) launch(b Backend, binaryPath string, args []string, env []stri
 		return fmt.Errorf("launch: %w", err)
 	}
 
-	pid, cmd, err := startTracedProcess(b, binaryPath, args, env)
+	pid, cmd, err := startTracedProcess(b, binaryPath, args, env, cwd)
 	if err != nil {
 		return fmt.Errorf("launch: %w", err)
 	}
@@ -42,6 +43,9 @@ func (p *process) launch(b Backend, binaryPath string, args []string, env []stri
 func (p *process) attach(b Backend, pid int) error {
 	if p.live {
 		return ErrAlreadyRunning
+	}
+	if pid <= 0 || pid > math.MaxInt32 {
+		return fmt.Errorf("attach: pid must be a positive 32-bit process ID")
 	}
 	if err := attachToProcess(b, pid); err != nil {
 		if detacher, ok := b.(interface{ retainsAttachedOwnership() bool }); ok &&

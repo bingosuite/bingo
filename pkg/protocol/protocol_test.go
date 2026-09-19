@@ -517,12 +517,13 @@ var _ = Describe("Command", func() {
 
 			Entry("Launch",
 				protocol.CmdLaunch,
-				protocol.LaunchPayload{Program: "/tmp/myapp", Args: []string{"--verbose"}},
+				protocol.LaunchPayload{Program: "/tmp/myapp", Args: []string{"--verbose"}, Cwd: "/tmp/working directory"},
 				func(c protocol.Command) {
 					var p protocol.LaunchPayload
 					Expect(protocol.DecodeCommandPayload(c, &p)).To(Succeed())
 					Expect(p.Program).To(Equal("/tmp/myapp"))
 					Expect(p.Args).To(ConsistOf("--verbose"))
+					Expect(p.Cwd).To(Equal("/tmp/working directory"))
 				},
 			),
 

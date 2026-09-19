@@ -2501,7 +2501,7 @@ for ones that fail to resolve (bingo: `protocol.DiscardedBreakpoint`).
 Bookkeeping needed across the kill+relaunch, since the old engine's state is
 gone once killed:
 
-- `h.lastLaunch *protocol.LaunchPayload` — the program/args/env from the most
+- `h.lastLaunch *protocol.LaunchPayload` — the program/args/env/cwd from the most
   recent successful `Launch`. Restart refuses to run if this is nil (no prior
   Launch, or the session was started via `Attach` — mirrors Delve's
   `canRestart`: there's no "same binary" to relaunch for an attached process).
@@ -3007,18 +3007,23 @@ slow-client eviction. There is deliberately no DAP-awareness anywhere in
   `godap.ReadProtocolMessage` → `dispatchRequest`. Runs the handshake state
   machine, enqueues bingo commands, and answers non-hub requests directly.
 
-**Three goroutines touch a Handler** — `Serve` (socket reads), the hub read pump
-(`ReadMessage`), the hub write pump (`WriteMessage`→`translateEvent`). `mu`
+**Three long-lived goroutines touch a Handler** — `Serve` (socket reads), the
+hub read pump (`ReadMessage`), the hub write pump
+(`WriteMessage`→`translateEvent`); source launch adds one joined build worker. `mu`
 guards coordination state; `writeMu` serialises socket writes + the DAP `seq`.
 **Rule: never hold `mu` across a socket write or a `cmdOut` enqueue** (release
 `mu`, then take `writeMu`). go-dap's `WriteProtocolMessage` does not set `Seq`,
 so `send` stamps it via reflection (`setSeqField` walks anonymous-embedded
 structs for the int `Seq`).
 
-**Managed-session discovery event.** Immediately after `startSession` has
-successfully attached the DAP handler to a created or joined managed session,
-the adapter emits exactly one custom DAP event named `bingo/session/v1` with
+**Managed-session discovery event.** After `startSession` has successfully
+attached the DAP handler to a created or joined managed session, the adapter
+emits exactly one custom DAP event named `bingo/session/v1` with
 body `{"version":1,"sessionId":"…"}` and preserves the console announcement.
+Binary launch, attach, and join announce immediately; source launch waits for
+its successful native entry stop, before `initialized`. An observer that joins
+and queries immediately therefore cannot race compilation or an uninstalled
+debugger. Failed builds/native source launches announce nothing.
 It emits neither event on create/join failure. `sessionAnnounced` is claimed
 under `mu`, but the event write occurs after unlocking, preserving the
 no-lock-across-socket-write invariant. Go DAP clients must read through
@@ -3257,6 +3262,50 @@ Empty results keep Fit/zoom callbacks safe even without an SVG scene. SVG
 treeitems carry `aria-level`, sibling position/size, selection, and parent
 context; arrow navigation moves DOM focus with selection.
 
+### Server-local source launch and working directories
+
+DAP `launch` accepts `mode:"debug"` for a local Go **package directory**, or
+`mode:"exec"` for a compiled binary. Omitting mode retains binary semantics;
+explicit empty/unknown modes are errors. No source-file selection, import-path
+selection, buildFlags, or noDebug execution is supported. Paths are local to
+the **server**, including connectOnly/remote connections. Both DAP and native
+`LaunchPayload` accept optional `cwd`; a relative program resolves against it,
+or against the server directory when absent. Source mode defaults an empty cwd
+to the resolved package directory. Exec's empty cwd preserves inheritance.
+`internal/launch` resolves paths without global `os.Chdir`; Linux uses `Cmd.Dir`,
+Darwin checked `posix_spawn` child file-action chdir. Explicit cwd also replaces
+inherited/overridden `PWD`. The additive `debugger.LaunchWithOptions` helper
+preserves the three-argument `Debugger.Launch`; legacy implementations reject a
+nonempty cwd rather than silently ignoring it. Restart preserves cwd and
+reuses the built executable, not edited source; existing nil-vs-empty args/env
+overrides are unchanged. These additive fields leave wire 1.4 unchanged.
+
+`internal/dap/source.go` builds with argv-based
+`go build -gcflags='all=-N -l' -o <private-directory>/debuggee .`, running in the
+package directory with server environment plus launch overrides. It requires
+Go on the server PATH, allows ordinary dependency resolution, and bounds the
+build to two minutes and combined diagnostics to 64 KiB. Compiler/linker
+children share an owned process group, canceled together; the command and
+output pumps are joined before its exact temporary directory is removed.
+`GOTMPDIR` and `TMPDIR` also point inside that owned directory so canceled Go
+drivers cannot orphan compiler scratch elsewhere.
+
+The handler creates/registers a managed session **before** compilation to
+prevent idle shutdown, but keeps Serve responsive with one tracked build.
+Terminate, disconnect, and server Close cancel it; Serve cannot return until
+the build worker joins. Duplicate starts, ambiguous pid/session attaches,
+invalid PID ranges, and premature configurationDone/restart are rejected
+without changing the first startup's state. A canceled or late build success
+cannot admit Launch; build failure settles the start once and closes its
+connection so an otherwise empty hub retires. Successful binaries belong to
+the exact managed session until `Session.Done`/`Hub.Done`, never just until
+Handler.Close or process exit. This preserves restart and shared observers,
+including retained native cleanup. DAP Close joins builders; server shutdown
+then joins artifact retirement **after** its hubs finish. The hub has no
+source-build logic. Deterministic builder/lifecycle tests and the native
+`source-launch` (also `dap`) specs pin paths with spaces, child cwd/PWD,
+immediate discovery queries, restart, cancellation, and artifact ownership.
+
 ### Handshake (Delve-style, VS Code-compatible)
 
 1. `initialize` → `Capabilities` (ConfigurationDone/Terminate/Restart +
@@ -3264,7 +3313,8 @@ context; arrow navigation moves DOM focus with selection.
    Only capabilities bingo actually implements are advertised — `evaluate`
    (name-only, see below) backs the hover cap.
 2. `launch`/`attach` → `startSession` (`CreateSession` + `AddClient(self)`)
-   **then** enqueue `CmdLaunch`/`CmdAttach`; set `launching=true`. Registering as
+   **then** enqueue `CmdLaunch`/`CmdAttach` (after compilation in source mode);
+   claim `launching=true` before admission. Registering as
    a client BEFORE enqueuing the launch is what guarantees we receive the entry
    stop. An `EventError(Launch/Attach)` during `launching` → error the start
    request + `terminated` (`failStart`).

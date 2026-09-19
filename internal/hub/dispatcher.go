@@ -32,7 +32,8 @@ func dispatch(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, erro
 		if err := protocol.DecodeCommandPayload(cmd, &p); err != nil {
 			return dispatchResult{}, err
 		}
-		return dispatchResult{}, dbg.Launch(p.Program, p.Args, p.Env)
+		return dispatchResult{}, debugger.LaunchWithOptions(dbg, p.Program, p.Args, p.Env,
+			debugger.LaunchOptions{Cwd: p.Cwd})
 
 	case protocol.CmdAttach:
 		var p protocol.AttachPayload

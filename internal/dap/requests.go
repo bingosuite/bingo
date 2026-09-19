@@ -1,7 +1,6 @@
 package dap
 
 import (
-	"encoding/json"
 	"fmt"
 
 	godap "github.com/google/go-dap"
@@ -86,86 +85,65 @@ func (h *Handler) onInitialize(req *godap.InitializeRequest) {
 }
 
 func (h *Handler) onLaunch(req *godap.LaunchRequest) {
-	var cfg launchConfig
-	if len(req.Arguments) > 0 {
-		if err := json.Unmarshal(req.Arguments, &cfg); err != nil {
-			h.send(h.errorResponse(req.Seq, "launch", "invalid launch arguments: "+err.Error()))
-			return
-		}
+	cfg, err := decodeStartConfig(req.Arguments)
+	if err == nil {
+		cfg, err = prepareLaunch(cfg)
 	}
-	if cfg.Program == "" {
-		h.send(h.errorResponse(req.Seq, "launch", "launch requires 'program'"))
-		return
-	}
-	if err := h.startSession(cfg.Session); err != nil {
-		h.send(h.errorResponse(req.Seq, "launch", err.Error()))
-		return
-	}
-
-	h.mu.Lock()
-	h.startReqSeq = req.Seq
-	h.startCmd = "launch"
-	h.stopOnEntry = cfg.StopOnEntry
-	h.attached = false
-	h.launching = true
-	h.mu.Unlock()
-
-	h.announceSession()
-
-	cmd, err := marshalCommand(protocol.CmdLaunch, protocol.LaunchPayload{
-		Program: cfg.Program, Args: cfg.Args, Env: cfg.Env,
-	})
 	if err != nil {
+		h.send(h.errorResponse(req.Seq, "launch", "invalid launch arguments: "+err.Error()))
+		return
+	}
+	if err := h.claimStart(req.Seq, "launch", cfg, false); err != nil {
 		h.send(h.errorResponse(req.Seq, "launch", err.Error()))
 		return
 	}
-	h.enqueue(cmd)
+	if err := h.startSession(""); err != nil {
+		h.abandonStart(req.Seq)
+		h.send(h.errorResponse(req.Seq, "launch", err.Error()))
+		return
+	}
+	if cfg.Mode == "debug" {
+		h.startSourceBuild(cfg)
+		return
+	}
+	h.announceSession()
+	h.enqueueStart(protocol.CmdLaunch, protocol.LaunchPayload{
+		Program: cfg.Program, Args: cfg.Args, Env: cfg.Env, Cwd: cfg.Cwd,
+	})
 }
 
 func (h *Handler) onAttach(req *godap.AttachRequest) {
-	var cfg launchConfig
-	if len(req.Arguments) > 0 {
-		if err := json.Unmarshal(req.Arguments, &cfg); err != nil {
-			h.send(h.errorResponse(req.Seq, "attach", "invalid attach arguments: "+err.Error()))
-			return
-		}
+	cfg, err := decodeStartConfig(req.Arguments)
+	if err == nil {
+		err = validateAttach(cfg)
+	}
+	if err != nil {
+		h.send(h.errorResponse(req.Seq, "attach", "invalid attach arguments: "+err.Error()))
+		return
 	}
 	// A `session` argument with no pid means "join an already-running bingo
 	// session as an additional client", not "attach to an OS process". Route it
 	// to the join path, which registers as a client without relaunching.
-	if cfg.Session != "" && cfg.PID == 0 {
+	if cfg.Session != "" {
 		h.onJoin(req, cfg)
 		return
 	}
-	if cfg.PID == 0 {
-		h.send(h.errorResponse(req.Seq, "attach", "attach requires 'pid' (or 'session' to join an existing bingo session)"))
-		return
-	}
-	if err := h.startSession(cfg.Session); err != nil {
+	if err := h.claimStart(req.Seq, "attach", cfg, false); err != nil {
 		h.send(h.errorResponse(req.Seq, "attach", err.Error()))
 		return
 	}
-
-	h.mu.Lock()
-	h.startReqSeq = req.Seq
-	h.startCmd = "attach"
-	h.stopOnEntry = cfg.StopOnEntry
-	h.attached = true
-	h.launching = true
-	h.mu.Unlock()
-
+	if err := h.startSession(""); err != nil {
+		h.abandonStart(req.Seq)
+		h.send(h.errorResponse(req.Seq, "attach", err.Error()))
+		return
+	}
 	h.announceSession()
 
 	binary := cfg.BinaryPath
 	if binary == "" {
 		binary = cfg.Program
 	}
-	cmd, err := marshalCommand(protocol.CmdAttach, protocol.AttachPayload{PID: cfg.PID, BinaryPath: binary})
-	if err != nil {
-		h.send(h.errorResponse(req.Seq, "attach", err.Error()))
-		return
-	}
-	h.enqueue(cmd)
+	h.enqueueStart(protocol.CmdAttach, protocol.AttachPayload{PID: *cfg.PID, BinaryPath: binary})
 }
 
 // onJoin registers this connection as an ADDITIONAL client on an existing bingo
@@ -179,20 +157,13 @@ func (h *Handler) onJoin(req *godap.AttachRequest, cfg launchConfig) {
 	// Set the join flags BEFORE registering as a client: the hub delivers its
 	// welcome EventSessionState as soon as AddClient runs, and onSessionState
 	// must see awaitingWelcome=true to translate it into the initial DAP state.
-	h.mu.Lock()
-	h.startReqSeq = req.Seq
-	h.startCmd = "attach"
-	h.stopOnEntry = cfg.StopOnEntry
-	h.attached = true
-	h.joining = true
-	h.awaitingWelcome = true
-	h.mu.Unlock()
+	if err := h.claimStart(req.Seq, "attach", cfg, true); err != nil {
+		h.send(h.errorResponse(req.Seq, "attach", err.Error()))
+		return
+	}
 
 	if err := h.startSession(cfg.Session); err != nil {
-		h.mu.Lock()
-		h.joining = false
-		h.awaitingWelcome = false
-		h.mu.Unlock()
+		h.abandonStart(req.Seq)
 		h.send(h.errorResponse(req.Seq, "attach", err.Error()))
 		return
 	}
@@ -206,6 +177,10 @@ func (h *Handler) onJoin(req *godap.AttachRequest, cfg launchConfig) {
 // command is enqueued guarantees the entry-stop event is delivered to us.
 func (h *Handler) startSession(existingID string) error {
 	h.mu.Lock()
+	if err := h.ctx.Err(); err != nil {
+		h.mu.Unlock()
+		return err
+	}
 	if h.session != nil || h.sessionStarting {
 		h.mu.Unlock()
 		return fmt.Errorf("session already started for this connection")
@@ -249,7 +224,7 @@ func (h *Handler) startSession(existingID string) error {
 	h.sessionStarting = false
 	started = true
 	h.mu.Unlock()
-	return nil
+	return h.ctx.Err()
 }
 
 // announceSession publishes the managed-session identity once the handler is
@@ -258,7 +233,7 @@ func (h *Handler) startSession(existingID string) error {
 func (h *Handler) announceSession() {
 	h.mu.Lock()
 	sess := h.session
-	if sess == nil || h.sessionAnnounced {
+	if sess == nil || h.sessionAnnounced || h.ctx.Err() != nil || h.terminated || h.terminating {
 		h.mu.Unlock()
 		return
 	}
@@ -277,6 +252,13 @@ func (h *Handler) announceSession() {
 }
 
 func (h *Handler) onConfigurationDone(req *godap.ConfigurationDoneRequest) {
+	h.mu.Lock()
+	notReady := h.launching && !h.terminated && !h.terminating
+	h.mu.Unlock()
+	if notReady {
+		h.send(h.errorResponse(req.Seq, "configurationDone", "launch or attach has not reached its entry stop"))
+		return
+	}
 	h.send(&godap.ConfigurationDoneResponse{Response: h.response(req.Seq, "configurationDone")})
 
 	h.mu.Lock()
@@ -494,11 +476,16 @@ func (h *Handler) onEvaluate(req *godap.EvaluateRequest) {
 }
 
 func (h *Handler) onDisconnect(req *godap.DisconnectRequest) {
+	h.startReplyMu.Lock()
+	defer h.startReplyMu.Unlock()
 	h.mu.Lock()
 	attached := h.attached
 	hasSession := h.session != nil
 	killComplete := h.terminated && !h.restarting
-	h.mu.Unlock()
+	building := h.sourceBuild != nil && !h.sourceBuild.submitted
+	if building {
+		h.sourceBuild.cancel()
+	}
 
 	// Launch sessions terminate the debuggee by default; attach sessions leave
 	// it running. terminateDebuggee overrides either way.
@@ -507,17 +494,26 @@ func (h *Handler) onDisconnect(req *godap.DisconnectRequest) {
 		terminate = true
 	}
 
-	if terminate && hasSession && !killComplete {
+	if terminate && hasSession && !killComplete && !building {
 		if cmd, err := marshalCommand(protocol.CmdKill, nil); err == nil {
-			h.enqueue(cmd) // drained by ReadMessage's priority path before EOF
+			h.queueCommandLocked(cmd)
 		}
 	}
+	h.mu.Unlock()
+	h.flushCommands()
 	h.send(&godap.DisconnectResponse{Response: h.response(req.Seq, "disconnect")})
 	_ = h.Close()
 }
 
 func (h *Handler) onTerminate(req *godap.TerminateRequest) {
+	h.startReplyMu.Lock()
+	defer h.startReplyMu.Unlock()
 	h.mu.Lock()
+	building := h.sourceBuild != nil && !h.sourceBuild.submitted
+	if building {
+		h.terminating = true
+		h.sourceBuild.cancel()
+	}
 	hasSession := h.session != nil
 	complete := !hasSession || (!h.launching && !h.restarting && h.sessionEndedLocked())
 	kill := hasSession && !complete && !h.terminating && (!h.terminated || h.restarting)
@@ -527,20 +523,23 @@ func (h *Handler) onTerminate(req *godap.TerminateRequest) {
 	}
 	if kill {
 		h.terminating = true
-	}
-	h.mu.Unlock()
-
-	if kill {
 		if cmd, err := marshalCommand(protocol.CmdKill, nil); err == nil {
-			h.enqueue(cmd)
+			h.queueCommandLocked(cmd)
 		}
 	}
+	h.mu.Unlock()
+	h.flushCommands()
 	h.send(&godap.TerminateResponse{Response: h.response(req.Seq, "terminate")})
 	h.send(messages...)
 }
 
 func (h *Handler) onRestart(req *godap.RestartRequest) {
 	h.mu.Lock()
+	if h.launching || h.startReqSeq != 0 {
+		h.mu.Unlock()
+		h.send(h.errorResponse(req.Seq, "restart", "launch or attach is still in progress"))
+		return
+	}
 	if h.terminating {
 		h.mu.Unlock()
 		h.send(h.errorResponse(req.Seq, "restart", "termination already in progress"))

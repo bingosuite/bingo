@@ -214,6 +214,7 @@ type LaunchPayload struct {
 	Program string   `json:"program"`
 	Args    []string `json:"args,omitempty"`
 	Env     []string `json:"env,omitempty"` // additional KEY=VALUE entries
+	Cwd     string   `json:"cwd,omitempty"`
 }
 
 // AttachPayload asks the debugger to attach to PID. BinaryPath is optional but

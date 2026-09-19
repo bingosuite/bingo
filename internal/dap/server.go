@@ -20,8 +20,10 @@ type Server struct {
 	// A handler that connected but never started a session has no hub to tear
 	// it down, so its Serve goroutine would otherwise block forever in
 	// ReadProtocolMessage and wedge wg.Wait().
-	handlers map[*Handler]struct{}
-	wg       sync.WaitGroup
+	handlers    map[*Handler]struct{}
+	wg          sync.WaitGroup
+	artifacts   sourceArtifacts
+	buildSource func(context.Context, launchConfig) (*sourceArtifact, error)
 }
 
 // NewServer creates a DAP server over provider. It does not listen until Serve.
@@ -88,6 +90,10 @@ func (s *Server) acceptLoop(ln net.Listener) {
 			return
 		}
 		h := NewHandler(conn, s.provider, s.log)
+		h.artifacts = &s.artifacts
+		if s.buildSource != nil {
+			h.buildSource = s.buildSource
+		}
 		if !s.register(h) {
 			// Server closed between Accept and registration; drop the conn so
 			// its Serve goroutine never starts (and never joins wg).
@@ -150,4 +156,11 @@ func (s *Server) Close() error {
 	}
 	s.wg.Wait()
 	return err
+}
+
+// WaitForArtifacts is called after Close has joined all builders and the
+// provider has shut down its sessions. Close alone cannot wait for this:
+// another observer may still own a live, restartable session.
+func (s *Server) WaitForArtifacts() {
+	s.artifacts.wg.Wait()
 }
