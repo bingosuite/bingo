@@ -151,43 +151,53 @@ func TestArchiveRejectsSymlinksAndMissingCompanion(t *testing.T) {
 func TestEndUserChecksumsAllowOnlyVerifiedSubsets(t *testing.T) {
 	for _, state := range []string{"selected asset", "tampered selected asset", "no present assets"} {
 		t.Run(state, func(t *testing.T) {
-			directory := t.TempDir()
-			assets := []string{"bundle.tar.gz", "extension.vsix", "companion.tar.gz", "metadata.json"}
-			for _, name := range assets {
-				if err := os.WriteFile(filepath.Join(directory, name), []byte(name), 0o644); err != nil {
-					t.Fatal(err)
-				}
-			}
-			const sums = "bingo_v0.7.0_darwin_arm64_SHA256SUMS.txt"
-			if err := writeChecksums(directory, sums, assets); err != nil {
-				t.Fatal(err)
-			}
-			for _, name := range assets[1:] {
-				if err := os.Remove(filepath.Join(directory, name)); err != nil {
-					t.Fatal(err)
-				}
-			}
-			switch state {
-			case "tampered selected asset":
-				if err := os.WriteFile(filepath.Join(directory, assets[0]), []byte("tampered"), 0o644); err != nil {
-					t.Fatal(err)
-				}
-			case "no present assets":
-				if err := os.Remove(filepath.Join(directory, assets[0])); err != nil {
-					t.Fatal(err)
-				}
-			}
-			cmd := exec.Command("shasum", "-a", "256", "-c", "--ignore-missing", sums)
-			cmd.Dir = directory
-			out, err := cmd.CombinedOutput()
-			if state == "selected asset" {
-				if err != nil || strings.TrimSpace(string(out)) != assets[0]+": OK" {
-					t.Fatalf("selected asset was not explicitly verified: %v\n%s", err, out)
-				}
-			} else if err == nil || strings.Contains(string(out), ": OK") {
-				t.Fatalf("unverified subset reported success: %v\n%s", err, out)
-			}
+			checkEndUserChecksumSubset(t, state)
 		})
+	}
+}
+
+func checkEndUserChecksumSubset(t *testing.T, state string) {
+	t.Helper()
+	directory := t.TempDir()
+	assets := []string{"bundle.tar.gz", "extension.vsix", "companion.tar.gz", "metadata.json"}
+	const sums = "bingo_v0.7.0_darwin_arm64_SHA256SUMS.txt"
+	writeChecksumFixture(t, directory, sums, assets)
+	for _, name := range assets[1:] {
+		if err := os.Remove(filepath.Join(directory, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	switch state {
+	case "tampered selected asset":
+		if err := os.WriteFile(filepath.Join(directory, assets[0]), []byte("tampered"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	case "no present assets":
+		if err := os.Remove(filepath.Join(directory, assets[0])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cmd := exec.Command("shasum", "-a", "256", "-c", "--ignore-missing", sums)
+	cmd.Dir = directory
+	out, err := cmd.CombinedOutput()
+	if state == "selected asset" {
+		if err != nil || strings.TrimSpace(string(out)) != assets[0]+": OK" {
+			t.Fatalf("selected asset was not explicitly verified: %v\n%s", err, out)
+		}
+	} else if err == nil || strings.Contains(string(out), ": OK") {
+		t.Fatalf("unverified subset reported success: %v\n%s", err, out)
+	}
+}
+
+func writeChecksumFixture(t *testing.T, directory, sums string, assets []string) {
+	t.Helper()
+	for _, name := range assets {
+		if err := os.WriteFile(filepath.Join(directory, name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writeChecksums(directory, sums, assets); err != nil {
+		t.Fatal(err)
 	}
 }
 

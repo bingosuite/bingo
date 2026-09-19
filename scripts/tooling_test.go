@@ -188,33 +188,37 @@ func TestLocalVSIXUsesOneVerifiedPackage(t *testing.T) {
 			if err != nil {
 				t.Fatalf("package: %v\n%s", err, out)
 			}
-			log := f.log()
-			commands := []string{
-				"npm --prefix editors/vscode ci --ignore-scripts",
-				"npm --prefix editors/vscode run package\n",
-				"npm --prefix editors/vscode run package:verify",
-			}
-			previous := -1
-			for _, command := range commands {
-				index := strings.Index(log, command)
-				if index <= previous || strings.Count(log, command) != 1 {
-					t.Fatalf("wrong package order/count for %q:\n%s", command, log)
-				}
-				previous = index
-			}
-			for _, forbidden := range []string{"run check", "run build", "reproducible", "go cgo="} {
-				if strings.Contains(log, forbidden) {
-					t.Fatalf("local install performed full/redundant work:\n%s", log)
-				}
-			}
-			if install {
-				if strings.Index(log, "code --install-extension") <= previous || !strings.Contains(log, "dist/bingo-linux-x64.vsix --force") {
-					t.Fatalf("install did not follow exact package verification:\n%s", log)
-				}
-			} else if strings.HasPrefix(log, "code ") || strings.Contains(log, "\ncode ") {
-				t.Fatalf("packaging touched VS Code:\n%s", log)
-			}
+			assertSingleVerifiedPackage(t, f.log(), install)
 		})
+	}
+}
+
+func assertSingleVerifiedPackage(t *testing.T, log string, install bool) {
+	t.Helper()
+	commands := []string{
+		"npm --prefix editors/vscode ci --ignore-scripts",
+		"npm --prefix editors/vscode run package\n",
+		"npm --prefix editors/vscode run package:verify",
+	}
+	previous := -1
+	for _, command := range commands {
+		index := strings.Index(log, command)
+		if index <= previous || strings.Count(log, command) != 1 {
+			t.Fatalf("wrong package order/count for %q:\n%s", command, log)
+		}
+		previous = index
+	}
+	for _, forbidden := range []string{"run check", "run build", "reproducible", "go cgo="} {
+		if strings.Contains(log, forbidden) {
+			t.Fatalf("local install performed full/redundant work:\n%s", log)
+		}
+	}
+	if install {
+		if strings.Index(log, "code --install-extension") <= previous || !strings.Contains(log, "dist/bingo-linux-x64.vsix --force") {
+			t.Fatalf("install did not follow exact package verification:\n%s", log)
+		}
+	} else if strings.HasPrefix(log, "code ") || strings.Contains(log, "\ncode ") {
+		t.Fatalf("packaging touched VS Code:\n%s", log)
 	}
 }
 

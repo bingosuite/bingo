@@ -70,19 +70,29 @@ func TestReleaseWorkflowBoundaries(t *testing.T) {
 		t.Fatalf("manual workflow uploads by default: %v", value)
 	}
 	for _, name := range []string{"resolve", "build"} {
-		if len(w.Jobs[name].Permissions) != 0 {
-			t.Fatalf("%s overrides read-only permissions", name)
+		assertReadOnlyReleaseJob(t, name, w.Jobs[name])
+	}
+	assertNativeReleaseBuild(t, w.Jobs["build"])
+	assertReleaseUploadJob(t, w.Jobs["upload"])
+}
+
+func assertReadOnlyReleaseJob(t *testing.T, name string, job workflowJob) {
+	t.Helper()
+	if len(job.Permissions) != 0 {
+		t.Fatalf("%s overrides read-only permissions", name)
+	}
+	for _, step := range job.Steps {
+		if strings.HasPrefix(step.Uses, "actions/checkout@") && step.With["persist-credentials"] != false {
+			t.Fatalf("%s retains a checkout token", name)
 		}
-		for _, step := range w.Jobs[name].Steps {
-			if strings.HasPrefix(step.Uses, "actions/checkout@") && step.With["persist-credentials"] != false {
-				t.Fatalf("%s retains a checkout token", name)
-			}
-			if strings.Contains(step.Run, "${{") {
-				t.Fatalf("%s interpolates expressions into shell code", name)
-			}
+		if strings.Contains(step.Run, "${{") {
+			t.Fatalf("%s interpolates expressions into shell code", name)
 		}
 	}
-	build := w.Jobs["build"]
+}
+
+func assertNativeReleaseBuild(t *testing.T, build workflowJob) {
+	t.Helper()
 	matrix := build.Strategy.Matrix.Include
 	if len(matrix) != 2 ||
 		matrix[0].Runner != "ubuntu-latest" || matrix[0].Target != "linux-x64" || matrix[0].GOOS != "linux" || matrix[0].GOARCH != "amd64" ||
@@ -92,7 +102,10 @@ func TestReleaseWorkflowBoundaries(t *testing.T) {
 	if build.Steps[0].With["ref"] != "${{ needs.resolve.outputs.commit }}" {
 		t.Fatal("builds no longer use the resolved immutable commit")
 	}
-	upload := w.Jobs["upload"]
+}
+
+func assertReleaseUploadJob(t *testing.T, upload workflowJob) {
+	t.Helper()
 	if upload.Permissions["contents"] != "write" || len(upload.Permissions) != 1 ||
 		upload.If != "github.event_name == 'release' || inputs.upload_to_draft" {
 		t.Fatalf("unexpected upload authority: %+v", upload)
@@ -112,6 +125,18 @@ func TestReleaseWorkflowBoundaries(t *testing.T) {
 	}
 }
 
+type uploadCase struct {
+	name     string
+	event    string
+	draft    string
+	tag      string
+	sha      string
+	tagType  string
+	apiFails bool
+	damage   string
+	succeeds bool
+}
+
 func TestUploadScriptChecksIdentityDraftAndChecksums(t *testing.T) {
 	w := readWorkflow(t)
 	var script string
@@ -123,17 +148,7 @@ func TestUploadScriptChecksIdentityDraftAndChecksums(t *testing.T) {
 	if !strings.Contains(script, "gh release upload") {
 		t.Fatal("missing upload transaction")
 	}
-	for _, tc := range []struct {
-		name     string
-		event    string
-		draft    string
-		tag      string
-		sha      string
-		tagType  string
-		apiFails bool
-		damage   string
-		succeeds bool
-	}{
+	for _, tc := range []uploadCase{
 		{name: "manual draft", event: "workflow_dispatch", draft: "true", succeeds: true},
 		{name: "annotated tag", event: "workflow_dispatch", draft: "true", tagType: "tag", succeeds: true},
 		{name: "non-commit ref", event: "workflow_dispatch", draft: "true", tagType: "tree"},
@@ -151,33 +166,82 @@ func TestUploadScriptChecksIdentityDraftAndChecksums(t *testing.T) {
 		{name: "unsafe checksum path", event: "workflow_dispatch", draft: "true", damage: "path"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			root := t.TempDir()
-			bin := filepath.Join(root, "bin")
-			directory := filepath.Join(root, "release-assets")
-			for _, dir := range []string{bin, directory} {
-				if err := os.Mkdir(dir, 0o755); err != nil {
-					t.Fatal(err)
-				}
-			}
-			for _, platform := range []string{"linux_amd64", "darwin_arm64"} {
-				target := "linux-x64"
-				if platform == "darwin_arm64" {
-					target = "darwin-arm64"
-				}
-				base := "bingo_v0.7.0_" + platform
-				assets := []string{base + ".tar.gz", base + ".json", "bingo-neovim_v0.7.0_" + platform + ".tar.gz", "bingo-v0.7.0-" + target + ".vsix"}
-				for _, name := range assets {
-					if err := os.WriteFile(filepath.Join(directory, name), []byte(name), 0o644); err != nil {
-						t.Fatal(err)
-					}
-				}
-				sums := base + "_SHA256SUMS.txt"
-				if err := writeChecksums(directory, sums, assets); err != nil {
-					t.Fatal(err)
-				}
-				damageUploadFixture(t, directory, sums, assets[0], tc.damage)
-			}
-			gh := `#!/bin/bash
+			runUploadCase(t, script, tc)
+		})
+	}
+}
+
+func runUploadCase(t *testing.T, script string, tc uploadCase) {
+	t.Helper()
+	root := newUploadFixture(t, tc.damage)
+	bin := filepath.Join(root, "bin")
+	tag := tc.tag
+	if tag == "" {
+		tag = "v0.7.0"
+	}
+	sha := tc.sha
+	if sha == "" {
+		sha = strings.Repeat("a", 40)
+	}
+	tagType := tc.tagType
+	if tagType == "" {
+		tagType = "commit"
+	}
+	apiFails := "false"
+	if tc.apiFails {
+		apiFails = "true"
+	}
+	cmd := exec.Command("bash", "-e", "-o", "pipefail", "-c", script)
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(),
+		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"RELEASE_TAG="+tag, "RELEASE_COMMIT="+strings.Repeat("a", 40),
+		"RELEASE_EVENT="+tc.event, "GITHUB_REPOSITORY=bingosuite/bingo",
+		"GH_TOKEN=test-only", "FAKE_DRAFT="+tc.draft, "FAKE_SHA="+sha,
+		"FAKE_TAG_TYPE="+tagType,
+		"FAKE_API_FAIL="+apiFails,
+		"UPLOAD_LOG="+filepath.Join(root, "uploaded"),
+	)
+	out, err := cmd.CombinedOutput()
+	if (err == nil) != tc.succeeds {
+		t.Fatalf("upload outcome mismatch: %v\n%s", err, out)
+	}
+	uploaded, readErr := os.ReadFile(filepath.Join(root, "uploaded"))
+	if tc.succeeds {
+		if readErr != nil || !strings.Contains(string(uploaded), "darwin-arm64.vsix") ||
+			!strings.Contains(string(uploaded), "linux-x64.vsix") ||
+			strings.Count(string(uploaded), "_SHA256SUMS.txt") != 2 {
+			t.Fatalf("missing platform assets: %v, %s", readErr, uploaded)
+		}
+	} else if !os.IsNotExist(readErr) {
+		t.Fatalf("failed transaction uploaded assets: %v, %s", readErr, uploaded)
+	}
+}
+
+func newUploadFixture(t *testing.T, damage string) string {
+	t.Helper()
+	root := t.TempDir()
+	bin := filepath.Join(root, "bin")
+	directory := filepath.Join(root, "release-assets")
+	for _, dir := range []string{bin, directory} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, platform := range []struct {
+		name   string
+		target string
+	}{
+		{"linux_amd64", "linux-x64"},
+		{"darwin_arm64", "darwin-arm64"},
+	} {
+		base := "bingo_v0.7.0_" + platform.name
+		assets := []string{base + ".tar.gz", base + ".json", "bingo-neovim_v0.7.0_" + platform.name + ".tar.gz", "bingo-v0.7.0-" + platform.target + ".vsix"}
+		sums := base + "_SHA256SUMS.txt"
+		writeChecksumFixture(t, directory, sums, assets)
+		damageUploadFixture(t, directory, sums, assets[0], damage)
+	}
+	gh := `#!/bin/bash
 set -eu
 case "$1 $2" in
   "api repos/bingosuite/bingo/git/ref/tags/"*)
@@ -193,52 +257,10 @@ case "$1 $2" in
   *) echo "unexpected gh invocation: $*" >&2; exit 1 ;;
 esac
 `
-			if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(gh), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			tag := tc.tag
-			if tag == "" {
-				tag = "v0.7.0"
-			}
-			sha := tc.sha
-			if sha == "" {
-				sha = strings.Repeat("a", 40)
-			}
-			tagType := tc.tagType
-			if tagType == "" {
-				tagType = "commit"
-			}
-			apiFails := "false"
-			if tc.apiFails {
-				apiFails = "true"
-			}
-			cmd := exec.Command("bash", "-e", "-o", "pipefail", "-c", script)
-			cmd.Dir = root
-			cmd.Env = append(os.Environ(),
-				"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
-				"RELEASE_TAG="+tag, "RELEASE_COMMIT="+strings.Repeat("a", 40),
-				"RELEASE_EVENT="+tc.event, "GITHUB_REPOSITORY=bingosuite/bingo",
-				"GH_TOKEN=test-only", "FAKE_DRAFT="+tc.draft, "FAKE_SHA="+sha,
-				"FAKE_TAG_TYPE="+tagType,
-				"FAKE_API_FAIL="+apiFails,
-				"UPLOAD_LOG="+filepath.Join(root, "uploaded"),
-			)
-			out, err := cmd.CombinedOutput()
-			if (err == nil) != tc.succeeds {
-				t.Fatalf("upload outcome mismatch: %v\n%s", err, out)
-			}
-			uploaded, readErr := os.ReadFile(filepath.Join(root, "uploaded"))
-			if tc.succeeds {
-				if readErr != nil || !strings.Contains(string(uploaded), "darwin-arm64.vsix") ||
-					!strings.Contains(string(uploaded), "linux-x64.vsix") ||
-					strings.Count(string(uploaded), "_SHA256SUMS.txt") != 2 {
-					t.Fatalf("missing platform assets: %v, %s", readErr, uploaded)
-				}
-			} else if !os.IsNotExist(readErr) {
-				t.Fatalf("failed transaction uploaded assets: %v, %s", readErr, uploaded)
-			}
-		})
+	if err := os.WriteFile(filepath.Join(bin, "gh"), []byte(gh), 0o755); err != nil {
+		t.Fatal(err)
 	}
+	return root
 }
 
 func damageUploadFixture(t *testing.T, directory, sums, asset, kind string) {
