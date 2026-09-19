@@ -766,7 +766,8 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 	if h.isClosing() {
 		return
 	}
-	if err := newDbg.Launch(program, args, env); err != nil {
+	if err := debugger.LaunchWithOptions(newDbg, program, args, env,
+		debugger.LaunchOptions{Cwd: launch.Cwd}); err != nil {
 		if h.isClosing() {
 			return
 		}
@@ -779,7 +780,7 @@ func (h *Hub) handleRestart(cmd protocol.Command) {
 		return
 	}
 	candidate = nil
-	h.lastLaunch = &protocol.LaunchPayload{Program: program, Args: args, Env: env}
+	h.lastLaunch = &launch
 	if !h.transitionState(protocol.StateRunning) {
 		return
 	}

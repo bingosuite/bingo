@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/bingosuite/bingo/internal/launch"
 )
 
 func newBackend() Backend {
@@ -325,7 +327,7 @@ const linuxPtraceOptions = syscall.PTRACE_O_TRACEEXIT |
 // originate from that same thread. The initial status is consumed outside the
 // tracer closure through the process-global wait broker; blocking the tracer
 // thread on a wait would prevent every later control operation.
-func startTracedProcess(b Backend, binaryPath string, args []string, env []string) (retPID int, retCmd *exec.Cmd, retErr error) {
+func startTracedProcess(b Backend, binaryPath string, args []string, env []string, cwd string) (retPID int, retCmd *exec.Cmd, retErr error) {
 	lb, ok := b.(*linuxBackend)
 	if !ok || lb.tracer == nil || lb.waits == nil {
 		return 0, nil, fmt.Errorf("startTracedProcess: backend does not support Linux wait ownership")
@@ -333,13 +335,12 @@ func startTracedProcess(b Backend, binaryPath string, args []string, env []strin
 
 	// codeql-suppress[go/command-injection]: The debugger intentionally launches the local binary selected by the operator.
 	cmd := exec.Command(binaryPath, args...)
+	cmd.Dir = cwd
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Ptrace: true}
-	if len(env) > 0 {
-		cmd.Env = append(os.Environ(), env...)
-	}
+	cmd.Env = launch.Environment(cwd, env)
 
 	var startErr error
 	lb.execPtrace(func() {

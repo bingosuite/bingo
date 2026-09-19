@@ -100,7 +100,7 @@ type steppingSIGURGTracee struct {
 func startSteppingSIGURGTracee(t *testing.T, binary string) *steppingSIGURGTracee {
 	t.Helper()
 	b := newBackend().(*linuxBackend)
-	pid, cmd, err := startTracedProcess(b, binary, nil, nil)
+	pid, cmd, err := startTracedProcess(b, binary, nil, nil, "")
 	if err != nil {
 		b.closeTracer()
 		t.Fatalf("start target: %v", err)

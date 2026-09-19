@@ -150,7 +150,11 @@ func (h *Handler) onStop(evt protocol.Event) {
 	if launching {
 		h.launching = false
 		h.suspended = true
+		sourceLaunch := h.sourceBuild != nil && h.sourceBuild.submitted
 		h.mu.Unlock()
+		if sourceLaunch {
+			h.announceSession()
+		}
 		h.send(&godap.InitializedEvent{Event: h.event("initialized")})
 		return
 	}
@@ -713,6 +717,8 @@ func (h *Handler) failRestart(msg string) {
 // failStart reports a Launch/Attach failure during the handshake: error the
 // pending start request and terminate the DAP session.
 func (h *Handler) failStart(msg string) {
+	h.startReplyMu.Lock()
+	defer h.startReplyMu.Unlock()
 	h.mu.Lock()
 	launching := h.launching
 	seq := h.startReqSeq
@@ -731,6 +737,12 @@ func (h *Handler) failStart(msg string) {
 	}
 	h.send(h.errorResponse(seq, cmd, msg))
 	h.finishTermination(nil)
+	h.mu.Lock()
+	sourceLaunch := h.sourceBuild != nil
+	h.mu.Unlock()
+	if sourceLaunch {
+		_ = h.Close()
+	}
 }
 
 // failBreakpointSet reports a rejected SetBreakpoint against the operation at the

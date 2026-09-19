@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/bingosuite/bingo/internal/launch"
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
@@ -268,12 +269,23 @@ func newEngine(b Backend, log *slog.Logger) *engine {
 func (e *engine) Events() <-chan protocol.Event { return e.events }
 
 func (e *engine) Launch(binaryPath string, args []string, env []string) error {
+	return e.LaunchWithOptions(binaryPath, args, env, LaunchOptions{})
+}
+
+func (e *engine) LaunchWithOptions(binaryPath string, args []string, env []string, options LaunchOptions) error {
 	return e.dispatch(func() error {
-		if err := e.proc.launch(e.backend, binaryPath, args, env); err != nil {
+		path, cwd, err := launch.Resolve(binaryPath, options.Cwd)
+		if err != nil {
+			return fmt.Errorf("launch: %w", err)
+		}
+		if err := launch.ValidateArguments(args, env); err != nil {
+			return err
+		}
+		if err := e.proc.launch(e.backend, path, args, env, cwd); err != nil {
 			return err
 		}
 		setPID(e.backend, e.proc.pid)
-		e.loadDWARF(binaryPath)
+		e.loadDWARF(path)
 		// startTracedProcess already consumed the initial SIGTRAP. The process
 		// is stopped — no waitLoop needed.
 		e.setState(stateSuspended)

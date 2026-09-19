@@ -16,6 +16,9 @@ type Session interface {
 	// receives the session's event stream and can inject commands. Must be called
 	// before the Launch/Attach command is enqueued so the entry stop is delivered.
 	AddClient(conn hub.WSConn, log *slog.Logger) (*hub.Client, error)
+	// Done acknowledges complete session teardown, including retained debugger
+	// cleanup. Source launch artifacts remain owned until this closes.
+	Done() <-chan struct{}
 }
 
 // Provider creates and looks up managed sessions. internal/server implements it

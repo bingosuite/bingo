@@ -294,18 +294,41 @@ extern char **environ;
 // bingo_posix_spawn launches path with POSIX_SPAWN_START_SUSPENDED: the child is
 // created and its image mapped, but left Mach-suspended at its entry point
 // (before dyld runs any user code) so we win the race to attach the exception
-// port. fds and cwd are inherited from the parent (matching the previous
-// exec.Command default). Returns 0 on success (pid in *pid_out) or the errno
-// posix_spawn reports.
+// port. Empty cwd inherits the parent's directory; an explicit cwd is applied
+// only in the child, never through process-global chdir.
 static inline int bingo_posix_spawn(
-    const char *path, char *const argv[], char *const envp[], int *pid_out)
+    const char *path, const char *cwd, char *const argv[], char *const envp[],
+    int *pid_out)
 {
     posix_spawnattr_t attr;
-    if (posix_spawnattr_init(&attr) != 0) return -1;
-    posix_spawnattr_setflags(&attr, POSIX_SPAWN_START_SUSPENDED);
+    int rc = posix_spawnattr_init(&attr);
+    if (rc != 0) return rc;
+    rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_START_SUSPENDED);
+    if (rc != 0) {
+        posix_spawnattr_destroy(&attr);
+        return rc;
+    }
+    posix_spawn_file_actions_t actions;
+    rc = posix_spawn_file_actions_init(&actions);
+    if (rc != 0) {
+        posix_spawnattr_destroy(&attr);
+        return rc;
+    }
+    if (cwd && cwd[0]) {
+        // The _np spelling is also available on pre-26 macOS deployment targets.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        rc = posix_spawn_file_actions_addchdir_np(&actions, cwd);
+#pragma clang diagnostic pop
+        if (rc != 0) {
+            posix_spawn_file_actions_destroy(&actions);
+            posix_spawnattr_destroy(&attr);
+            return rc;
+        }
+    }
     pid_t pid = 0;
-    int rc = posix_spawn(&pid, path, NULL, &attr, argv,
-                         envp ? envp : environ);
+    rc = posix_spawn(&pid, path, &actions, &attr, argv, envp ? envp : environ);
+    posix_spawn_file_actions_destroy(&actions);
     posix_spawnattr_destroy(&attr);
     if (rc != 0) return rc;
     *pid_out = (int)pid;

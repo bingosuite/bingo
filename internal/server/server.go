@@ -232,6 +232,9 @@ func (s *Server) shutdown(timeout time.Duration) {
 		s.log.Error("session shutdown timed out", "remaining", s.sessions.count())
 		s.sessions.waitEmpty(context.Background())
 	}
+	if ds != nil {
+		ds.WaitForArtifacts()
+	}
 }
 
 func (s *Server) beginSessionOperation() bool {
