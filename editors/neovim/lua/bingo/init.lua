@@ -18,6 +18,7 @@ local state = {
 }
 
 local default_configuration_names = {
+  ["bingo: Debug Go package"] = true,
   ["bingo: Launch binary"] = true,
   ["bingo: Attach to process"] = true,
   ["bingo: Join session"] = true,
@@ -28,7 +29,14 @@ local function notify(message, level)
 end
 
 local function prompt(label, default, completion)
-  return vim.fn.input(label, default or "", completion)
+  local ok, value = pcall(vim.fn.input, label, default or "", completion)
+  if ok then
+    return value
+  end
+  if not tostring(value):find("Vim:Interrupt", 1, true) then
+    notify("prompt failed: " .. tostring(value), vim.log.levels.ERROR)
+  end
+  return nil
 end
 
 local function ensure_listener(dap, stage, name)
@@ -122,6 +130,12 @@ local function register_session_listeners(dap, options)
     terminated = remove_current,
     exited = remove_current,
     on_session = on_session,
+    previous = {
+      event = ensure_listener(dap, "before", event_key).bingo,
+      terminated = ensure_listener(dap, "before", "event_terminated").bingo,
+      exited = ensure_listener(dap, "before", "event_exited").bingo,
+      on_session = dap.listeners.on_session.bingo,
+    },
   }
   state.listeners = listeners
 
@@ -144,9 +158,20 @@ end
 local function default_configurations(dap)
   return {
     {
+      name = "bingo: Debug Go package",
+      type = "bingo",
+      request = "launch",
+      mode = "debug",
+      program = config.package_directory,
+      args = {},
+      env = {},
+      stopOnEntry = false,
+    },
+    {
       name = "bingo: Launch binary",
       type = "bingo",
       request = "launch",
+      mode = "exec",
       program = function()
         return required_prompt(
           dap,
@@ -165,13 +190,14 @@ local function default_configurations(dap)
       request = "attach",
       pid = function()
         local pid = tonumber(prompt("Process ID: "))
-        if type(pid) ~= "number" or pid % 1 ~= 0 or pid <= 0 then
+        if type(pid) ~= "number" or pid % 1 ~= 0 or pid <= 0 or pid > 2147483647 then
           return dap.ABORT
         end
         return pid
       end,
       binaryPath = function()
-        return prompt("Path to executable (optional): ", "", "file")
+        local value = prompt("Path to executable (optional): ", "", "file")
+        return value == nil and dap.ABORT or value
       end,
       stopOnEntry = true,
     },
@@ -222,14 +248,14 @@ local function remove_configurations(dap)
   state.configurations = {}
 end
 
-local function remove_listener(dap, stage, name, callback)
+local function remove_listener(dap, stage, name, callback, previous)
   local stage_listeners = dap.listeners[stage]
   if type(stage_listeners) ~= "table" then
     return
   end
   local listeners = rawget(stage_listeners, name)
   if listeners ~= nil and listeners.bingo == callback then
-    listeners.bingo = nil
+    listeners.bingo = previous
   end
 end
 
@@ -245,13 +271,15 @@ local function unregister_dap()
   end
   local listeners = state.listeners
   if listeners.event_key ~= nil then
-    remove_listener(dap, "before", listeners.event_key, listeners.event)
-    remove_listener(dap, "before", "event_terminated", listeners.terminated)
-    remove_listener(dap, "before", "event_exited", listeners.exited)
+    remove_listener(dap, "before", listeners.event_key, listeners.event, listeners.previous.event)
+    remove_listener(dap, "before", "event_terminated", listeners.terminated, listeners.previous.terminated)
+    remove_listener(dap, "before", "event_exited", listeners.exited, listeners.previous.exited)
   end
   local on_session = dap.listeners.on_session
-  if type(on_session) == "table" and on_session.bingo == listeners.on_session then
-    on_session.bingo = nil
+  if listeners.on_session ~= nil and type(on_session) == "table"
+    and on_session.bingo == listeners.on_session
+  then
+    on_session.bingo = listeners.previous.on_session
   end
 
   state.adapter = nil
@@ -288,14 +316,22 @@ function M.setup(options)
   state.manager = manager
   state.dap = dap
   state.previous_adapter = dap.adapters.bingo
+  local generation = state.generation
 
   local adapter = function(callback, debug_config)
-    local valid, validation_error = pcall(config.validate_request, debug_config)
-    if not valid then
-      notify(tostring(validation_error), vim.log.levels.ERROR)
+    if generation ~= state.generation then
       return
     end
+    local valid, prepared = pcall(config.prepare_request, debug_config, normalized)
+    if not valid then
+      notify(tostring(prepared), vim.log.levels.ERROR)
+      return
+    end
+    debug_config.program, debug_config.cwd = prepared.program, prepared.cwd
     manager:ensure(debug_config, function(error_message, endpoint)
+      if generation ~= state.generation then
+        return
+      end
       if error_message ~= nil then
         notify(error_message, vim.log.levels.ERROR)
         return
@@ -305,7 +341,8 @@ function M.setup(options)
         host = endpoint.host,
         port = endpoint.port,
         options = {
-          initialize_timeout_sec = 10,
+          -- nvim-dap's watchdog includes the launch response, not just initialize.
+          initialize_timeout_sec = debug_config.mode == "debug" and 130 or 10,
           disconnect_timeout_sec = 5,
         },
       })
@@ -344,17 +381,36 @@ local function require_non_empty(value, label)
 end
 
 local function run(configuration)
-  local ok, message = pcall(config.validate_request, configuration)
+  local ok, prepared = pcall(config.prepare_request, configuration, state.options)
   if not ok then
-    notify(tostring(message), vim.log.levels.ERROR)
+    notify(tostring(prepared), vim.log.levels.ERROR)
     return
   end
-  state.dap.run(configuration)
+  state.dap.run(prepared)
+end
+
+function M.debug(directory)
+  ensure_setup()
+  run({
+    name = "bingo: Debug Go package",
+    type = "bingo",
+    request = "launch",
+    mode = "debug",
+    program = directory == nil and config.package_directory() or directory,
+    args = {},
+    env = {},
+    stopOnEntry = false,
+  })
 end
 
 function M.launch(program)
   ensure_setup()
-  program = program or prompt("Path to executable: ", vim.fn.getcwd() .. "/", "file")
+  if program == nil then
+    program = prompt("Path to executable: ", vim.fn.getcwd() .. "/", "file")
+    if program == nil or program:match("^%s*$") then
+      return
+    end
+  end
   program = require_non_empty(program, "executable path")
   if program == nil then
     return
@@ -363,6 +419,7 @@ function M.launch(program)
     name = "bingo: " .. vim.fs.basename(program),
     type = "bingo",
     request = "launch",
+    mode = "exec",
     program = program,
     args = {},
     env = {},
@@ -372,8 +429,14 @@ end
 
 function M.attach(pid, binary_path)
   ensure_setup()
-  pid = pid or tonumber(prompt("Process ID: "))
-  if type(pid) ~= "number" or pid % 1 ~= 0 or pid <= 0 then
+  if pid == nil then
+    local value = prompt("Process ID: ")
+    if value == nil or value:match("^%s*$") then
+      return
+    end
+    pid = tonumber(value)
+  end
+  if type(pid) ~= "number" or pid % 1 ~= 0 or pid <= 0 or pid > 2147483647 then
     notify("a positive process ID is required", vim.log.levels.ERROR)
     return
   end
@@ -383,6 +446,9 @@ function M.attach(pid, binary_path)
       "",
       "file"
     )
+    if binary_path == nil then
+      return
+    end
   end
   run({
     name = "bingo: Attach " .. tostring(pid),
@@ -396,7 +462,12 @@ end
 
 function M.join(session_id)
   ensure_setup()
-  session_id = session_id or prompt("Managed bingo session ID: ")
+  if session_id == nil then
+    session_id = prompt("Managed bingo session ID: ")
+    if session_id == nil or session_id:match("^%s*$") then
+      return
+    end
+  end
   session_id = require_non_empty(session_id, "managed session ID")
   if session_id == nil then
     return
@@ -411,6 +482,10 @@ end
 
 function M.session_id()
   return state.current_session
+end
+
+function M.server_info()
+  return server.inspect(state.options or config.normalize())
 end
 
 function M.show_session()

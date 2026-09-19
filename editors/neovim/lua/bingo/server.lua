@@ -32,8 +32,10 @@ local function source_root()
     source = source:sub(2)
   end
   local dirname = vim.fs.dirname
-  return dirname(dirname(dirname(source)))
+  return dirname(dirname(dirname(vim.fn.fnamemodify(source, ":p"))))
 end
+
+local plugin_root = source_root()
 
 local function supported_platform(uv)
   local uname = uv.os_uname()
@@ -179,7 +181,7 @@ function Manager:_resolve_binary(resolved)
     return nil, "configured bingo binary is not executable: " .. explicit
   end
 
-  local bundled = vim.fs.joinpath(source_root(), "bin", "bingo")
+  local bundled = vim.fs.joinpath(plugin_root, "bin", "bingo")
   if self.deps.executable(bundled) == 1 then
     return bundled
   end
@@ -188,7 +190,24 @@ function Manager:_resolve_binary(resolved)
     return path_binary
   end
   return nil,
-    "no bingo server binary found; run `just neovim-prepare`, put bingo on PATH, or set server.binary"
+    "no bingo server binary found; run the plugin manager build hook or `bash editors/neovim/scripts/prepare.sh` from a checkout, put bingo on PATH, or set server.binary"
+end
+
+function M.inspect(options, dependencies)
+  local resolved = config.resolve({}, options)
+  local manager = M.new(options, dependencies)
+  local info = {
+    mode = resolved.mode,
+    management = config.endpoint(resolved.management),
+    dap = config.endpoint(resolved.dap),
+  }
+  if resolved.mode == "auto" then
+    info.platform_supported = supported_platform(manager.deps.uv)
+    info.platform = manager.deps.uv.os_uname().sysname
+    info.binary, info.binary_error = manager:_resolve_binary(resolved)
+    info.prepare_script = vim.fs.joinpath(plugin_root, "scripts", "prepare.sh")
+  end
+  return info
 end
 
 function Manager:_log_path(resolved)

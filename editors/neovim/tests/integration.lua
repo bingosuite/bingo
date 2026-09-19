@@ -1,9 +1,11 @@
 local root = assert(vim.env.BINGO_NVIM_SMOKE_ROOT, "run scripts/integration.sh")
 local work = assert(vim.env.BINGO_NVIM_SMOKE_WORK, "run scripts/integration.sh")
 local uv = vim.uv
-local source = root .. "/editors/neovim/tests/fixtures/smoke/main.go"
+work = assert(uv.fs_realpath(work))
+local package_dir = work .. "/source package"
+local source = package_dir .. "/main.go"
 local server_log = work .. "/server.log"
-local target_path = work .. "/target"
+local target_path
 local retain_observer = vim.env.BINGO_NVIM_SMOKE_RETAIN_OBSERVER ~= "0"
 local server_handle, server_pid, server_exit, target_pid
 local dap, bingo
@@ -86,6 +88,11 @@ local function executable(pid)
   end
 end
 
+local function owned_target(path)
+  local prefix = work .. "/work/"
+  return type(path) == "string" and path:sub(1, #prefix) == prefix
+end
+
 local management_port
 local function http(path)
   local result = vim.system({
@@ -148,6 +155,7 @@ local function smoke()
   assert(server_exit == nil and alive(server_pid), "server did not remain running")
   local health = assert(http("/api/health"))
   assert(health.service == "bingo" and health.sessionCount == 0, "unexpected initial health")
+  assert(health.dap.sourceLaunchVersion == 1, "server does not support source launch version 1")
   assert(health.dap.address == "127.0.0.1:" .. dap_port, "health advertised wrong DAP endpoint")
   assert(health.managedIdleShutdown.timeoutMs == idle_ms, "server-owned idle shutdown disabled")
   note("health ready HTTP=" .. management_port .. " DAP=" .. dap_port .. " sessions=0")
@@ -215,14 +223,15 @@ local function smoke()
   vim.cmd.edit(vim.fn.fnameescape(source))
   vim.api.nvim_win_set_cursor(0, { breakpoint_line, 0 })
   dap.set_breakpoint()
-  bingo.launch(target_path)
+  bingo.debug()
 
   wait_for("one real custom event and companion session announcement", function()
     return announcement ~= nil and bingo.session_id() == announcement
-  end)
+  end, 130000)
   assert(counts.announcements == 1 and counts.user_events == 1, "duplicate or missing session events")
-  wait_for("real nvim-dap entry stop", function()
-    return stopped ~= nil and stopped.body.reason == "entry"
+  wait_for("source-built target reaches its breakpoint without an entry resume", function()
+    target_pid = tonumber(text(vim.env.BINGO_NVIM_SMOKE_PID_FILE))
+    return stopped ~= nil and stopped.body.reason == "breakpoint"
   end)
   local session = assert(dap.session(), "nvim-dap has no focused session")
   assert(session == announced_session and session_count() == 1, "nvim-dap live sessions() mismatch")
@@ -233,16 +242,14 @@ local function smoke()
   assert(sessions[1].clients == 1, "unexpected client or retained session")
   note("session=" .. announcement .. " nvim-dap live sessions=1 managed sessions=1")
 
-  stopped = nil
-  -- Entry is intentionally an unknown goroutine (omitted threadId); nvim-dap's
-  -- UI continue prompts without a focused thread. Keep the real request API
-  -- and preserve thread zero rather than fabricating a Go runtime identity.
-  request(session, "continue", { threadId = 0 })
-  wait_for("source breakpoint stop", function()
-    target_pid = tonumber(text(vim.env.BINGO_NVIM_SMOKE_PID_FILE))
-    return stopped ~= nil and stopped.body.reason == "breakpoint"
-  end)
+  assert(session.config.mode == "debug" and session.config.program == package_dir
+    and session.config.stopOnEntry == false, "no-argument source launch configuration mismatch")
+  assert(counts.stopped == 1, "source launch exposed an entry stop")
   assert(target_pid and alive(target_pid), "target pid not live at source breakpoint")
+  target_path = executable(target_pid)
+  assert(owned_target(target_path), "target executable is not a server-owned private build: " .. tostring(target_path))
+  assert(text(vim.env.BINGO_NVIM_SMOKE_CWD_FILE) == package_dir, "source target cwd is not its package directory")
+  note("server-built target=" .. target_path .. " cwd=" .. package_dir)
   assert(stopped.session == session, "breakpoint belongs to a different session")
   local frames = request(session, "stackTrace", { threadId = stopped.body.threadId or 0, startFrame = 0, levels = 20 })
   local frame = assert(frames.stackFrames[1], "no real stack frame")
@@ -302,6 +309,9 @@ local function smoke()
     local remaining = http("/api/sessions")
     return remaining ~= nil and #remaining == 0
   end, 3000)
+  wait_for("server-owned source build directory removed after session cleanup", function()
+    return uv.fs_stat(vim.fs.dirname(target_path)) == nil
+  end, 3000)
   wait_for("server-owned idle exit (no test signal)", function()
     return server_exit ~= nil
   end, idle_ms + 4000)
@@ -318,13 +328,15 @@ end
 local function cleanup()
   target_pid = target_pid or tonumber(text(vim.env.BINGO_NVIM_SMOKE_PID_FILE))
   if target_pid == nil and server_pid ~= nil then
-    -- Launch can stall before Go main writes the PID file. Only adopt a child
-    -- of our exact server whose executable is this run's unique target.
+    -- A source launch can stall before main writes the PID file. The server's
+    -- private TMPDIR and exact parent PID exclude another session's children.
     local result = vim.system({ "ps", "-ax", "-o", "pid=,ppid=" }, { text = true }):wait(1000)
     for line in (result.stdout or ""):gmatch("[^\n]+") do
       local pid, parent = line:match("^%s*(%d+)%s+(%d+)%s*$")
-      if tonumber(parent) == server_pid and executable(pid) == target_path then
+      local path = tonumber(parent) == server_pid and executable(pid) or nil
+      if owned_target(path) then
         target_pid = tonumber(pid)
+        target_path = path
       end
     end
   end
@@ -343,9 +355,8 @@ local function cleanup()
     end, 20)
   end
   if alive(target_pid) then
-    -- The PID file is written by this run's fixture. Also require its unique
-    -- executable path before signalling, so a reused PID is never a target.
-    if executable(target_pid) == target_path then
+    local path = executable(target_pid)
+    if owned_target(path) and (target_path == nil or path == target_path) then
       uv.kill(target_pid, 9)
     end
   end

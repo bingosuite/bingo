@@ -6,6 +6,7 @@ M.service = "bingo"
 M.management_api_version = 1
 M.wire_protocol_version = "1.4"
 M.session_event_version = 1
+M.source_launch_version = 1
 
 local maximum_response_bytes = http.maximum_response_bytes
 
@@ -33,7 +34,10 @@ local function parse_address(value)
   if host == nil or host == "" or port == nil or port % 1 ~= 0 or port < 1 or port > 65535 then
     return nil
   end
-  return { host = host, port = port }
+  local ok, resolved = pcall(config.resolve, {
+    serverMode = "connectOnly", dapHost = host, dapPort = port,
+  })
+  return ok and resolved.dap or nil
 end
 
 local function wildcard(host)
@@ -86,6 +90,15 @@ function M.validate(status_code, decoded, expected_dap)
         "DAP session event version is %s, expected %d",
         tostring(decoded.dap.sessionEventVersion),
         M.session_event_version
+      )
+    )
+  end
+  if decoded.dap.sourceLaunchVersion ~= M.source_launch_version then
+    return incompatible(
+      string.format(
+        "DAP source launch version is %s, expected %d; update the bingo server",
+        tostring(decoded.dap.sourceLaunchVersion),
+        M.source_launch_version
       )
     )
   end
@@ -155,6 +168,38 @@ function M.check()
   else
     vim.health.error("nvim-dap is required")
   end
+
+  local ok, info = pcall(function() return require("bingo").server_info() end)
+  if not ok then
+    vim.health.error("Cannot resolve bingo configuration: " .. tostring(info))
+    return
+  end
+  if info.mode == "connectOnly" then
+    vim.health.info("connectOnly: DAP " .. info.dap .. "; no local binary, health probe, or autostart")
+    vim.health.info("Source packages and Go toolchain must be available on the server, not this editor")
+    return
+  end
+  if info.platform_supported then
+    vim.health.ok("Native server platform is supported")
+  else
+    vim.health.error("Autostart supports only linux/amd64 and darwin/arm64; use connectOnly for an existing server")
+  end
+  if info.binary then
+    vim.health.ok("Server binary: " .. info.binary)
+  else
+    vim.health.warn(info.binary_error)
+    vim.health.info("Prepare from the monorepo: bash " .. vim.fn.shellescape(info.prepare_script))
+  end
+  local go = vim.fn.exepath("go")
+  if go ~= "" then
+    vim.health.ok("Go for local source launches: " .. go)
+  else
+    vim.health.warn("Go is not on PATH; :BingoDebug needs Go on the server's PATH. Binary launch and attach do not compile targets")
+  end
+  if info.platform == "Darwin" and (vim.fn.executable("codesign") ~= 1 or vim.fn.executable("xcrun") ~= 1) then
+    vim.health.warn("Building the macOS server requires Xcode Command Line Tools (xcode-select --install) and codesign; prepared releases are already signed")
+  end
+  vim.health.info("Management " .. info.management .. "; DAP " .. info.dap)
   vim.health.info("Server compatibility is checked when a bingo debug session starts")
 end
 

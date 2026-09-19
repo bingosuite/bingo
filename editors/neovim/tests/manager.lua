@@ -259,6 +259,42 @@ return function(test, equal, T)
       end
     end)
   end
+  test("diagnostic inspection shares binary resolution without probing or starting anything", function()
+    local c = setup()
+    local info = server.inspect(config.normalize({ server = { binary = "/configured bingo" } }), c.deps)
+    equal(info.binary, "/configured bingo")
+    equal(info.platform_supported, true)
+    equal(info.management, "127.0.0.1:6060")
+    equal(info.dap, "127.0.0.1:4711")
+    T.contains(info.prepare_script, "editors/neovim/scripts/prepare.sh")
+    equal(#c.probes, 0)
+    equal(#c.opens, 0)
+    equal(#c.spawns, 0)
+  end)
+  test("connectOnly diagnostics never inspect local platform or binaries", function()
+    local c = setup(nil, function(clock, deps)
+      clock.uv.os_uname = function() error("remote native platform check") end
+      deps.executable = function() error("remote executable check") end
+      deps.exepath = function() error("remote PATH check") end
+    end)
+    local info = server.inspect(config.normalize({
+      server = { mode = "connectOnly", dap_host = "debug.internal" },
+    }), c.deps)
+    equal(info.mode, "connectOnly")
+    equal(info.dap, "debug.internal:4711")
+    equal(info.binary, nil)
+    equal(#c.probes, 0)
+    equal(#c.spawns, 0)
+  end)
+  test("bundled server path stays absolute when the editor changes cwd after loading bingo", function()
+    local c = setup()
+    local before = server.inspect(config.normalize(), c.deps).binary
+    equal(before:sub(1, 1), "/")
+    local cwd, temporary = vim.fn.getcwd(), T.tempdir()
+    T.defer(function() vim.fn.chdir(cwd) end)
+    vim.fn.chdir(temporary)
+    equal(server.inspect(config.normalize(), c.deps).binary, before)
+  end)
   test("a child losing listener arbitration is success when a compatible winner appears", function()
     local c = setup()
     c.ensure()

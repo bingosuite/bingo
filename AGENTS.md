@@ -2831,14 +2831,43 @@ wire protocol or `launchConfig`.
 that asynchronously resolves to the existing TCP listener; it does not
 implement another adapter or invoke Delve. `auto` mode mirrors the VS Code
 health contract and spawn safety: exact service/management/wire/session-event
-compatibility, loopback-only start, detached argv-based spawn, endpoint-level
-coalescing, persistent logs, and server-owned idle teardown. `connectOnly`
+and source-launch compatibility, loopback-only start, detached argv-based spawn,
+endpoint-level coalescing, persistent logs, and server-owned idle teardown. `connectOnly`
 bypasses health and spawn. The prepared native binary is generated under
-`editors/neovim/bin/` by `just neovim-prepare` and is never committed; runtime
-falls back to `PATH` or explicit `server.binary`.
+`editors/neovim/bin/` by the opt-in
+`bash editors/neovim/scripts/prepare.sh` (or `just neovim-prepare`) and is never
+committed; runtime falls back to `PATH` or explicit `server.binary`. The script
+delegates to the shared `scripts/build-binary.sh`; no just/Node or startup-time
+server build is required. The monorepo lazy.nvim spec adds the companion's
+runtimepath and explicitly loads `plugin/bingo.lua` before setup. Healthcheck
+uses the same binary resolver without probing or spawning; the bundled path is
+anchored when the module loads so changing editor cwd cannot move it.
+
+`:BingoDebug [package-directory]` and the primary `Debug Go package`
+configuration send `mode:"debug"` with `stopOnEntry:false`. Without an argument,
+use the current regular Go buffer's directory, otherwise Neovim's cwd. The
+server alone compiles source and owns build cancellation/artifacts. `BingoLaunch`
+and the binary configuration send `mode:"exec"` and retain the entry stop;
+an omitted mode in a user configuration remains legacy exec. Local auto source
+paths and explicit `cwd` are checked as directories before transport and made
+absolute against the editor's cwd; relative program is based on explicit cwd.
+The default source cwd is the package directory. Exec without cwd retains the
+server cwd. `connectOnly` never probes or locally validates/rewrites server
+paths. Reject other modes and attach/join `mode`/`cwd`, and abort interrupted
+prompts, including the optional attach binary prompt, before `dap.run`.
+Commands decode Ex path escaping without a shell; an attach path is the rest of
+the command after its PID, so spaces survive.
+
+The pinned nvim-dap initialization warning timer includes the delayed launch
+response. Source launches set its existing `initialize_timeout_sec` to 130
+(two-minute server build deadline plus handshake), while exec/attach retain 10;
+nvim-dap has no hard timeout on its ordinary launch request.
 
 Neovim health compatibility uses the exact wire version **1.4**; tests derive
 their fixture from Go's service/API/wire/DAP constants, not the Lua consumer.
+`dap.sourceLaunchVersion` must exactly match `protocol.DAPSourceLaunchVersion`
+(1); an incompatible running server is reported for operator upgrade, never
+killed.
 Auto management/DAP endpoints must be distinct. Request validation runs before
 adapter transport; DNS/IPv6 host normalization must reject header delimiters
 without changing a scoped IPv6 interface's case. The health reader supports
@@ -2859,7 +2888,10 @@ Only registered live bingo sessions in the current setup generation may
 announce IDs. Duplicate announcements are idempotent; conflicting IDs are
 reported and ignored. Cleanup restores an owned previous `on_close` hook, even
 across repeated setup, and queued old-generation closes/events cannot remove or
-revive a new session.
+revive a new session. Adapter callbacks are generation-fenced too: an old
+success cannot connect and an old failure cannot report against a replacement
+setup. Disposal restores prior adapter/listener registrations only while still
+owned, and removes only configurations added by this setup.
 
 **VS Code connect-or-start invariants.** Default `serverMode:"auto"` is local
 only: management `127.0.0.1:6060`, DAP `127.0.0.1:4711`, readiness 5s, managed
@@ -3765,7 +3797,12 @@ translator keeps DAP entirely outside the hub — a strictly additive package.
   darwin/arm64, with read-only permissions and no user's configuration. The
   separately invoked `bash editors/neovim/scripts/integration.sh` pins a real
   nvim-dap archive by revision/hash in isolated build storage and runs native
-  launch/breakpoint/stack/locals/session discovery. Its second real DAP client
+  no-argument source launch/breakpoint/stack/locals/session discovery. The fixture
+  package has a space-containing path; the server builds it with the package cwd
+  and no entry-stop resume, and its private build directory must retire with
+  the session. The default Lua suite also covers real Ex escaping and the
+  preparation script's literal argv/failure propagation without invoking a
+  compiler. Its second real DAP client
   must receive exactly one `terminated` after one terminate intent: the
   initiating nvim-dap client closes on the response and alone would mask a
   missing terminal event. Both registries must empty, the target disappear, and

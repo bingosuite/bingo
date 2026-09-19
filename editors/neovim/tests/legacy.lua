@@ -52,6 +52,7 @@ local valid_health = {
     enabled = true,
     address = "127.0.0.1:4711",
     sessionEventVersion = 1,
+    sourceLaunchVersion = 1,
   },
 }
 
@@ -74,6 +75,7 @@ test("incompatible DAP capability is rejected", function()
       enabled = true,
       address = "127.0.0.1:4711",
       sessionEventVersion = 0,
+      sourceLaunchVersion = 1,
     },
   }
   local result = health.validate(200, decoded, {
@@ -113,6 +115,9 @@ test("bingo exposes a valid Neovim healthcheck", function()
       end,
       info = function(message)
         reports[#reports + 1] = "info:" .. message
+      end,
+      warn = function(message)
+        reports[#reports + 1] = "warn:" .. message
       end,
     },
     fn = setmetatable({
@@ -574,7 +579,7 @@ test("nvim-dap registrations and prompts follow the plugin lifecycle", function(
   local bingo = require("bingo")
   bingo.setup()
   equal(type(dap.adapters.bingo), "function")
-  equal(#dap.configurations.go, 4)
+  equal(#dap.configurations.go, 5)
   local first_adapter = dap.adapters.bingo
 
   local adapter
@@ -630,7 +635,7 @@ test("nvim-dap registrations and prompts follow the plugin lifecycle", function(
   equal(dap.adapters.bingo, first_adapter)
 
   bingo.setup()
-  equal(#dap.configurations.go, 4)
+  equal(#dap.configurations.go, 5)
   equal(dap.configurations.go[1], user_configuration)
 
   bingo.setup({ configurations = false })
@@ -639,6 +644,7 @@ test("nvim-dap registrations and prompts follow the plugin lifecycle", function(
   local second_adapter = dap.adapters.bingo
   equal(type(second_adapter), "function")
 
+  local notification_count = #notifications
   local stale_ok = pcall(first_adapter, function()
     error("disposed adapter unexpectedly resolved")
   end, {
@@ -647,9 +653,7 @@ test("nvim-dap registrations and prompts follow the plugin lifecycle", function(
     serverMode = "connectOnly",
   })
   equal(stale_ok, true)
-  if notifications[#notifications].message:find("disposed", 1, true) == nil then
-    error("stale adapter did not report its disposed manager")
-  end
+  equal(#notifications, notification_count)
 
   bingo.dispose()
   equal(dap.adapters.bingo, previous_adapter)
@@ -667,9 +671,7 @@ test("nvim-dap registrations and prompts follow the plugin lifecycle", function(
     serverMode = "connectOnly",
   })
   equal(disposed_ok, true)
-  if notifications[#notifications].message:find("disposed", 1, true) == nil then
-    error("disposed adapter did not report its state")
-  end
+  equal(#notifications, notification_count)
 
   package.preload.dap = nil
   package.loaded.dap = nil
