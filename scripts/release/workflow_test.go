@@ -39,10 +39,12 @@ type workflowJob struct {
 }
 
 type workflowStep struct {
-	Name string         `yaml:"name"`
-	Uses string         `yaml:"uses"`
-	Run  string         `yaml:"run"`
-	With map[string]any `yaml:"with"`
+	ID   string            `yaml:"id"`
+	Name string            `yaml:"name"`
+	Uses string            `yaml:"uses"`
+	Run  string            `yaml:"run"`
+	With map[string]any    `yaml:"with"`
+	Env  map[string]string `yaml:"env"`
 }
 
 func readWorkflow(t *testing.T) workflow {
@@ -82,8 +84,13 @@ func assertReadOnlyReleaseJob(t *testing.T, name string, job workflowJob) {
 		t.Fatalf("%s overrides read-only permissions", name)
 	}
 	for _, step := range job.Steps {
-		if strings.HasPrefix(step.Uses, "actions/checkout@") && step.With["persist-credentials"] != false {
-			t.Fatalf("%s retains a checkout token", name)
+		if strings.HasPrefix(step.Uses, "actions/checkout@") {
+			if step.With["persist-credentials"] != false {
+				t.Fatalf("%s retains a checkout token", name)
+			}
+			if step.With["ref"] != "${{ github.sha }}" {
+				t.Fatalf("%s checks out code outside the triggering workflow revision", name)
+			}
 		}
 		if strings.Contains(step.Run, "${{") {
 			t.Fatalf("%s interpolates expressions into shell code", name)
@@ -99,8 +106,8 @@ func assertNativeReleaseBuild(t *testing.T, build workflowJob) {
 		matrix[1].Runner != "macos-15" || matrix[1].Target != "darwin-arm64" || matrix[1].GOOS != "darwin" || matrix[1].GOARCH != "arm64" {
 		t.Fatalf("native release matrix changed: %+v", matrix)
 	}
-	if build.Steps[0].With["ref"] != "${{ needs.resolve.outputs.commit }}" {
-		t.Fatal("builds no longer use the resolved immutable commit")
+	if build.Steps[0].With["ref"] != "${{ github.sha }}" {
+		t.Fatal("builds no longer use the immutable triggering workflow commit")
 	}
 }
 

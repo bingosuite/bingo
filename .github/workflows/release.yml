@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing vMAJOR.MINOR.PATCH tag (optional prerelease suffix)
+        description: Existing version tag at the selected workflow revision (optional prerelease suffix)
         required: true
         type: string
       upload_to_draft:
@@ -32,22 +32,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.workflow_sha }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - name: Validate tag before using it as a ref
         id: tag
         env:
           REQUESTED_TAG: ${{ github.event.release.tag_name || inputs.tag }}
         run: bash scripts/release-ref.sh "$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
-      - uses: actions/checkout@v4
-        with:
-          ref: refs/tags/${{ steps.tag.outputs.tag }}
-          persist-credentials: false
-      - name: Resolve immutable release commit
+      - name: Require the tag to match the triggering revision
         id: commit
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          RELEASE_COMMIT: ${{ github.sha }}
         run: |
           commit=$(git rev-parse --verify HEAD)
           [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          test "$commit" = "$RELEASE_COMMIT"
+          tag_commit=$(git rev-parse --verify "refs/tags/$RELEASE_TAG^{commit}")
+          if [[ "$tag_commit" != "$RELEASE_COMMIT" ]]; then
+            echo "The release tag must match the triggering revision; dispatch with --ref set to that tag." >&2
+            exit 1
+          fi
           printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
 
   build:
@@ -85,7 +91,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.resolve.outputs.commit }}
+          # Actions cache authority follows the event ref, not a separately selected tag.
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-go@v5

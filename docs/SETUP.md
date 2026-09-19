@@ -242,13 +242,23 @@ Extension Development Host command in the
 
 The [Release workflow](../.github/workflows/release.yml) accepts an existing
 `vMAJOR.MINOR.PATCH` tag (optional prerelease suffix, at most 80 characters).
-It resolves the tag to a commit, checks out that exact commit for both native
-builders, and fails if the tag moved or the checkout is dirty.
+Both native builders check out the immutable triggering commit. The tag must
+resolve to that same commit before building; a separately selected tag cannot
+run its code with a different branch's Actions cache authority. Moved tags and
+dirty checkouts are rejected.
 
-Use **Actions -> Release -> Run workflow** with the tag. The default produces
-downloadable Actions artifacts only. To stage a release, first create a
-**draft release** for that tag and select `upload_to_draft`; this attaches
-verified assets but never publishes the draft. Publishing an existing release
+For a tag at the selected branch's tip, use **Actions -> Release -> Run
+workflow** with that tag. For an older tag, dispatch from the tag itself
+(replace `vX.Y.Z` with the release tag):
+
+```sh
+gh workflow run release.yml --repo bingosuite/bingo --ref vX.Y.Z -f tag=vX.Y.Z
+```
+
+The default produces downloadable Actions artifacts only. To stage a release,
+first create a **draft release** for that tag and select `upload_to_draft`; this attaches
+verified assets but never publishes the draft. With the CLI, add
+`-F upload_to_draft=true` to the command above. Publishing an existing release
 also triggers verified asset builds/uploads. Neither path invokes `code` or
 modifies an editor profile.
 
