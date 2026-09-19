@@ -10,9 +10,10 @@ bingo speaks two protocols against **one** debug session at the same time:
   the OS-thread set, and created/exited lifecycle deltas — streams here as
   `EventGoroutineSnapshot`.
 
-The VS Code 0.4.0 extension wires both together automatically: DAP drives while
-the **Bingo Concurrency** Activity Bar view observes the exact session over
-WebSocket. `cmd/wsmon` remains the terminal observer for non-VS Code workflows.
+The VS Code extension wires both together automatically: DAP drives while
+the **Bingo Concurrency** editor panel or Activity Bar view observes the exact
+session over WebSocket. `cmd/wsmon` remains the terminal observer for non-VS Code
+workflows.
 
 The Neovim companion drives the same DAP workflow through `nvim-dap`, captures
 the managed-session announcement, and pairs with `cmd/wsmon` for read-only
@@ -37,38 +38,41 @@ architecture behind this.
 - For Go language tooling in VS Code: Microsoft's **Go extension**. The repo
   keeps its `go.buildTags: bingonative` settings for gopls, navigation,
   formatting, and tests.
-- For the VS Code debugger: bingo's separate companion extension. Build and
-  install the matching platform VSIX once:
+- For the VS Code debugger: install the matching native VSIX when available from
+  a release, or build/install from source once:
 
   ```sh
-  just vscode-install
+  bash scripts/package-vscode.sh install
   ```
 
-  Automatic graphical telemetry requires **bingosuite.bingo 0.4.0 or newer**. Run
-  **Developer: Reload Window** once after installation or update. The companion
+  Run **Developer: Reload Window** once after installation or update. The companion
   owns debugger type `"bingo"` and connects directly to bingo's DAP listener;
   it neither invokes nor validates `dlv`, and it does not replace the Go
-  extension's `"go"` type. To update, rerun `just vscode-install`; uninstall with
+  extension's `"go"` type. To update from source, rerun the install command; uninstall with
   `code --uninstall-extension bingosuite.bingo`.
 
 - For Neovim: Neovim 0.11.7 or newer plus `nvim-dap`. Run
-  `just neovim-prepare`, add `editors/neovim` to the runtime path, and call
+  `bash editors/neovim/scripts/prepare.sh`, add `editors/neovim` to the runtime path, and call
   `require("bingo").setup()`. See the [Neovim guide](../editors/neovim/README.md).
 
 ## 1. Demo targets
 
+Source debugging needs Go on the server's PATH; using a prebuilt debugger/target
+does not. See [Setup](SETUP.md) for the installation prerequisites.
+
 The [progressive example suite](../examples/README.md) is available from the
-normal workspace launch picker. `level5-workflow` gives the richest hierarchy:
+**bingo: Debug example** workspace launch picker. `level5-workflow` gives the richest hierarchy:
 **main → workflow×3 → stage×3**, including a deterministic canceled workflow.
 The intended telemetry breakpoint is the result send in `inventoryStage`
-(`examples/level5-workflow/main.go:83`). The workspace launch runs
-**bingo: build examples** before F5 and uses the installed VSIX's bundled
-server; it does not rebuild or codesign extension sources.
+(`examples/level5-workflow/main.go:83`). The workspace launch sends the selected
+source directory in DAP `mode: "debug"`; the server compiles only that package.
+There is no pre-launch task, and F5 does not rebuild the extension.
 
 `examples/spawntree` remains the dedicated long-running lifecycle demo. It
 churns a deterministic **main → supervisor → worker×3** tree so consecutive
 snapshots show workers appearing in `created` and leaving in `exited`. Build it
-with `just build-spawntree` and drive it with `cmd/dapcli` as shown below.
+with **bingo: Debug spawntree telemetry demo**, or compile it with
+`just build-spawntree` for `cmd/dapcli` as shown below.
 Contributor source-extension work is a separate command-line path: run
 `just vscode-dev`, then
 `code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"`.
@@ -77,15 +81,15 @@ It is intentionally absent from the root Run and Debug dropdown.
 ## 2. Drive with VS Code (DAP, automatic server)
 
 1. Open this repo in VS Code.
-2. Select **“bingo DAP: launch example (stop on entry)”**. The only other root
-   choice is **“bingo DAP: join running session”**.
-3. Press F5, choose **level5-workflow**, and let VS Code run
-   **“bingo: build examples”**. The companion
+2. Select **bingo: Debug example**. A separate choice debugs spawntree, and
+   **bingo: Join running session** joins an existing session.
+3. Press F5 and choose **level5-workflow**. The companion
    health-checks `127.0.0.1:6060`,
    reuses a compatible server or starts its detached bundled server, waits up
    to `serverReadyTimeoutMs` (five seconds by default) for compatible readiness,
-   then connects to DAP at `127.0.0.1:4711`. bingo launches
-   `build/examples/level5-workflow` and stops at entry.
+   then connects to DAP at `127.0.0.1:4711`. bingo compiles
+   `examples/level5-workflow` into a session-owned temporary binary and launches
+   it. Source compilation has its own deadline, separate from server readiness.
 4. Set a breakpoint on `examples/level5-workflow/main.go:83` and **Continue** —
    the tracee stops with several workflow and stage goroutines alive.
 5. **Bingo Concurrency** opens beside source, leaving native **Run and Debug**
@@ -103,6 +107,10 @@ It is intentionally absent from the root Run and Debug dropdown.
    Disable `bingo.concurrency.autoReveal` for manual-only access. The Activity
    Bar remains an alternative view, using the same session model.
 
+For your own project, **Bingo: Debug Go Package** chooses the package directly
+without a saved launch configuration. Start a fresh session to rebuild source
+edits; Restart reuses the session binary.
+
 No manual `just server` is required. The extension never kills the shared
 process. The default managed server exits only after its 30-second idle grace
 with no sessions. Open **bingo Server** for the persistent child log path. If
@@ -117,7 +125,7 @@ occupied/incompatible endpoint or startup timeout, inspect the endpoint and log
 path in **bingo Server** rather than killing a potentially shared process.
 
 > A second VS Code window can *join* the same session (observe/drive over DAP)
-> with the **“bingo DAP: join running session”** config, which sends a DAP
+> with the **bingo: Join running session** config, which sends a DAP
 > `attach` carrying only the `session` id (no `pid`) — bingo's join path.
 > A separate `"request": "attach"` configuration with numeric `pid` and optional
 > `binaryPath` attaches to an OS process instead; the extension README has the
@@ -125,11 +133,14 @@ path in **bingo Server** rather than killing a potentially shared process.
 
 ## 3. Drive with Neovim (DAP, automatic server)
 
-1. Run `just neovim-prepare` and configure the companion as described in
+1. Install the native companion bundle or run the source prepare hook and
+   configure the companion as described in
    [editors/neovim/README.md](../editors/neovim/README.md).
-2. Open a Go source file and run `:BingoLaunch ./build/examples/level5-workflow`.
+2. Run `:BingoDebug ./examples/level5-workflow` from the repository root, or
+   open one of its Go files and run `:BingoDebug`.
    The adapter health-checks the loopback management endpoint, reuses or starts
-   a compatible detached server, and connects `nvim-dap`.
+   a compatible detached server, and connects `nvim-dap`. The server builds the
+   source package; no manually prepared target binary is needed.
 3. Use normal `nvim-dap` breakpoint and continue mappings. The plugin validates
    `bingo/session/v1`; `:BingoSession` shows the ID.
 4. Run `go run ./cmd/wsmon -session <session-id>` in another terminal for the

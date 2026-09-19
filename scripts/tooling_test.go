@@ -117,6 +117,112 @@ func TestBuildBinaryFailuresPreserveInstalledBinary(t *testing.T) {
 	}
 }
 
+func TestBuildBinaryRejectsDirectoryOutputBeforeWork(t *testing.T) {
+	for _, shape := range []string{"directory", "symlink", "trailing slash", "trailing dot", "trailing parent"} {
+		t.Run(shape, func(t *testing.T) {
+			f := newToolingFixture(t)
+			directory := filepath.Join(f.root, "existing directory")
+			if err := os.Mkdir(directory, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			output := directory
+			switch shape {
+			case "symlink":
+				output = f.output
+				if err := os.Symlink(directory, output); err != nil {
+					t.Fatal(err)
+				}
+			case "trailing slash":
+				output = f.output + "/"
+			case "trailing dot":
+				output = f.output + "/."
+			case "trailing parent":
+				output = f.output + "/.."
+			}
+			out, err := f.run(nil, "bingo", output)
+			if err == nil || !strings.Contains(string(out), "OUTPUT must name a file") || f.log() != "" {
+				t.Fatalf("directory output performed work: %v\n%s\n%s", err, out, f.log())
+			}
+			contents, err := os.ReadDir(directory)
+			if err != nil || len(contents) != 0 {
+				t.Fatalf("modified directory output: %v, %v", contents, err)
+			}
+		})
+	}
+}
+
+func TestLocalVSIXUsesOneVerifiedPackage(t *testing.T) {
+	for _, install := range []bool{false, true} {
+		t.Run(map[bool]string{false: "package only", true: "explicit install"}[install], func(t *testing.T) {
+			f := newToolingFixture(t)
+			var args []string
+			if install {
+				args = []string{"install"}
+			}
+			out, err := f.runScript("package-vscode.sh", nil, args...)
+			if err != nil {
+				t.Fatalf("package: %v\n%s", err, out)
+			}
+			log := f.log()
+			commands := []string{
+				"npm --prefix editors/vscode ci --ignore-scripts",
+				"npm --prefix editors/vscode run package\n",
+				"npm --prefix editors/vscode run package:verify",
+			}
+			previous := -1
+			for _, command := range commands {
+				index := strings.Index(log, command)
+				if index <= previous || strings.Count(log, command) != 1 {
+					t.Fatalf("wrong package order/count for %q:\n%s", command, log)
+				}
+				previous = index
+			}
+			for _, forbidden := range []string{"run check", "run build", "reproducible", "go cgo="} {
+				if strings.Contains(log, forbidden) {
+					t.Fatalf("local install performed full/redundant work:\n%s", log)
+				}
+			}
+			if install {
+				if strings.Index(log, "code --install-extension") <= previous || !strings.Contains(log, "dist/bingo-linux-x64.vsix --force") {
+					t.Fatalf("install did not follow exact package verification:\n%s", log)
+				}
+			} else if strings.HasPrefix(log, "code ") || strings.Contains(log, "\ncode ") {
+				t.Fatalf("packaging touched VS Code:\n%s", log)
+			}
+		})
+	}
+}
+
+func TestLocalInstallFailuresDoNotInstall(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		env  []string
+		want string
+	}{
+		{"code unavailable", []string{"FAKE_CODE_FAIL=1"}, "cannot run the VS Code CLI"},
+		{"old Node", []string{"FAKE_NODE_VERSION=v20.0.0"}, "Node.js 22.x"},
+		{"emulated Node", []string{"FAKE_NODE_HOST=darwin/x64"}, "Node.js must run natively"},
+		{"old Go", []string{"FAKE_GO_VERSION=go1.24.9"}, "Go 1.25.5"},
+		{"cross target", []string{"BINGO_VSCODE_TARGET=darwin-arm64"}, "must target this host"},
+		{"verify failed", []string{"FAKE_NPM_FAIL=package:verify"}, "injected npm failure"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newToolingFixture(t)
+			out, err := f.runScript("package-vscode.sh", tc.env, "install")
+			if err == nil || !strings.Contains(string(out), tc.want) {
+				t.Fatalf("wanted %q: %v\n%s", tc.want, err, out)
+			}
+			log := f.log()
+			if strings.Contains(log, "--install-extension") {
+				t.Fatalf("installed after failure:\n%s", log)
+			}
+			if tc.name != "verify failed" && strings.Contains(log, "npm ") {
+				t.Fatalf("preflight failed after expensive work:\n%s", log)
+			}
+		})
+	}
+}
+
 type toolingFixture struct {
 	t      *testing.T
 	root   string
@@ -133,7 +239,7 @@ func newToolingFixture(t *testing.T) toolingFixture {
 			t.Fatal(err)
 		}
 	}
-	for _, name := range []string{"build-binary.sh", "tooling.sh"} {
+	for _, name := range []string{"build-binary.sh", "tooling.sh", "preflight.sh", "package-vscode.sh", "release-ref.sh"} {
 		content, err := os.ReadFile(name)
 		if err != nil {
 			t.Fatal(err)
@@ -165,7 +271,16 @@ if [[ "${FAKE_BUILD_FAIL:-0}" == 1 ]]; then echo 'injected build failure' >&2; e
 	f.write("fake-bin/node", `#!/bin/bash
 [[ "${FAKE_NODE_FAIL:-0}" == 0 ]] || { echo 'Node should not be needed' >&2; exit 1; }
 if [[ "$1" == --version ]]; then echo "${FAKE_NODE_VERSION:-v22.17.0}"; exit; fi
+if [[ "$1" == -p ]]; then echo "${FAKE_NODE_HOST:-linux/x64}"; exit; fi
 echo normalize >> "$BINGO_TEST_LOG"
+`)
+	f.write("fake-bin/npm", `#!/bin/bash
+echo "npm $*" >> "$BINGO_TEST_LOG"
+if [[ -n "${FAKE_NPM_FAIL:-}" && "$*" == *"$FAKE_NPM_FAIL"* ]]; then echo 'injected npm failure' >&2; exit 1; fi
+`)
+	f.write("fake-bin/code", `#!/bin/bash
+echo "code $*" >> "$BINGO_TEST_LOG"
+[[ "${FAKE_CODE_FAIL:-0}" == 0 ]]
 `)
 	f.write("fake-bin/xcrun", "#!/bin/bash\necho /test/clang\n")
 	f.write("fake-bin/codesign", `#!/bin/bash
@@ -185,8 +300,12 @@ func (f toolingFixture) write(name, content string) {
 }
 
 func (f toolingFixture) run(env []string, args ...string) ([]byte, error) {
+	return f.runScript("build-binary.sh", env, args...)
+}
+
+func (f toolingFixture) runScript(script string, env []string, args ...string) ([]byte, error) {
 	f.t.Helper()
-	cmd := exec.Command("bash", append([]string{filepath.Join(f.root, "scripts/build-binary.sh")}, args...)...)
+	cmd := exec.Command("bash", append([]string{filepath.Join(f.root, "scripts", script)}, args...)...)
 	cmd.Dir = f.t.TempDir()
 	for _, item := range os.Environ() {
 		if !strings.HasPrefix(item, "BINGO_") && !strings.HasPrefix(item, "FAKE_") {

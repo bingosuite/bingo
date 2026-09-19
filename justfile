@@ -5,19 +5,16 @@
 # positional args still override.
 os_name := if os() == "macos" { "darwin" } else { os() }
 arch_name := if arch() == "aarch64" { "arm64" } else if arch() == "x86_64" { "amd64" } else { arch() }
-vscode_target := if os_name + "/" + arch_name == "darwin/arm64" { "darwin-arm64" } else if os_name + "/" + arch_name == "linux/amd64" { "linux-x64" } else { "unsupported" }
 go_test := if os_name + "/" + arch_name == "darwin/arm64" { "env CGO_ENABLED=1 go test -tags bingonative" } else { "go test" }
+go_vet := if os_name + "/" + arch_name == "darwin/arm64" { "env CGO_ENABLED=1 go vet -tags bingonative" } else { "go vet" }
 
-# Build the Target, build BinGo and run the Target
-default: build-target build run
+# Show commands without building or starting a server.
+default:
+	@just --list
 
-# Usage: just build 				-> 	bingo_<host os>_<host arch> (auto-detected)
-#		 just build darwin arm64    -> 	bingo_darwin_arm64 (MacOs specified, ARM64 specified)
-# Build the BinGo binary. Takes positional arguments for the target OS and architecture (Must be valid `go build` targets).
+# Build bingo for a supported target; Darwin requires native Apple Silicon.
 build OS=os_name ARCH=arch_name:
-	go clean
-	mkdir -p ./build/bingo
-	{{ if OS == "darwin" { "env CGO_ENABLED=1 GOOS=" + OS + " GOARCH=" + ARCH + " go build -tags bingonative -o ./build/bingo/bingo_" + OS + "_" + ARCH + " ./cmd/bingo && codesign --sign - --entitlements entitlements.plist --force ./build/bingo/bingo_" + OS + "_" + ARCH } else { "env GOOS=" + OS + " GOARCH=" + ARCH + " go build -o ./build/bingo/bingo_" + OS + "_" + ARCH + " ./cmd/bingo" } }}
+	bash ./scripts/build-binary.sh bingo "./build/bingo/bingo_{{OS}}_{{ARCH}}" "{{OS}}" "{{ARCH}}"
 
 # Usage: just run 										->	runs ./build/bingo/bingo_<host os>_<host arch> (auto-detected)
 #		 just run darwin arm64 							-> 	runs ./build/bingo/bingo_darwin_arm64 (MacOs specified, ARM64 specified)
@@ -45,13 +42,13 @@ dap_addr := "127.0.0.1:4711"
 # via the ADDR/DAP_ADDR positionals; extra flags (e.g. `-idle-timeout 30s`) pass
 # through in ARGS. No idle timeout is supplied by default, so manual servers
 # remain persistent.
-server OS=os_name ARCH=arch_name ADDR=ws_addr DAP_ADDR=dap_addr *ARGS="": build-target (build OS ARCH)
+server OS=os_name ARCH=arch_name ADDR=ws_addr DAP_ADDR=dap_addr *ARGS="": (build OS ARCH)
 	./build/bingo/bingo_{{OS}}_{{ARCH}} -addr {{ADDR}} -dap-addr {{DAP_ADDR}} {{ARGS}}
 
 # Build then run the server with ONLY the WebSocket (-addr) listener; DAP stays
 # disabled (the binary leaves -dap-addr empty). Override the address via ADDR;
 # extra flags (e.g. -v) pass through in ARGS.
-server-ws OS=os_name ARCH=arch_name ADDR=ws_addr *ARGS="": build-target (build OS ARCH)
+server-ws OS=os_name ARCH=arch_name ADDR=ws_addr *ARGS="": (build OS ARCH)
 	./build/bingo/bingo_{{OS}}_{{ARCH}} -addr {{ADDR}} {{ARGS}}
 
 # Build the Target with maximum debugging information
@@ -59,8 +56,7 @@ build-target:
 	mkdir -p ./build/target
 	go build --gcflags="all=-N -l" -o ./build/target/target ./cmd/target
 
-# The picker has one pre-launch task, so build every selectable target with
-# debugger-friendly code generation before resolving its chosen binary.
+# Optional prebuilt examples for binary-mode and terminal debugging.
 build-examples:
 	mkdir -p ./build/examples
 	go build -gcflags="all=-N -l" -o ./build/examples/level1-loop ./examples/level1-loop
@@ -76,12 +72,14 @@ build-spawntree:
 # Build the native server into the extension-local layout used by both an
 # Extension Development Host and the platform-specific VSIX.
 vscode-prepare:
+	bash ./scripts/preflight.sh vscode
 	npm --prefix editors/vscode run binary:prepare
 
-# Prepare source-extension and target artifacts for an Extension Development
-# Host. Normal target F5 uses the installed VSIX and only rebuilds the examples.
-vscode-dev: build-examples vscode-prepare
+# Prepare an Extension Development Host; installed users need only vscode-install.
+vscode-dev:
+	bash ./scripts/preflight.sh vscode
 	npm --prefix editors/vscode ci --ignore-scripts
+	npm --prefix editors/vscode run binary:prepare
 	npm --prefix editors/vscode run build
 
 # ARGS: -addr string    server address (default "localhost:6060")
@@ -101,6 +99,7 @@ dapcli *ARGS:
 # Reinstall from the lockfile so local checks exercise the same dependency graph
 # as CI rather than whatever happens to be present in node_modules.
 vscode-check:
+	bash ./scripts/preflight.sh vscode
 	npm --prefix editors/vscode ci --ignore-scripts
 	npm --prefix editors/vscode run check
 
@@ -111,17 +110,18 @@ vscode-package: vscode-check
 	npm --prefix editors/vscode run package:reproducible
 	npm --prefix editors/vscode run package:verify
 
-# Explicit opt-in keeps packaging/CI from mutating a developer's normal VS Code
-# profile while still providing a one-command local install/update path.
-vscode-install: vscode-package
-	code --install-extension ./dist/bingo-{{vscode_target}}.vsix --force
+# One native VSIX build and exact archive verification; no profile changes.
+vscode-local-package:
+	bash ./scripts/package-vscode.sh
+
+# Fast local install: preflight, locked dependencies, one verified package.
+vscode-install:
+	bash ./scripts/package-vscode.sh install
 
 # Stage the host-native server where the Neovim companion resolves it before
-# falling back to PATH. The macOS build is already codesigned by `build`.
-neovim-prepare: (build os_name arch_name)
-	mkdir -p ./editors/neovim/bin
-	cp ./build/bingo/bingo_{{os_name}}_{{arch_name}} ./editors/neovim/bin/bingo
-	chmod 755 ./editors/neovim/bin/bingo
+# falling back to PATH. The plugin-manager hook also works without just.
+neovim-prepare:
+	bash ./editors/neovim/scripts/prepare.sh
 
 # Parse all plugin files and run the contract tests in Neovim's Lua runtime.
 neovim-check:
@@ -131,6 +131,9 @@ neovim-check:
 test PKG="./...":
 	{{go_test}} -v {{PKG}}
 
+vet PKG="./...":
+	{{go_vet}} {{PKG}}
+
 # Run coverage on the PKG (defaults to ./...)
 coverage PKG="./...":
 	{{go_test}} -coverprofile=test/coverage.out {{PKG}}
@@ -138,7 +141,15 @@ coverage PKG="./...":
 
 # Run integration tests
 integration:
-	go run github.com/onsi/ginkgo/v2/ginkgo -r ./test/integration/.
+	{{go_test}} -v ./test/integration
+
+# Build all native release assets, retaining full VSIX and reproducibility gates.
+# dev permits a dirty local preview; release tags require a clean matching checkout.
+release-package VERSION="dev":
+	bash ./scripts/preflight.sh release
+	npm --prefix editors/vscode ci --ignore-scripts
+	npm --prefix editors/vscode run check
+	go run ./scripts/release -version "{{VERSION}}"
 
 # Run the debugger E2E acceptance tests on linux/amd64 (native ptrace backend).
 # Runs every label (no filter): `basic` correctness, `churn` robustness, `pause`

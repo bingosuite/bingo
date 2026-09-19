@@ -91,6 +91,35 @@ Git SHA, an explicitly dirty SHA, or `unknown`. Only the server embeds them.
 wire version without entering the server lifecycle; help and invalid arguments
 also return before creating listeners. Positional arguments are rejected.
 
+Bare `just` lists recipes without starting a process; server recipes build only
+the server, never an unrelated example target, and builds preserve Go's cache.
+[`scripts/package-vscode.sh`](scripts/package-vscode.sh) is the local fast path:
+preflight, locked npm restore with lifecycle scripts disabled, one `package`
+(including its `vscode:prepublish` bundle build), exact package verification.
+Only its explicit `install` argument invokes `code --install-extension`, after
+checking that CLI before any expensive work. `just vscode-local-package` never
+installs; `just vscode-package` retains full source checks and two-build binary/
+VSIX reproducibility. Neither release jobs nor validation install an editor.
+
+[`scripts/release`](scripts/release/) assembles native terminal tools, the
+existing platform VSIX, a prepared Neovim runtime, metadata and platform-named
+SHA256SUMS files. It reuses the reproducible VSIX server byte-for-byte in both
+tar archives, builds each terminal client twice, checks exact archive contents
+and modes, and checks hashes before promoting staged files. Archives have sorted
+regular-file paths, fixed ownership/timestamps and no symlinks. Suite release
+tags, the extension manifest version and wire version are independent metadata.
+Only `dev` previews accept dirty source; tagged builds require a clean matching
+tag/HEAD/resolved-commit identity before and after packaging.
+
+The [release workflow](.github/workflows/release.yml) uses native Ubuntu x86-64
+and `macos-15` arm64 builders, Go from `go.mod`, and Node from `.nvmrc`.
+Manual dispatch defaults to Actions artifacts only. An explicit upload requires
+an existing draft; it never creates or publishes one. The existing published
+release trigger remains supported. Only the final, checkout-free upload job
+has write permission, and it checks the tag SHA, release state and exact
+per-platform checksum sets. Health/idle smoke on hosted Darwin is not native
+debugger acceptance; the existing local Darwin E2E procedure still applies.
+
 ### Platform scope
 
 - Supported platforms are **linux/amd64** and **darwin/arm64** only. Do not add
@@ -4333,17 +4362,21 @@ side `chan error` — every debugger outcome, failures included, rides the singl
 Build/test commands:
 
 ```sh
-just build [linux amd64 | darwin arm64]   # produces ./build/bingo/...
+just                                      # list recipes; never starts a server
+just build [linux amd64 | darwin arm64]     # produces ./build/bingo/...
 just test [PKG]                            # go test -v
+just vet [PKG]                             # go vet with the host's native tag
 just coverage [PKG]                        # writes test/coverage.out
 just integration                           # ginkgo -r ./test/integration (no e2e tag)
 just build-examples                        # build five progressive targets with -N -l
 just build-spawntree                       # build the dedicated telemetry demo with -N -l
 just vscode-prepare                        # stage the current native server inside the extension
-just vscode-dev                            # stage source extension + native server + examples for CLI-launched Extension Host
+just vscode-dev                            # stage source extension + native server for CLI-launched Extension Host
 just vscode-check                          # lint, typecheck, test, bundle, package-list smoke
-just vscode-package                        # writes verified dist/bingo-<platform>.vsix
-just vscode-install                        # explicitly installs/updates bingosuite.bingo
+just vscode-local-package                  # one verified VSIX build; no profile changes
+just vscode-package                        # full checks + reproducible dist/bingo-<platform>.vsix
+just vscode-install                        # fast, explicit one-build install/update of bingosuite.bingo
+just release-package [VERSION]             # native tools + VSIX + Neovim + checksums; default dev preview
 npm --prefix editors/vscode run test:integration # pinned Electron activation/view/custom-event test
 npm --prefix editors/vscode run e2e:packaged     # real native packaged DAP + graphical telemetry path
 just neovim-prepare                        # stage the host-native server for the Lua companion

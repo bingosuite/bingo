@@ -1,51 +1,178 @@
 name: Release
 
 on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing vMAJOR.MINOR.PATCH tag (optional prerelease suffix)
+        required: true
+        type: string
+      upload_to_draft:
+        description: Attach verified assets to an existing draft release; never publish it
+        required: false
+        default: false
+        type: boolean
   release:
     types: [published]
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
 
 jobs:
-  build-and-upload:
+  resolve:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      commit: ${{ steps.commit.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Validate tag before using it as a ref
+        id: tag
+        env:
+          REQUESTED_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: bash scripts/release-ref.sh "$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          persist-credentials: false
+      - name: Resolve immutable release commit
+        id: commit
+        run: |
+          commit=$(git rev-parse --verify HEAD)
+          [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+          printf 'commit=%s\n' "$commit" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Native assets (${{ matrix.target }})
+    needs: resolve
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         include:
-          - goos: linux
+          - runner: ubuntu-latest
+            target: linux-x64
+            goos: linux
             goarch: amd64
-
+            uname_os: Linux
+            uname_arch: x86_64
+            go_tags: ""
+          - runner: macos-15
+            target: darwin-arm64
+            goos: darwin
+            goarch: arm64
+            uname_os: Darwin
+            uname_arch: arm64
+            go_tags: bingonative
+    env:
+      BINGO_VERSION: ${{ needs.resolve.outputs.tag }}
+      BINGO_COMMIT: ${{ needs.resolve.outputs.commit }}
+      BINGO_VSCODE_TARGET: ${{ matrix.target }}
+      GO_TAGS: ${{ matrix.go_tags }}
+      EXPECTED_GOOS: ${{ matrix.goos }}
+      EXPECTED_GOARCH: ${{ matrix.goarch }}
+      EXPECTED_UNAME_OS: ${{ matrix.uname_os }}
+      EXPECTED_UNAME_ARCH: ${{ matrix.uname_arch }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v4
         with:
-          go-version: "1.25.5"
-
-      - name: Build binary
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-          CGO_ENABLED: "0"
-        run: |
-          mkdir -p dist
-          BIN_NAME="bingo_${GOOS}_${GOARCH}"
-          go build -trimpath -ldflags="-s -w" -o "dist/${BIN_NAME}" ./cmd/bingo
-
-      - name: Package artifact
-        env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
-        run: |
-          mkdir -p release
-          ASSET_BASE="bingo_${GOOS}_${GOARCH}"
-          tar -C dist -czf "release/${ASSET_BASE}.tar.gz" "${ASSET_BASE}"
-
-      - name: Upload release asset
-        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@v5
         with:
-          files: release/*
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: editors/vscode/.nvmrc
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+      - name: Require the exact tag and a native builder
+        run: |
+          test "$(git rev-parse HEAD)" = "$BINGO_COMMIT"
+          test "$(git rev-parse --verify "refs/tags/$BINGO_VERSION^{commit}")" = "$BINGO_COMMIT"
+          test "$(uname -s)" = "$EXPECTED_UNAME_OS"
+          test "$(uname -m)" = "$EXPECTED_UNAME_ARCH"
+          test "$(go env GOHOSTOS)" = "$EXPECTED_GOOS"
+          test "$(go env GOHOSTARCH)" = "$EXPECTED_GOARCH"
+          bash scripts/preflight.sh release
+      - name: Verify Go source and tooling
+        run: |
+          go mod tidy -diff
+          go vet -tags "$GO_TAGS" ./...
+          go test -tags "$GO_TAGS" ./...
+      - name: Restore locked extension dependencies
+        run: npm --prefix editors/vscode ci --ignore-scripts
+      - name: Verify extension source
+        run: npm --prefix editors/vscode run check
+      - name: Build reproducible binaries, VSIX, companion and checksums
+        run: go run ./scripts/release -version "$BINGO_VERSION"
+      - name: Smoke packaged server health and idle exit (no native debug claim)
+        run: npm --prefix editors/vscode run smoke:server
+      - name: Ensure packaging left source unchanged
+        run: test -z "$(git status --porcelain --untracked-files=normal)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  upload:
+    name: Attach verified assets (never publish a draft)
+    needs: [resolve, build]
+    if: github.event_name == 'release' || inputs.upload_to_draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
+      - name: Recheck tag, release state and exact checksums before upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.resolve.outputs.commit }}
+          RELEASE_EVENT: ${{ github.event_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
+          [[ "${#RELEASE_TAG}" -le 80 ]]
+          [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          check_release() {
+            test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)" = "$RELEASE_COMMIT"
+            draft=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+            if [[ "$RELEASE_EVENT" == workflow_dispatch ]]; then
+              test "$draft" = true || { echo "Manual uploads require an existing draft release." >&2; exit 1; }
+            else
+              test "$draft" = false || { echo "Published-release uploads require a published release." >&2; exit 1; }
+            fi
+          }
+          check_release
+          cd release-assets
+          assets=()
+          for platform in linux_amd64 darwin_arm64; do
+            if [[ "$platform" == linux_amd64 ]]; then target=linux-x64; else target=darwin-arm64; fi
+            base="bingo_${RELEASE_TAG}_${platform}"
+            sums="${base}_SHA256SUMS.txt"
+            expected=("${base}.tar.gz" "bingo-neovim_${RELEASE_TAG}_${platform}.tar.gz" "bingo-${RELEASE_TAG}-${target}.vsix" "${base}.json")
+            printf '%s\n' "${expected[@]}" | LC_ALL=C sort > expected.txt
+            awk 'length($1) != 64 || $1 ~ /[^0-9a-f]/ || NF != 2 { exit 1 } { print $2 }' "$sums" | LC_ALL=C sort > actual.txt
+            diff -u expected.txt actual.txt
+            shasum -a 256 -c "$sums"
+            assets+=("${expected[@]}" "$sums")
+          done
+          check_release
+          gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
