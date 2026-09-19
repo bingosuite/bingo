@@ -50,9 +50,11 @@ Requires VS Code **1.85 or newer**.
    ```
 
 2. Run **Developer: Reload Window** after an install/update.
-3. Open your Go project and run **Bingo: Debug Go Package**. With no launch
-   configuration, F5 can also select bingo. Pick the directory containing the
-   runnable `main` package.
+3. Open a saved Go file in a runnable `main` package and run
+   **Bingo: Debug Go Package**. It uses that file's directory, or the workspace
+   root when it contains Go source; it does not open a directory picker.
+   With no launch configuration, F5 can also select bingo. Use an explicit
+   `launch.json` configuration for a different package path.
 4. Set breakpoints and use the native Debug UI. The Bingo Concurrency editor
    opens beside source; the Activity Bar offers the same read-only model.
 
@@ -261,13 +263,17 @@ Each platform contributes these assets, with `VERSION` including the leading
 | `bingo_VERSION_PLATFORM.json` | Exact commit, suite version, platform, Go/wire/extension versions, signing information |
 | `bingo_VERSION_PLATFORM_SHA256SUMS.txt` | SHA-256 of the other four assets, sorted by basename |
 
-Download all four artifacts for your platform plus its checksum file into one
-directory. Before installing or extracting them, run:
+Download only the artifact(s) you want plus your platform's checksum file into
+one directory. Before installing or extracting them, run:
 
 ```sh
-shasum -a 256 -c bingo_VERSION_PLATFORM_SHA256SUMS.txt
-# Linux may also use: sha256sum -c bingo_VERSION_PLATFORM_SHA256SUMS.txt
+shasum -a 256 -c --ignore-missing bingo_VERSION_PLATFORM_SHA256SUMS.txt
+# Linux may also use: sha256sum -c --ignore-missing bingo_VERSION_PLATFORM_SHA256SUMS.txt
 ```
+
+Proceed only when the command succeeds **and each chosen artifact's exact
+filename is reported `OK`**. No verified files is not success, and a `FAILED`
+result means the download must not be used.
 
 Checksum names are relative to that download directory, and checksum filenames
 are platform-specific so the two release jobs never overwrite one another.

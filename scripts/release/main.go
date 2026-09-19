@@ -304,9 +304,11 @@ not. Only native linux/amd64 and Apple Silicon darwin/arm64 are supported.
 On macOS the server has an ad-hoc debugger-entitled signature, NOT notarization.
 Do not disable Gatekeeper or SIP globally to install a downloaded binary.
 
-Verify the separately downloaded platform SHA256SUMS file before installation:
-  shasum -a 256 -c bingo_` + m.Version + `_` + m.GOOS + `_` + m.GOARCH + `_SHA256SUMS.txt
-The checksum names are relative to the directory containing the downloaded assets.
+Download only your chosen asset(s) and the platform SHA256SUMS file, then verify:
+  shasum -a 256 -c --ignore-missing bingo_` + m.Version + `_` + m.GOOS + `_` + m.GOARCH + `_SHA256SUMS.txt
+Proceed only when the command succeeds and each chosen artifact's exact filename
+is reported OK. No verified files or any FAILED result is not verification.
+Checksum names are relative to the directory containing the downloaded assets.
 
 Full setup and limitations:
 https://github.com/bingosuite/bingo/blob/` + revision + `/docs/SETUP.md

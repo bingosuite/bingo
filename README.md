@@ -62,7 +62,10 @@ CLI; macOS also needs Xcode Command Line Tools. `just vscode-install` is an
 optional shorthand for the same **single-build, verified** install, not the full
 release test suite.
 
-Reload VS Code, open your Go project, and run **Bingo: Debug Go Package**.
+Reload VS Code, open a saved Go file in a runnable `main` package, and run
+**Bingo: Debug Go Package**. The command uses that file's directory, or the
+workspace root when it contains Go source; use a launch configuration for a
+different path.
 Without a launch configuration, F5 can also select bingo to debug a Go package.
 The server compiles the selected source directory with debugging information
 and launches it; no `just`, pre-launch build task, separate server terminal, or

@@ -104,6 +104,7 @@ func TestReleaseWorkflowBoundaries(t *testing.T) {
 	for _, step := range upload.Steps {
 		if strings.HasPrefix(step.Uses, "actions/checkout@") ||
 			strings.Contains(step.Run, "scripts/") ||
+			strings.Contains(step.Run, "--ignore-missing") ||
 			strings.Contains(step.Run, "gh release create") ||
 			strings.Contains(step.Run, "gh release edit") {
 			t.Fatalf("write job executes repository code or publishes a release: %+v", step)

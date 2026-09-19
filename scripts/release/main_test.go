@@ -102,7 +102,10 @@ func TestBundledInstallInstructions(t *testing.T) {
 	m := metadata{Version: "v0.7.0", Commit: strings.Repeat("a", 40), GOOS: "darwin", GOARCH: "arm64", WireProtocolVersion: "1.4"}
 	for _, neovim := range []bool{false, true} {
 		text := installText(m, neovim)
-		for _, want := range []string{"notarization", "do not require Go", "server's PATH", m.Commit + "/docs/SETUP.md", "SHA256SUMS"} {
+		for _, want := range []string{
+			"notarization", "do not require Go", "server's PATH", m.Commit + "/docs/SETUP.md",
+			"SHA256SUMS", "--ignore-missing", "exact filename\nis reported OK", "No verified files",
+		} {
 			if !strings.Contains(text, want) {
 				t.Fatalf("bundled onboarding is missing %q", want)
 			}
