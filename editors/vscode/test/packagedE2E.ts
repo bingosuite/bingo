@@ -16,6 +16,7 @@ import { probeBingoHealth } from "../src/health.js";
 import { DebugInspectionController, type DebugSessionClient } from "../src/inspection.js";
 import { decodeAction } from "../src/messages.js";
 import type { DebugVariable, SessionModel, SessionViewModel } from "../src/model.js";
+import { goPackageConfiguration } from "../src/quickStart.js";
 import { readSourceContext, SpawnSourceController } from "../src/source.js";
 import { filterTree } from "../src/tree.js";
 import { SessionRegistry } from "../src/registry.js";
@@ -28,6 +29,7 @@ import {
 } from "../src/sessionEvent.js";
 
 const repositoryRoot = resolve(process.cwd(), "../..");
+const sourceStartupTimeoutMs = 130_000;
 const target = packageTarget();
 if (target === undefined) {
   throw new Error(`unsupported packaged E2E host ${process.platform}/${process.arch}`);
@@ -275,18 +277,40 @@ async function runExample(
       linesStartAt1: true,
       columnsStartAt1: true,
     });
-    const program = resolve(repositoryRoot, "build", "examples", name);
-    const sourceFile = resolve(repositoryRoot, "examples", name, "main.go");
-    const launch = client.request("launch", { program, stopOnEntry: true });
-    const custom = await client.message(
-      (message) => message.type === "event" && message.event === sessionDAPEventName,
+    const sourceDirectory = resolve(repositoryRoot, "examples", name);
+    const sourceFile = join(sourceDirectory, "main.go");
+    const workspace = { scheme: "file", fsPath: repositoryRoot };
+    const launchConfig = await goPackageConfiguration({
+      activeDocument: {
+        scheme: "file",
+        fsPath: sourceFile,
+        languageId: "go",
+        isUntitled: false,
+      },
+      folder: workspace,
+      workspaceFolders: [workspace],
+    });
+    assert.equal(launchConfig.mode, "debug");
+    assert.equal(launchConfig.program, sourceDirectory);
+    assert.equal(launchConfig.cwd, sourceDirectory);
+    // Discovery follows the native entry stop, after the server's bounded Go build.
+    const startupDeadline = Date.now() + sourceStartupTimeoutMs;
+    const launch = client.request("launch", { ...launchConfig, stopOnEntry: true });
+    const startupEvent = (event: string): Promise<DAPMessage> => connectedClient.message(
+      (message) => {
+        if (message.type === "response" && message.request_seq === launch) {
+          assert.equal(message.success, true, `source launch failed: ${JSON.stringify(message)}`);
+        }
+        return message.type === "event" && message.event === event;
+      },
+      Math.max(1, startupDeadline - Date.now()),
     );
+    const custom = await startupEvent(sessionDAPEventName);
     const announcement = decodeSessionAnnouncement(String(custom.event), custom.body);
     assert.ok(announcement, `${name} omitted the session announcement`);
     const sessionId = announcement.sessionId;
-    await client.message(
-      (message) => message.type === "event" && message.event === "initialized",
-    );
+    await startupEvent("initialized");
+    process.stdout.write(`[source] ${name}: program=${launchConfig.program} cwd=${launchConfig.cwd}\n`);
     assert.equal(
       registry.add({
         debugSessionId,
@@ -303,7 +327,7 @@ async function runExample(
       10_000,
     );
     const breakpointResponse = await client.customRequest("setBreakpoints", {
-      source: { name: basename(program), path: sourceFile },
+      source: { name: basename(sourceFile), path: sourceFile },
       breakpoints: [{ line }],
       sourceModified: false,
     });

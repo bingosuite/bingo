@@ -3002,7 +3002,13 @@ passes `VSCODE_TEST_VERSION` to the runner, which passes its selected version
 matches before UI work so a mislabeled matrix cannot silently exercise a fallback.
 Darwin native-debug execution
 requires local/self-hosted Apple Silicon, where the same E2E covers all five
-examples. Both tests observe server-owned idle exit on success. On failure the
+examples. That native packaged gate calls the production `goPackageConfiguration`
+helper from each active Go source path and sends source mode/package cwd to the
+packaged server, which must build the targets itself. Neither the harness nor
+the workflow prebuilds example binaries. Discovery and `initialized` share a
+130-second deadline around the server's two-minute build budget; explicit
+`stopOnEntry:true` retains the entry, breakpoint, locals/source-DOM, observer,
+and single-terminate assertions. Both tests observe server-owned idle exit on success. On failure the
 smoke may SIGKILL only the detached process group it created; the packaged E2E
 may signal only its exact captured server PID. Cleanup is test-only and must
 never enter extension production code.
@@ -3869,7 +3875,9 @@ translator keeps DAP entirely outside the hub — a strictly additive package.
   webview security/messages, and manifest/workspace/package contracts; a pinned
   `@vscode/test-electron` run activates the real extension/view and acknowledges
   a fake adapter's namespaced custom event, while `packagedE2E.ts` drives the
-  actual native packaged server, DAP, WebSocket observer, and graphical model.
+  actual native packaged server's source-package build/launch path, DAP,
+  WebSocket observer, and graphical model for all five progressive examples
+  without prebuilt target binaries.
   The
   dedicated [vscode-extension.yml](.github/workflows/vscode-extension.yml)
   workflow lints, typechecks, tests, bundles, and builds the local VSIX without
