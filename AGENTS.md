@@ -3542,7 +3542,12 @@ also advertises `sessionEventVersion:1`; graphical clients require it before
 reusing a managed server because older API-v1 servers on earlier wire versions do not emit the
 `bingo/session/v1` discovery event. Management API
 compatibility and WebSocket wire compatibility are separate checks: changing
-one does not implicitly version the other. A DAP bind to `:0` MUST publish the
+one does not implicitly version the other. `dap.sourceLaunchVersion:1`, from
+`protocol.DAPSourceLaunchVersion`, is the independent capability for server-local
+Go-package builds through DAP `launch` with `mode:"debug"`. Managed companions
+must require that exact value: older wire-1.4 adapters ignore unknown launch
+arguments and would otherwise attempt to execute a source directory.
+A DAP bind to `:0` MUST publish the
 actual listener address, never the unresolved configured address. Health
 polling has no lifecycle effect. Positive idle durations below `1ms` or with a
 fractional millisecond are rejected so the timer and integer `timeoutMs` field
