@@ -2939,7 +2939,10 @@ VSIXes are platform-specific: `linux-x64` contains only linux/amd64 bingo;
 checks the target, and repairs executable mode if extraction lost it.
 `prepare-binary.mjs` delegates native build/sign/version metadata to
 `scripts/build-binary.sh` with `BINGO_REPRODUCIBLE=1`, then writes the VSIX target
-marker. Package builders are native linux/amd64 or darwin/arm64; Apple Silicon
+marker. Preparation never deletes the prior binary/marker before invoking the
+helper: compile, signing, or verification failure must preserve both. Unexpected
+files remain visible to the exact archive verifier rather than being deleted.
+Package builders are native linux/amd64 or darwin/arm64; Apple Silicon
 may also cross-build the Linux package, never execute its debugger.
 Packaging rebuilds/signs twice and requires identical binary and VSIX hashes;
 tests drift-check service/API/wire constants against Go source and inspect exact
