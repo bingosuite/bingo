@@ -9,6 +9,7 @@ export const defaultManagedIdleTimeoutMs = 30000;
 type JsonRecord = Record<string, unknown>;
 
 export type ServerMode = "auto" | "connectOnly";
+export type LaunchMode = "debug" | "exec";
 
 export interface BingoEndpoint {
   readonly host: string;
@@ -23,11 +24,13 @@ export interface BingoServerConfiguration {
   readonly idleTimeoutMs: number;
 }
 
-export interface ValidatedBingoConfiguration {
+export type ValidatedBingoConfiguration = {
   readonly endpoint: BingoEndpoint;
-  readonly request: "attach" | "launch";
   readonly server: BingoServerConfiguration;
-}
+} & (
+  | { readonly request: "launch"; readonly mode: LaunchMode }
+  | { readonly request: "attach" }
+);
 
 export class ConfigurationError extends Error {
   public override readonly name = "ConfigurationError";
@@ -45,9 +48,15 @@ export function validateBingoConfiguration(
 
   if (request === "launch") {
     requireNonEmptyString(config, "program");
+    validateOptionalPath(config, "program");
+    validateOptionalPath(config, "cwd");
+    const mode = config.mode === undefined ? "exec" : config.mode;
+    if (mode !== "debug" && mode !== "exec") {
+      throw new ConfigurationError('bingo mode must be "debug" or "exec"');
+    }
     validateOptionalStringArray(config, "args");
     validateOptionalStringArray(config, "env");
-    return { endpoint, request, server };
+    return { endpoint, request, server, mode };
   }
 
   if (request === "attach") {
@@ -170,6 +179,13 @@ function validateOptionalString(config: JsonRecord, key: string): void {
   const value = config[key];
   if (value !== undefined && typeof value !== "string") {
     throw new ConfigurationError(`bingo ${key} must be a string`);
+  }
+}
+
+function validateOptionalPath(config: JsonRecord, key: string): void {
+  validateOptionalString(config, key);
+  if (typeof config[key] === "string" && config[key].includes("\0")) {
+    throw new ConfigurationError(`bingo ${key} must not contain a NUL character`);
   }
 }
 

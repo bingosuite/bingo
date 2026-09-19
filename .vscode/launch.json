@@ -2,47 +2,24 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "bingo DAP: launch example (stop on entry)",
+      "name": "bingo: Debug example",
       "type": "bingo",
       "request": "launch",
-      "program": "${workspaceFolder}/build/examples/${input:bingoExample}",
-      "preLaunchTask": "bingo: build examples",
-      "stopOnEntry": true,
-      "serverMode": "auto",
-      "managementHost": "127.0.0.1",
-      "managementPort": 6060,
-      "dapHost": "127.0.0.1",
-      "dapPort": 4711,
-      "serverReadyTimeoutMs": 5000,
-      "managedIdleTimeoutMs": 30000
+      "mode": "debug",
+      "program": "${workspaceFolder}/examples/${input:bingoExample}"
     },
     {
-      "name": "bingo DAP: launch spawntree telemetry demo",
+      "name": "bingo: Debug spawntree telemetry demo",
       "type": "bingo",
       "request": "launch",
-      "program": "${workspaceFolder}/build/spawntree",
-      "preLaunchTask": "bingo: build spawntree",
-      "stopOnEntry": false,
-      "serverMode": "auto",
-      "managementHost": "127.0.0.1",
-      "managementPort": 6060,
-      "dapHost": "127.0.0.1",
-      "dapPort": 4711,
-      "serverReadyTimeoutMs": 5000,
-      "managedIdleTimeoutMs": 30000
+      "mode": "debug",
+      "program": "${workspaceFolder}/examples/spawntree"
     },
     {
-      "name": "bingo DAP: join running session",
+      "name": "bingo: Join running session",
       "type": "bingo",
       "request": "attach",
-      "session": "${input:bingoSession}",
-      "serverMode": "auto",
-      "managementHost": "127.0.0.1",
-      "managementPort": 6060,
-      "dapHost": "127.0.0.1",
-      "dapPort": 4711,
-      "serverReadyTimeoutMs": 5000,
-      "managedIdleTimeoutMs": 30000
+      "session": "${input:bingoSession}"
     }
   ],
   "inputs": [

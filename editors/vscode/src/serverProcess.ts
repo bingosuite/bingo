@@ -70,11 +70,16 @@ export function spawnDetachedServer(
   };
   child.on("error", handleError);
   child.on("exit", handleExit);
+  child.once("close", () => {
+    child.off("error", handleError);
+    child.off("exit", handleExit);
+  });
   child.unref();
 
   return {
     stopObserving(): void {
-      child.off("error", handleError);
+      // A cancelled readiness wait can precede spawn's asynchronous error.
+      // Keep reporting errors until close so they cannot crash the extension host.
       child.off("exit", handleExit);
     },
   };

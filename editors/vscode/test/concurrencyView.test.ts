@@ -171,6 +171,8 @@ class VscodeMock {
   readonly ViewColumn = { One: 1, Two: 2, Beside: -2 };
   readonly ExtensionMode = { Test: 3 };
   readonly StatusBarAlignment = { Left: 1 };
+  readonly DebugConfigurationProviderTriggerKind = { Initial: 1, Dynamic: 2 };
+  readonly ProgressLocation = { Notification: 15 };
   readonly registeredCommands = new Map<string, () => unknown>();
   readonly registeredViews = new Map<string, ConcurrencyViewProvider>();
   readonly commands = {
@@ -410,6 +412,8 @@ describe("concurrency host surfaces", () => {
               export const ViewColumn = mock.ViewColumn;
               export const ExtensionMode = mock.ExtensionMode;
               export const StatusBarAlignment = mock.StatusBarAlignment;
+              export const DebugConfigurationProviderTriggerKind = mock.DebugConfigurationProviderTriggerKind;
+              export const ProgressLocation = mock.ProgressLocation;
               export const window = mock.window;
               export const env = mock.env;
               export const workspace = mock.workspace;

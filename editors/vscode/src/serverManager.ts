@@ -56,10 +56,15 @@ const pollIntervalMs = 100;
 const finalWindowMs = 50;
 const finalPollIntervalMs = 10;
 
+interface StartupAttempt {
+  readonly controller: AbortController;
+  readonly promise: Promise<BingoEndpoint>;
+  waiters: number;
+}
+
 export class ServerManager {
   readonly #dependencies: ServerManagerDependencies;
-  readonly #inFlight = new Map<string, Promise<BingoEndpoint>>();
-  readonly #lifetime = new AbortController();
+  readonly #inFlight = new Map<string, StartupAttempt>();
   #disposed = false;
 
   public constructor(dependencies: ServerManagerDependencies) {
@@ -70,7 +75,7 @@ export class ServerManager {
     config: BingoServerConfiguration,
     signal?: AbortSignal,
   ): Promise<BingoEndpoint> {
-    if (this.#disposed) {
+    if (this.#disposed || signal?.aborted === true) {
       return Promise.reject(cancelledError());
     }
     if (config.mode === "connectOnly") {
@@ -80,19 +85,29 @@ export class ServerManager {
       );
     }
 
-    this.#validateAutoConfiguration(config);
+    this.validateConfiguration(config);
     const key = endpointKey(config);
-    let ensured = this.#inFlight.get(key);
-    if (ensured === undefined) {
-      ensured = this.#ensureAuto(config);
-      this.#inFlight.set(key, ensured);
-      void ensured.finally(() => {
-        if (this.#inFlight.get(key) === ensured) {
+    let attempt = this.#inFlight.get(key);
+    if (attempt === undefined) {
+      const controller = new AbortController();
+      attempt = {
+        controller,
+        promise: this.#ensureAuto(config, controller.signal),
+        waiters: 0,
+      };
+      this.#inFlight.set(key, attempt);
+    }
+    const ownedAttempt = attempt;
+    ownedAttempt.waiters += 1;
+    return awaitWithCancellation(ownedAttempt.promise, signal, () => {
+      ownedAttempt.waiters -= 1;
+      if (ownedAttempt.waiters === 0) {
+        if (this.#inFlight.get(key) === ownedAttempt) {
           this.#inFlight.delete(key);
         }
-      }).catch(() => undefined);
-    }
-    return awaitWithCancellation(ensured, signal);
+        ownedAttempt.controller.abort();
+      }
+    });
   }
 
   public dispose(): void {
@@ -100,12 +115,15 @@ export class ServerManager {
       return;
     }
     this.#disposed = true;
-    this.#lifetime.abort();
+    for (const attempt of this.#inFlight.values()) {
+      attempt.controller.abort();
+    }
     this.#inFlight.clear();
   }
 
   async #ensureAuto(
     config: BingoServerConfiguration,
+    signal: AbortSignal,
   ): Promise<BingoEndpoint> {
     const target = supportedTargetFor(this.#dependencies.runtime);
     if (target === undefined) {
@@ -119,6 +137,7 @@ export class ServerManager {
       config.managementEndpoint,
       config.dapEndpoint,
       Math.min(probeTimeoutMs, config.readyTimeoutMs),
+      signal,
     );
     if (initial.kind === "compatible") {
       this.#dependencies.log(
@@ -139,27 +158,29 @@ export class ServerManager {
 
     let binaryPath: string;
     try {
-      binaryPath = await this.#dependencies.resolveBinary(target);
+      binaryPath = await awaitWithCancellation(
+        this.#dependencies.resolveBinary(target), signal,
+      );
     } catch (error: unknown) {
-      this.#throwIfCancelled(error);
+      this.#throwIfCancelled(signal, error);
       throw new ServerManagerError(
         "binaryUnavailable",
         `cannot use the bundled ${target} bingo server: ${errorMessage(error)}`,
         { cause: error },
       );
     }
-    this.#throwIfCancelled();
+    this.#throwIfCancelled(signal);
 
     let logPath: string;
     try {
-      logPath = await this.#dependencies.logPathFor(
-        config.managementEndpoint,
+      logPath = await awaitWithCancellation(
+        this.#dependencies.logPathFor(config.managementEndpoint), signal,
       );
     } catch (error: unknown) {
-      this.#throwIfCancelled(error);
+      this.#throwIfCancelled(signal, error);
       throw error;
     }
-    this.#throwIfCancelled();
+    this.#throwIfCancelled(signal);
     const args = serverArguments(config);
     this.#dependencies.log(
       `starting bundled bingo server; logs: ${logPath}`,
@@ -167,12 +188,18 @@ export class ServerManager {
 
     let childOutcome: ServerProcessOutcome | undefined;
     let observation: ServerProcessObservation;
-    this.#throwIfCancelled();
+    let observing = true;
+    this.#throwIfCancelled(signal);
     try {
       observation = this.#dependencies.spawnServer(
         { binaryPath, args, logPath },
         (outcome) => {
           childOutcome = outcome;
+          if (!observing && outcome.kind === "error") {
+            this.#dependencies.log(
+              `bingo server process error: ${outcome.error.message}; logs: ${logPath}`,
+            );
+          }
         },
       );
     } catch (error: unknown) {
@@ -191,6 +218,7 @@ export class ServerManager {
           config.managementEndpoint,
           config.dapEndpoint,
           Math.min(probeTimeoutMs, timeoutMs),
+          signal,
         );
         if (lastProbe.kind === "compatible") {
           this.#dependencies.log(
@@ -218,7 +246,7 @@ export class ServerManager {
           break;
         }
         if (remaining <= minimumHealthProbeTimeoutMs) {
-          await this.#dependencies.delay(remaining, this.#lifetime.signal);
+          await this.#dependencies.delay(remaining, signal);
           break;
         }
         const delayMs =
@@ -228,13 +256,14 @@ export class ServerManager {
                 finalPollIntervalMs,
                 remaining - minimumHealthProbeTimeoutMs,
               );
-        await this.#dependencies.delay(delayMs, this.#lifetime.signal);
+        await this.#dependencies.delay(delayMs, signal);
+        this.#throwIfCancelled(signal);
         const probeRemaining = deadline - this.#dependencies.now();
         if (probeRemaining < minimumHealthProbeTimeoutMs) {
           if (probeRemaining > 0) {
             await this.#dependencies.delay(
               probeRemaining,
-              this.#lifetime.signal,
+              signal,
             );
           }
           break;
@@ -244,11 +273,10 @@ export class ServerManager {
         }
       }
     } catch (error: unknown) {
-      if (isAbortError(error)) {
-        throw cancelledError();
-      }
+      this.#throwIfCancelled(signal, error);
       throw error;
     } finally {
+      observing = false;
       observation.stopObserving();
     }
 
@@ -268,31 +296,37 @@ export class ServerManager {
     managementEndpoint: BingoEndpoint,
     dapEndpoint: BingoEndpoint,
     timeoutMs: number,
+    signal: AbortSignal,
   ): Promise<HealthProbeResult> {
     try {
-      const result = await this.#dependencies.probe(
-        managementEndpoint,
-        dapEndpoint,
-        timeoutMs,
-        this.#lifetime.signal,
+      this.#throwIfCancelled(signal);
+      const result = await awaitWithCancellation(
+        this.#dependencies.probe(
+          managementEndpoint, dapEndpoint, timeoutMs, signal,
+        ),
+        signal,
       );
       this.#throwIfCancelled(
+        signal,
         result.kind === "transportError" ? result.error : undefined,
       );
       return result;
     } catch (error: unknown) {
-      this.#throwIfCancelled(error);
+      this.#throwIfCancelled(signal, error);
       throw error;
     }
   }
 
-  #throwIfCancelled(error?: unknown): void {
-    if (this.#lifetime.signal.aborted || isAbortError(error)) {
+  #throwIfCancelled(signal: AbortSignal, error?: unknown): void {
+    if (signal.aborted || isAbortError(error)) {
       throw cancelledError();
     }
   }
 
-  #validateAutoConfiguration(config: BingoServerConfiguration): void {
+  public validateConfiguration(config: BingoServerConfiguration): void {
+    if (config.mode === "connectOnly") {
+      return;
+    }
     if (
       config.managementEndpoint.host !== "127.0.0.1" ||
       config.dapEndpoint.host !== "127.0.0.1"
@@ -343,7 +377,7 @@ function occupiedError(
 ): ServerManagerError {
   return new ServerManagerError(
     "endpointOccupied",
-    `cannot use bingo management endpoint ${formatEndpoint(config.managementEndpoint)}: ${reason}; no server was started`,
+    `cannot use bingo management endpoint ${formatEndpoint(config.managementEndpoint)}: ${reason}. Update the existing server or choose unused managementPort and dapPort values; bingo never stops or replaces a shared server`,
   );
 }
 
@@ -377,21 +411,37 @@ function describeProbe(probe: HealthProbeResult): string {
 function awaitWithCancellation<T>(
   promise: Promise<T>,
   signal?: AbortSignal,
+  onSettled?: () => void,
 ): Promise<T> {
-  if (signal === undefined) {
+  if (signal === undefined && onSettled === undefined) {
     return promise;
   }
-  if (signal.aborted) {
-    return Promise.reject(cancelledError());
-  }
   return new Promise((resolve, reject) => {
-    const onAbort = (): void => {
-      reject(cancelledError());
+    let settled = false;
+    const finish = (complete: () => void): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      onSettled?.();
+      complete();
     };
-    signal.addEventListener("abort", onAbort, { once: true });
-    void promise.then(resolve, reject).finally(() => {
-      signal.removeEventListener("abort", onAbort);
-    });
+    const onAbort = (): void => {
+      finish(() => { reject(cancelledError()); });
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    void promise.then(
+      (value) => { finish(() => { resolve(value); }); },
+      (error: unknown) => {
+        finish(() => {
+          reject(error instanceof Error ? error : new Error(String(error), { cause: error }));
+        });
+      },
+    );
+    if (signal?.aborted === true) {
+      onAbort();
+    }
   });
 }
 

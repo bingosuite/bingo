@@ -2803,8 +2803,8 @@ bingo UI gets its bonus features, both against the same tracee).
 **VS Code companion — managed transport, separate from Go tooling.**
 [editors/vscode](editors/vscode/) packages as extension ID
 `bingosuite.bingo`, registers a
-`DebugAdapterDescriptorFactory` for debugger type `bingo`. The async factory
-first ensures a compatible server, then returns
+`DebugAdapterDescriptorFactory` for debugger type `bingo`. The cancellable
+substituted-configuration hook first ensures a compatible server; the factory returns
 `DebugAdapterServer(dapPort, dapHost)` (defaults `127.0.0.1:4711`). It never
 registers type `go`, launches or validates `dlv`, or calls into Microsoft's Go
 extension. Keep `golang.go` installed for gopls/navigation/formatting/tests; a
@@ -2812,7 +2812,14 @@ extension. Keep `golang.go` installed for gopls/navigation/formatting/tests; a
 The explicit IPv4 default matches `internal/dap/server.go`'s `tcp4` listener;
 do not change it to `localhost`, which older VS Code/Node runtimes can resolve
 to `::1` without falling back to IPv4.
-The extension validates launch (`program`), existing-session join (`session`),
+**Bingo: Debug Go Package**, the Go editor action, and F5 with no launch
+configuration select the active saved Go file's directory, or an explicitly
+selected/single workspace root that contains Go source. Never guess a nested
+package or one of several roots. Generated configurations explicitly set
+`mode:"debug"` and an absolute package `program`/`cwd`; the server owns the Go
+build, its progress/errors, and artifact lifetime. Existing program configurations
+with no mode retain `exec` semantics. `stopOnEntry` remains false by default.
+The extension validates launch (`program`, `mode`, `cwd`), existing-session join (`session`),
 and OS-process attach (`pid`, optional `binaryPath`) before connecting.
 `serverMode`/management/DAP/timing fields are client-owned and remain in VS
 Code's raw launch/attach arguments; Go's JSON decoder ignores those unknown
@@ -2860,7 +2867,7 @@ idle grace 30s. Its management and DAP endpoints must be distinct; an identical
 pair is rejected synchronously before probes or spawn, while `connectOnly`
 remains permissive. It health-checks before spawning and requires
 `service:"bingo"`, management API 1, the exact wire version, enabled DAP,
-`dap.sessionEventVersion:1`, and
+`dap.sessionEventVersion:1`, `dap.sourceLaunchVersion:1`, and
 the expected DAP port/host (wildcard advertised hosts retain the configured
 connect host). Only connection refusal permits spawning; a non-bingo or
 incompatible occupant fails safely. `connectOnly` bypasses management and spawn
@@ -2873,7 +2880,14 @@ the last 50ms, then a 10ms cadence while every request can retain at least a
 probe no longer fits it waits out the absolute deadline rather than issuing a
 sub-millisecond request or spinning.
 
-One extension host coalesces in-flight ensures by normalized endpoint. Across
+One extension host coalesces in-flight ensures by normalized endpoint. Each caller
+owns a cancellable waiter: cancelling one cannot abort another, but cancelling
+the last retires that exact attempt and cancels probes/delays and awaited
+binary/log prerequisites before they can spawn. A late completion cannot remove
+a replacement attempt. VS Code's startup token and the preparation notification's
+Cancel action both reach this path; cancellation returns no configuration and
+shows no error popup. **Bingo: Show Server Output** and error actions expose the
+management diagnostics and persistent log path. Across
 hosts, listener binding arbitrates races: a child that loses is success if the
 compatible winner becomes healthy before the deadline. The bundled child is
 spawned with argv (never a shell), detached/unref'd with ignored stdin and
@@ -2896,12 +2910,14 @@ target metadata, architecture, mode, and entitlements.
 The extension package version is the installed-runtime upgrade boundary:
 material shipped behavior changes must bump both `package.json` and the lockfile
 or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.6.0**) in source and VSIX
+and package verifier pin the current version (**0.7.0**) in source and VSIX
 metadata.
-The root Run and Debug dropdown exposes exactly two `"type":"bingo"` choices:
-launch one of five progressive examples through a `pickString`, and join a
-running session. Normal F5 uses the installed VSIX and rebuilds the five targets
-with `just build-examples`; contributor source-extension development runs
+The root Run and Debug dropdown exposes three `"type":"bingo"` choices:
+debug one of five progressive source packages through a `pickString`, debug the
+spawntree source package, and join a running session. Normal F5 uses the installed
+VSIX and asks the server to build only the selected package, with no pre-launch
+task or `just` dependency; the build tasks are optional terminal-client helpers.
+Contributor source-extension development runs
 `just vscode-dev` and launches an Extension Development Host explicitly from
 the CLI with
 `code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"`,

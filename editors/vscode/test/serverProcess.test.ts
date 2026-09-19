@@ -9,7 +9,10 @@ import type {
   SpawnOptions,
 } from "node:child_process";
 
-import { spawnDetachedServer } from "../src/serverProcess.js";
+import {
+  spawnDetachedServer,
+  type ServerProcessOutcome,
+} from "../src/serverProcess.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -47,7 +50,7 @@ describe("detached server process", () => {
 
     const observation = spawnDetachedServer(
       {
-        binaryPath: "/extension/bin/bingo",
+        binaryPath: "/extension with spaces/bin/bingo",
         args: ["-addr", "127.0.0.1:6060"],
         logPath: join(root, "logs", "server.log"),
       },
@@ -58,7 +61,7 @@ describe("detached server process", () => {
       },
     );
 
-    assert.equal(captured?.command, "/extension/bin/bingo");
+    assert.equal(captured?.command, "/extension with spaces/bin/bingo");
     assert.deepEqual(captured?.args, ["-addr", "127.0.0.1:6060"]);
     assert.equal(captured?.options.detached, true);
     assert.equal(captured?.options.shell, false);
@@ -70,5 +73,27 @@ describe("detached server process", () => {
     assert.equal(child.unrefCalled, true);
     assert.equal("kill" in observation, false);
     observation.stopObserving();
+  });
+
+  it("still reports a late spawn error after readiness cancellation without an unhandled error", async () => {
+    const root = resolve("dist", "test-artifacts", `bingo-process-${randomUUID()}`);
+    await mkdir(root, { recursive: true });
+    temporaryDirectories.push(root);
+    const child = new EventEmitter() as ChildProcess;
+    child.unref = () => {};
+    const outcomes: ServerProcessOutcome[] = [];
+    const observation = spawnDetachedServer({
+      binaryPath: "/missing/bingo",
+      args: [],
+      logPath: join(root, "server.log"),
+    }, (outcome) => { outcomes.push(outcome); }, () => child);
+    observation.stopObserving();
+    observation.stopObserving();
+    const error = new Error("spawn ENOENT");
+    assert.doesNotThrow(() => child.emit("error", error));
+    assert.deepEqual(outcomes, [{ kind: "error", error }]);
+    child.emit("close");
+    assert.equal(child.listenerCount("error"), 0);
+    assert.equal(child.listenerCount("exit"), 0);
   });
 });
