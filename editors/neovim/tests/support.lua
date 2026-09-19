@@ -28,6 +28,13 @@ function T.defer(callback)
   cleanup[#cleanup + 1] = callback
 end
 
+function T.tempdir()
+  local path = vim.fn.tempname() .. " bingo test"
+  assert(vim.fn.mkdir(path, "p") == 1)
+  T.defer(function() assert(vim.fn.delete(path, "rf") == 0) end)
+  return path
+end
+
 local function shallow(value)
   local result = {}
   for key, item in pairs(value) do
@@ -79,6 +86,7 @@ function T.health()
       enabled = true,
       address = "127.0.0.1:4711",
       sessionEventVersion = tonumber(assert(dap:match("DAPSessionEventVersion%s*=%s*(%d+)"))),
+      sourceLaunchVersion = tonumber(assert(dap:match("DAPSourceLaunchVersion%s*=%s*(%d+)"))),
     },
     managedIdleShutdown = { enabled = true, timeoutMs = 30000 },
     sessionCount = 0,

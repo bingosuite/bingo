@@ -84,21 +84,22 @@ if [[ -n "$binary" ]]; then
   [[ -x "$binary" ]] || { echo "ERROR: native server is not executable: $binary" >&2; exit 1; }
 else
   binary="$work/bingo"
-  if [[ "$goos" == darwin ]]; then
-    CGO_ENABLED=1 go build -tags bingonative -o "$binary" ./cmd/bingo
-    codesign --sign - --entitlements entitlements.plist --force "$binary"
-  else
-    go build -o "$binary" ./cmd/bingo
-  fi
+  bash "$root/scripts/build-binary.sh" bingo "$binary"
 fi
 echo "Bingo server=$binary sha256=$(shasum -a 256 "$binary" | cut -d ' ' -f 1)"
 go version -m "$binary" > "$work/server-build.txt"
-go build -gcflags='all=-N -l' -o "$work/target" ./editors/neovim/tests/fixtures/smoke
-go vet ./editors/neovim/tests/fixtures/smoke
+mkdir "$work/source package"
+cp editors/neovim/tests/fixtures/smoke/main.go "$work/source package/main.go"
+{
+  printf 'module bingo-neovim-smoke\n\n'
+  awk '$1 == "go" { print; exit }' go.mod
+} > "$work/source package/go.mod"
+go vet -tags bingonative ./editors/neovim/tests/fixtures/smoke
 
 export BINGO_NVIM_SMOKE_ROOT="$root" BINGO_NVIM_SMOKE_WORK="$work"
 export BINGO_NVIM_SMOKE_SERVER="$binary"
 export BINGO_NVIM_SMOKE_PID_FILE="$work/target.pid"
+export BINGO_NVIM_SMOKE_CWD_FILE="$work/target.cwd"
 export HOME="$work/home" XDG_CONFIG_HOME="$work/config" XDG_DATA_HOME="$work/data"
 export XDG_STATE_HOME="$work/state" XDG_CACHE_HOME="$work/cache" XDG_RUNTIME_DIR="$work/runtime"
 export NVIM_APPNAME=bingo-native-smoke

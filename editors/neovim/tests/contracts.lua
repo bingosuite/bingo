@@ -30,6 +30,7 @@ return function(test, equal, T)
     equal(health.management_api_version, fixture.managementApiVersion)
     equal(health.wire_protocol_version, fixture.wireProtocolVersion)
     equal(health.session_event_version, fixture.dap.sessionEventVersion)
+    equal(health.source_launch_version, fixture.dap.sourceLaunchVersion)
     equal(session.event_version, fixture.dap.sessionEventVersion)
     equal(session.event_name, assert(T.read(T.root .. "/../../pkg/protocol/dap.go")
       :match('DAPSessionEventName%s*=%s*"([^"]+)"')))
@@ -153,6 +154,7 @@ return function(test, equal, T)
   end
   for _, bad in ipairs({
     "", " ", "a\r\nInjected: yes", "a\0b", "a b", "http://host", "host/path",
+    "127.0.0.1\r\n", "\t127.0.0.1", "debug.internal\n",
     "host:4711", "host?query", "host#fragment", "[broken", ":::1", "[dns.internal]", "[127.0.0.1]",
     "1:2:3:4:5:6:7", "1:2:3:4:5:6:7:8:9", "::ffff:999.1.1.1", "::g", "a%zone",
   }) do
@@ -172,6 +174,8 @@ return function(test, equal, T)
 
   local valid_requests = {
     { request = "launch", program = "/tmp/a b;$(x)", args = { "", "a b" }, env = { "X=a=b" } },
+    { request = "launch", mode = "debug", program = ".", cwd = "/tmp/a b" },
+    { request = "launch", mode = "exec", program = "./binary", cwd = "/tmp/a b" },
     { request = "attach", pid = 1, binaryPath = "", stopOnEntry = false },
     { request = "attach", pid = 2147483647, binaryPath = "/tmp/target" },
     { request = "attach", session = "session-1._" },
@@ -192,9 +196,23 @@ return function(test, equal, T)
     { { request = "launch", program = "/x", args = { 1 } }, "args" },
     { { request = "launch", program = "/x", args = { "a\0b" } }, "args" },
     { { request = "launch", program = "/x", stopOnEntry = 1 }, "stopOnEntry" },
+    { { request = "launch", program = "/x", mode = "" }, "launch mode" },
+    { { request = "launch", program = "/x", mode = false }, "launch mode" },
+    { { request = "launch", program = "/x", mode = "test" }, "launch mode" },
+    { { request = "launch", program = "/x", mode = "auto" }, "launch mode" },
+    { { request = "launch", program = "/x", mode = "Debug" }, "launch mode" },
+    { { request = "launch", program = "/x", mode = {} }, "launch mode" },
+    { { request = "launch", program = "/x", cwd = "" }, "cwd" },
+    { { request = "launch", program = "/x", cwd = " \t" }, "cwd" },
+    { { request = "launch", program = "/x", cwd = false }, "cwd" },
+    { { request = "launch", program = "/x", cwd = "a\0b" }, "cwd" },
     { { request = "attach" }, "exactly one" },
     { { request = "attach", pid = 1, session = "s" }, "exactly one" },
     { { request = "attach", pid = 1, program = "/x" }, "attach cannot" },
+    { { request = "attach", pid = 1, mode = "debug" }, "attach cannot" },
+    { { request = "attach", pid = 1, cwd = "/x" }, "attach cannot" },
+    { { request = "attach", session = "s", mode = "exec" }, "attach cannot" },
+    { { request = "attach", session = "s", cwd = "/x" }, "attach cannot" },
     { { request = "attach", pid = "1" }, "pid" },
     { { request = "attach", pid = 0 }, "pid" },
     { { request = "attach", pid = 1.5 }, "pid" },
@@ -237,11 +255,18 @@ return function(test, equal, T)
     { "enabled", false, "not enabled" }, { "enabled", 1, "not enabled" },
     { "sessionEventVersion", 0, "session event" },
     { "sessionEventVersion", "1", "session event" },
+    { "sourceLaunchVersion", 0, "source launch" },
+    { "sourceLaunchVersion", 2, "source launch" },
+    { "sourceLaunchVersion", "1", "source launch" },
+    { "sourceLaunchVersion", false, "source launch" },
+    { "sourceLaunchVersion", {}, "source launch" },
     { "address", "127.0.0.1:14711", "port" },
     { "address", "foreign:4711", "host" },
     { "address", "127.0.0.1:0", "invalid" },
     { "address", "127.0.0.1:65536", "invalid" },
     { "address", "::1:4711", "invalid" },
+    { "address", "[:::1]:4711", "invalid" },
+    { "address", "127.0.0.1\n:4711", "invalid" },
     { "address", false, "invalid" },
   }) do
     test("health rejects DAP " .. entry[1] .. "=" .. tostring(entry[2]), function()
@@ -252,6 +277,22 @@ return function(test, equal, T)
       T.contains(result.reason, entry[3])
     end)
   end
+  test("old server without source capability gives an upgrade diagnostic", function()
+    local fixture = T.health()
+    fixture.dap.sourceLaunchVersion = nil
+    local result = health.validate(200, fixture, endpoint)
+    equal(result.kind, "incompatible")
+    T.contains(result.reason, "source launch version is nil, expected 1")
+    T.contains(result.reason, "update the bingo server")
+  end)
+  test("health normalizes host case without changing the IPv6 zone identity", function()
+    local fixture = T.health()
+    fixture.dap.address = "DEBUG.internal:4711"
+    equal(health.validate(200, fixture, { host = "debug.internal", port = 4711 }).kind, "compatible")
+    fixture.dap.address = "[FE80::AB%TestNIC]:4711"
+    equal(health.validate(200, fixture, { host = "fe80::ab%TestNIC", port = 4711 }).kind, "compatible")
+    equal(health.validate(200, fixture, { host = "fe80::ab%testnic", port = 4711 }).kind, "incompatible")
+  end)
   for _, address in ipairs({ "0.0.0.0:4711", "[::]:4711" }) do
     test("wildcard health retains configured connect host: " .. address, function()
       local fixture = T.health()

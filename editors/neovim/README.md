@@ -11,33 +11,88 @@ invokes Delve.
 - Neovim 0.11.7 or newer;
 - `mfussenegger/nvim-dap`;
 - Apple Silicon macOS or x86-64 Linux;
-- a bingo server prepared with `just neovim-prepare`, available as `bingo` on
-  `PATH`, or configured explicitly.
+- Go on the server's `PATH` for source-package debugging;
+- a native bingo server, prepared by the install hook below, bundled in a
+  platform release, available as `bingo` on `PATH`, or configured explicitly.
 
-## Install from this repository
+## Install with lazy.nvim
 
-Prepare the platform-native server:
-
-```sh
-just neovim-prepare
-```
-
-Add `editors/neovim` to Neovim's runtime path with your plugin manager. For a
-local checkout with `lazy.nvim`:
+Add this spec to your plugins. It installs the monorepo, exposes the Neovim
+companion, and builds the native server at install/update time:
 
 ```lua
 {
-  dir = "/absolute/path/to/bingo/editors/neovim",
+  "bingosuite/bingo",
+  lazy = false,
   dependencies = { "mfussenegger/nvim-dap" },
-  config = function()
+  build = function(plugin)
+    local result = vim.system({
+      "bash", plugin.dir .. "/editors/neovim/scripts/prepare.sh",
+    }, { text = true }):wait()
+    if result.code ~= 0 then
+      error("bingo preparation failed:\n" .. result.stderr .. result.stdout)
+    end
+  end,
+  config = function(plugin)
+    vim.opt.rtp:append(plugin.dir .. "/editors/neovim")
+    vim.cmd.runtime("plugin/bingo.lua")
     require("bingo").setup()
   end,
 }
 ```
 
-The generated `editors/neovim/bin/bingo` is platform-specific and ignored by
-Git. If the plugin directory is installed separately, put a compatible `bingo`
-binary on `PATH` or pass `server.binary`.
+Building the server requires the Go version in the repository's `go.mod`
+(currently 1.25.5+) and, on macOS, Xcode Command Line Tools
+(`xcode-select --install`). Neither `just` nor Node is required. The explicit
+build hook runs `scripts/prepare.sh`; startup itself never builds or downloads a
+server. The shared native builder checks prerequisites, signs with debugger
+entitlements on Darwin, and replaces `editors/neovim/bin/bingo` only after a
+successful build/signature check.
+
+For a local monorepo checkout the same preparation is:
+
+```sh
+bash editors/neovim/scripts/prepare.sh
+```
+
+It takes no arguments and works from any directory when invoked by its full
+path. The generated binary is platform-specific and ignored by Git.
+
+Alternatively, extract the matching Neovim archive from
+[Releases](https://github.com/bingosuite/bingo/releases) and point a local
+plugin-manager `dir` at the directory containing `lua/`, `plugin/`, and
+`bin/bingo`; call `require("bingo").setup()` with no build hook. A standalone
+plugin without its bundled binary can use `PATH` or `server.binary` instead.
+It cannot run the monorepo preparation script without the rest of the checkout.
+
+## Debug a Go package
+
+Open a saved `.go` file in a runnable `main` package, set a breakpoint with
+`:DapToggleBreakpoint`, then run:
+
+```vim
+:BingoDebug
+```
+
+The server builds the current Go buffer's **directory** with
+`go build -gcflags='all=-N -l'`, launches it, and runs to your breakpoint.
+There is no executable-path prompt or manual target build. Outside a regular
+Go buffer, the default is Neovim's current working directory. To select another
+package:
+
+```vim
+:BingoDebug ./cmd/myapp
+```
+
+Use a package directory, not a `.go` file or a `./...` package pattern. Source
+is read from disk; save edits first. The default `bingo: Debug Go package`
+configuration in `:DapContinue` uses the same selection and
+`stopOnEntry = false`. Source build failures are reported by the server; it owns
+build cancellation, temporary binaries, and their cleanup with the session.
+Restart reuses the built binary rather than rebuilding changed source.
+
+Run `:checkhealth bingo` for binary resolution and actionable tool/prerequisite
+diagnostics. It does not probe, spawn a server, or build a target.
 
 ## Managed connect-or-start
 
@@ -55,7 +110,10 @@ The plugin never kills it. Logs default to
 `stdpath("state") .. "/bingo/server.log"`.
 
 Compatibility requires the exact Go wire version (currently 1.4), management
-API 1, and DAP session-event version 1. Auto mode requires distinct management
+API 1, DAP session-event version 1, and DAP source-launch version 1.
+An older server on the management port is rejected with an upgrade diagnostic;
+the plugin does not kill or replace a shared server. Update that process after
+its other sessions finish. Auto mode requires distinct management
 and DAP endpoints, both on `127.0.0.1`. Invalid launch/attach/join arguments
 are rejected before transport or spawn. Remote DNS and IPv6 hosts are accepted
 in `connectOnly`; header delimiters and malformed IPv6 addresses are rejected.
@@ -86,11 +144,12 @@ require("bingo").setup({
 })
 ```
 
-`setup()` adds three Go configurations to `dap.configurations.go`: launch a
-binary, attach to a PID, and join a managed session. Set `configurations = false`
-to register only the adapter.
+`setup()` adds four Go configurations to `dap.configurations.go`: debug a Go
+package, launch a binary, attach to a PID, and join a managed session. Existing
+user configurations, including bingo configurations with these names, are
+preserved. Set `configurations = false` to register only the adapter.
 
-## Drive a session
+## Binary launch, attach, and join
 
 Use `:DapContinue` and the rest of your normal `nvim-dap` mappings, or start
 through the companion commands:
@@ -101,6 +160,12 @@ through the companion commands:
 :BingoJoin session-id
 :BingoSession
 ```
+
+`BingoLaunch` still runs an already-compiled binary without building it, and
+omitting its path prompts for one. Binary launch and process attach retain
+their entry stop. Paths containing spaces work, including completion-escaped
+paths. Lua callers can use `require("bingo").debug(directory)`,
+`.launch(binary)`, `.attach(pid, optional_binary)`, and `.join(session_id)`.
 
 `BingoAttach` accepts an optional binary path, but DWARF-backed source
 breakpoints, stack frames, and locals require it. Joining does not relaunch,
@@ -114,6 +179,40 @@ are idempotent; malformed or conflicting ones are reported and ignored.
 Termination, disconnect, and transport closure clear session ownership. Repeated
 setup restores owned close hooks, and callbacks from the old setup cannot
 repopulate the new session registry.
+
+## Custom launch configurations
+
+Source and binary launches share the existing DAP adapter. For arguments, an
+explicit target working directory, or a different entry-stop preference, add
+your own configuration:
+
+```lua
+table.insert(require("dap").configurations.go, {
+  name = "My service",
+  type = "bingo",
+  request = "launch",
+  mode = "debug",
+  program = "./cmd/service",
+  cwd = vim.fn.getcwd(),
+  args = { "--listen", "127.0.0.1:8080" },
+  env = { "LOG_LEVEL=debug" },
+  stopOnEntry = false,
+})
+```
+
+`mode = "debug"` builds a Go package directory on the server; `mode = "exec"`
+launches a binary. An omitted mode retains the old binary-launch semantics.
+`cwd` is the target's working directory and the base for a relative `program`.
+In local `auto` mode, source paths and explicit `cwd` are validated and made
+absolute against Neovim's cwd before transport; a source launch without `cwd`
+uses its package directory. A binary launch without `cwd` keeps the legacy
+server working directory. Attach/join do not accept launch-only `mode` or `cwd`.
+
+The pinned nvim-dap's initialization warning timer covers the delayed launch
+response too. Source launches give that existing timer 130 seconds to accommodate
+the server's two-minute build deadline and handshake, avoiding a false
+"adapter didn't respond" warning during a cold build. Binary launch/attach keep
+the ten-second setting; there is no added client-side request timeout.
 
 ## Remote and custom endpoints
 
@@ -129,6 +228,12 @@ require("bingo").setup({
   },
 })
 ```
+
+In `connectOnly`, source `program` and `cwd` are **server-local** paths. They
+are not checked against this editor's filesystem or rewritten, and the server
+needs Go available on its own `PATH`. Use an explicit server path in
+`:BingoDebug` or a custom configuration when the editor and server directories
+differ; no source synchronization or path mapping is implied.
 
 Each `nvim-dap` configuration may override the same camel-case lifecycle fields
 as VS Code: `serverMode`, `managementHost`, `managementPort`, `dapHost`,
@@ -156,8 +261,9 @@ The default suite parses every Lua file and requires no installed `nvim-dap`,
 debugger binary, user configuration, or external service. Its focused modules
 cover Go-source-driven contract drift, configuration/request boundaries,
 HTTP framing, deterministic libuv faults/deadlines/cancellation, manager
-coalescing and spawn/log ownership, and adapter/session lifecycle. Shared helpers
-restore globals and loaded/preloaded modules even after failures. Stress cases
+coalescing and spawn/log ownership, source/cwd preparation, real Ex path escaping,
+cancelled prompts, native preparation delegation, and adapter/session lifecycle.
+Shared helpers restore globals and loaded/preloaded modules even after failures. Stress cases
 exercise hundreds of coalesced callbacks and repeated sessions; real loopback
 TCP cases use ephemeral ports and close only their own sockets/timers.
 
@@ -177,21 +283,23 @@ NVIM=/absolute/path/to/nvim BINGO_TEST_BINARY=/absolute/path/to/bingo \
 
 This explicitly invoked layer downloads nvim-dap revision
 `c9a0738e45f1bd41d792a126941348dce661cf9b`, verifies its pinned SHA-256, and puts it
-on a test-only runtimepath. It builds a small unoptimized target and, unless
-`BINGO_TEST_BINARY` is supplied, the current server (with debugger entitlements
-on Darwin). A supplied server is used unchanged; its hash/build metadata and
+on a test-only runtimepath. Unless `BINGO_TEST_BINARY` is supplied, it builds the
+current server through the shared native builder (with debugger entitlements on
+Darwin). A supplied server is used unchanged; its hash/build metadata and
 the Neovim version are saved with the logs. `BINGO_NVIM_SMOKE_DAP_ARCHIVE` can
 name an offline copy of the exact pinned archive.
 
-The smoke launches through the real companion/nvim-dap adapter, observes the
-custom session announcement, hits a source breakpoint, and reads the real
-`known:int=42` local through stack/scopes/variables requests. Entry has no
-resolved goroutine, so it uses nvim-dap's real `Session:request` with thread
-zero to continue rather than inventing a thread ID. A second real nvim-dap
-client joins the same suspended target before a **single** terminate intent.
+The smoke opens an isolated source package whose directory contains spaces and
+calls `bingo.debug()` with no arguments. The **server** builds the target;
+there is no precompiled target or Lua compiler. It observes the custom session
+announcement, runs directly to a source breakpoint without an entry-stop
+resume, verifies the package working directory, and reads the real
+`known:int=42` local through stack/scopes/variables requests. A second real
+nvim-dap client joins the same suspended target before a **single** terminate intent.
 That observer must receive exactly one server `terminated` event; both client
-registries must empty, the target must disappear, and the server must exit
-through its own idle grace. The observer is load-bearing: pinned nvim-dap
+registries must empty, the target and its server-owned build directory must
+disappear, and the server must exit through its own idle grace. The observer is
+load-bearing: pinned nvim-dap
 closes the initiating client on the terminate response and would otherwise
 mask a missing server terminal event. `BINGO_NVIM_SMOKE_RETAIN_OBSERVER=0`
 selects a complementary single-client control, not the CI acceptance path.
@@ -199,12 +307,9 @@ selects a complementary single-client control, not the CI acceptance path.
 All configuration, runtimepath, ports, processes, and logs are isolated under
 ignored `build/neovim-integration/run-*` directories; no user configuration is
 read or modified. Success never signals the server. Failure cleanup targets
-only the test-owned server and the fixture PID after verifying its unique
-executable path. Runs retain diagnostics for inspection. Requirements are
-Neovim 0.11.7+, the repository's Go toolchain, curl, tar, and a **native**
+only the test-owned server and fixture process after verifying its executable
+is inside this run's private server TMPDIR. Runs retain diagnostics for inspection.
+Requirements are Neovim 0.11.7+, the repository's Go toolchain, curl, tar, and a **native**
 linux/amd64 or local/self-hosted darwin/arm64 host. Linux CI executes this
 layer; hosted macOS explicitly skips native Mach execution while still
 running the default Lua/real-TCP suite. Emulation is not a native-kernel proof.
-
-Run `:checkhealth bingo` inside Neovim to verify the required Neovim and
-`nvim-dap` dependencies are available.

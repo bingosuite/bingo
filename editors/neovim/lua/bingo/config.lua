@@ -83,7 +83,11 @@ local function ipv6(value)
 end
 
 local function host_value(value, fallback, name)
-  value = string_value(value, fallback, name):match("^%s*(.-)%s*$")
+  value = string_value(value, fallback, name)
+  if value:find("%c") then
+    fail(name .. " must be a host without control characters")
+  end
+  value = value:match("^%s*(.-)%s*$")
   local address, zone = value:match("^(.-)(%%[^%%]+)$")
   value = address and address:lower() .. zone or value:lower()
   if value:sub(1, 1) == "[" and value:sub(-1) == "]" then
@@ -277,6 +281,10 @@ function M.validate_request(value)
   end
   boolean(value.stopOnEntry, nil, "stopOnEntry")
   if value.request == "launch" then
+    if value.mode ~= nil and value.mode ~= "debug" and value.mode ~= "exec" then
+      fail('launch mode must be "debug" or "exec"')
+    end
+    string_value(value.cwd, nil, "cwd")
     string_value(value.program, nil, "program")
     if value.program == nil then
       fail("program is required")
@@ -298,8 +306,8 @@ function M.validate_request(value)
       end
     end
   elseif value.request == "attach" then
-    if value.program ~= nil then
-      fail("attach cannot specify program")
+    if value.program ~= nil or value.mode ~= nil or value.cwd ~= nil then
+      fail("attach cannot specify program, mode, or cwd")
     end
     if (value.session ~= nil) == (value.pid ~= nil) then
       fail("attach requires exactly one of session or pid")
@@ -324,6 +332,52 @@ function M.validate_request(value)
   else
     fail('request must be "launch" or "attach"')
   end
+end
+
+function M.package_directory()
+  local name = vim.api.nvim_buf_get_name(0)
+  if vim.bo.buftype == "" and name:match("%.go$") then
+    return vim.fs.dirname(name)
+  end
+  return vim.fn.getcwd()
+end
+
+local function local_directory(path, base, name)
+  path = vim.fs.normalize(path, { expand_env = false })
+  if path:sub(1, 1) ~= "/" then
+    path = vim.fs.normalize(vim.fs.joinpath(base, path), { expand_env = false })
+  end
+  local stat, err = (vim.uv or vim.loop).fs_stat(path)
+  if stat == nil then
+    fail(name .. " directory is unavailable: " .. path .. " (" .. tostring(err) .. ")")
+  end
+  if stat.type ~= "directory" then
+    fail(name .. " must be a directory: " .. path)
+  end
+  return path
+end
+
+function M.prepare_request(value, options)
+  M.validate_request(value)
+  local resolved = M.resolve(value, options)
+  local prepared = {}
+  for key, item in pairs(value) do
+    prepared[key] = item
+  end
+  -- A reused local server can have a different cwd from this editor. Remote
+  -- configurations, and legacy exec launches without cwd, stay server-local.
+  if resolved.mode == "auto" and prepared.request == "launch" then
+    if prepared.cwd ~= nil then
+      prepared.cwd = local_directory(prepared.cwd, vim.fn.getcwd(), "cwd")
+    end
+    if prepared.mode == "debug" then
+      prepared.program = local_directory(
+        prepared.program, prepared.cwd or vim.fn.getcwd(), "program"
+      )
+      prepared.cwd = prepared.cwd or prepared.program
+    end
+  end
+  return prepared
 end
 
 return M

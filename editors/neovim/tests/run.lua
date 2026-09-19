@@ -28,7 +28,7 @@ local function test(name, callback)
   end
 end
 
-for _, suite in ipairs({ "legacy", "contracts", "transport", "manager", "plugin", "loopback" }) do
+for _, suite in ipairs({ "legacy", "contracts", "startup", "prepare", "transport", "manager", "plugin", "loopback" }) do
   require(suite)(test, T.equal, T)
 end
 
