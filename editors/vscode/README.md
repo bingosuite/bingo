@@ -374,7 +374,7 @@ just vscode-package   # native reproducible package + content verification
 npm --prefix editors/vscode run test:integration # isolated Electron + fake DAP + displayed DOM
 VSCODE_TEST_VERSION=1.85.2 npm --prefix editors/vscode run test:integration
 VSCODE_TEST_VERSION=1.137.0 npm --prefix editors/vscode run test:integration
-npm --prefix editors/vscode run e2e:packaged     # native packaged server + DAP + WS + DOM
+npm --prefix editors/vscode run e2e:packaged     # server-built source packages + native DAP + WS + DOM
 ```
 
 `just vscode-dev` restores the exact npm lockfile with lifecycle scripts
@@ -407,10 +407,16 @@ These are complementary layers, not a claim that the native target ran inside
 Electron.
 
 The packaged E2E reserves unique loopback management/DAP ports, proves
-compatible-instance reuse without a competing spawn, drives levels 1–5 (with a
-nested level-5 tree), exercises displayed source and read-only inspection as well
-as select/filter/copy/refresh, and waits for the managed server to exit by its idle
-policy. It signals only its exact captured server PID, and only on failure.
+compatible-instance reuse without a competing spawn, and drives levels 1–5
+through the same `goPackageConfiguration` helper as **Debug Go Package**. The
+packaged server builds each source directory in `mode: "debug"` with its package
+`cwd`; neither the harness nor CI prebuilds `build/examples` targets. Discovery
+and `initialized` share a 130-second deadline to allow the server's two-minute
+build budget. The test explicitly enables `stopOnEntry` to preserve entry
+inspection, then checks real breakpoints, locals, a nested level-5 tree,
+displayed creation source and variable expansion, select/filter/copy/refresh,
+single-terminate behavior with the observer still connected, and server-owned
+idle exit. It signals only its exact captured server PID, and only on failure.
 
 ## Troubleshooting
 

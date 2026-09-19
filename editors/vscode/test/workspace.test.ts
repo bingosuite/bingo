@@ -258,6 +258,23 @@ describe("repository VS Code integration", () => {
     assert.match(String(requireRecord(manifest.scripts).build), /--target=node18/);
   });
 
+  it("runs native packaged acceptance through source quick start without prebuilt examples", () => {
+    const workflow = readText(".github/workflows/vscode-extension.yml");
+    const acceptance = readText("editors/vscode/test/packagedE2E.ts");
+    assert.doesNotMatch(workflow, /Build progressive concurrency targets|build\/examples/);
+    assert.match(workflow, /npm --prefix editors\/vscode run e2e:packaged/);
+    assert.match(acceptance, /const launchConfig = await goPackageConfiguration\(\{/);
+    assert.match(acceptance, /activeDocument: \{/);
+    assert.match(acceptance, /assert\.equal\(launchConfig\.mode, "debug"\)/);
+    assert.match(acceptance, /assert\.equal\(launchConfig\.cwd, sourceDirectory\)/);
+    assert.match(acceptance, /client\.request\("launch", \{ \.\.\.launchConfig, stopOnEntry: true \}\)/);
+    assert.match(acceptance, /sourceStartupTimeoutMs = 130_000/);
+    assert.match(acceptance, /startupDeadline - Date\.now\(\)/);
+    assert.match(acceptance, /startupEvent\(sessionDAPEventName\)/);
+    assert.match(acceptance, /startupEvent\("initialized"\)/);
+    assert.doesNotMatch(acceptance, /"build", "examples"|build-examples|run\("go",/);
+  });
+
   it("carries the CI matrix version through the runner into the Electron runtime assertion", () => {
     const workflow = readText(".github/workflows/vscode-extension.yml");
     const runner = readText("editors/vscode/scripts/run-vscode-integration.mjs");
