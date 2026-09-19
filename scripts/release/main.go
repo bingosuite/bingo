@@ -72,6 +72,31 @@ func packageRelease(root, output, version string) (retErr error) {
 	}
 	defer func() { retErr = errors.Join(retErr, os.RemoveAll(scratch)) }()
 
+	binaries := filepath.Join(scratch, "bin")
+	if err := buildReleaseBinaries(root, binaries, target, m); err != nil {
+		return err
+	}
+	assets, err := stageReleaseAssets(root, scratch, binaries, target, m)
+	if err != nil {
+		return err
+	}
+	current, err := sourceMetadata(root, version, os.Getenv("BINGO_COMMIT"))
+	if err != nil {
+		return err
+	}
+	if current != m {
+		return fmt.Errorf("source identity changed during packaging")
+	}
+	for _, name := range assets {
+		if err := os.Rename(filepath.Join(scratch, name), filepath.Join(output, name)); err != nil {
+			return err
+		}
+		fmt.Println(filepath.Join(output, name))
+	}
+	return nil
+}
+
+func buildReleaseBinaries(root, binaries, target string, m metadata) error {
 	env := []string{
 		"BINGO_VERSION=" + m.Version,
 		"BINGO_COMMIT=" + m.Commit,
@@ -85,7 +110,6 @@ func packageRelease(root, output, version string) (retErr error) {
 		return err
 	}
 
-	binaries := filepath.Join(scratch, "bin")
 	if err := os.Mkdir(binaries, 0o755); err != nil {
 		return err
 	}
@@ -107,35 +131,43 @@ func packageRelease(root, output, version string) (retErr error) {
 	}
 	for _, command := range []string{"cli", "dapcli", "wsmon"} {
 		binary := filepath.Join(binaries, "bingo-"+command)
-		args := []string{"scripts/build-binary.sh", command, binary, m.GOOS, m.GOARCH}
-		if err := run(root, env, "bash", args...); err != nil {
-			return err
-		}
-		first, err := fileHash(binary)
-		if err != nil {
-			return err
-		}
-		if err := run(root, env, "bash", args...); err != nil {
-			return err
-		}
-		second, err := fileHash(binary)
-		if err != nil {
-			return err
-		}
-		if first != second {
-			return fmt.Errorf("%s is not reproducible: %s != %s", command, first, second)
-		}
-		if _, err := capture(root, nil, binary, "-help"); err != nil {
+		if err := buildReproducibleClient(root, binary, command, env, m); err != nil {
 			return err
 		}
 	}
+	return nil
+}
 
+func buildReproducibleClient(root, binary, command string, env []string, m metadata) error {
+	args := []string{"scripts/build-binary.sh", command, binary, m.GOOS, m.GOARCH}
+	if err := run(root, env, "bash", args...); err != nil {
+		return err
+	}
+	first, err := fileHash(binary)
+	if err != nil {
+		return err
+	}
+	if err := run(root, env, "bash", args...); err != nil {
+		return err
+	}
+	second, err := fileHash(binary)
+	if err != nil {
+		return err
+	}
+	if first != second {
+		return fmt.Errorf("%s is not reproducible: %s != %s", command, first, second)
+	}
+	_, err = capture(root, nil, binary, "-help")
+	return err
+}
+
+func stageReleaseAssets(root, scratch, binaries, target string, m metadata) ([]string, error) {
 	base := "bingo_" + m.Version + "_" + m.GOOS + "_" + m.GOARCH
 	neovimBase := "bingo-neovim_" + m.Version + "_" + m.GOOS + "_" + m.GOARCH
 	vsixName := "bingo-" + m.Version + "-" + target + ".vsix"
 	metadataBytes, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	metadataBytes = append(metadataBytes, '\n')
 	common := []archiveEntry{
@@ -151,12 +183,12 @@ func packageRelease(root, output, version string) (retErr error) {
 	neovim = append(neovim,
 		archiveEntry{name: "INSTALL.txt", data: []byte(installText(m, true)), mode: 0o644},
 		archiveEntry{name: "README.md", source: filepath.Join(root, "editors/neovim/README.md"), mode: 0o644},
-		archiveEntry{name: "bin/bingo", source: server, mode: 0o755},
+		archiveEntry{name: "bin/bingo", source: filepath.Join(binaries, "bingo"), mode: 0o755},
 	)
 	for _, dir := range []string{"lua", "plugin"} {
 		entries, err := directoryEntries(filepath.Join(root, "editors/neovim"), dir)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		neovim = append(neovim, entries...)
 	}
@@ -170,40 +202,27 @@ func packageRelease(root, output, version string) (retErr error) {
 	} {
 		path := filepath.Join(scratch, archive.name+".tar.gz")
 		if err := writeArchive(path, archive.name, archive.entries); err != nil {
-			return err
+			return nil, err
 		}
 		if err := verifyArchive(path, archive.name, archive.entries); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if err := copyFile(filepath.Join(root, "dist/bingo-"+target+".vsix"), filepath.Join(scratch, vsixName), 0o644); err != nil {
-		return err
+		return nil, err
 	}
 	if err := os.WriteFile(filepath.Join(scratch, base+".json"), metadataBytes, 0o644); err != nil {
-		return err
+		return nil, err
 	}
 	assets := []string{base + ".tar.gz", neovimBase + ".tar.gz", vsixName, base + ".json"}
 	checksums := base + "_SHA256SUMS.txt"
 	if err := writeChecksums(scratch, checksums, assets); err != nil {
-		return err
+		return nil, err
 	}
 	if err := verifyChecksums(scratch, checksums, assets); err != nil {
-		return err
+		return nil, err
 	}
-	current, err := sourceMetadata(root, version, os.Getenv("BINGO_COMMIT"))
-	if err != nil {
-		return err
-	}
-	if current != m {
-		return fmt.Errorf("source identity changed during packaging")
-	}
-	for _, name := range append(assets, checksums) {
-		if err := os.Rename(filepath.Join(scratch, name), filepath.Join(output, name)); err != nil {
-			return err
-		}
-		fmt.Println(filepath.Join(output, name))
-	}
-	return nil
+	return append(assets, checksums), nil
 }
 
 func sourceMetadata(root, version, expectedCommit string) (metadata, error) {
