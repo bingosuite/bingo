@@ -49,15 +49,11 @@ function validateBuilder(target) {
   }
   const native =
     details.platform === process.platform && details.arch === process.arch;
-  const darwinCrossBuild =
-    target === "darwin-arm64" &&
-    process.platform === "darwin" &&
-    process.arch === "x64";
   const linuxCrossBuild =
     target === "linux-x64" &&
     process.platform === "darwin" &&
-    (process.arch === "arm64" || process.arch === "x64");
-  if (!native && !darwinCrossBuild && !linuxCrossBuild) {
+    process.arch === "arm64";
+  if (!native && !linuxCrossBuild) {
     throw new Error(
       `target ${target} cannot be packaged from ${process.platform}/${process.arch}`,
     );
