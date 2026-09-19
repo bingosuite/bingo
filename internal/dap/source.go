@@ -31,7 +31,7 @@ type sourceArtifact struct {
 
 func (a *sourceArtifact) remove() error {
 	if err := os.RemoveAll(a.dir); err != nil {
-		return fmt.Errorf("remove Go build directory %q: %w", a.dir, err)
+		return fmt.Errorf("remove go build directory %q: %w", a.dir, err)
 	}
 	return nil
 }
@@ -43,15 +43,15 @@ type sourceBuilder struct {
 
 func (b sourceBuilder) build(ctx context.Context, cfg launchConfig) (artifact *sourceArtifact, err error) {
 	if err := ctx.Err(); err != nil {
-		return nil, fmt.Errorf("Go build: %w", err)
+		return nil, fmt.Errorf("go build: %w", err)
 	}
 	goTool, err := exec.LookPath("go")
 	if err != nil {
-		return nil, fmt.Errorf("Go build requires 'go' on the server PATH: %w", err)
+		return nil, fmt.Errorf("go build requires 'go' on the server PATH: %w", err)
 	}
 	dir, err := os.MkdirTemp(b.tempDir, "bingo-dap-build-")
 	if err != nil {
-		return nil, fmt.Errorf("create Go build directory: %w", err)
+		return nil, fmt.Errorf("create go build directory: %w", err)
 	}
 	owned := &sourceArtifact{dir: dir, program: filepath.Join(dir, "debuggee")}
 	defer func() {
@@ -88,14 +88,14 @@ func (b sourceBuilder) build(ctx context.Context, cfg launchConfig) (artifact *s
 		runErr = errors.Join(ctx.Err(), runErr)
 	}
 	if runErr != nil {
-		return nil, fmt.Errorf("Go build: %w%s", runErr, output.diagnosticSuffix())
+		return nil, fmt.Errorf("go build: %w%s", runErr, output.diagnosticSuffix())
 	}
 	info, err := os.Stat(owned.program)
 	if err != nil {
-		return nil, fmt.Errorf("Go build output: %w", err)
+		return nil, fmt.Errorf("go build output: %w", err)
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
-		return nil, fmt.Errorf("Go build: program must be a main package producing an executable")
+		return nil, fmt.Errorf("go build: program must be a main package producing an executable")
 	}
 	owned.diagnostics = output.text()
 	return owned, nil
@@ -185,7 +185,7 @@ func (h *Handler) finishSourceBuild(build *sourceBuild, cfg launchConfig) {
 		err = build.ctx.Err()
 	}
 	if err == nil && artifact == nil {
-		err = fmt.Errorf("Go build returned no executable")
+		err = fmt.Errorf("go build returned no executable")
 	}
 	if err == nil {
 		if artifact.diagnostics != "" {

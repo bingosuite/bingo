@@ -23,23 +23,8 @@ func decodeStartConfig(data json.RawMessage) (launchConfig, error) {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return cfg, err
 	}
-	for _, name := range []string{"program", "mode", "cwd", "pid", "session", "binaryPath", "stopOnEntry", "noDebug"} {
-		if value, ok := fields[name]; ok && string(value) == "null" {
-			return cfg, fmt.Errorf("%s must not be null", name)
-		}
-	}
-	for _, name := range []string{"args", "env"} {
-		if value, ok := fields[name]; ok {
-			var elements []json.RawMessage
-			if err := json.Unmarshal(value, &elements); err != nil {
-				return cfg, err
-			}
-			for _, element := range elements {
-				if string(element) == "null" {
-					return cfg, fmt.Errorf("%s elements must be strings, not null", name)
-				}
-			}
-		}
+	if err := validateStartNulls(fields); err != nil {
+		return cfg, err
 	}
 	if _, ok := fields["mode"]; ok && cfg.Mode == "" {
 		return cfg, fmt.Errorf("mode must be 'debug' or 'exec'")
@@ -55,6 +40,28 @@ func decodeStartConfig(data json.RawMessage) (launchConfig, error) {
 		return cfg, fmt.Errorf("launch and attach paths or session IDs must not contain NUL")
 	}
 	return cfg, launch.ValidateArguments(cfg.Args, cfg.Env)
+}
+
+func validateStartNulls(fields map[string]json.RawMessage) error {
+	for _, name := range []string{"program", "mode", "cwd", "pid", "session", "binaryPath", "stopOnEntry", "noDebug"} {
+		if value, ok := fields[name]; ok && string(value) == "null" {
+			return fmt.Errorf("%s must not be null", name)
+		}
+	}
+	for _, name := range []string{"args", "env"} {
+		if value, ok := fields[name]; ok {
+			var elements []json.RawMessage
+			if err := json.Unmarshal(value, &elements); err != nil {
+				return err
+			}
+			for _, element := range elements {
+				if string(element) == "null" {
+					return fmt.Errorf("%s elements must be strings, not null", name)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 func prepareLaunch(cfg launchConfig) (launchConfig, error) {
