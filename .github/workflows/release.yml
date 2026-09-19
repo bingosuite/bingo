@@ -151,8 +151,23 @@ jobs:
           [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]
           [[ "${#RELEASE_TAG}" -le 80 ]]
           [[ "$RELEASE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          tag_commit() {
+            object=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '[.object.type, .object.sha] | @tsv') || return 1
+            for depth in 1 2 3 4 5 6 7 8; do
+              read -r object_type object_sha extra <<< "$object" || return 1
+              [[ "$object_sha" =~ ^[0-9a-f]{40}$ && -z "$extra" ]] ||
+                { echo "Malformed release tag object." >&2; return 1; }
+              case "$object_type" in
+                commit) printf '%s\n' "$object_sha"; return ;;
+                tag) object=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$object_sha" --jq '[.object.type, .object.sha] | @tsv') || return 1 ;;
+                *) echo "Release ref does not resolve to a commit." >&2; return 1 ;;
+              esac
+            done
+            echo "Release tag nesting exceeds the supported bound." >&2
+            return 1
+          }
           check_release() {
-            test "$(gh api "repos/$GITHUB_REPOSITORY/commits/$RELEASE_TAG" --jq .sha)" = "$RELEASE_COMMIT"
+            test "$(tag_commit)" = "$RELEASE_COMMIT"
             draft=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
             if [[ "$RELEASE_EVENT" == workflow_dispatch ]]; then
               test "$draft" = true || { echo "Manual uploads require an existing draft release." >&2; exit 1; }

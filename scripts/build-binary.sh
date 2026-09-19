@@ -48,9 +48,12 @@ fi
 bingo_validate_commit "$commit"
 bingo_check_go
 if [[ "$target_os" == darwin ]]; then
-  bingo_check_darwin
-  if [[ "$reproducible" == 1 ]]; then
-    bingo_check_node
+  bingo_require codesign
+  if [[ "$command_name" == bingo ]]; then
+    bingo_check_darwin
+    if [[ "$reproducible" == 1 ]]; then
+      bingo_check_node
+    fi
   fi
 fi
 
@@ -62,17 +65,18 @@ if [[ "$command_name" == bingo ]]; then
   ldflags="$ldflags -X main.buildVersion=$version -X main.buildCommit=$commit"
 fi
 arguments=(build -trimpath -buildvcs=false "-ldflags=$ldflags")
-if [[ "$target_os" == darwin ]]; then
+if [[ "$target_os" == darwin && "$command_name" == bingo ]]; then
   arguments+=(-tags bingonative)
   cgo=1
 else
+  # Go-only clients use the deterministic internal linker, whose Mach-O has no LC_UUID.
   cgo=0
 fi
 CGO_ENABLED=$cgo GOOS=$target_os GOARCH=$target_arch \
   go "${arguments[@]}" -o "$temporary" "./cmd/$command_name"
 
 if [[ "$target_os" == darwin ]]; then
-  if [[ "$reproducible" == 1 ]]; then
+  if [[ "$reproducible" == 1 && "$command_name" == bingo ]]; then
     # dyld needs LC_UUID; normalize before signing, never remove it.
     node --input-type=module -e \
       'import { normalizeMachOUUID } from "./editors/vscode/scripts/normalize-mach-o-uuid.mjs"; normalizeMachOUUID(process.argv[1]);' \

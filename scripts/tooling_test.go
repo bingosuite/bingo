@@ -74,6 +74,31 @@ func TestBuildBinary(t *testing.T) {
 	}
 }
 
+func TestDarwinTerminalClientsUseTheGoLinker(t *testing.T) {
+	for _, command := range []string{"cli", "dapcli", "wsmon"} {
+		t.Run(command, func(t *testing.T) {
+			f := newToolingFixture(t)
+			out, err := f.run([]string{
+				"FAKE_OS=Darwin", "FAKE_ARCH=arm64", "BINGO_REPRODUCIBLE=1", "FAKE_NODE_FAIL=1",
+			}, command, f.output)
+			if err != nil {
+				t.Fatalf("Go-only client build: %v\n%s", err, out)
+			}
+			log := f.log()
+			for _, want := range []string{"cgo=0 target=darwin/arm64", "--identifier bingosuite." + command, "codesign --verify --strict"} {
+				if !strings.Contains(log, want) {
+					t.Fatalf("missing %q:\n%s", want, log)
+				}
+			}
+			for _, forbidden := range []string{"normalize", "--entitlements", "-tags bingonative"} {
+				if strings.Contains(log, forbidden) {
+					t.Fatalf("Go-only client used native server linking/signing:\n%s", log)
+				}
+			}
+		})
+	}
+}
+
 func TestBuildBinaryFailuresPreserveInstalledBinary(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
