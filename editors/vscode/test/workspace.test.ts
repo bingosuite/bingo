@@ -205,7 +205,9 @@ describe("repository VS Code integration", () => {
     assert.match(buildScript, /bingonative/);
     assert.match(buildScript, /codesign/);
     assert.match(buildScript, /normalizeMachOUUID/);
-    assert.ok(buildScript.indexOf("normalizeMachOUUID") < buildScript.indexOf("codesign"));
+    const normalizationCall = buildScript.indexOf("normalizeMachOUUID(process.argv[1])");
+    const signingCall = buildScript.indexOf('codesign "${signing[@]}" "$temporary"');
+    assert.ok(normalizationCall >= 0 && signingCall > normalizationCall);
     assert.match(workflow, /BINGO_VSCODE_TARGET: \$\{\{ matrix\.target \}\}/);
     assert.match(workflow, /runner: macos-15/);
     assert.doesNotMatch(workflow, /runner: macos-14(?:\s|$)/);
