@@ -107,9 +107,11 @@ It is intentionally absent from the root Run and Debug dropdown.
    Disable `bingo.concurrency.autoReveal` for manual-only access. The Activity
    Bar remains an alternative view, using the same session model.
 
-For your own project, **Bingo: Debug Go Package** chooses the package directly
-without a saved launch configuration. Start a fresh session to rebuild source
-edits; Restart reuses the session binary.
+For your own project, open a saved Go file in the runnable `main` package and use
+**Bingo: Debug Go Package**. It uses that file's directory (or the workspace root
+when it contains Go source), without a directory picker or saved configuration.
+Use an explicit launch configuration for another package path. Start a fresh
+session to rebuild source edits; Restart reuses the session binary.
 
 No manual `just server` is required. The extension never kills the shared
 process. The default managed server exits only after its 30-second idle grace
