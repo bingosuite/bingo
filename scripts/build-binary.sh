@@ -18,6 +18,8 @@ esac
 repository_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 source "$repository_root/scripts/tooling.sh"
 cd "$repository_root"
+[[ "$output" != */ && "$output" != */. && "$output" != */.. && ! -d "$output" ]] ||
+  bingo_fail "OUTPUT must name a file, not a directory"
 
 bingo_host
 target_os=${3:-$bingo_host_os}

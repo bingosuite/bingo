@@ -46,30 +46,37 @@ bounded goroutine events, and exact per-envelope version enforcement.
 
 ## Quick start
 
-bingo is built from source and supports Apple Silicon macOS and x86-64 Linux.
-You need Go 1.25.5 and [`just`](https://github.com/casey/just). The
-[setup guide](docs/SETUP.md) covers platform prerequisites, editor-specific
-dependencies, verification, and troubleshooting.
-
-For the recommended VS Code workflow:
+bingo supports **Apple Silicon macOS and x86-64 Linux**. In VS Code, install the
+matching platform VSIX from a [release](https://github.com/bingosuite/bingo/releases)
+that provides one, using **Extensions: Install from VSIX...**. Release artifacts
+are not assumed to be available yet; the source fallback is:
 
 ```sh
 git clone https://github.com/bingosuite/bingo.git
 cd bingo
-just vscode-install
+bash scripts/package-vscode.sh install
 ```
 
-Then:
+Building the extension needs Go 1.25.5 or newer, Node.js 22, npm, and the `code`
+CLI; macOS also needs Xcode Command Line Tools. `just vscode-install` is an
+optional shorthand for the same **single-build, verified** install, not the full
+release test suite.
 
-1. Run **Developer: Reload Window** in VS Code.
-2. Open **Run and Debug** and select **bingo DAP: launch example (stop on entry)**.
-3. Press F5 and choose one of the five progressive examples.
-4. Use VS Code's Debug UI for breakpoints, stepping, stack frames, and variables.
-5. The **Bingo Concurrency** Activity Bar view follows the session
-   automatically and shows its goroutine tree, threads, and source locations.
+Reload VS Code, open your Go project, and run **Bingo: Debug Go Package**.
+Without a launch configuration, F5 can also select bingo to debug a Go package.
+The server compiles the selected source directory with debugging information
+and launches it; no `just`, pre-launch build task, separate server terminal, or
+extension-development host is needed. In this checkout, **bingo: Debug example**
+lets you choose one of the five progressive examples.
 
-No separate server process or extension-development host is required. Prefer
-another frontend? Follow the [Neovim setup](docs/SETUP.md#neovim) or the
+Use the native Debug UI for breakpoints, stepping, stacks, and variables.
+**Bingo Concurrency** opens beside source and follows the same session's
+goroutine tree, threads, and lifecycle. The Activity Bar view remains available.
+
+**Go is needed on the server's PATH to debug source, not to run a prebuilt bingo
+binary or launch a prebuilt target.** See the [setup guide](docs/SETUP.md) for
+installation choices and binary-mode configurations. Prefer another frontend?
+Follow the [Neovim setup](docs/SETUP.md#neovim) (`:BingoDebug [directory]`) or the
 [terminal-only setup](docs/SETUP.md#terminal-only), then use the
 [concurrency telemetry runbook](docs/ConcurrencyTelemetry.md) for a complete
 DAP-driver/WebSocket-observer walkthrough.
@@ -95,9 +102,8 @@ monotonic hub sequence number.
 
 ## VS Code concurrency view
 
-The repository currently packages extension version **0.4.2**. Its
-**Bingo Concurrency** Activity Bar view automatically follows the exact
-DAP-created session over WebSocket without copying a session ID and provides:
+The **Bingo Concurrency** editor panel and Activity Bar view follow the exact
+DAP-created session over WebSocket without copying a session ID and provide:
 
 - a deterministic, bounded goroutine spawn tree;
 - current goroutine and OS-thread state;
@@ -125,6 +131,9 @@ Equivalent binary invocation:
 bingo -addr 127.0.0.1:6060 -dap-addr 127.0.0.1:4711
 ```
 
+`bingo -version` prints the build version, commit, platform, Go toolchain, and
+independent wire protocol version without starting a listener.
+
 Use `just server-ws` for a WebSocket-only server. Manual servers are persistent
 by default; process-managing integrations can opt into server-owned cleanup:
 
@@ -138,6 +147,7 @@ bingo \
 Frontends discover compatibility through `GET /api/health`. The response
 separately advertises management API version 1, the exact wire protocol version,
 the process instance ID, resolved DAP listener, DAP session-event version,
+source-launch capability (`sourceLaunchVersion: 1`),
 managed idle policy, and session count. Native peers also validate the wire
 version on every envelope; an incompatible peer is disconnected without
 affecting the shared session.
@@ -174,8 +184,10 @@ backend is registered.
 ## Development
 
 ```sh
+just                       # list commands; never starts a server
 just build                 # build for the current supported host
 just test                  # run Go tests
+just vet                   # run Go vet with the host's native build tag
 just integration           # run non-native integration tests
 just vscode-check          # lint, typecheck, test, and bundle the extension
 just neovim-check          # parse and test the Neovim companion
@@ -185,6 +197,21 @@ just e2e-darwin            # signed native macOS acceptance suite
 
 On macOS, use the `just` recipes or pass `-tags bingonative` to Go commands.
 Plain `go test ./...` cannot compile the Darwin backend.
+
+Local installation and release verification are separate:
+
+```sh
+just vscode-local-package  # one verified VSIX; no installation
+just vscode-package        # full extension checks + two-build reproducibility
+just release-package       # dev preview: native tools, VSIX, Neovim and checksums
+```
+
+The [release workflow](.github/workflows/release.yml) builds both supported
+platforms on native runners from an exact release tag. Manual runs keep assets
+in Actions by default; an explicit option attaches them to an existing draft
+without publishing it. The published-release trigger also uploads verified
+assets. See [release preparation](docs/SETUP.md#release-preparation) for the
+artifact names, checksum verification, and native-debug verification limits.
 
 ## Resources
 

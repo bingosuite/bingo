@@ -58,8 +58,10 @@ bingo_check_darwin() {
 }
 
 bingo_validate_version() {
-  [[ "$1" == dev || "$1" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] ||
-    bingo_fail "version must be dev or vMAJOR.MINOR.PATCH with an optional prerelease suffix"
+  local version=$1
+  [[ "${#version}" -le 80 &&
+     ("$version" == dev || "$version" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$) ]] ||
+    bingo_fail "version must be dev or vMAJOR.MINOR.PATCH with an optional prerelease suffix (at most 80 characters)"
 }
 
 bingo_validate_commit() {
