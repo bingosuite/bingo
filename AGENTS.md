@@ -2993,7 +2993,7 @@ target metadata, architecture, mode, and entitlements.
 The extension package version is the installed-runtime upgrade boundary:
 material shipped behavior changes must bump both `package.json` and the lockfile
 or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.7.0**) in source and VSIX
+and package verifier pin the current version (**0.7.1**) in source and VSIX
 metadata.
 The root Run and Debug dropdown exposes three `"type":"bingo"` choices:
 debug one of five progressive source packages through a `pickString`, debug the

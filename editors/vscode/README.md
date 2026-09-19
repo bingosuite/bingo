@@ -31,8 +31,9 @@ expandable variables, and source navigation to the goroutine inspector.
 **0.6.0** keeps native Run and Debug alongside a reusable Bingo editor panel,
 adds bounded creation-source previews, and bounds aggregate inspector work.
 **0.7.0** adds configuration-free Go-package debugging, server-owned automatic
-builds, cancellable startup, and source-launch capability checks. Use a matching
-0.7.0 companion and server for the source quick start.
+builds, cancellable startup, and source-launch capability checks. **0.7.1**
+updates the WebSocket runtime and packaging dependencies for security fixes.
+Use a matching 0.7.1 companion and server for the source quick start.
 Rerun the command to update, then run
 **Developer: Reload Window** once so the active extension host loads the new
 bundle. Package without installing with `just vscode-package`. Uninstall with:
