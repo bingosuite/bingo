@@ -2917,8 +2917,10 @@ owns a cancellable waiter: cancelling one cannot abort another, but cancelling
 the last retires that exact attempt and cancels probes/delays and awaited
 binary/log prerequisites before they can spawn. A late completion cannot remove
 a replacement attempt. VS Code's startup token and the preparation notification's
-Cancel action both reach this path; cancellation returns no configuration and
-shows no error popup. **Bingo: Show Server Output** and error actions expose the
+Cancel action both reach this path; cancellation returns `undefined` and shows
+no error popup. Keep that distinct from `null`, which asks VS Code to open
+launch.json for an uncancelled token. Already-reported startup errors also return
+`undefined`. **Bingo: Show Server Output** and error actions expose the
 management diagnostics and persistent log path. Across
 hosts, listener binding arbitrates races: a child that loses is success if the
 compatible winner becomes healthy before the deadline. The bundled child is

@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer as createHTTPServer } from "node:http";
 import { createServer, type Server, type Socket } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import * as vscode from "vscode";
 import { WebSocketServer, type WebSocket } from "ws";
@@ -51,6 +52,7 @@ export async function run(): Promise<void> {
     );
     await runQuickStarts(api, fixture);
     await runStartupCancellation();
+    await runRegisteredStartupCancellation(api, fixture);
 
     for (const autoReveal of [true, false]) {
       await configuration.update(
@@ -210,6 +212,85 @@ async function runStartupCancellation(): Promise<void> {
     provider.dispose();
     manager.dispose();
     output.dispose();
+  }
+}
+
+async function runRegisteredStartupCancellation(
+  api: BingoExtensionAPI,
+  fixture: SourceFixture,
+): Promise<void> {
+  const root = vscode.workspace.workspaceFolders?.[0];
+  let requests = 0;
+  let healthClosed = false;
+  let launchTabs = 0;
+  let startedSessions = 0;
+  const management = createHTTPServer((_request, response) => {
+    requests += 1;
+    response.once("close", () => { healthClosed = true; });
+    response.writeHead(200, { "Content-Type": "application/json" });
+    response.write("{");
+  });
+  management.listen(0, "127.0.0.1");
+  await once(management, "listening");
+  const dap = await FakeDAPServer.start(fixture);
+  const tabs = vscode.window.tabGroups.onDidChangeTabs((event) => {
+    launchTabs += event.opened.filter((tab) =>
+      tab.input instanceof vscode.TabInputText &&
+      tab.input.uri.path.endsWith("/.vscode/launch.json"),
+    ).length;
+  });
+  const starts = vscode.debug.onDidStartDebugSession((session) => {
+    if (session.type === "bingo") {
+      startedSessions += 1;
+    }
+  });
+  try {
+    await vscode.window.showTextDocument(fixture.uri, {
+      viewColumn: vscode.ViewColumn.One, preview: false,
+    });
+    const config = {
+      type: "bingo",
+      request: "launch",
+      name: "Cancel actual bingo startup",
+      mode: "debug",
+      program: dirname(fixture.uri.fsPath),
+      managementPort: listeningPort(management.address()),
+      dapPort: dap.port,
+    };
+    const starting = vscode.debug.startDebugging(root, config);
+    await waitFor(() => requests > 0 ? true : undefined, "actual provider health probe");
+    const cancelledAt = Date.now();
+    await vscode.debug.stopDebugging();
+    assert.equal(await starting, false);
+    await waitFor(() => healthClosed ? true : undefined, "cancelled health socket close");
+    assert.ok(Date.now() - cancelledAt < 750, "Stop must cancel, not wait for the one-second probe timeout");
+    assert.equal(dap.activeConnections, 0);
+    assert.equal(dap.lastLaunchArguments, undefined);
+    assert.equal(api.getConcurrencyState().sessions.length, 0);
+    assert.equal(startedSessions, 0);
+    assert.equal(launchTabs, 0, "Stop must not open launch.json");
+
+    // Unlike native Stop, a reported configuration error leaves VS Code's
+    // token uncancelled. Returning null here would open launch.json on 1.85.
+    for (const fields of [{ mode: "invalid" }, { cwd: 42 }]) {
+      assert.equal(await vscode.debug.startDebugging(root, { ...config, ...fields }), false);
+    }
+    assert.equal(requests, 1, "invalid launch arguments must fail before another probe");
+    assert.equal(startedSessions, 0);
+    assert.equal(launchTabs, 0, "already-reported startup errors must not open launch.json");
+    assert.equal(vscode.window.activeTextEditor?.document.uri.toString(), fixture.uri.toString());
+    console.log("Verified real Stop and invalid configuration abort without launch.json or a late adapter");
+  } finally {
+    tabs.dispose();
+    starts.dispose();
+    await vscode.debug.stopDebugging();
+    management.closeAllConnections();
+    await Promise.all([
+      dap.close(),
+      new Promise<void>((resolve, reject) => {
+        management.close((error) => { if (error) { reject(error); } else { resolve(); } });
+      }),
+    ]);
   }
 }
 
