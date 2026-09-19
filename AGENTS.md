@@ -83,8 +83,12 @@ ad-hoc signature is **not notarization**. Explicit linux/amd64 cross-compilation
 from Apple Silicon is allowed, but never counts as native runtime verification.
 
 `BINGO_REPRODUCIBLE=1` reuses the VS Code Mach-O UUID normalizer before signing
-(Node from `.nvmrc` is needed only for reproducible Darwin builds). Never remove
-the UUID or normalize an already-signed output. `BINGO_VERSION` accepts `dev` or
+the Darwin **server** (Node from `.nvmrc` is needed only for that build).
+Terminal clients use `CGO_ENABLED=0` on both platforms: Go's deterministic
+internal Mach-O linker emits no `LC_UUID`, so clients must skip the external
+linker's UUID normalizer. They are still signed and release builds compare two
+builds of each. Never remove a server UUID or normalize an already-signed output.
+`BINGO_VERSION` accepts `dev` or
 a `vMAJOR.MINOR.PATCH` tag with optional prerelease; `BINGO_COMMIT` accepts a full
 Git SHA, an explicitly dirty SHA, or `unknown`. Only the server embeds them.
 `bingo -version` reports build identity, platform, toolchain and the independent

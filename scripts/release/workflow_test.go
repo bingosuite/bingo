@@ -128,10 +128,16 @@ func TestUploadScriptChecksIdentityDraftAndChecksums(t *testing.T) {
 		draft    string
 		tag      string
 		sha      string
+		tagType  string
+		apiFails bool
 		damage   string
 		succeeds bool
 	}{
 		{name: "manual draft", event: "workflow_dispatch", draft: "true", succeeds: true},
+		{name: "annotated tag", event: "workflow_dispatch", draft: "true", tagType: "tag", succeeds: true},
+		{name: "non-commit ref", event: "workflow_dispatch", draft: "true", tagType: "tree"},
+		{name: "extra ref fields", event: "workflow_dispatch", draft: "true", sha: strings.Repeat("a", 40) + " extra"},
+		{name: "failed API with misleading stdout", event: "workflow_dispatch", draft: "true", apiFails: true},
 		{name: "published", event: "release", draft: "false", succeeds: true},
 		{name: "manual published refuses", event: "workflow_dispatch", draft: "false"},
 		{name: "published reverted to draft refuses", event: "release", draft: "true"},
@@ -173,7 +179,11 @@ func TestUploadScriptChecksIdentityDraftAndChecksums(t *testing.T) {
 			gh := `#!/bin/bash
 set -eu
 case "$1 $2" in
-  "api "*) echo "$FAKE_SHA" ;;
+  "api repos/bingosuite/bingo/git/ref/tags/"*)
+    printf '%s\t%s\n' "$FAKE_TAG_TYPE" "$FAKE_SHA"
+    [[ "$FAKE_API_FAIL" != true ]] || exit 1
+    ;;
+  "api repos/bingosuite/bingo/git/tags/"*) printf 'commit\t%s\n' "$FAKE_SHA" ;;
   "release view")
     [[ "$FAKE_DRAFT" != missing ]] || { echo 'release not found' >&2; exit 1; }
     echo "$FAKE_DRAFT"
@@ -193,6 +203,14 @@ esac
 			if sha == "" {
 				sha = strings.Repeat("a", 40)
 			}
+			tagType := tc.tagType
+			if tagType == "" {
+				tagType = "commit"
+			}
+			apiFails := "false"
+			if tc.apiFails {
+				apiFails = "true"
+			}
 			cmd := exec.Command("bash", "-e", "-o", "pipefail", "-c", script)
 			cmd.Dir = root
 			cmd.Env = append(os.Environ(),
@@ -200,6 +218,8 @@ esac
 				"RELEASE_TAG="+tag, "RELEASE_COMMIT="+strings.Repeat("a", 40),
 				"RELEASE_EVENT="+tc.event, "GITHUB_REPOSITORY=bingosuite/bingo",
 				"GH_TOKEN=test-only", "FAKE_DRAFT="+tc.draft, "FAKE_SHA="+sha,
+				"FAKE_TAG_TYPE="+tagType,
+				"FAKE_API_FAIL="+apiFails,
 				"UPLOAD_LOG="+filepath.Join(root, "uploaded"),
 			)
 			out, err := cmd.CombinedOutput()
