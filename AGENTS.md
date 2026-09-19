@@ -117,6 +117,15 @@ tag/HEAD/resolved-commit identity before and after packaging.
 
 The [release workflow](.github/workflows/release.yml) uses native Ubuntu x86-64
 and `macos-15` arm64 builders, Go from `go.mod`, and Node from `.nvmrc`.
+Resolve and build checkouts are pinned directly to `github.sha`, and the
+validated tag must peel to that exact triggering commit before building.
+Actions cache authority follows the event ref, not a later checkout: never
+execute an independently selected tag under a default-branch dispatch's cache
+scope. Historical tags must be dispatched with `--ref` set to that tag;
+read-only repository permissions and disabling automatic caches alone do not
+replace this trust boundary. Regression cases execute the actual context guard
+over real Git refs, including annotated tags, mismatched checkouts/contexts,
+and same-named branches.
 Manual dispatch defaults to Actions artifacts only. An explicit upload requires
 an existing draft; it never creates or publishes one. The existing published
 release trigger remains supported. Only the final, checkout-free upload job
