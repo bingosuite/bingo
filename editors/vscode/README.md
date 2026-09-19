@@ -368,7 +368,7 @@ just server
 ## Contributor extension development
 
 ```sh
-just vscode-dev       # build extension, native bundled server, and examples
+just vscode-dev       # stage the native server and extension for a development host
 just vscode-check     # clean install, lint, typecheck, tests, bundle/list smoke
 just vscode-package   # native reproducible package + content verification
 npm --prefix editors/vscode run test:integration # isolated Electron + fake DAP + displayed DOM
@@ -378,9 +378,12 @@ npm --prefix editors/vscode run e2e:packaged     # native packaged server + DAP 
 ```
 
 `just vscode-dev` restores the exact npm lockfile with lifecycle scripts
-disabled, stages the source extension's native binary, builds its bundle, and
-rebuilds the progressive examples. It does not add contributor tooling to the root Run and
-Debug dropdown. To exercise the staged source extension, launch its Extension
+disabled, stages the source extension's native binary, and builds its bundle.
+It does not pre-build the examples: the server builds the selected source
+package when debugging starts. A failed native build or signing step preserves
+the previously prepared binary and target marker.
+Contributor tooling is not added to the root Run and Debug dropdown. To exercise
+the staged source extension, launch its Extension
 Development Host explicitly from a terminal:
 
 ```sh

@@ -4,7 +4,6 @@ import {
   chmodSync,
   mkdirSync,
   readFileSync,
-  rmSync,
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -21,7 +20,6 @@ const binaryPath = join(binDirectory, "bingo");
 const requestedTarget = process.env.BINGO_VSCODE_TARGET;
 const target = targetDetails(requestedTarget);
 
-rmSync(binDirectory, { force: true, recursive: true });
 mkdirSync(binDirectory, { recursive: true });
 
 run("bash", [
