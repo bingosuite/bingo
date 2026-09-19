@@ -26,7 +26,11 @@ describe("repository VS Code integration", () => {
     const sources = [
       JSON.stringify(requireRecord(manifest.scripts)),
       readText("editors/vscode/src/configuration.ts"),
+      readText("editors/vscode/src/quickStart.ts"),
+      readText("editors/vscode/src/debugConfiguration.ts"),
       readText("editors/vscode/src/extension.ts"),
+      readText("editors/vscode/src/debugConfiguration.ts"),
+      readText("editors/vscode/src/quickStart.ts"),
       readText("editors/vscode/src/serverManager.ts"),
       readText("editors/vscode/src/serverProcess.ts"),
       readText("editors/vscode/scripts/clean.mjs"),
@@ -67,45 +71,50 @@ describe("repository VS Code integration", () => {
     assert.deepEqual(
       configurations.map((configuration) => configuration.name),
       [
-        "bingo DAP: launch example (stop on entry)",
-        "bingo DAP: launch spawntree telemetry demo",
-        "bingo DAP: join running session",
+        "bingo: Debug example",
+        "bingo: Debug spawntree telemetry demo",
+        "bingo: Join running session",
       ],
     );
     for (const configuration of configurations) {
       assert.equal(configuration.type, "bingo");
-      assert.equal("mode" in configuration, false);
       assert.equal("debugServer" in configuration, false);
-      assertLifecycleDefaults(configuration);
+      assert.equal("preLaunchTask" in configuration, false);
+      for (const field of [
+        "serverMode", "managementHost", "managementPort", "dapHost",
+        "dapPort", "serverReadyTimeoutMs", "managedIdleTimeoutMs",
+      ]) {
+        assert.equal(field in configuration, false);
+      }
     }
     assert.doesNotMatch(serialized, /extensionHost|Run bingo extension/);
     assert.doesNotMatch(serialized, /"type":"go"/);
     assert.doesNotMatch(serialized, /\bdlv\b/i);
 
-    const binaryLaunches = configurations.filter(
+    const sourceLaunches = configurations.filter(
       (configuration) => configuration.request === "launch",
     );
-    assert.equal(binaryLaunches.length, 2);
-    const binaryLaunch = binaryLaunches.find(
+    assert.equal(sourceLaunches.length, 2);
+    for (const launch of sourceLaunches) {
+      assert.equal(launch.mode, "debug");
+      assert.equal("stopOnEntry" in launch, false);
+    }
+    const exampleLaunch = sourceLaunches.find(
       (configuration) =>
-        configuration.name === "bingo DAP: launch example (stop on entry)",
+        configuration.name === "bingo: Debug example",
     );
-    assert.notEqual(binaryLaunch, undefined);
+    assert.notEqual(exampleLaunch, undefined);
     assert.equal(
-      binaryLaunch?.program,
-      "${workspaceFolder}/build/examples/${input:bingoExample}",
+      exampleLaunch?.program,
+      "${workspaceFolder}/examples/${input:bingoExample}",
     );
-    assert.equal(binaryLaunch?.preLaunchTask, "bingo: build examples");
-    assert.equal(binaryLaunch?.stopOnEntry, true);
 
-    const spawntreeLaunch = binaryLaunches.find(
+    const spawntreeLaunch = sourceLaunches.find(
       (configuration) =>
-        configuration.name === "bingo DAP: launch spawntree telemetry demo",
+        configuration.name === "bingo: Debug spawntree telemetry demo",
     );
     assert.notEqual(spawntreeLaunch, undefined);
-    assert.equal(spawntreeLaunch?.program, "${workspaceFolder}/build/spawntree");
-    assert.equal(spawntreeLaunch?.preLaunchTask, "bingo: build spawntree");
-    assert.equal(spawntreeLaunch?.stopOnEntry, false);
+    assert.equal(spawntreeLaunch?.program, "${workspaceFolder}/examples/spawntree");
 
     const inputs = requireArray(launch.inputs).map(requireRecord);
     assert.equal(inputs.length, 2);
@@ -125,12 +134,12 @@ describe("repository VS Code integration", () => {
       (configuration) => configuration.request === "attach",
     );
     assert.notEqual(sessionJoin, undefined);
-    assert.equal(sessionJoin?.name, "bingo DAP: join running session");
+    assert.equal(sessionJoin?.name, "bingo: Join running session");
     assert.equal(sessionJoin?.session, "${input:bingoSession}");
     assert.equal("preLaunchTask" in (sessionJoin ?? {}), false);
   });
 
-  it("defines target preparation tasks for launchable examples", () => {
+  it("retains optional terminal binary tasks without requiring them for F5", () => {
     const tasksConfig = readJSON(".vscode/tasks.json");
     const tasks = requireArray(tasksConfig.tasks).map(requireRecord);
 
@@ -149,12 +158,11 @@ describe("repository VS Code integration", () => {
 
     const launch = readJSON(".vscode/launch.json");
     const configurations = requireArray(launch.configurations).map(requireRecord);
-    for (const binaryLaunch of configurations.filter(
+    for (const sourceLaunch of configurations.filter(
       (configuration) => configuration.request === "launch",
     )) {
-      assert.ok(
-        tasks.some((task) => task.label === binaryLaunch.preLaunchTask),
-      );
+      assert.equal(sourceLaunch.mode, "debug");
+      assert.equal(sourceLaunch.preLaunchTask, undefined);
     }
 
     const justfile = readText("justfile");
@@ -219,7 +227,8 @@ describe("repository VS Code integration", () => {
   });
 
   it("uses supported editor layout without focus timers or mutating user debug settings", () => {
-    const extension = readText("editors/vscode/src/extension.ts");
+    const extension = readText("editors/vscode/src/extension.ts") +
+      readText("editors/vscode/src/debugConfiguration.ts");
     const view = readText("editors/vscode/src/concurrencyView.ts");
     assert.doesNotMatch(extension, /setTimeout|firstStop|ConfigurationTarget\.Global|\.update\(/);
     assert.match(view, /createWebviewPanel\(/);
@@ -229,16 +238,6 @@ describe("repository VS Code integration", () => {
     assert.doesNotMatch(extension + view, /moveView|moveActiveEditor|workbench\.action\.debug\.run/);
   });
 });
-
-function assertLifecycleDefaults(record: JsonRecord): void {
-  assert.equal(record.serverMode, "auto");
-  assert.equal(record.managementHost, "127.0.0.1");
-  assert.equal(record.managementPort, 6060);
-  assert.equal(record.dapHost, "127.0.0.1");
-  assert.equal(record.dapPort, 4711);
-  assert.equal(record.serverReadyTimeoutMs, 5000);
-  assert.equal(record.managedIdleTimeoutMs, 30000);
-}
 
 function readJSON(path: string): JsonRecord {
   return requireRecord(

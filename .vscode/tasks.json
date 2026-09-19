@@ -3,6 +3,7 @@
   "tasks": [
     {
       "label": "bingo: build examples",
+      "detail": "Optional binary build for terminal clients. VS Code source launches build their selected package automatically.",
       "type": "process",
       "command": "just",
       "args": [
@@ -12,6 +13,7 @@
     },
     {
       "label": "bingo: build spawntree",
+      "detail": "Optional binary build for terminal clients. VS Code source launches do not require this task.",
       "type": "process",
       "command": "just",
       "args": [

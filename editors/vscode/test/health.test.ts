@@ -9,6 +9,7 @@ import { describe, it } from "node:test";
 import {
   bingoServiceIdentity,
   dapSessionEventVersion,
+  dapSourceLaunchVersion,
   managementApiVersion,
   minimumHealthProbeTimeoutMs,
   probeBingoHealth,
@@ -28,6 +29,7 @@ function health(overrides: Record<string, unknown> = {}): string {
       enabled: true,
       address: "127.0.0.1:4711",
       sessionEventVersion: 1,
+      sourceLaunchVersion: 1,
     },
     managedIdleShutdown: {
       enabled: true,
@@ -47,6 +49,7 @@ describe("health compatibility", () => {
         result.health.dapSessionEventVersion,
         dapSessionEventVersion,
       );
+      assert.equal(result.health.dapSourceLaunchVersion, dapSourceLaunchVersion);
     }
   });
 
@@ -68,7 +71,7 @@ describe("health compatibility", () => {
       const result = validateHealthResponse(
         200,
         health({
-          dap: { enabled: true, address, sessionEventVersion: 1 },
+          dap: { enabled: true, address, sessionEventVersion: 1, sourceLaunchVersion: 1 },
         }),
         expectedDAP,
       );
@@ -153,6 +156,7 @@ describe("health compatibility", () => {
             enabled: true,
             address: "127.0.0.1:4711",
             sessionEventVersion: 2,
+            sourceLaunchVersion: 1,
           },
         }),
       },
@@ -162,7 +166,7 @@ describe("health compatibility", () => {
       {
         status: 200,
         body: health({
-          dap: { enabled: false, address: "", sessionEventVersion: 1 },
+          dap: { enabled: false, address: "", sessionEventVersion: 1, sourceLaunchVersion: 1 },
         }),
       },
     ],
@@ -175,6 +179,7 @@ describe("health compatibility", () => {
             enabled: true,
             address: "127.0.0.1:9999",
             sessionEventVersion: 1,
+            sourceLaunchVersion: 1,
           },
         }),
       },
@@ -188,6 +193,7 @@ describe("health compatibility", () => {
             enabled: true,
             address: "192.0.2.1:4711",
             sessionEventVersion: 1,
+            sourceLaunchVersion: 1,
           },
         }),
       },
@@ -196,6 +202,21 @@ describe("health compatibility", () => {
     it(`rejects ${label}`, () => {
       const result = validateHealthResponse(body.status, body.body, expectedDAP);
       assert.equal(result.kind, "incompatible");
+    });
+  }
+
+  for (const version of [undefined, null, 0, 2, "1", true]) {
+    it(`refuses source launch capability ${String(version)} on an otherwise compatible 1.4 server`, () => {
+      const result = validateHealthResponse(200, health({
+        dap: {
+          enabled: true,
+          address: "127.0.0.1:4711",
+          sessionEventVersion: 1,
+          sourceLaunchVersion: version,
+        },
+      }), expectedDAP);
+      assert.equal(result.kind, "incompatible");
+      assert.match(result.reason, /DAP source launch version.*expected 1/);
     });
   }
 
@@ -234,6 +255,11 @@ describe("health compatibility", () => {
         `DAPSessionEventVersion\\s*=\\s*${String(dapSessionEventVersion)}`,
       ),
     );
+    assert.match(
+      dapProtocol,
+      new RegExp(`DAPSourceLaunchVersion\\s*=\\s*${String(dapSourceLaunchVersion)}`),
+    );
+    assert.match(handler, /SourceLaunchVersion:\s+protocol\.DAPSourceLaunchVersion/);
   });
 });
 

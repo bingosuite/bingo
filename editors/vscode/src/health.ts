@@ -7,6 +7,7 @@ export const bingoServiceIdentity = "bingo";
 export const managementApiVersion = 1;
 export const wireProtocolVersion = "1.4";
 export const dapSessionEventVersion = sessionDAPEventVersion;
+export const dapSourceLaunchVersion = 1;
 export const minimumHealthProbeTimeoutMs = 25;
 
 const maximumHealthBytes = 64 * 1024;
@@ -15,6 +16,7 @@ export interface CompatibleHealth {
   readonly instanceId: string;
   readonly dapAddress: string;
   readonly dapSessionEventVersion: number;
+  readonly dapSourceLaunchVersion: number;
 }
 
 export type HealthProbeResult =
@@ -215,6 +217,12 @@ export function validateHealthResponse(
       reason: `DAP session event version is ${JSON.stringify(decoded.dap.sessionEventVersion)}, expected ${String(dapSessionEventVersion)}`,
     };
   }
+  if (decoded.dap.sourceLaunchVersion !== dapSourceLaunchVersion) {
+    return {
+      kind: "incompatible",
+      reason: `DAP source launch version is ${JSON.stringify(decoded.dap.sourceLaunchVersion)}, expected ${String(dapSourceLaunchVersion)}`,
+    };
+  }
   if (typeof decoded.dap.address !== "string") {
     return {
       kind: "incompatible",
@@ -248,6 +256,7 @@ export function validateHealthResponse(
       instanceId: decoded.instanceId,
       dapAddress: decoded.dap.address,
       dapSessionEventVersion,
+      dapSourceLaunchVersion,
     },
   };
 }

@@ -30,8 +30,9 @@ DAP listeners before managed startup. **0.5.0** adds call stacks, frame locals,
 expandable variables, and source navigation to the goroutine inspector.
 **0.6.0** keeps native Run and Debug alongside a reusable Bingo editor panel,
 adds bounded creation-source previews, and bounds aggregate inspector work.
-0.4.0 is the
-minimum supported version.
+**0.7.0** adds configuration-free Go-package debugging, server-owned automatic
+builds, cancellable startup, and source-launch capability checks. Use a matching
+0.7.0 companion and server for the source quick start.
 Rerun the command to update, then run
 **Developer: Reload Window** once so the active extension host loads the new
 bundle. Package without installing with `just vscode-package`. Uninstall with:
@@ -43,13 +44,35 @@ code --uninstall-extension bingosuite.bingo
 Generated binaries and VSIX files are ignored. Packaging rebuilds the native
 binary and VSIX twice and requires both SHA-256 hashes to match.
 
-## F5: connect or start
+## Debug a Go package without configuration
 
-Install the matching platform VSIX once, select
-**bingo DAP: launch example (stop on entry)** (or
-**bingo DAP: join running session**) from the repository's Run and Debug
-dropdown, press F5, and choose one of the five progressive targets. There is no
-separate server-start or extension-host choice. In the default `auto` mode the extension:
+Install the matching platform VSIX, open a saved Go file in a runnable `main`
+package, set a breakpoint, then run **Bingo: Debug Go Package** from the Command
+Palette or the Go editor's debug button. No `launch.json`, manual binary build,
+`just`, or separate server command is needed. With no launch configuration,
+press F5 and choose **bingo Debugger** for the same path.
+
+The active Go file selects its **directory**, not just that file, so sibling
+source files are included. With no active Go file, Bingo can use a selected or
+single workspace root only if it contains Go source. A multi-root workspace
+without a selected folder, an untitled Go buffer, or a root without Go files
+gets an actionable message instead of an arbitrary guessed package. Open a file
+under `cmd/your-app/` when the module root is not the package you want to run.
+
+The server runs `go build` with `-gcflags="all=-N -l"` and owns the temporary
+binary. **Go must be installed and on the server's PATH**; a bundled debugger is
+not a bundled Go toolchain. Build progress and compiler errors come through DAP
+in the native Debug Console. Execution runs to your breakpoints by default;
+`"stopOnEntry": true` remains available for an explicit early stop.
+
+In this repository, **bingo: Debug example** offers the five progressive source
+packages. **bingo: Debug spawntree telemetry demo** and **bingo: Join running
+session** are the other Run and Debug choices. F5 builds only the selected
+package. The optional workspace build tasks remain for terminal binary clients.
+
+## Connect or start
+
+In the default `auto` mode the extension:
 
 1. checks `http://127.0.0.1:6060/api/health`;
 2. reuses a compatible manual or managed bingo server;
@@ -60,28 +83,36 @@ separate server-start or extension-host choice. In the default `auto` mode the e
 5. receives the DAP adapter's `bingo/session/v1` event and automatically joins
    that exact managed session over WebSocket in **Bingo Concurrency**.
 
-Compatible health must advertise `dap.sessionEventVersion: 1`; an older server
-that lacks managed-session discovery is reported as incompatible and is never
-reused or replaced while it occupies the configured endpoint.
+Compatible health must advertise both `dap.sessionEventVersion: 1` and
+`dap.sourceLaunchVersion: 1`, in addition to exact wire version 1.4 and matching
+management/DAP endpoints. An older 1.4 server without source-build support is
+incompatible and is never reused or replaced while it occupies the endpoint.
 
 Concurrent VS Code extension hosts may both try to start. Listener binding
 chooses the winner; a child that loses the race is harmless because both hosts
 reuse the compatible winner. Requests in one extension host for the same
-endpoint share one readiness operation.
+endpoint share one readiness operation. Cancel from the **Preparing bingo
+debugger** notification or VS Code's startup cancellation. Cancelling one
+request does not affect another waiting request; cancelling the last stops
+pending startup work and prevents a late binary/log lookup from spawning a
+server. If a server has already started, it remains server-owned and exits
+under its idle policy rather than being killed.
 
 Auto mode requires distinct management and DAP endpoints and rejects an
 identical host/port pair before probing or spawning. `connectOnly` remains
 permissive for custom endpoint arrangements.
 
-The child is detached and logs to persistent extension storage. Open the
-**bingo Server** output channel to see the absolute server log path. The
+The child is detached and logs to persistent extension storage. Run
+**Bingo: Show Server Output**, or choose **Show Logs** on a startup error, to
+open the **bingo Server** output channel and find the absolute server log path. The
 extension never kills a server, including one it spawned. Closing VS Code only
 disconnects its client; bingo's `-idle-timeout` owns managed shutdown so DAP and
 WebSocket clients can share the process safely.
 
 If the management port answers with non-bingo HTTP or an incompatible bingo,
-F5 fails without spawning over it. Errors include the endpoints and server log
-path.
+F5 fails without spawning over it. Update that server or configure a different
+unused management/DAP port pair. Managed spawn/readiness errors include the
+persistent log path; failures before a spawn have no new server log.
 
 ## Bingo Concurrency
 
@@ -212,6 +243,27 @@ than a failure:
 
 ## Configurations
 
+### Build and debug a package
+
+For a repeatable target, save this in `.vscode/launch.json`'s `configurations`:
+
+```json
+{
+  "name": "bingo: Debug Go Package",
+  "type": "bingo",
+  "request": "launch",
+  "mode": "debug",
+  "program": "${workspaceFolder}/cmd/my-app"
+}
+```
+
+`program` must name a server-local directory, not a `.go` file, import path, or
+`go test` target. Optional `cwd` sets the target's working directory and the base
+for a relative `program`. Without `cwd`, source mode uses the resolved package
+directory. Paths containing spaces are passed as paths, not shell commands.
+`args`, `env`, and `stopOnEntry` work in both launch modes. `env` is an array of
+`KEY=value` strings; the server applies overrides to the build and target.
+
 ### Launch a binary
 
 ```json
@@ -219,21 +271,17 @@ than a failure:
   "name": "bingo: Launch binary",
   "type": "bingo",
   "request": "launch",
+  "mode": "exec",
   "program": "${workspaceFolder}/build/target/target",
   "args": [],
   "env": ["BINGO_MODE=debug"],
-  "stopOnEntry": true,
-  "serverMode": "auto",
-  "managementHost": "127.0.0.1",
-  "managementPort": 6060,
-  "dapHost": "127.0.0.1",
-  "dapPort": 4711,
-  "serverReadyTimeoutMs": 5000,
-  "managedIdleTimeoutMs": 30000
+  "stopOnEntry": true
 }
 ```
 
-`env` is an array of `KEY=value` strings.
+Existing launch configurations with a `program` but **no `mode` still launch a
+binary**. Bingo does not silently reinterpret them as source. In exec mode an
+omitted or empty `cwd` retains the server's working directory.
 
 ### Join a managed session
 
@@ -242,12 +290,7 @@ than a failure:
   "name": "bingo: Join session",
   "type": "bingo",
   "request": "attach",
-  "session": "replace-with-session-id",
-  "serverMode": "auto",
-  "managementHost": "127.0.0.1",
-  "managementPort": 6060,
-  "dapHost": "127.0.0.1",
-  "dapPort": 4711
+  "session": "replace-with-session-id"
 }
 ```
 
@@ -262,12 +305,7 @@ Joining does not relaunch, reattach, or automatically resume the shared session.
   "request": "attach",
   "pid": 1234,
   "binaryPath": "/absolute/path/to/the/binary",
-  "stopOnEntry": true,
-  "serverMode": "auto",
-  "managementHost": "127.0.0.1",
-  "managementPort": 6060,
-  "dapHost": "127.0.0.1",
-  "dapPort": 4711
+  "stopOnEntry": true
 }
 ```
 
@@ -296,10 +334,14 @@ or any custom host, explicitly select connect-only mode:
 
 ```json
 {
+  "name": "bingo: Remote Go Package",
   "type": "bingo",
   "request": "launch",
-  "program": "/workspace/build/target",
+  "mode": "debug",
+  "program": "/workspace/cmd/my-app",
   "serverMode": "connectOnly",
+  "managementHost": "debug.internal",
+  "managementPort": 16060,
   "dapHost": "debug.internal",
   "dapPort": 14711
 }
@@ -308,7 +350,10 @@ or any custom host, explicitly select connect-only mode:
 Connect-only mode does not probe management health, inspect a bundled binary, or
 spawn. Start and secure the reachable bingo server through that environment's
 normal process manager. The concurrency observer uses the same configured
-management host/port for its WebSocket connection.
+management host/port for its WebSocket connection. Both `program` and `cwd`
+are **server-local**, not paths on the VS Code client. Source mode requires a
+server with source-launch support even though connect-only mode deliberately
+skips compatibility probes.
 
 ## Manual server option
 
@@ -343,9 +388,9 @@ code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"
 ```
 
 Inside that window, select the normal example configuration. Ordinary target
-debugging instead uses the installed VSIX and runs only
-**bingo: build examples**, so F5 does not rebuild or codesign the
-extension-local server.
+debugging instead uses the installed VSIX and asks the server to build the
+selected source package, so F5 does not rebuild or codesign the extension-local
+server.
 
 Electron tests run in isolated profiles, not the user's installed editor. The
 default runner is pinned to 1.107.1; the compatibility matrix additionally pins

@@ -4,16 +4,15 @@ import process from "node:process";
 import * as vscode from "vscode";
 
 import { resolveBundledBinary } from "./binary.js";
+import { resolveServerConfiguration } from "./configuration.js";
 import {
-  ConfigurationError,
-  resolveServerConfiguration,
-  validateBingoConfiguration,
-} from "./configuration.js";
+  BingoDebugAdapterDescriptorFactory,
+  BingoDebugConfigurationProvider,
+} from "./debugConfiguration.js";
 import { probeBingoHealth } from "./health.js";
 import {
   defaultDelay,
   ServerManager,
-  ServerManagerError,
 } from "./serverManager.js";
 import { spawnDetachedServer } from "./serverProcess.js";
 import {
@@ -43,71 +42,6 @@ export interface BingoExtensionAPI {
   };
   getSidebarViewStatus(): { readonly resolved: boolean; readonly ready: boolean; readonly visible: boolean };
   testUI?(operation?: TestOperation, target?: number): Promise<DisplayedState>;
-}
-
-class BingoDebugConfigurationProvider
-  implements vscode.DebugConfigurationProvider
-{
-  public resolveDebugConfigurationWithSubstitutedVariables(
-    _folder: vscode.WorkspaceFolder | undefined,
-    config: vscode.DebugConfiguration,
-  ): vscode.DebugConfiguration | undefined {
-    try {
-      const validated = validateBingoConfiguration(config);
-      return {
-        ...config,
-        serverMode: validated.server.mode,
-        managementHost: validated.server.managementEndpoint.host,
-        managementPort: validated.server.managementEndpoint.port,
-        dapHost: validated.endpoint.host,
-        dapPort: validated.endpoint.port,
-        serverReadyTimeoutMs: validated.server.readyTimeoutMs,
-        managedIdleTimeoutMs: validated.server.idleTimeoutMs,
-      };
-    } catch (error: unknown) {
-      const message =
-        error instanceof ConfigurationError
-          ? error.message
-          : `invalid bingo debug configuration: ${String(error)}`;
-      void vscode.window.showErrorMessage(message);
-      return undefined;
-    }
-  }
-}
-
-class BingoDebugAdapterDescriptorFactory
-  implements vscode.DebugAdapterDescriptorFactory
-{
-  public constructor(
-    private readonly manager: ServerManager,
-    private readonly output: vscode.OutputChannel,
-  ) {}
-
-  public createDebugAdapterDescriptor(
-    session: vscode.DebugSession,
-  ): vscode.ProviderResult<vscode.DebugAdapterDescriptor> {
-    return this.createDescriptor(session);
-  }
-
-  private async createDescriptor(
-    session: vscode.DebugSession,
-  ): Promise<vscode.DebugAdapterDescriptor> {
-    const { endpoint, server } = validateBingoConfiguration(
-      session.configuration,
-    );
-    try {
-      await this.manager.ensureServer(server);
-    } catch (error: unknown) {
-      const message =
-        error instanceof ServerManagerError
-          ? error.message
-          : `cannot prepare bingo server: ${String(error)}`;
-      this.output.appendLine(message);
-      void vscode.window.showErrorMessage(message);
-      throw error;
-    }
-    return new vscode.DebugAdapterServer(endpoint.port, endpoint.host);
-  }
 }
 
 export function activate(context: vscode.ExtensionContext): BingoExtensionAPI {
@@ -195,6 +129,7 @@ export function activate(context: vscode.ExtensionContext): BingoExtensionAPI {
       output.appendLine(message);
     },
   });
+  const configurationProvider = new BingoDebugConfigurationProvider(manager, output);
 
   context.subscriptions.push(
     output,
@@ -204,6 +139,7 @@ export function activate(context: vscode.ExtensionContext): BingoExtensionAPI {
     source,
     concurrencyView,
     editor,
+    configurationProvider,
     { dispose: unsubscribeStatus },
     {
       dispose(): void {
@@ -212,12 +148,26 @@ export function activate(context: vscode.ExtensionContext): BingoExtensionAPI {
     },
     vscode.debug.registerDebugConfigurationProvider(
       debugType,
-      new BingoDebugConfigurationProvider(),
+      configurationProvider,
+    ),
+    vscode.debug.registerDebugConfigurationProvider(
+      debugType,
+      {
+        provideDebugConfigurations: (folder, token) =>
+          configurationProvider.provideDebugConfigurations(folder, token),
+      },
+      vscode.DebugConfigurationProviderTriggerKind.Dynamic,
     ),
     vscode.debug.registerDebugAdapterDescriptorFactory(
       debugType,
-      new BingoDebugAdapterDescriptorFactory(manager, output),
+      new BingoDebugAdapterDescriptorFactory(),
     ),
+    vscode.commands.registerCommand("bingo.debugGoPackage", () =>
+      configurationProvider.debugGoPackage(),
+    ),
+    vscode.commands.registerCommand("bingo.showServerOutput", () => {
+      output.show(true);
+    }),
     vscode.debug.registerDebugAdapterTrackerFactory(debugType, {
       createDebugAdapterTracker(session) {
         return {

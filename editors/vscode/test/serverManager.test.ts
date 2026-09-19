@@ -25,6 +25,7 @@ const compatible: HealthProbeResult = {
     instanceId: "winner",
     dapAddress: "127.0.0.1:4711",
     dapSessionEventVersion: 1,
+    dapSourceLaunchVersion: 1,
   },
 };
 const absent: HealthProbeResult = { kind: "absent" };
@@ -188,6 +189,166 @@ describe("server manager", () => {
     release?.(compatible);
     await Promise.all([first, second]);
     assert.equal(probes, 1);
+  });
+
+  it("does no work for an already-cancelled caller", async () => {
+    let probes = 0;
+    const test = harness(() => {
+      probes += 1;
+      return Promise.resolve(absent);
+    });
+    const controller = new AbortController();
+    controller.abort();
+
+    await assert.rejects(
+      test.manager.ensureServer(configuration(), controller.signal),
+      hasCode("cancelled"),
+    );
+    await Promise.resolve();
+    assert.equal(probes, 0);
+    assert.equal(test.requests.length, 0);
+  });
+
+  it("keeps a shared startup alive while another caller still needs it", async () => {
+    const gate = deferred<HealthProbeResult>();
+    let probeSignal: AbortSignal | undefined;
+    const test = harness((_management, _dap, _timeout, signal) => {
+      probeSignal = signal;
+      return gate.promise;
+    });
+    const controller = new AbortController();
+    const first = test.manager.ensureServer(configuration(), controller.signal);
+    const second = test.manager.ensureServer(configuration());
+    controller.abort();
+
+    await assert.rejects(first, hasCode("cancelled"));
+    assert.equal(probeSignal?.aborted, false);
+    gate.resolve(compatible);
+    assert.deepEqual(await second, configuration().dapEndpoint);
+    assert.equal(test.requests.length, 0);
+  });
+
+  it("retires a cancelled last caller before a retry, even if the old probe returns late", async () => {
+    const gate = deferred<HealthProbeResult>();
+    const replacement = deferred<HealthProbeResult>();
+    let probeSignal: AbortSignal | undefined;
+    let probes = 0;
+    const test = harness((_management, _dap, _timeout, signal) => {
+      probes += 1;
+      probeSignal = signal;
+      return gate.promise;
+    });
+    const controller = new AbortController();
+    const first = test.manager.ensureServer(configuration(), controller.signal);
+    controller.abort();
+    await assert.rejects(first, hasCode("cancelled"));
+    assert.equal(probeSignal?.aborted, true);
+
+    test.setProbe(() => {
+      probes += 1;
+      return replacement.promise;
+    });
+    const second = test.manager.ensureServer(configuration());
+    gate.resolve(absent);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const third = test.manager.ensureServer(configuration());
+    assert.equal(probes, 2);
+    replacement.resolve(compatible);
+    assert.deepEqual(await Promise.all([second, third]), [
+      configuration().dapEndpoint, configuration().dapEndpoint,
+    ]);
+    assert.equal(test.requests.length, 0);
+  });
+
+  for (const [phase, shared] of [
+    ["binary", false], ["binary", true], ["log", false], ["log", true],
+  ] as const) {
+    it(`cancels during ${phase} resolution with ${shared ? "a surviving shared" : "no other"} caller`, async () => {
+      const gate = deferred<string>();
+      const entered = deferred<void>();
+      let spawns = 0;
+      let clock = 0;
+      const manager = new ServerManager({
+        probe: sequence(absent, compatible),
+        resolveBinary: () => {
+          if (phase === "binary") {
+            entered.resolve();
+            return gate.promise;
+          }
+          return Promise.resolve("/extension with spaces/bin/bingo");
+        },
+        spawnServer: () => {
+          spawns += 1;
+          return { stopObserving() {} };
+        },
+        delay: (milliseconds) => {
+          clock += milliseconds;
+          return Promise.resolve();
+        },
+        now: () => clock,
+        runtime: { platform: "darwin", arch: "arm64" },
+        logPathFor: () => {
+          if (phase === "log") {
+            entered.resolve();
+            return gate.promise;
+          }
+          return Promise.resolve("/logs with spaces/server.log");
+        },
+        log() {},
+      });
+      const controller = new AbortController();
+      const ensured = manager.ensureServer(configuration(), controller.signal);
+      await entered.promise;
+      const other = shared ? manager.ensureServer(configuration()) : undefined;
+      controller.abort();
+      await assert.rejects(ensured, hasCode("cancelled"));
+      gate.resolve(phase === "binary"
+        ? "/extension with spaces/bin/bingo"
+        : "/logs with spaces/server.log");
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (other !== undefined) {
+        assert.deepEqual(await other, configuration().dapEndpoint);
+      }
+      assert.equal(spawns, shared ? 1 : 0);
+      manager.dispose();
+    });
+  }
+
+  it("cancels the last readiness waiter without terminating its spawned server", async () => {
+    const entered = deferred<void>();
+    let observationStops = 0;
+    let readinessSignal: AbortSignal | undefined;
+    const manager = new ServerManager({
+      probe: sequence(absent),
+      resolveBinary: () => Promise.resolve("/extension/bin/bingo"),
+      spawnServer: () => ({
+        stopObserving() { observationStops += 1; },
+      }),
+      delay: (_milliseconds, signal) => {
+        readinessSignal = signal;
+        entered.resolve();
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener("abort", () => {
+            const error = new Error("aborted");
+            error.name = "AbortError";
+            reject(error);
+          }, { once: true });
+        });
+      },
+      now: () => 0,
+      runtime: { platform: "darwin", arch: "arm64" },
+      logPathFor: () => Promise.resolve("/logs/server.log"),
+      log() {},
+    });
+    const controller = new AbortController();
+    const ensured = manager.ensureServer(configuration(), controller.signal);
+    await entered.promise;
+    controller.abort();
+    await assert.rejects(ensured, hasCode("cancelled"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(readinessSignal?.aborted, true);
+    assert.equal(observationStops, 1);
+    manager.dispose();
   });
 
   it("clears a failed ensure so a retry can succeed", async () => {

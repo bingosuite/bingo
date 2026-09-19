@@ -12,7 +12,7 @@ const manifest = requireRecord(
 const contributes = requireRecord(manifest.contributes);
 const debuggers = requireArray(contributes.debuggers);
 const debuggerContribution = requireRecord(debuggers[0]);
-const expectedExtensionVersion = "0.6.0";
+const expectedExtensionVersion = "0.7.0";
 
 describe("extension manifest", () => {
   it("versions the managed-server runtime as an installable upgrade", () => {
@@ -49,6 +49,19 @@ describe("extension manifest", () => {
     const breakpoints = requireArray(contributes.breakpoints);
     assert.deepEqual(breakpoints, [{ language: "go" }]);
     assert.deepEqual(debuggerContribution.languages, ["go"]);
+  });
+
+  it("offers a configuration-free Go command and discoverable diagnostics", () => {
+    const commands = requireArray(contributes.commands).map(requireRecord);
+    const quickStart = commands.find((command) => command.command === "bingo.debugGoPackage");
+    assert.equal(quickStart?.title, "Bingo: Debug Go Package");
+    assert.equal(quickStart?.enablement, "isWorkspaceTrusted");
+    assert.ok(commands.some((command) => command.command === "bingo.showServerOutput"));
+    const editorActions = requireArray(requireRecord(contributes.menus)["editor/title"]).map(requireRecord);
+    const action = editorActions.find((item) => item.command === "bingo.debugGoPackage");
+    assert.match(String(action?.when), /resourceLangId == go/);
+    assert.match(String(action?.when), /resourceScheme == file/);
+    assert.match(String(action?.when), /isWorkspaceTrusted/);
   });
 
   it("contributes the concurrency Activity Bar view and controls", () => {
@@ -101,24 +114,36 @@ describe("extension manifest", () => {
     ).map(requireRecord);
     assert.ok(initialConfigurations.length > 0);
     for (const configuration of initialConfigurations) {
-      assertLifecycleDefaults(configuration);
+      assert.equal(configuration.mode, "debug");
+      assert.equal(configuration.program, "${workspaceFolder}");
+      assertMinimalConfiguration(configuration);
     }
   });
 
-  it("ships launch, join, and PID attach snippets", () => {
+  it("documents source launch without changing omitted-mode binary semantics", () => {
+    const attributes = requireRecord(debuggerContribution.configurationAttributes);
+    const properties = requireRecord(requireRecord(attributes.launch).properties);
+    assert.deepEqual(requireRecord(properties.mode).enum, ["debug", "exec"]);
+    assert.equal(requireRecord(properties.mode).default, "exec");
+    assert.equal(requireRecord(properties.cwd).type, "string");
+    assert.equal(requireRecord(properties.stopOnEntry).default, false);
+  });
+
+  it("ships minimal source, binary, join, and PID attach snippets", () => {
     const snippets = requireArray(debuggerContribution.configurationSnippets);
     const bodies = snippets.map((snippet) =>
       requireRecord(requireRecord(snippet).body),
     );
     for (const body of bodies) {
-      assertLifecycleDefaults(body);
+      assertMinimalConfiguration(body);
     }
 
     assert.ok(
       bodies.some(
-        (body) => body.request === "launch" && typeof body.program === "string",
+        (body) => body.request === "launch" && body.mode === "debug" && typeof body.program === "string",
       ),
     );
+    assert.ok(bodies.some((body) => body.request === "launch" && body.mode === "exec"));
     assert.ok(
       bodies.some(
         (body) => body.request === "attach" && typeof body.session === "string",
@@ -130,6 +155,15 @@ describe("extension manifest", () => {
       ),
     );
   });
+
+  function assertMinimalConfiguration(record: JsonRecord): void {
+    for (const field of [
+      "preLaunchTask", "serverMode", "managementHost", "managementPort",
+      "dapHost", "dapPort", "serverReadyTimeoutMs", "managedIdleTimeoutMs", "stopOnEntry",
+    ]) {
+      assert.equal(field in record, false, `${field} need not repeat its default`);
+    }
+  }
 
   function assertLifecycleDefaults(record: JsonRecord): void {
     assert.equal(valueOrDefault(record.serverMode), "auto");

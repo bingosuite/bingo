@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
-import { readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer, type Server, type Socket } from "node:net";
+import { join } from "node:path";
 
 import * as vscode from "vscode";
 import { WebSocketServer, type WebSocket } from "ws";
 
 import type { BingoExtensionAPI } from "../src/extension.js";
+import { BingoDebugConfigurationProvider } from "../src/debugConfiguration.js";
+import { ServerManager } from "../src/serverManager.js";
+import type { HealthProbeResult } from "../src/health.js";
 import type { SessionViewModel } from "../src/model.js";
 import { sessionDAPEventName } from "../src/sessionEvent.js";
 
@@ -42,6 +46,12 @@ export async function run(): Promise<void> {
     assert.equal(typeof api.testUI, "function", "test host must expose its DOM driver");
     assert.equal(api.getConcurrencyViewStatus().resolved, false);
 
+    await configuration.update(
+      "bingo.concurrency.autoReveal", false, vscode.ConfigurationTarget.Global,
+    );
+    await runQuickStarts(api, fixture);
+    await runStartupCancellation();
+
     for (const autoReveal of [true, false]) {
       await configuration.update(
         "bingo.concurrency.autoReveal",
@@ -54,6 +64,152 @@ export async function run(): Promise<void> {
     for (const { key, value } of previous) {
       await configuration.update(key, value, vscode.ConfigurationTarget.Global);
     }
+  }
+}
+
+async function runQuickStarts(api: BingoExtensionAPI, fixture: SourceFixture): Promise<void> {
+  const root = vscode.workspace.workspaceFolders?.[0];
+  assert.notEqual(root, undefined);
+  const parent = join(root!.uri.fsPath, "dist", "test-artifacts");
+  await mkdir(parent, { recursive: true });
+  const directory = await mkdtemp(join(parent, "Go quick start with spaces-"));
+  const uri = vscode.Uri.file(join(directory, "main.go"));
+  await writeFile(uri.fsPath, await readFile(fixture.uri.fsPath));
+  const sourceFixture = { ...fixture, uri };
+  try {
+    for (const kind of ["command", "no-launch", "explicit-source"] as const) {
+      const buildDelayMs = kind === "command" ? 12_000 : 0;
+      const dap = await FakeDAPServer.start(sourceFixture, buildDelayMs);
+      const telemetry = await FakeTelemetryServer.start(sourceFixture);
+      let session: vscode.DebugSession | undefined;
+      let resolved = 0;
+      const started = vscode.debug.onDidStartDebugSession((candidate) => {
+        if (candidate.type === "bingo") {
+          session = candidate;
+        }
+      });
+      const transport = vscode.debug.registerDebugConfigurationProvider("bingo", {
+        resolveDebugConfiguration(_folder, config) {
+          // Route the real provider's generated launch to test-owned listeners.
+          // Assert generation happened first rather than masking a missing provider.
+          assert.equal(config.mode, "debug");
+          assert.equal(config.program, directory);
+          assert.equal(config.cwd, directory);
+          assert.equal(config.stopOnEntry, kind === "explicit-source" ? true : undefined);
+          resolved += 1;
+          return {
+            ...config,
+            serverMode: "connectOnly",
+            managementPort: telemetry.port,
+            dapPort: dap.port,
+          };
+        },
+      });
+      try {
+        await vscode.window.showTextDocument(uri, {
+          viewColumn: vscode.ViewColumn.One, preview: false,
+        });
+        const beforeStart = Date.now();
+        const start = kind === "command"
+          ? vscode.commands.executeCommand<boolean>("bingo.debugGoPackage")
+          : vscode.debug.startDebugging(root, kind === "no-launch" ? {
+            type: "bingo", request: "", name: "",
+          } : {
+            type: "bingo", request: "launch", name: "Explicit source",
+            mode: "debug", program: directory, cwd: directory, stopOnEntry: true,
+          });
+        if (buildDelayMs > 0) {
+          await waitFor(() => dap.lastLaunchArguments, "delayed source launch request");
+          assert.equal(api.getConcurrencyState().sessions.length, 0);
+          assert.equal(telemetry.activeConnections, 0, "no discovery/observer before source entry");
+        }
+        const success = await start;
+        assert.equal(success, true, `${kind} must start through the registered provider`);
+        const current = await waitFor(() => session, `${kind} start`);
+        await readyModel(api, 1, 20_000);
+        assert.ok(Date.now() - beforeStart >= buildDelayMs);
+        assert.equal(resolved, 1, "dynamic configuration registration must not duplicate resolution");
+        assert.equal(dap.lastLaunchArguments?.mode, "debug");
+        assert.equal(dap.lastLaunchArguments?.program, directory);
+        assert.equal(dap.lastLaunchArguments?.cwd, directory);
+        assert.equal(
+          dap.lastLaunchArguments?.stopOnEntry, kind === "explicit-source" ? true : undefined,
+        );
+        assert.equal(dap.lastLaunchArguments?.preLaunchTask, undefined);
+        await vscode.debug.stopDebugging(current);
+        await waitFor(
+          () => dap.activeConnections === 0 && telemetry.activeConnections === 0 &&
+            api.getConcurrencyState().sessions.length === 0 ? true : undefined,
+          `${kind} cleanup`,
+        );
+        assert.equal(dap.terminateRequests, 1);
+        session = undefined;
+        console.log(`Verified ${kind} Go package startup${buildDelayMs > 0 ? " with a 12-second simulated build" : ""}`);
+      } finally {
+        transport.dispose();
+        started.dispose();
+        if (session !== undefined) {
+          await vscode.debug.stopDebugging(session);
+        }
+        await Promise.all([dap.close(), telemetry.close()]);
+      }
+    }
+  } finally {
+    await vscode.commands.executeCommand("workbench.action.closeAllEditors");
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+async function runStartupCancellation(): Promise<void> {
+  let probeSignal: AbortSignal | undefined;
+  let probes = 0;
+  let spawns = 0;
+  let releaseProbe: ((result: HealthProbeResult) => void) | undefined;
+  const manager = new ServerManager({
+    probe: (_management, _dap, _timeout, signal) => {
+      probes += 1;
+      probeSignal = signal;
+      return new Promise((resolve) => { releaseProbe = resolve; });
+    },
+    resolveBinary: () => Promise.resolve("/must/not/launch/bingo"),
+    spawnServer: () => {
+      spawns += 1;
+      return { stopObserving() {} };
+    },
+    delay: () => Promise.resolve(),
+    now: Date.now,
+    runtime: { platform: "darwin", arch: "arm64" },
+    logPathFor: () => Promise.resolve("/must/not/create/server.log"),
+    log() {},
+  });
+  const output = vscode.window.createOutputChannel("Bingo Startup Integration");
+  const provider = new BingoDebugConfigurationProvider(manager, output);
+  const token = new vscode.CancellationTokenSource();
+  try {
+    const config = {
+      type: "bingo", request: "launch", name: "Cancelled source",
+      mode: "debug", program: "/server/package",
+    };
+    const pending = provider.resolveDebugConfigurationWithSubstitutedVariables(
+      undefined, config, token.token,
+    );
+    await waitFor(() => probeSignal, "native progress startup probe");
+    token.cancel();
+    assert.equal(await pending, undefined);
+    assert.equal(probeSignal?.aborted, true);
+    releaseProbe?.({ kind: "absent" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(spawns, 0);
+    assert.equal(await provider.resolveDebugConfigurationWithSubstitutedVariables(
+      undefined, config, token.token,
+    ), undefined);
+    assert.equal(probes, 1, "an already cancelled VS Code token must do no work");
+    console.log("Verified native startup-token cancellation during preparation progress");
+  } finally {
+    token.dispose();
+    provider.dispose();
+    manager.dispose();
+    output.dispose();
   }
 }
 
@@ -89,6 +245,7 @@ async function runSession(
       request: "launch",
       name: debugSessionName,
       program: fixture.uri.fsPath,
+      ...(autoReveal ? {} : { mode: "exec" }),
       stopOnEntry: true,
       serverMode: "connectOnly",
       managementHost: "127.0.0.1",
@@ -97,6 +254,9 @@ async function runSession(
       dapPort: dap.port,
     }), true);
     const started = await waitFor(() => session, "debug session start");
+    assert.equal(dap.lastLaunchArguments?.mode, autoReveal ? undefined : "exec");
+    assert.equal(dap.lastLaunchArguments?.program, fixture.uri.fsPath);
+    assert.equal(dap.lastLaunchArguments?.cwd, undefined);
     const first = await readyModel(api, 1);
     assert.equal(first.sessionId, managedSessionID);
     assert.equal(first.snapshot?.goroutines.length, 2);
@@ -436,7 +596,11 @@ function onlyConcurrencyTab(): vscode.Tab {
   return tabs[0]!;
 }
 
-async function readyModel(api: BingoExtensionAPI, generation: number): Promise<SessionViewModel> {
+async function readyModel(
+  api: BingoExtensionAPI,
+  generation: number,
+  timeoutMs = 10_000,
+): Promise<SessionViewModel> {
   return waitFor(() => {
     const model = api.getConcurrencyState().sessions[0];
     return model?.snapshot !== undefined &&
@@ -448,7 +612,7 @@ async function readyModel(api: BingoExtensionAPI, generation: number): Promise<S
       )
       ? model
       : undefined;
-  }, `stop ${String(generation)} stack, locals and source`);
+  }, `stop ${String(generation)} stack, locals and source`, timeoutMs);
 }
 
 async function changedAndRendered(
@@ -479,12 +643,18 @@ async function rendered(api: BingoExtensionAPI): Promise<void> {
 class FakeDAPServer {
   readonly #server: Server;
   readonly #sockets = new Set<Socket>();
+  readonly #launchTimers = new Set<NodeJS.Timeout>();
   #sequence = 1;
   public stopGeneration = 0;
   public terminateRequests = 0;
   public disconnectRequests = 0;
+  public lastLaunchArguments: Readonly<Record<string, unknown>> | undefined;
 
-  private constructor(server: Server, private readonly fixture: SourceFixture) {
+  private constructor(
+    server: Server,
+    private readonly fixture: SourceFixture,
+    private readonly sourceBuildDelayMs: number,
+  ) {
     this.#server = server;
     server.on("connection", (socket) => {
       this.#sockets.add(socket);
@@ -532,15 +702,19 @@ class FakeDAPServer {
     return this.#sockets.size;
   }
 
-  public static async start(fixture: SourceFixture): Promise<FakeDAPServer> {
+  public static async start(fixture: SourceFixture, sourceBuildDelayMs = 0): Promise<FakeDAPServer> {
     const server = createServer();
-    const fake = new FakeDAPServer(server, fixture);
+    const fake = new FakeDAPServer(server, fixture, sourceBuildDelayMs);
     server.listen(0, "127.0.0.1");
     await once(server, "listening");
     return fake;
   }
 
   public async close(): Promise<void> {
+    for (const timer of this.#launchTimers) {
+      clearTimeout(timer);
+    }
+    this.#launchTimers.clear();
     for (const socket of this.#sockets) {
       socket.destroy();
     }
@@ -561,6 +735,21 @@ class FakeDAPServer {
         });
         break;
       case "launch":
+        this.lastLaunchArguments = request.arguments;
+        if (request.arguments?.mode === "debug" && this.sourceBuildDelayMs > 0) {
+          this.#event(socket, "output", {
+            category: "console", output: "Simulated cold Go package build...\n",
+          });
+          const timer = setTimeout(() => {
+            this.#launchTimers.delete(timer);
+            if (!socket.destroyed) {
+              this.#announce(socket);
+              this.#event(socket, "initialized", {});
+            }
+          }, this.sourceBuildDelayMs);
+          this.#launchTimers.add(timer);
+          break;
+        }
         this.#announce(socket);
         this.#event(socket, "initialized", {});
         break;
@@ -859,8 +1048,9 @@ function snapshotPayload(fixture: SourceFixture): Record<string, unknown> {
 async function waitFor<T>(
   probe: () => T | undefined,
   label: string,
+  timeoutMs = 10_000,
 ): Promise<T> {
-  const deadline = Date.now() + 10_000;
+  const deadline = Date.now() + timeoutMs;
   for (;;) {
     const result = probe();
     if (result !== undefined) {

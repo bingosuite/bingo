@@ -118,7 +118,59 @@ describe("bingo debug configuration", () => {
 
     assert.equal(validated.request, "launch");
     assert.equal(validated.server.mode, "auto");
+    assert.equal(validated.mode, "exec");
   });
+
+  for (const mode of ["debug", "exec"] as const) {
+    it(`accepts ${mode} launch with cwd and paths containing spaces without rewriting them`, () => {
+      const config = {
+        request: "launch",
+        mode,
+        program: "./my package",
+        cwd: "/workspace with spaces/project",
+        stopOnEntry: false,
+      };
+      const before = { ...config };
+      const validated = validateBingoConfiguration(config);
+      assert.equal(validated.request, "launch");
+      assert.equal(validated.mode, mode);
+      assert.deepEqual(config, before);
+    });
+  }
+
+  it("accepts an empty cwd as the server's legacy default", () => {
+    const validated = validateBingoConfiguration({
+      request: "launch", program: "./target", cwd: "",
+    });
+    assert.equal(validated.request, "launch");
+    assert.equal(validated.mode, "exec");
+  });
+
+  it("keeps remote source paths server-local instead of checking this machine's filesystem", () => {
+    const validated = validateBingoConfiguration({
+      request: "launch", mode: "debug", program: "/remote/server/source",
+      cwd: "/remote/server", serverMode: "connectOnly", dapHost: "debug.internal",
+    });
+    assert.equal(validated.server.mode, "connectOnly");
+  });
+
+  for (const [label, fields] of [
+    ["unknown launch mode", { mode: "test" }],
+    ["empty launch mode", { mode: "" }],
+    ["null launch mode", { mode: null }],
+    ["numeric launch mode", { mode: 1 }],
+    ["object cwd", { cwd: {} }],
+    ["null cwd", { cwd: null }],
+    ["NUL cwd", { cwd: "/tmp/\0source" }],
+    ["NUL program", { program: "/tmp/\0target" }],
+    ["invalid stopOnEntry", { stopOnEntry: "true" }],
+  ] as const) {
+    it(`rejects ${label} before startup`, () => {
+      assert.throws(() => validateBingoConfiguration({
+        request: "launch", program: "/tmp/target", ...fields,
+      }), ConfigurationError);
+    });
+  }
 
   it("accepts existing-session join", () => {
     const validated = validateBingoConfiguration({

@@ -81,6 +81,7 @@ try {
     health.wireProtocolVersion !== "1.4" ||
     health.dap?.enabled !== true ||
     health.dap.sessionEventVersion !== 1 ||
+    health.dap.sourceLaunchVersion !== 1 ||
     health.dap.address !== `127.0.0.1:${String(dapPort)}` ||
     health.managedIdleShutdown?.enabled !== true ||
     health.managedIdleShutdown.timeoutMs !== idleTimeoutMs

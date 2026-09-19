@@ -23,10 +23,14 @@ go run -race ./examples/level5-workflow
 go test -race ./examples/...
 ```
 
-In VS Code, install the bingo extension, choose **bingo DAP: launch example
-(stop on entry)**, press F5, and select a level from the picker. The pre-launch
-task rebuilds all five binaries in `build/examples/` with
-`-gcflags="all=-N -l"`. The only other root debug configuration joins an
+In VS Code, install the bingo extension, set a suggested breakpoint, choose
+**bingo: Debug example**, press F5, and select a level from the picker. The
+server builds only the selected source directory with `-gcflags="all=-N -l"`;
+no manual build, `just`, or pre-launch task is required for F5. Alternatively,
+open a level's `main.go` and run **Bingo: Debug Go Package** without a launch
+configuration. Execution runs to your breakpoints by default; add
+`"stopOnEntry": true` only when you want the early entry stop.
+The other root choices launch the spawntree demo from source or join an
 existing bingo session. **Bingo Concurrency** automatically joins the selected
 DAP session and makes the increasing hierarchy visible from level 1's single
 application goroutine through level 5's nested workflows and stages.
@@ -46,5 +50,6 @@ worker and workflow status lines can interleave differently between runs, but
 every level's final summary is sorted or otherwise deterministic.
 
 [`spawntree`](spawntree/) remains the dedicated advanced hierarchy and lifecycle
-telemetry demo. Build it separately with `just build-spawntree` and follow
+telemetry demo. Choose **bingo: Debug spawntree telemetry demo** in VS Code,
+or build it separately with `just build-spawntree` for terminal clients and follow
 [`docs/ConcurrencyTelemetry.md`](../docs/ConcurrencyTelemetry.md).

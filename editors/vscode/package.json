@@ -2,7 +2,7 @@
   "name": "bingo",
   "displayName": "bingo Debugger",
   "description": "Debug Go concurrency with bingo's DAP adapter and live goroutine visualization.",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "bingosuite",
   "license": "MIT",
   "private": true,
@@ -41,6 +41,16 @@
   },
   "contributes": {
     "commands": [
+      {
+        "command": "bingo.debugGoPackage",
+        "title": "Bingo: Debug Go Package",
+        "icon": "$(debug-start)",
+        "enablement": "isWorkspaceTrusted"
+      },
+      {
+        "command": "bingo.showServerOutput",
+        "title": "Bingo: Show Server Output"
+      },
       {
         "command": "bingo.concurrency.openEditor",
         "title": "Bingo: Open Concurrency Beside Source",
@@ -100,6 +110,13 @@
       ]
     },
     "menus": {
+      "editor/title": [
+        {
+          "command": "bingo.debugGoPackage",
+          "when": "resourceLangId == go && resourceScheme == file && isWorkspaceTrusted",
+          "group": "navigation@10"
+        }
+      ],
       "view/title": [
         {
           "command": "bingo.concurrency.refresh",
@@ -180,7 +197,20 @@
               },
               "program": {
                 "type": "string",
-                "description": "Absolute path to the compiled Go binary to launch."
+                "description": "Server-local Go package directory in debug mode, or compiled binary in exec mode. Relative paths resolve against cwd."
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "debug",
+                  "exec"
+                ],
+                "default": "exec",
+                "description": "debug builds a local Go package directory with optimizations disabled; exec launches an existing binary. Omitted mode retains legacy exec behavior."
+              },
+              "cwd": {
+                "type": "string",
+                "description": "Server-local working directory for the target and base for relative program paths. Defaults to the package directory in debug mode, or the server's working directory in exec mode."
               },
               "args": {
                 "type": "array",
@@ -290,21 +320,25 @@
         },
         "initialConfigurations": [
           {
-            "name": "bingo: Launch binary",
+            "name": "bingo: Debug Go Package",
             "type": "bingo",
             "request": "launch",
-            "program": "${workspaceFolder}/build/target/target",
-            "stopOnEntry": true,
-            "serverMode": "auto",
-            "managementHost": "127.0.0.1",
-            "managementPort": 6060,
-            "dapHost": "127.0.0.1",
-            "dapPort": 4711,
-            "serverReadyTimeoutMs": 5000,
-            "managedIdleTimeoutMs": 30000
+            "mode": "debug",
+            "program": "${workspaceFolder}"
           }
         ],
         "configurationSnippets": [
+          {
+            "label": "bingo: Debug Go Package",
+            "description": "Build and debug a Go package directory without a pre-launch task.",
+            "body": {
+              "name": "bingo: Debug Go Package",
+              "type": "bingo",
+              "request": "launch",
+              "mode": "debug",
+              "program": "${workspaceFolder}"
+            }
+          },
           {
             "label": "bingo: Launch binary",
             "description": "Launch a compiled Go binary through a reused or managed bingo server.",
@@ -312,17 +346,8 @@
               "name": "bingo: Launch binary",
               "type": "bingo",
               "request": "launch",
-              "program": "${workspaceFolder}/build/target/target",
-              "args": [],
-              "env": [],
-              "stopOnEntry": true,
-              "serverMode": "auto",
-              "managementHost": "127.0.0.1",
-              "managementPort": 6060,
-              "dapHost": "127.0.0.1",
-              "dapPort": 4711,
-              "serverReadyTimeoutMs": 5000,
-              "managedIdleTimeoutMs": 30000
+              "mode": "exec",
+              "program": "${workspaceFolder}/build/target/target"
             }
           },
           {
@@ -332,14 +357,7 @@
               "name": "bingo: Join session",
               "type": "bingo",
               "request": "attach",
-              "session": "replace-with-session-id",
-              "serverMode": "auto",
-              "managementHost": "127.0.0.1",
-              "managementPort": 6060,
-              "dapHost": "127.0.0.1",
-              "dapPort": 4711,
-              "serverReadyTimeoutMs": 5000,
-              "managedIdleTimeoutMs": 30000
+              "session": "replace-with-session-id"
             }
           },
           {
@@ -350,15 +368,7 @@
               "type": "bingo",
               "request": "attach",
               "pid": 1234,
-              "binaryPath": "${workspaceFolder}/build/target/target",
-              "stopOnEntry": true,
-              "serverMode": "auto",
-              "managementHost": "127.0.0.1",
-              "managementPort": 6060,
-              "dapHost": "127.0.0.1",
-              "dapPort": 4711,
-              "serverReadyTimeoutMs": 5000,
-              "managedIdleTimeoutMs": 30000
+              "binaryPath": "${workspaceFolder}/build/target/target"
             }
           }
         ]
