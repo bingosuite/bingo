@@ -1,0 +1,35 @@
+name: Notify editor repositories
+
+on:
+  workflow_run:
+    workflows: [Build packages, Release]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      ((github.event.workflow_run.name == 'Build packages' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        (github.event.workflow_run.event == 'push' || github.event.workflow_run.event == 'workflow_dispatch')) ||
+       (github.event.workflow_run.name == 'Release' && github.event.workflow_run.event == 'release'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # This privileged job never checks out or executes the completed run's code.
+      - uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.EDITOR_DISPATCH_TOKEN }}
+          script: |
+            const run = context.payload.workflow_run;
+            for (const repo of ['bingo-vscode', 'bingo-nvim']) {
+              await github.rest.repos.createDispatchEvent({
+                owner: 'bingosuite', repo, event_type: 'bingo-build',
+                client_payload: { repository: context.repo.owner + '/' + context.repo.repo,
+                  run_id: run.id, sha: run.head_sha }
+              });
+            }

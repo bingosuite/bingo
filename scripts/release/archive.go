@@ -2,14 +2,12 @@ package main
 
 import (
 	"archive/tar"
-	"archive/zip"
 	"compress/gzip"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -37,31 +35,6 @@ func (e archiveEntry) bytes() ([]byte, error) {
 		return nil, fmt.Errorf("archive input is not a regular file: %s", e.source)
 	}
 	return os.ReadFile(e.source)
-}
-
-func directoryEntries(root, directory string) ([]archiveEntry, error) {
-	var entries []archiveEntry
-	err := filepath.WalkDir(filepath.Join(root, directory), func(file string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		if !entry.Type().IsRegular() {
-			return fmt.Errorf("non-regular companion file: %s", file)
-		}
-		name, err := filepath.Rel(root, file)
-		if err != nil {
-			return err
-		}
-		entries = append(entries, archiveEntry{name: filepath.ToSlash(name), source: file, mode: 0o644})
-		return nil
-	})
-	if err == nil && len(entries) == 0 {
-		err = fmt.Errorf("empty companion directory: %s", directory)
-	}
-	return entries, err
 }
 
 func safeArchivePath(name string) bool {
@@ -171,15 +144,6 @@ func verifyArchive(filename, root string, entries []archiveEntry) (retErr error)
 	return nil
 }
 
-func copyFile(source, destination string, mode fs.FileMode) error {
-	entry := archiveEntry{source: source}
-	content, err := entry.bytes()
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(destination, content, mode)
-}
-
 func hashBytes(content []byte) string {
 	hash := sha256.Sum256(content)
 	return hex.EncodeToString(hash[:])
@@ -229,44 +193,6 @@ func verifyChecksums(directory, name string, assets []string) error {
 	}
 	if string(content) != string(expected) {
 		return fmt.Errorf("checksum file does not match the exact asset set")
-	}
-	return nil
-}
-
-func verifyVSIXServer(filename, server string) (retErr error) {
-	expected, err := fileHash(server)
-	if err != nil {
-		return err
-	}
-	archive, err := zip.OpenReader(filename)
-	if err != nil {
-		return err
-	}
-	defer func() { retErr = errors.Join(retErr, archive.Close()) }()
-	found := false
-	for _, file := range archive.File {
-		if file.Name != "extension/bin/bingo" {
-			continue
-		}
-		if found {
-			return fmt.Errorf("duplicate VSIX server")
-		}
-		found = true
-		reader, err := file.Open()
-		if err != nil {
-			return err
-		}
-		hash := sha256.New()
-		_, copyErr := io.Copy(hash, reader)
-		if err := errors.Join(copyErr, reader.Close()); err != nil {
-			return err
-		}
-		if hex.EncodeToString(hash.Sum(nil)) != expected {
-			return fmt.Errorf("VSIX and standalone server bytes differ")
-		}
-	}
-	if !found {
-		return fmt.Errorf("VSIX has no bundled server")
 	}
 	return nil
 }

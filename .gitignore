@@ -42,12 +42,3 @@ test/coverage.out
 .DS_Store
 .idea/
 .vscode-test/
-
-# VS Code companion extension outputs
-/editors/vscode/node_modules/
-/editors/vscode/bin/
-/editors/vscode/dist/
-/editors/vscode/*.vsix
-
-# Neovim companion native server
-/editors/neovim/bin/

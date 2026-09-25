@@ -7,7 +7,7 @@
 
 [![Go CI](https://github.com/bingosuite/bingo/actions/workflows/go.yml/badge.svg)](https://github.com/bingosuite/bingo/actions/workflows/go.yml)
 [![Debugger E2E](https://github.com/bingosuite/bingo/actions/workflows/debugger-e2e.yml/badge.svg)](https://github.com/bingosuite/bingo/actions/workflows/debugger-e2e.yml)
-[![VS Code extension](https://github.com/bingosuite/bingo/actions/workflows/vscode-extension.yml/badge.svg)](https://github.com/bingosuite/bingo/actions/workflows/vscode-extension.yml)
+[![VS Code extension](https://github.com/bingosuite/bingo-vscode/actions/workflows/vscode-extension.yml/badge.svg)](https://github.com/bingosuite/bingo-vscode/actions/workflows/vscode-extension.yml)
 [![CodeQL](https://github.com/bingosuite/bingo/actions/workflows/codeql.yml/badge.svg)](https://github.com/bingosuite/bingo/actions/workflows/codeql.yml)
 
 bingo is a standalone debugger that combines a standard
@@ -18,8 +18,8 @@ hierarchy, OS-thread state, source locations, and lifecycle changes to visual or
 terminal observers.
 
 **Start here:** [Setup](docs/SETUP.md) ·
-[VS Code](editors/vscode/README.md) ·
-[Neovim](editors/neovim/README.md) ·
+[VS Code](https://github.com/bingosuite/bingo-vscode) ·
+[Neovim](https://github.com/bingosuite/bingo-nvim) ·
 [Examples](examples/README.md) ·
 [Architecture](AGENTS.md) ·
 [Roadmap](docs/ROADMAP.md)
@@ -47,20 +47,13 @@ bounded goroutine events, and exact per-envelope version enforcement.
 ## Quick start
 
 bingo supports **Apple Silicon macOS and x86-64 Linux**. In VS Code, install the
-matching platform VSIX from a [release](https://github.com/bingosuite/bingo/releases)
-that provides one, using **Extensions: Install from VSIX...**. Release artifacts
-are not assumed to be available yet; the source fallback is:
-
-```sh
-git clone https://github.com/bingosuite/bingo.git
-cd bingo
-bash scripts/package-vscode.sh install
-```
-
-Building the extension needs Go 1.25.5 or newer, Node.js 22, npm, and the `code`
-CLI; macOS also needs Xcode Command Line Tools. `just vscode-install` is an
-optional shorthand for the same **single-build, verified** install, not the full
-release test suite.
+matching platform VSIX from [bingo-vscode releases](https://github.com/bingosuite/bingo-vscode/releases)
+or its successful CI artifacts, using **Extensions: Install from VSIX...**.
+Editor source builds and installation instructions live in the
+[VS Code repository](https://github.com/bingosuite/bingo-vscode); [bingo-nvim](https://github.com/bingosuite/bingo-nvim) owns the Neovim plugin.
+This repository builds the server and terminal clients.
+See [repository ownership and CI setup](docs/EDITOR_REPOSITORIES.md) for the
+build handoff and required GitHub secrets.
 
 Reload VS Code, open a saved Go file in a runnable `main` package, and run
 **Bingo: Debug Go Package**. The command uses that file's directory, or the
@@ -192,8 +185,6 @@ just build                 # build for the current supported host
 just test                  # run Go tests
 just vet                   # run Go vet with the host's native build tag
 just integration           # run non-native integration tests
-just vscode-check          # lint, typecheck, test, and bundle the extension
-just neovim-check          # parse and test the Neovim companion
 just e2e-linux             # native Linux acceptance suite
 just e2e-darwin            # signed native macOS acceptance suite
 ```
@@ -201,12 +192,10 @@ just e2e-darwin            # signed native macOS acceptance suite
 On macOS, use the `just` recipes or pass `-tags bingonative` to Go commands.
 Plain `go test ./...` cannot compile the Darwin backend.
 
-Local installation and release verification are separate:
+Build a local native release preview:
 
 ```sh
-just vscode-local-package  # one verified VSIX; no installation
-just vscode-package        # full extension checks + two-build reproducibility
-just release-package       # dev preview: native tools, VSIX, Neovim and checksums
+just release-package       # dev preview: native server, terminal clients and checksums
 ```
 
 The [release workflow](.github/workflows/release.yml) builds both supported
@@ -221,8 +210,8 @@ artifact names, checksum verification, and native-debug verification limits.
 | Resource | Use it for |
 | --- | --- |
 | [Setup guide](docs/SETUP.md) | Prerequisites, installation, frontend setup, platform notes, and troubleshooting |
-| [VS Code extension](editors/vscode/README.md) | Launch, attach, join, remote endpoints, logs, and extension development |
-| [Neovim companion](editors/neovim/README.md) | `nvim-dap` configuration, managed startup, and session commands |
+| [VS Code extension](https://github.com/bingosuite/bingo-vscode) | Launch, attach, join, remote endpoints, logs, and extension development |
+| [Neovim companion](https://github.com/bingosuite/bingo-nvim) | `nvim-dap` configuration, managed startup, and session commands |
 | [Concurrency telemetry](docs/ConcurrencyTelemetry.md) | End-to-end DAP driver and WebSocket observer runbook |
 | [Progressive examples](examples/README.md) | Suggested breakpoints and expected telemetry |
 | [Architecture and contributor guide](AGENTS.md) | System design, invariants, code conventions, and test commands |

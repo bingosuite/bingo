@@ -79,7 +79,7 @@ if [[ "$target_os" == darwin ]]; then
   if [[ "$reproducible" == 1 && "$command_name" == bingo ]]; then
     # dyld needs LC_UUID; normalize before signing, never remove it.
     node --input-type=module -e \
-      'import { normalizeMachOUUID } from "./editors/vscode/scripts/normalize-mach-o-uuid.mjs"; normalizeMachOUUID(process.argv[1]);' \
+      'import { normalizeMachOUUID } from "./scripts/normalize-mach-o-uuid.mjs"; normalizeMachOUUID(process.argv[1]);' \
       "$temporary"
   fi
   signing=(--sign - --force --timestamp=none --identifier "bingosuite.$command_name")

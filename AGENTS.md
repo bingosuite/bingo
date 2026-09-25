@@ -82,56 +82,34 @@ Darwin server builds use `bingonative` and the debugger entitlement; the
 ad-hoc signature is **not notarization**. Explicit linux/amd64 cross-compilation
 from Apple Silicon is allowed, but never counts as native runtime verification.
 
-`BINGO_REPRODUCIBLE=1` reuses the VS Code Mach-O UUID normalizer before signing
-the Darwin **server** (Node from `.nvmrc` is needed only for that build).
-Terminal clients use `CGO_ENABLED=0` on both platforms: Go's deterministic
-internal Mach-O linker emits no `LC_UUID`, so clients must skip the external
-linker's UUID normalizer. They are still signed and release builds compare two
-builds of each. Never remove a server UUID or normalize an already-signed output.
-`BINGO_VERSION` accepts `dev` or
-a `vMAJOR.MINOR.PATCH` tag with optional prerelease; `BINGO_COMMIT` accepts a full
-Git SHA, an explicitly dirty SHA, or `unknown`. Only the server embeds them.
-`bingo -version` reports build identity, platform, toolchain and the independent
-wire version without entering the server lifecycle; help and invalid arguments
-also return before creating listeners. Positional arguments are rejected.
+`BINGO_REPRODUCIBLE=1` uses [scripts/normalize-mach-o-uuid.mjs](scripts/normalize-mach-o-uuid.mjs)
+before signing the Darwin server; Node from .nvmrc is required only for that build.
+Terminal clients use CGO_ENABLED=0 and skip UUID normalization. Never normalize
+an already-signed binary or remove a server UUID. The build helper replaces the
+output only after build/signature verification. Version and commit are embedded
+in the server; `bingo -version` returns before entering the server lifecycle.
 
-Bare `just` lists recipes without starting a process; server recipes build only
-the server, never an unrelated example target, and builds preserve Go's cache.
-[`scripts/package-vscode.sh`](scripts/package-vscode.sh) is the local fast path:
-preflight, locked npm restore with lifecycle scripts disabled, one `package`
-(including its `vscode:prepublish` bundle build), exact package verification.
-Only its explicit `install` argument invokes `code --install-extension`, after
-checking that CLI before any expensive work. `just vscode-local-package` never
-installs; `just vscode-package` retains full source checks and two-build binary/
-VSIX reproducibility. Neither release jobs nor validation install an editor.
+[scripts/release](scripts/release/) now packages only the native server and three
+terminal clients. Every binary is built twice and compared. Sorted archives have
+fixed timestamps, ownership, regular-file contents and checked modes/hashes.
+Only dev previews accept dirty source; tags require a clean matching HEAD.
 
-[`scripts/release`](scripts/release/) assembles native terminal tools, the
-existing platform VSIX, a prepared Neovim runtime, metadata and platform-named
-SHA256SUMS files. It reuses the reproducible VSIX server byte-for-byte in both
-tar archives, builds each terminal client twice, checks exact archive contents
-and modes, and checks hashes before promoting staged files. Archives have sorted
-regular-file paths, fixed ownership/timestamps and no symlinks. Suite release
-tags, the extension manifest version and wire version are independent metadata.
-Only `dev` previews accept dirty source; tagged builds require a clean matching
-tag/HEAD/resolved-commit identity before and after packaging.
+[Build packages](.github/workflows/build-packages.yml) validates and packages each
+main push on native Linux amd64 and Darwin arm64. [Release](.github/workflows/release.yml)
+retains manual tag builds, optional upload to an existing draft, and the published
+release trigger. Release checkouts must match github.sha and the selected tag;
+dispatch historical tags with --ref set to that tag to preserve cache authority.
+The upload job has no checkout and rechecks tag identity, release state and exact
+checksum sets. Hosted Darwin health smoke is not native debugger acceptance.
 
-The [release workflow](.github/workflows/release.yml) uses native Ubuntu x86-64
-and `macos-15` arm64 builders, Go from `go.mod`, and Node from `.nvmrc`.
-Resolve and build checkouts are pinned directly to `github.sha`, and the
-validated tag must peel to that exact triggering commit before building.
-Actions cache authority follows the event ref, not a later checkout: never
-execute an independently selected tag under a default-branch dispatch's cache
-scope. Historical tags must be dispatched with `--ref` set to that tag;
-read-only repository permissions and disabling automatic caches alone do not
-replace this trust boundary. Regression cases execute the actual context guard
-over real Git refs, including annotated tags, mismatched checkouts/contexts,
-and same-named branches.
-Manual dispatch defaults to Actions artifacts only. An explicit upload requires
-an existing draft; it never creates or publishes one. The existing published
-release trigger remains supported. Only the final, checkout-free upload job
-has write permission, and it checks the tag SHA, release state and exact
-per-platform checksum sets. Health/idle smoke on hosted Darwin is not native
-debugger acceptance; the existing local Darwin E2E procedure still applies.
+After successful main packaging or a published-release build,
+[Notify editor repositories](.github/workflows/notify-editors.yml) dispatches the
+immutable run ID and SHA to bingo-vscode and bingo-nvim. Its privileged job runs
+no checked-out code. EDITOR_DISPATCH_TOKEN needs Contents: write on only those
+two repositories. Editor CI independently verifies the run, downloads checksummed
+native assets, uses sources/fixtures from that exact commit, and packages the
+same binary unchanged. Plugin releases remain manual. See
+[repository split and CI setup](docs/EDITOR_REPOSITORIES.md).
 
 ### Platform scope
 
@@ -155,8 +133,8 @@ debugger acceptance; the existing local Darwin E2E procedure still applies.
 | [cmd/dapcli](cmd/dapcli/) | Interactive readline client that drives a session over DAP (mirrors `cmd/cli`'s UX). Talks to the server's `-dap-addr` listener; can create a session or `-session` join an existing one. |
 | [cmd/internal/repl](cmd/internal/repl/) | Shared interactive-client loop: readline interrupt/cancellation semantics, refresh-safe async output, and frame-index validation. |
 | [cmd/wsmon](cmd/wsmon/) | Read-only terminal telemetry observer. `-session`-joins a running session over WebSocket and live-renders the goroutine spawn tree + OS threads + created/exited lifecycle deltas from the `EventGoroutineSnapshot` stream, reporting included/total honestly and distinguishing wire omission from a clipped runtime scan. Never drives execution — the WS-observes half of the DAP-drives/WS-observes demo. |
-| [editors/vscode](editors/vscode/) | Platform-packaged TypeScript companion extension. Owns debugger type `bingo`, manages the shared server, and hosts the Bingo Concurrency Activity Bar observer plus its read-only DAP stack/locals inspector. |
-| [editors/neovim](editors/neovim/) | Lua companion for `nvim-dap`. Mirrors managed server discovery/start, drives launch/attach/join over DAP, and exposes the announced session ID for a separate WebSocket observer. |
+| [bingo-vscode](https://github.com/bingosuite/bingo-vscode/blob/main/) | Platform-packaged TypeScript companion extension. Owns debugger type `bingo`, manages the shared server, and hosts the Bingo Concurrency Activity Bar observer plus its read-only DAP stack/locals inspector. |
+| [bingo-nvim](https://github.com/bingosuite/bingo-nvim/blob/main/) | Lua companion for `nvim-dap`. Mirrors managed server discovery/start, drives launch/attach/join over DAP, and exposes the announced session ID for a separate WebSocket observer. |
 | [cmd/target](cmd/target/) | Trivial target program for manual testing. |
 | [examples/level1-loop](examples/level1-loop/) … [examples/level5-workflow](examples/level5-workflow/) | Progressive debugger targets, selected by the root VS Code launch picker and built together with `just build-examples` (see [examples/README.md](examples/README.md)). |
 | [examples/spawntree](examples/spawntree/) | Concurrency demo target: a deterministic main → supervisor → worker×N goroutine spawn tree for exercising the telemetry stream (see [docs/ConcurrencyTelemetry.md](docs/ConcurrencyTelemetry.md)). |
@@ -2193,7 +2171,7 @@ A Go spec generates it from the packer and diff-gates it (regenerate with
 decoder reaches the identical verdict on the identical wire strings — including
 that Node's replacement-mode UTF-8 decoding of the raw bytes matches what
 `encoding/json` produced. Moving the limit means regenerating the fixture and
-re-running the VS Code suite in the same change; neither side can move it alone.
+running the triggered VS Code compatibility suite against that exact build; coordinate producer and consumer changes.
 
 `MaxLifecycleDeltaIDs` (8192) is the same idea applied to `Created`/`Exited`.
 Those are NEVER trimmed, so they carry no packing limit — what bounds them is the
@@ -2842,194 +2820,9 @@ richer concurrency visualizations stay on the WebSocket side. The two coexist on
 one hub session (this is the whole point — an IDE gets a working debugger, the
 bingo UI gets its bonus features, both against the same tracee).
 
-**VS Code companion — managed transport, separate from Go tooling.**
-[editors/vscode](editors/vscode/) packages as extension ID
-`bingosuite.bingo`, registers a
-`DebugAdapterDescriptorFactory` for debugger type `bingo`. The cancellable
-substituted-configuration hook first ensures a compatible server; the factory returns
-`DebugAdapterServer(dapPort, dapHost)` (defaults `127.0.0.1:4711`). It never
-registers type `go`, launches or validates `dlv`, or calls into Microsoft's Go
-extension. Keep `golang.go` installed for gopls/navigation/formatting/tests; a
-`"type": "bingo"` launch is owned entirely by the companion and this DAP server.
-The explicit IPv4 default matches `internal/dap/server.go`'s `tcp4` listener;
-do not change it to `localhost`, which older VS Code/Node runtimes can resolve
-to `::1` without falling back to IPv4.
-**Bingo: Debug Go Package**, the Go editor action, and F5 with no launch
-configuration select the active saved Go file's directory, or an explicitly
-selected/single workspace root that contains Go source. Never guess a nested
-package or one of several roots. Generated configurations explicitly set
-`mode:"debug"` and an absolute package `program`/`cwd`; the server owns the Go
-build, its progress/errors, and artifact lifetime. Existing program configurations
-with no mode retain `exec` semantics. `stopOnEntry` remains false by default.
-The extension validates launch (`program`, `mode`, `cwd`), existing-session join (`session`),
-and OS-process attach (`pid`, optional `binaryPath`) before connecting.
-`serverMode`/management/DAP/timing fields are client-owned and remain in VS
-Code's raw launch/attach arguments; Go's JSON decoder ignores those unknown
-fields, so they never enter the bingo command payload. Do not add them to the
-wire protocol or `launchConfig`.
-
-**Neovim companion — the same managed transport through `nvim-dap`.**
-[editors/neovim](editors/neovim/) registers a function-form `dap.adapters.bingo`
-that asynchronously resolves to the existing TCP listener; it does not
-implement another adapter or invoke Delve. `auto` mode mirrors the VS Code
-health contract and spawn safety: exact service/management/wire/session-event
-and source-launch compatibility, loopback-only start, detached argv-based spawn,
-endpoint-level coalescing, persistent logs, and server-owned idle teardown. `connectOnly`
-bypasses health and spawn. The prepared native binary is generated under
-`editors/neovim/bin/` by the opt-in
-`bash editors/neovim/scripts/prepare.sh` (or `just neovim-prepare`) and is never
-committed; runtime falls back to `PATH` or explicit `server.binary`. The script
-delegates to the shared `scripts/build-binary.sh`; no just/Node or startup-time
-server build is required. The monorepo lazy.nvim spec adds the companion's
-runtimepath and explicitly loads `plugin/bingo.lua` before setup. Healthcheck
-uses the same binary resolver without probing or spawning; the bundled path is
-anchored when the module loads so changing editor cwd cannot move it.
-
-`:BingoDebug [package-directory]` and the primary `Debug Go package`
-configuration send `mode:"debug"` with `stopOnEntry:false`. Without an argument,
-use the current regular Go buffer's directory, otherwise Neovim's cwd. The
-server alone compiles source and owns build cancellation/artifacts. `BingoLaunch`
-and the binary configuration send `mode:"exec"` and retain the entry stop;
-an omitted mode in a user configuration remains legacy exec. Local auto source
-paths and explicit `cwd` are checked as directories before transport and made
-absolute against the editor's cwd; relative program is based on explicit cwd.
-The default source cwd is the package directory. Exec without cwd retains the
-server cwd. `connectOnly` never probes or locally validates/rewrites server
-paths. Reject other modes and attach/join `mode`/`cwd`, and abort interrupted
-prompts, including the optional attach binary prompt, before `dap.run`.
-Commands decode Ex path escaping without a shell; an attach path is the rest of
-the command after its PID, so spaces survive.
-
-The pinned nvim-dap initialization warning timer includes the delayed launch
-response. Source launches set its existing `initialize_timeout_sec` to 130
-(two-minute server build deadline plus handshake), while exec/attach retain 10;
-nvim-dap has no hard timeout on its ordinary launch request.
-
-Neovim health compatibility uses the exact wire version **1.4**; tests derive
-their fixture from Go's service/API/wire/DAP constants, not the Lua consumer.
-`dap.sourceLaunchVersion` must exactly match `protocol.DAPSourceLaunchVersion`
-(1); an incompatible running server is reported for operator upgrade, never
-killed.
-Auto management/DAP endpoints must be distinct. Request validation runs before
-adapter transport; DNS/IPv6 host normalization must reject header delimiters
-without changing a scoped IPv6 interface's case. The health reader supports
-Content-Length/chunked/EOF framing, caps headers/trailers at 8 KiB and the whole
-response at 64 KiB, and completes framed bodies without EOF. A single absolute
-timer bounds slow-drip peers. Each ensure attempt owns its cancellable probe and
-retry timer; disposal fences stale callbacks, closes handles, and never signals
-the child/shared server. A timer allocation/start error must settle its waiters,
-not leave an attempt with no future wakeup.
-
-The plugin listens on nvim-dap's literal
-`event_bingo/session/v1` listener key, validates the strict two-field payload,
-and emits `User BingoSession`; `Session.on_close` owns cleanup across terminate,
-disconnect, and transport failure. DAP remains drive-only. The plugin does not
-reimplement RFC 6455 in Lua: concurrency telemetry stays on the WebSocket side
-and uses `cmd/wsmon` until a bounded native observer exists.
-Only registered live bingo sessions in the current setup generation may
-announce IDs. Duplicate announcements are idempotent; conflicting IDs are
-reported and ignored. Cleanup restores an owned previous `on_close` hook, even
-across repeated setup, and queued old-generation closes/events cannot remove or
-revive a new session. Adapter callbacks are generation-fenced too: an old
-success cannot connect and an old failure cannot report against a replacement
-setup. Disposal restores prior adapter/listener registrations only while still
-owned, and removes only configurations added by this setup.
-
-**VS Code connect-or-start invariants.** Default `serverMode:"auto"` is local
-only: management `127.0.0.1:6060`, DAP `127.0.0.1:4711`, readiness 5s, managed
-idle grace 30s. Its management and DAP endpoints must be distinct; an identical
-pair is rejected synchronously before probes or spawn, while `connectOnly`
-remains permissive. It health-checks before spawning and requires
-`service:"bingo"`, management API 1, the exact wire version, enabled DAP,
-`dap.sessionEventVersion:1`, `dap.sourceLaunchVersion:1`, and
-the expected DAP port/host (wildcard advertised hosts retain the configured
-connect host). Only connection refusal permits spawning; a non-bingo or
-incompatible occupant fails safely. `connectOnly` bypasses management and spawn
-for remote/custom workflows. Health reads have both response abort/error
-handling and an independent wall-clock deadline; readiness probes receive only
-the remaining overall budget, so a slow-drip HTTP peer cannot hold F5 open. The
-poller probes immediately after spawn, uses the normal 100ms cadence outside
-the last 50ms, then a 10ms cadence while every request can retain at least a
-25ms wall-clock budget (covered by a real localhost test). When another useful
-probe no longer fits it waits out the absolute deadline rather than issuing a
-sub-millisecond request or spinning.
-
-One extension host coalesces in-flight ensures by normalized endpoint. Each caller
-owns a cancellable waiter: cancelling one cannot abort another, but cancelling
-the last retires that exact attempt and cancels probes/delays and awaited
-binary/log prerequisites before they can spawn. A late completion cannot remove
-a replacement attempt. VS Code's startup token and the preparation notification's
-Cancel action both reach this path; cancellation returns `undefined` and shows
-no error popup. Keep that distinct from `null`, which asks VS Code to open
-launch.json for an uncancelled token. Already-reported startup errors also return
-`undefined`. **Bingo: Show Server Output** and error actions expose the
-management diagnostics and persistent log path. Across
-hosts, listener binding arbitrates races: a child that loses is success if the
-compatible winner becomes healthy before the deadline. The bundled child is
-spawned with argv (never a shell), detached/unref'd with ignored stdin and
-stdout/stderr inherited from a persistent extension-storage log file. The
-extension NEVER kills a server, including one it spawned; disposal only aborts
-bounded probes. Cancellation is rechecked after every awaited binary/log
-prerequisite and immediately before spawn, because a child started after
-deactivation cannot be reclaimed without violating the never-kill contract.
-Server-owned `-idle-timeout` is the sole teardown owner.
-
-VSIXes are platform-specific: `linux-x64` contains only linux/amd64 bingo;
-`darwin-arm64` contains only a `bingonative` arm64 binary codesigned with
-[entitlements.plist](entitlements.plist). Runtime resolves only
-`bin/bingo` + `bin/target.json` inside the installed/development extension,
-checks the target, and repairs executable mode if extraction lost it.
-`prepare-binary.mjs` delegates native build/sign/version metadata to
-`scripts/build-binary.sh` with `BINGO_REPRODUCIBLE=1`, then writes the VSIX target
-marker. Preparation never deletes the prior binary/marker before invoking the
-helper: compile, signing, or verification failure must preserve both. Unexpected
-files remain visible to the exact archive verifier rather than being deleted.
-Package builders are native linux/amd64 or darwin/arm64; Apple Silicon
-may also cross-build the Linux package, never execute its debugger.
-Packaging rebuilds/signs twice and requires identical binary and VSIX hashes;
-tests drift-check service/API/wire constants against Go source and inspect exact
-archive contents (one native binary plus the two bundles and original icon),
-target metadata, architecture, mode, and entitlements.
-The extension package version is the installed-runtime upgrade boundary:
-material shipped behavior changes must bump both `package.json` and the lockfile
-or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.7.1**) in source and VSIX
-metadata.
-The root Run and Debug dropdown exposes three `"type":"bingo"` choices:
-debug one of five progressive source packages through a `pickString`, debug the
-spawntree source package, and join a running session. Normal F5 uses the installed
-VSIX and asks the server to build only the selected package, with no pre-launch
-task or `just` dependency; the build tasks are optional terminal-client helpers.
-Contributor source-extension development runs
-`just vscode-dev` and launches an Extension Development Host explicitly from
-the CLI with
-`code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"`,
-outside the root launch configurations. The recipe restores the exact npm
-lockfile with lifecycle scripts disabled before building. The macOS packaging
-job uses the supported `macos-15` arm64 image, asserts `uname -m`, and runs the
-real packaged-server smoke. Both package matrix legs run the pinned Electron
-activation/view/custom-event acknowledgement test; linux additionally runs the
-real packaged DAP→WebSocket graphical-model E2E. The floor/current Electron matrix
-passes `VSCODE_TEST_VERSION` to the runner, which passes its selected version
-(including the default) into the test host; the suite asserts `vscode.version`
-matches before UI work so a mislabeled matrix cannot silently exercise a fallback.
-Darwin native-debug execution
-requires local/self-hosted Apple Silicon, where the same E2E covers all five
-examples. That native packaged gate calls the production `goPackageConfiguration`
-helper from each active Go source path and sends source mode/package cwd to the
-packaged server, which must build the targets itself. Neither the harness nor
-the workflow prebuilds example binaries. Discovery and `initialized` share a
-130-second deadline around the server's two-minute build budget; explicit
-`stopOnEntry:true` retains the entry, breakpoint, locals/source-DOM, observer,
-and single-terminate assertions. Both tests observe server-owned idle exit on success. On failure the
-smoke may SIGKILL only the detached process group it created; the packaged E2E
-may signal only its exact captured server PID. Cleanup is test-only and must
-never enter extension production code.
-Apple's external linker can vary `LC_UUID` even for identical cgo inputs, but
-current dyld rejects binaries with `-no_uuid`; `normalize-mach-o-uuid.mjs`
-therefore derives a stable UUID from the unsigned Mach-O with its UUID and
-linker signature zeroed, writes it back, then codesigns. Preserve that
-normalize-before-sign order and the repeated two-build gate.
+Editor runtime invariants and tests are maintained in
+[bingo-vscode](https://github.com/bingosuite/bingo-vscode) and [bingo-nvim](https://github.com/bingosuite/bingo-nvim). Both drive the
+server through DAP and observe the existing health/wire contracts.
 
 **Architecture — a translator at the `hub.WSConn` seam, ZERO hub changes.**
 `dap.Handler` implements `hub.WSConn` and is registered via
@@ -3085,233 +2878,8 @@ Code extension subscribes at
 activation and keys observers by `DebugSession.id`, never
 `activeDebugSession`.
 
-**Concurrency webview ownership/security.** The extension host, not the
-webview, owns one bounded WebSocket observer/model per live DAP session. It
-reuses the normalized management endpoint, validates protocol 1.4 envelopes,
-payload/string/count limits and seq gaps, and reconnects only while the DAP
-session lives. It sends `CmdGoroutineSnapshot` once after every successful
-WebSocket join and thereafter only for explicit Refresh—never run control.
-The extension host also owns a bounded read-only DAP inspector. On each DAP
-`stopped` event it requests `stackTrace`, then `scopes` and `variables` for the
-selected frame; selecting frames and expanding variables issues only those
-inspection requests. Results are bound to the exact session, telemetry snapshot,
-selected stopped goroutine, and stop generation so delayed responses cannot
-replace a newer stop. The adapter currently exposes stacks only for the stopped
-goroutine, so selecting another graph node reports that limit instead of
-fabricating frames. A stop with no DAP `threadId` is inspected with thread zero,
-which preserves stack/locals after cheap synthetic step stops even though the
-goroutine graph intentionally keeps its previous snapshot. No webview action
-sends Continue, Step, Pause, Kill, or any other run-control command.
-
-With `bingo.concurrency.autoReveal`, a session announcement opens one reusable
-**editor WebviewPanel beside source**, using public `ViewColumn.Beside` and
-`preserveFocus`. Native Run and Debug remains available for Watch, Breakpoints,
-and standard controls; Debug Console stays native. The Activity Bar view remains
-manual access to the same model. Never compete with native debug UI via focus
-timers, private view-move commands, or user/global setting mutations. Stops and
-restart never open/refocus panels. A user-closed panel stays closed for that
-session until explicitly reopened; another session may auto-open it. Each surface
-owns its own delivery generation/listeners and shares the registry/renderer/CSP,
-so closing one never disposes the observer or other surface.
-The Activity Bar title Fit routes to `bingo.concurrency.fitSidebar` and fits only
-its own provider, without opening/revealing the editor. The explicit
-`bingo.concurrency.fit` command opens/fits the editor; in-webview Fit stays local.
-
-Every graph node exposes parent goid, full `CreatedLoc`, and `StartLoc`; the
-creation statement and the possibly wrapped entry function are distinct.
-`SpawnSourceController` serializes reads, keeps only the newest selection, and
-binds results/cache to the exact session/snapshot/selection. Automatic previews
-require a trusted canonical workspace-local regular file, use no-follow
-descriptor opens and inode/canonical-path rechecks, and read at most 256 KiB
-(plus one overflow sentinel byte). Files over 10,000 lines are unavailable;
-the nine-line window caps each displayed line at 300 UTF-16 units including its
-clipping marker. Cache capacity is 16 per snapshot; Refresh invalidates it.
-Source on disk is never claimed to match the binary or unsaved editor content.
-These checks reject traversal/symlink escapes; they are not an atomic filesystem
-snapshot against an actor concurrently replacing trusted workspace directories.
-
-Webview actions carry document generation, rendered revision, debug session ID,
-and selected goid. Source actions name only a metadata location kind/frame ID,
-never a path; the host resolves the current authoritative location and opens a
-local file with native VS Code APIs in a source column. Stale actions from a
-closed/replaced document, frame/selection change, or replacement session are
-ignored. Tracee source and metadata remain textContent, never executable markup.
-Variable rendering caps total nodes at 1,000 and depth at 20, with one expansion
-per shared reference subtree and explicit circular/shared/limit messages.
-The inspector independently caps each frame generation at 2,000 variable nodes,
-256 KiB UTF-8 variable text, 256 references, and 128 requests. Response caps are
-200 frames, 32 scopes, 500 variables, 512 KiB text, 12,000 structural nodes,
-16 levels, 64 fields/object, and 16,384 bytes/string. The controller allows four
-wire requests in flight and applies five-second UI deadlines; expiry cancels the
-UI waiter but retains the wire slot until the underlying request settles.
-Stale scopes never fan out variables requests. Outgoing Continue/Next/StepIn/
-StepOut and incoming `continued` synchronously call `resumed`, invalidating
-inspection before lagging WebSocket state can authorize another read. A later
-`stopped` reopens inspection, including thread zero. Restart is not optimistically
-gated this way: a rejected restart need not produce another stop.
-
-`refresh()` is the manual recovery for EVERY terminal state — a fatal latch or an
-exhausted reconnect ladder — and redials whenever no socket is left, because
-re-sending a snapshot request over a socket that is gone silently strands the
-panel. While no snapshot has arrived the view names the connection state it is
-actually in; claiming "Connecting" after the observer stopped makes the panel
-look busy, so nobody presses the one control that would recover it. An empty tree
-is attributed to the cause the evidence supports — a filter that matched nothing,
-elements the event omitted (when `Totals` proves the debugger had them), or an
-unreadable runtime — never guessed, and each collection's shortfall is reported
-once, beside its own data.
-
-**Two limits, deliberately different (issue #194).** `maximumEnvelopeBytes`
-(2 MiB) is the decoder contract and mirrors `protocol.MaxGoroutineEventBytes`;
-`maximumTransportBytes` = that plus 64 KiB slack is what `ws` gets as
-`maxPayload`. The transport MUST stay strictly above the decoder so a frame that
-violates the contract is delivered and rejected *here*, as a deterministic
-`TelemetryProtocolError`, instead of dying below the decoder where it is
-indistinguishable from a flaky link. Byte checking still happens before parse.
-
-**Fatal vs transient — latch only on a PROVEN violation.** A
-`TelemetryProtocolError` names a specific broken rule, so the same peer will
-produce the identical frame again and the observer latches `connection: "error"`
-without reconnecting; that is what stops the 1 + 6-attempt ladder that used to
-kill the view. Everything else stays transient, including `ws`'s
-`WS_ERR_UNSUPPORTED_MESSAGE_LENGTH`: a frame above the TRANSPORT cap is never
-delivered, so its kind is unknowable, and a legal, deliberately-unbounded
-`Locals`/`Frames`/`Evaluate` broadcast — which the hub sends to EVERY client —
-can land there. Latching on it would kill the view over an event the observer
-never even reads. The 64 KiB slack exists so a frame just over the decoder
-budget is still delivered and can be classified by kind; it cannot make an
-unbounded family fit, so it does not make a transport rejection safe to latch.
-
-The full classification, pinned by real-`ws` tests:
-
-| Frame | Kind readable? | Outcome |
-| --- | --- | --- |
-| > transport cap, any kind | no — `ws` discarded it | transient, reconnects |
-| > decoder cap, bounded kind | yes, via prefix scan | **fatal**, no reconnect |
-| > decoder cap, unbounded kind | yes, via prefix scan | transient, reconnects |
-| > decoder cap, unreadable prefix | no | transient, reconnects |
-| decoded, breaks a named rule | n/a | **fatal**, no reconnect |
-
-**Refresh is the manual recovery path.** The latch stops the *automatic* ladder;
-an explicit user Refresh is not a loop, so it clears the latch and redials.
-
-The acceptance invariant, pinned by test, splits by *what was proven*, not by how
-deep the failure was found. **Terminal, no reconnect attempt consumed:** a
-malformed envelope (bad JSON, wrong version, unknown kind, wrong keys, bad seq),
-and any structural/schema proof inside a *consumed* payload — a value
-`JSON.parse` could not have produced, or, **for a field a validator owns**, a
-wrong-typed value or one outside a closed enum (`SessionState`'s own checks, or
-a typed bounded decoder rejecting its own field schema). Those name a rule the
-peer broke, so the
-identical frame would be produced again. **Transient — closes, redials, and
-spends a reconnect rung:** a genuine socket close, and every *size-derived*
-failure in a consumed **unbounded** kind (string/array/object-width/field-name/
-node-budget/depth), because the contract never bounded that kind and the server
-was entitled to send it. A size violation of a **bounded** kind stays terminal:
-there the cap *is* the contract. Shallow-parsing an unused-but-valid kind is
-explicitly NOT a violation: it leaves the connection open, sets no error, and
-still advances the sequence.
-
-**The retry ladder is incident-cumulative, by design.** The six rungs
-(`100,250,500,1000,2000,4000` ms) are spent across the whole session: an
-automatic reconnect **success does not reset them**, so a burst of legal
-oversized unbounded events each spends a rung and can exhaust the ladder even
-though every frame was lawful. Recovery is the explicit user Refresh, which is
-not a loop and therefore restores a full ladder (and clears a fatal latch).
-That is the intended trade — a lifetime cross-incident reset would let a genuinely
-broken peer retry forever. Do not change this policy without changing the tests
-that pin it.
-
-**Fatality is scoped to the bounded kinds.** The byte check must stay *before*
-the parse, but the kind is only known *after* it — so an over-budget frame gets a
-bounded scan of its envelope prefix (the server emits `v`,`kind`,`seq`,`payload`
-in that order) and is fatal only for `GoroutineSnapshot`/`Goroutines`. Everything
-else on the wire is deliberately unbounded: `EventLocals`/`EventFrames`/
-`EventEvaluate` are broadcast to **every** client and are capped only by the
-debugger's `maxTotalNodes`, so a big variable expansion in the Variables pane can
-legitimately exceed 2 MiB. Latching the view dead on that would be a regression,
-so it stays transient. An unreadable prefix also falls back to transient — never
-latch on a guess.
-
-The same scoping binds the PAYLOAD walk, not just the byte check. `validatePayload`
-applies the bounded family's caps (string length, array length, object width,
-field-name length, node budget, depth) to every consumed kind as this process's
-own defence, but those kinds are mostly ones the contract does not bound — so a
-size overrun there is not a broken promise and must not latch. `walkLimits`/`tooLarge` in
-[telemetry.ts](editors/vscode/src/telemetry.ts) return a plain `Error` for an
-unbounded kind and a `TelemetryProtocolError` for a bounded one. What survives
-that scoping is exactly one non-size terminal case in the generic walk: a value
-`JSON.parse` could not have produced. The walk validates JSON *shape* only, so
-it does NOT reject a field merely for having the wrong type. Field-type and
-schema violations are terminal only where an **owning validator** checks them —
-`SessionState`, which bypasses the walk and checks its own fields, and the
-bounded family's typed decoders, which enforce theirs. A plain JSON number
-is accepted whatever its magnitude or fractional part — demanding a *safe
-integer* there made a stray `1.5` in an `Error` body latch the view dead, which
-is the precise regression this split exists to stop; integer-ness is a rule for
-the bounded family's ids only, enforced by the typed decoders. `SessionState`
-re-applies the split by hand: `sizedString` for its
-opaque `sessionID`, but its `state` is deliberately NOT sized: the enum is
-closed, so any value outside it — including one that is outside it only because
-it is enormous — is a proven violation and is terminal. Gating that on length
-first would report a proof as a transient overrun and retry a frame that can
-never become valid.
-Note the limit this draws: because the walk validates JSON
-*shape*, not per-kind schemas, a consumed unbounded kind carrying a
-well-formed-but-wrong body (`Error.message` as an object, an unknown
-`Continued` field) is accepted and degrades to that kind's fallback rather than
-terminating. Per-kind schema validators for the consumed unbounded kinds are
-deliberately out of scope here. The
-reachable case this closes: a >4080-character Watch expression comes back as an
-`EventError` echoing it, which killed the Concurrency view for the session over
-output the server was entitled to send. `bounded` is latent today — the two
-bounded kinds never reach this walk — and exists so that adding either to
-`consumedKinds` cannot silently downgrade a real violation to a retry.
-
-**Lifecycle deltas are not packed elements.** `created`/`exited` are never
-trimmed by the packer, and the debugger's scan reaches `maxGoroutineScan` (8192),
-well past `MaxSnapshotGoroutines` (5000). The consumer must therefore NOT apply
-the element cap to them; doing so falsely rejected a legal frame, which — now
-that protocol errors are terminal — killed the view on exactly the workload this
-contract exists for. The byte contract is their real bound.
-
-**Shallow parse for unconsumed kinds.** The envelope is strictly validated for
-every kind (exact keys, `v == 1.4`, known kind, `seq >= 1`, object payload). But
-only the kinds the observer actually reads — `SessionState`, `BreakpointHit`,
-`Paused`, `Stepped`, `Panic`, `Continued`, `ProcessExited`, `Error`,
-`GoroutineSnapshot` — get the deep recursive node walk. Everything else
-(`Output`, `BreakpointSet`/`Cleared`, `Locals`, `Frames`, `Goroutines`,
-`Evaluate`, `Restarted`) returns a **sanitized empty payload** immediately: the
-raw body is never forwarded to `applyEvent`. Keep that set in lockstep with
-`observer.ts` — a broadcast `EventGoroutines` exceeding the 20,000-node budget on
-an event nobody reads is exactly the bug this closes.
-
-**Truthful omission surfacing.** `SnapshotTotals` is decoded (optional, unknown
-keys still rejected) and surfaced as `SessionViewModel.serverTotals`, kept
-separate from `tree.omitted` (this view's own filter and render cap). The thread
-statistic uses `totals.threads` when present, and a clipped scan renders a
-trailing `+` lower-bound marker. A goroutine whose parent was omitted stays a
-root in the tree.
-
-The recreatable webview receives validated view models through a
-ready/rendered-ack protocol. Every document has a generation token; async
-`postMessage` completions may mutate delivery state only while their captured
-view and generation are current, even when an old and new render share a
-revision. Rendered acknowledgements echo both generation and revision, so a
-destroyed document cannot acknowledge its replacement. A fresh `ready` resets
-any in-flight revision
-because a hidden non-retained webview may have discarded its prior delivery;
-otherwise the host can wait forever for an acknowledgement from a dead document.
-Preserve the strict nonce CSP, `dist`-only `localResourceRoots`,
-DOM/textContent rendering, deterministic capped cycle-safe tree, bounded
-lifecycle history, and multi-session selector. Filtering searches the full
-validated snapshot (up to the protocol's 5,000-goroutine delivery bound — a
-larger scan is reported through `totals`, never delivered) before applying
-the 500-node rendering cap, re-lays out each match with at most four ancestors,
-and resets fit so a deep or previously capped match cannot remain invisible.
-Empty results keep Fit/zoom callbacks safe even without an SVG scene. SVG
-treeitems carry `aria-level`, sibling position/size, selection, and parent
-context; arrow navigation moves DOM focus with selection.
+The concurrency webview and decoder invariants live in
+[bingo-vscode/AGENTS.md](https://github.com/bingosuite/bingo-vscode/blob/main/AGENTS.md).
 
 ### Server-local source launch and working directories
 
@@ -3882,42 +3450,9 @@ translator keeps DAP entirely outside the hub — a strictly additive package.
   agnostic; only the backend differs). CI: the `dap` label runs in the
   `fullstack-*` jobs of
   [debugger-e2e.yml](.github/workflows/debugger-e2e.yml).
-- VS Code: [editors/vscode](editors/vscode/) uses strict TypeScript unit tests
-  for endpoint/request validation, telemetry codecs/observer/reconnect/session
-  registry, tree normalization/layout/lifecycle, a real lightweight DOM renderer,
-  webview security/messages, and manifest/workspace/package contracts; a pinned
-  `@vscode/test-electron` run activates the real extension/view and acknowledges
-  a fake adapter's namespaced custom event, while `packagedE2E.ts` drives the
-  actual native packaged server's source-package build/launch path, DAP,
-  WebSocket observer, and graphical model for all five progressive examples
-  without prebuilt target binaries.
-  The
-  dedicated [vscode-extension.yml](.github/workflows/vscode-extension.yml)
-  workflow lints, typechecks, tests, bundles, and builds the local VSIX without
-  changing the Go CI jobs.
-- Neovim: [editors/neovim](editors/neovim/) runs focused contract, transport,
-  manager, plugin lifecycle and real-loopback modules with `just neovim-check`;
-  the same runner parses every Lua source file. The default suite is independent
-  of nvim-dap and a debugger binary. Deterministic helpers restore globals and
-  module tables after failures, count exact ownership/cleanup and fence stale
-  callbacks; real libuv tests use ephemeral listeners and bounded wall deadlines.
-  [neovim-extension.yml](.github/workflows/neovim-extension.yml) runs the suite
-  with checksum-pinned minimum Neovim 0.11.7 on native linux/amd64 and
-  darwin/arm64, with read-only permissions and no user's configuration. The
-  separately invoked `bash editors/neovim/scripts/integration.sh` pins a real
-  nvim-dap archive by revision/hash in isolated build storage and runs native
-  no-argument source launch/breakpoint/stack/locals/session discovery. The fixture
-  package has a space-containing path; the server builds it with the package cwd
-  and no entry-stop resume, and its private build directory must retire with
-  the session. The default Lua suite also covers real Ex escaping and the
-  preparation script's literal argv/failure propagation without invoking a
-  compiler. Its second real DAP client
-  must receive exactly one `terminated` after one terminate intent: the
-  initiating nvim-dap client closes on the response and alone would mask a
-  missing terminal event. Both registries must empty, the target disappear, and
-  the owned server exit by idle grace without a test signal. Linux CI runs it;
-  Mach execution requires local/self-hosted Apple Silicon, never hosted macOS
-  or emulation. Only failure cleanup may signal exact test-owned processes.
+- Editor integration suites now run in [bingo-vscode](https://github.com/bingosuite/bingo-vscode) and
+  [bingo-nvim](https://github.com/bingosuite/bingo-nvim) against exact upstream build artifacts and matching
+  protocol fixtures; every successful main/release build triggers both.
 
 ## Error handling
 
@@ -4391,17 +3926,7 @@ just coverage [PKG]                        # writes test/coverage.out
 just integration                           # ginkgo -r ./test/integration (no e2e tag)
 just build-examples                        # build five progressive targets with -N -l
 just build-spawntree                       # build the dedicated telemetry demo with -N -l
-just vscode-prepare                        # stage the current native server inside the extension
-just vscode-dev                            # stage source extension + native server for CLI-launched Extension Host
-just vscode-check                          # lint, typecheck, test, bundle, package-list smoke
-just vscode-local-package                  # one verified VSIX build; no profile changes
-just vscode-package                        # full checks + reproducible dist/bingo-<platform>.vsix
-just vscode-install                        # fast, explicit one-build install/update of bingosuite.bingo
-just release-package [VERSION]             # native tools + VSIX + Neovim + checksums; default dev preview
-npm --prefix editors/vscode run test:integration # pinned Electron activation/view/custom-event test
-npm --prefix editors/vscode run e2e:packaged     # real native packaged DAP + graphical telemetry path
-just neovim-prepare                        # stage the host-native server for the Lua companion
-just neovim-check                          # parse and test the Neovim companion
+just release-package [VERSION]             # native server + terminal clients + checksums; default dev preview
 just e2e-linux                             # native linux/amd64 ptrace E2E (all labels)
 just e2e-darwin                            # native darwin/arm64 Mach-exception E2E (codesigned; all labels)
 # Filter to one label, e.g. only the correctness gate (package path must come
@@ -4457,7 +3982,7 @@ through the justfile.
   do not generalise it into a hub or client cap, and do not add `Location`
   truncation, chunking, or compression. If you change a limit, the selection
   order, or the totals rule, update the VS Code decoder constants
-  (`editors/vscode/src/telemetry.ts`) in the same commit: the drift test pins
+  (`bingo-vscode/src/telemetry.ts`) in the companion repository: its triggered drift test pins
   them against this Go source. Keep `maximumTransportBytes` strictly **above**
   `maximumEnvelopeBytes` so a contract violation is delivered and rejected as a
   deterministic protocol error rather than killed inside `ws`.
@@ -4518,7 +4043,7 @@ through the justfile.
   are safely ignored in `translateEvent`, but decide deliberately — a new
   *suspending* event especially must map to a `stopped` reason or the IDE won't
   realise the tracee halted.
-- **VS Code debug configuration** (`editors/vscode`): keep debugger ownership on
+- **VS Code debug configuration** (bingo-vscode repository): keep debugger ownership on
   type `bingo` and transport through `DebugAdapterServer`; never route bingo
   launches back through `type: go`, `debugServer`, or Delve. Keep the manifest
   schema, pure configuration tests, `.vscode/launch.json`, and extension README
