@@ -41,9 +41,7 @@ architecture behind this.
 - For the VS Code debugger: install the matching native VSIX when available from
   a release, or build/install from source once:
 
-  ```sh
-  bash scripts/package-vscode.sh install
-  ```
+  [VS Code installation](https://github.com/bingosuite/bingo-vscode)
 
   Run **Developer: Reload Window** once after installation or update. The companion
   owns debugger type `"bingo"` and connects directly to bingo's DAP listener;
@@ -52,8 +50,8 @@ architecture behind this.
   `code --uninstall-extension bingosuite.bingo`.
 
 - For Neovim: Neovim 0.11.7 or newer plus `nvim-dap`. Run
-  `bash editors/neovim/scripts/prepare.sh`, add `editors/neovim` to the runtime path, and call
-  `require("bingo").setup()`. See the [Neovim guide](../editors/neovim/README.md).
+  [bingo-nvim](https://github.com/bingosuite/bingo-nvim), add its plugin directory to the runtime path, and call
+  `require("bingo").setup()`. See the [Neovim guide](https://github.com/bingosuite/bingo-nvim).
 
 ## 1. Demo targets
 
@@ -74,8 +72,7 @@ snapshots show workers appearing in `created` and leaving in `exited`. Build it
 with **bingo: Debug spawntree telemetry demo**, or compile it with
 `just build-spawntree` for `cmd/dapcli` as shown below.
 Contributor source-extension work is a separate command-line path: run
-`just vscode-dev`, then
-`code --new-window --extensionDevelopmentPath="$PWD/editors/vscode" "$PWD"`.
+the commands in [bingo-vscode](https://github.com/bingosuite/bingo-vscode).
 It is intentionally absent from the root Run and Debug dropdown.
 
 ## 2. Drive with VS Code (DAP, automatic server)
@@ -137,7 +134,7 @@ path in **bingo Server** rather than killing a potentially shared process.
 
 1. Install the native companion bundle or run the source prepare hook and
    configure the companion as described in
-   [editors/neovim/README.md](../editors/neovim/README.md).
+   [editors/neovim/README.md](https://github.com/bingosuite/bingo-nvim).
 2. Run `:BingoDebug ./examples/level5-workflow` from the repository root, or
    open one of its Go files and run `:BingoDebug`.
    The adapter health-checks the loopback management endpoint, reuses or starts

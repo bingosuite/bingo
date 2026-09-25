@@ -13,8 +13,8 @@ from a Marketplace listing. The source paths below work from this checkout.
 
 | What you want | Prebuilt package, when released | Source fallback |
 | --- | --- | --- |
-| VS Code | Platform `.vsix`, including the server | `bash scripts/package-vscode.sh install` |
-| Neovim | Platform `bingo-neovim_*.tar.gz`, including `bin/bingo` | Plugin-manager prepare hook or `bash editors/neovim/scripts/prepare.sh` |
+| VS Code | Platform VSIX including the server | [bingo-vscode](https://github.com/bingosuite/bingo-vscode) |
+| Neovim | Platform plugin archive including the server | [bingo-nvim](https://github.com/bingosuite/bingo-nvim) |
 | Terminal | Platform `bingo_*.tar.gz`, containing server and three clients | `bash scripts/build-binary.sh bingo build/bin/bingo` |
 
 **Prebuilt debugger and client binaries do not need Go, Node, npm, or `just`.**
@@ -29,26 +29,16 @@ git clone https://github.com/bingosuite/bingo.git
 cd bingo
 ```
 
-Source builds require Go **1.25.5 or newer** (the release toolchain is pinned by
-`go.mod`). VSIX source builds additionally require **Node.js 22.x** (pinned by
-`editors/vscode/.nvmrc`), npm, `unzip`, and `file`. The install command also needs
-the `code` CLI; packaging alone does not. On macOS, native server builds need
-Xcode Command Line Tools and `codesign`; install the tools with
-`xcode-select --install` if absent. Preflight reports missing requirements
-before dependency restoration or compilation.
+Core source builds require Go **1.25.5 or newer**. Reproducible Darwin server
+builds also need Node.js 22 (see `.nvmrc`); ordinary native builds need no Node.
+Darwin requires Xcode Command Line Tools and codesign.
 
 ## VS Code
 
 Requires VS Code **1.85 or newer**.
 
-1. Install the matching release VSIX with **Extensions: Install from VSIX...**,
-   or run this once from the source checkout:
-
-   ```sh
-   bash scripts/package-vscode.sh install
-   # equivalent optional shorthand: just vscode-install
-   ```
-
+1. Install the matching package from [bingo-vscode](https://github.com/bingosuite/bingo-vscode/releases)
+   or its successful CI artifacts using **Extensions: Install from VSIX...**.
 2. Run **Developer: Reload Window** after an install/update.
 3. Open a saved Go file in a runnable `main` package and run
    **Bingo: Debug Go Package**. It uses that file's directory, or the workspace
@@ -68,21 +58,11 @@ examples; **bingo: Debug spawntree telemetry demo** opens the long-running
 concurrency demo. Both launch source directories. See the
 [examples guide](../examples/README.md) for useful breakpoints.
 
-The source install path restores the exact npm lockfile with lifecycle scripts
-disabled, packages the native server and extension **once**, verifies the exact
-VSIX contents/architecture/executable mode/signature, then invokes
-`code --install-extension`. It deliberately does not run the full lint/test
-suite or double packaging gate. To build the same artifact without changing
-your VS Code profile:
-
-```sh
-bash scripts/package-vscode.sh
-# equivalent: just vscode-local-package
-```
+Source packaging and contributor commands live in [bingo-vscode](https://github.com/bingosuite/bingo-vscode).
 
 Microsoft's Go extension remains useful for `gopls`, formatting, and tests.
 bingo owns debugger type `"bingo"` and never invokes Delve. The
-[extension guide](../editors/vscode/README.md) covers attach/join, remote
+[extension guide](https://github.com/bingosuite/bingo-vscode) covers attach/join, remote
 endpoints, logs, and contributor extension-host development.
 
 ## Neovim
@@ -91,16 +71,9 @@ Requires **Neovim 0.11.7 or newer** and
 [`nvim-dap`](https://github.com/mfussenegger/nvim-dap).
 
 Use the matching prebuilt companion archive as a local plugin/runtime directory,
-keeping its `lua/`, `plugin/`, and `bin/` directories together. It needs no prepare
-hook. For a source checkout, the plugin-manager build hook is:
-
-```sh
-bash editors/neovim/scripts/prepare.sh
-```
-
-The hook builds/signs only the server and needs neither Node nor `just`.
-The [Neovim guide](../editors/neovim/README.md) includes the full monorepo
-`lazy.nvim` configuration and the local/prebuilt runtime-path setup. After
+keeping its `lua/`, `plugin/`, and `bin/` directories together. Source installation
+uses [bingo-nvim](https://github.com/bingosuite/bingo-nvim) with nvim-dap and a downloaded Bingo binary on PATH
+or configured as `server.binary`. After
 `require("bingo").setup()`, open a Go file and run:
 
 ```vim
@@ -226,17 +199,12 @@ just                        # list commands without starting anything
 just build
 just test
 just vet
-just vscode-check           # lint, typecheck, unit/DOM tests, bundle
-just vscode-package         # full checks + two-build binary/VSIX reproducibility
-just neovim-check
 ```
 
 On macOS, direct Go test/vet commands need `-tags bingonative`. The native
 debugger acceptance suites are `just e2e-linux` and `just e2e-darwin`; Darwin
 execution requires a suitable local/self-hosted Apple Silicon machine.
-Contributor source-extension work uses `just vscode-dev`, then the explicit
-Extension Development Host command in the
-[extension guide](../editors/vscode/README.md). It does not rebuild the examples.
+Contributor editor work is documented in [bingo-vscode](https://github.com/bingosuite/bingo-vscode) and [bingo-nvim](https://github.com/bingosuite/bingo-nvim).
 
 ## Release preparation
 
@@ -268,10 +236,8 @@ Each platform contributes these assets, with `VERSION` including the leading
 | Asset | Contents |
 | --- | --- |
 | `bingo_VERSION_PLATFORM.tar.gz` | Server, three named terminal clients, MIT license, install instructions, build metadata |
-| `bingo-neovim_VERSION_PLATFORM.tar.gz` | Lua companion, native `bin/bingo`, README, MIT license, install instructions, metadata |
-| `bingo-VERSION-linux-x64.vsix` or `bingo-VERSION-darwin-arm64.vsix` | Matching platform VS Code extension and the same server |
-| `bingo_VERSION_PLATFORM.json` | Exact commit, suite version, platform, Go/wire/extension versions, signing information |
-| `bingo_VERSION_PLATFORM_SHA256SUMS.txt` | SHA-256 of the other four assets, sorted by basename |
+| `bingo_VERSION_PLATFORM.json` | Exact commit, suite version, platform, Go and wire versions, signing information |
+| `bingo_VERSION_PLATFORM_SHA256SUMS.txt` | SHA-256 of the other two assets, sorted by basename |
 
 Download only the artifact(s) you want plus your platform's checksum file into
 one directory. Before installing or extracting them, run:
@@ -292,8 +258,7 @@ Checksums detect corruption; they are not an independent signing identity.
 For a local, non-publishing preview, run `just release-package` and inspect
 `dist/release/`. It explicitly labels modified source as `dev`/`-dirty`. For a
 tagged build use `just release-package vX.Y.Z` from its clean, matching checkout.
-Both run full extension checks and the existing two-build VSIX/binary
-reproducibility gate. Terminal clients are also built twice and compared.
+Every native binary is built twice and compared. Editor packaging runs separately in each editor repository.
 Archive contents, executable permissions, metadata, and checksum sets are
 verified before files are promoted from staging.
 

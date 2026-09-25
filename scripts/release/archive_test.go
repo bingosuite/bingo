@@ -1,58 +1,12 @@
 package main
 
 import (
-	"archive/zip"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
-
-func TestVSIXAndArchivesUseTheSameServer(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		binaries []string
-		valid    bool
-	}{
-		{"matching", []string{"same server"}, true},
-		{"mismatched", []string{"old server"}, false},
-		{"missing", nil, false},
-		{"duplicate", []string{"same server", "same server"}, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			directory := t.TempDir()
-			server := filepath.Join(directory, "bingo")
-			if err := os.WriteFile(server, []byte("same server"), 0o755); err != nil {
-				t.Fatal(err)
-			}
-			vsix := filepath.Join(directory, "bingo.vsix")
-			file, err := os.Create(vsix)
-			if err != nil {
-				t.Fatal(err)
-			}
-			archive := zip.NewWriter(file)
-			for _, binary := range tc.binaries {
-				writer, err := archive.Create("extension/bin/bingo")
-				if err != nil {
-					t.Fatal(err)
-				}
-				if _, err := writer.Write([]byte(binary)); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if err := archive.Close(); err != nil {
-				t.Fatal(err)
-			}
-			if err := file.Close(); err != nil {
-				t.Fatal(err)
-			}
-			if err := verifyVSIXServer(vsix, server); (err == nil) != tc.valid {
-				t.Fatalf("unexpected server identity verdict: %v", err)
-			}
-		})
-	}
-}
 
 func TestArchiveContentsModesAndReproducibility(t *testing.T) {
 	directory := t.TempDir()
@@ -121,27 +75,15 @@ func TestArchiveRejectsUnsafeOrDuplicateEntries(t *testing.T) {
 	}
 }
 
-func TestArchiveRejectsSymlinksAndMissingCompanion(t *testing.T) {
+func TestArchiveRejectsSymlinkInputs(t *testing.T) {
 	root := t.TempDir()
-	if _, err := directoryEntries(root, "lua"); err == nil {
-		t.Fatal("accepted missing Lua companion")
-	}
-	if err := os.Mkdir(filepath.Join(root, "lua"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := directoryEntries(root, "lua"); err == nil {
-		t.Fatal("accepted empty Lua companion")
-	}
 	target := filepath.Join(root, "target")
 	if err := os.WriteFile(target, []byte("target"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	link := filepath.Join(root, "lua/link.lua")
+	link := filepath.Join(root, "link")
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
-	}
-	if _, err := directoryEntries(root, "lua"); err == nil {
-		t.Fatal("accepted a symlink in the companion")
 	}
 	if _, err := (archiveEntry{source: link}).bytes(); err == nil {
 		t.Fatal("followed an archive input symlink")
@@ -159,7 +101,7 @@ func TestEndUserChecksumsAllowOnlyVerifiedSubsets(t *testing.T) {
 func checkEndUserChecksumSubset(t *testing.T, state string) {
 	t.Helper()
 	directory := t.TempDir()
-	assets := []string{"bundle.tar.gz", "extension.vsix", "companion.tar.gz", "metadata.json"}
+	assets := []string{"bundle.tar.gz", "metadata.json"}
 	const sums = "bingo_v0.7.0_darwin_arm64_SHA256SUMS.txt"
 	writeChecksumFixture(t, directory, sums, assets)
 	for _, name := range assets[1:] {
