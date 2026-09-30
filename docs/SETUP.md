@@ -212,6 +212,10 @@ debugger test environment.
 
 Default endpoints are loopback-only: management/WebSocket **127.0.0.1:6060**,
 DAP **127.0.0.1:4711**. The protocols do not authenticate non-loopback clients.
+The Go CLI and WebSocket observer use HTTPS/WSS by default for non-loopback
+`-addr` values; use a TLS-terminating proxy for remote access. An explicit
+`http://host:port` opts into plaintext only for trusted networks. Loopback
+`host:port` retains HTTP/WS.
 Managed servers exit after their idle grace; manual servers stay running unless
 started with `-idle-timeout`. If an endpoint is occupied or incompatible, inspect
 the server logs and active sessions, deliberately stop a server you own, or use

@@ -43,7 +43,7 @@ type config struct {
 
 func bindFlags(fs *flag.FlagSet) *config {
 	cfg := &config{}
-	fs.StringVar(&cfg.addr, "addr", "localhost:6060", "server address (host:port)")
+	fs.StringVar(&cfg.addr, "addr", "localhost:6060", "server address (host:port or HTTP(S)/WS(S) URL)")
 	fs.StringVar(&cfg.sessionID, "session", "", "session ID to join")
 	fs.BoolVar(&cfg.once, "once", false, "print one snapshot then exit")
 	fs.DurationVar(&cfg.timeout, "timeout", 30*time.Second,

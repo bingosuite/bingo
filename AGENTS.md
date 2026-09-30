@@ -3733,6 +3733,11 @@ WebSocket, and DAP endpoints to explicit IPv4 loopback. The protocols do not
 authenticate clients, and WebSocket clients without an `Origin` header are
 valid, so never restore wildcard defaults. Operators may explicitly choose a
 non-loopback address for trusted-network or externally authenticated setups.
+The Go SDK and terminal WebSocket clients use HTTP/WS only for bare loopback
+addresses; bare non-loopback addresses use HTTPS/WSS through a TLS terminator,
+while an explicit `http://` or `ws://` address opts into plaintext on a trusted
+network. REST session discovery never follows redirects, so an HTTPS endpoint
+cannot silently downgrade to HTTP.
 
 **Connect-or-start and ownership.** A frontend health-checks the known
 management address and reuses a compatible process; otherwise it starts bingo
