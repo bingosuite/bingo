@@ -158,6 +158,11 @@ affecting the shared session.
 Both default listeners bind to IPv4 loopback. Non-loopback binds are
 unauthenticated and should only be exposed on a trusted network or behind an
 authenticated transport.
+The Go clients (`bingo-cli`, `bingo-wsmon`, and `pkg/client`) use HTTP/WS for
+bare loopback addresses and HTTPS/WSS for bare non-loopback addresses. Remote
+connections need a TLS terminator forwarding `/api/sessions` and `/ws` to bingo;
+the server itself does not provide TLS or authentication. An explicit
+`http://host:port` or `ws://host:port` opts into plaintext for a trusted network.
 
 ## Progressive examples
 

@@ -39,7 +39,7 @@ func mainExitCode() int {
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
 
-	addr := flag.String("addr", "localhost:6060", "server address (host:port)")
+	addr := flag.String("addr", "localhost:6060", "server address (host:port or HTTP(S)/WS(S) URL)")
 	sessionID := flag.String("session", "", "session ID to join (omit to create)")
 	flag.Parse()
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"sync"
 	"time"
 
@@ -61,8 +62,11 @@ type wsClient struct {
 }
 
 // dial opens the WebSocket and waits for the server's welcome SessionState.
-func dial(ctx context.Context, addr, query string) (Client, error) {
-	url := fmt.Sprintf("ws://%s/ws?%s", addr, query)
+func dial(ctx context.Context, addr string, query url.Values) (Client, error) {
+	address, err := serverURL(addr, "/ws", query, true)
+	if err != nil {
+		return nil, fmt.Errorf("dial: %w", err)
+	}
 
 	dialer := *websocket.DefaultDialer
 	var stopDialCancel func() bool
@@ -76,7 +80,7 @@ func dial(ctx context.Context, addr, query string) (Client, error) {
 		stopDialCancel = context.AfterFunc(ctx, func() { _ = rawConn.Close() })
 		return rawConn, nil
 	}
-	conn, _, err := dialer.DialContext(ctx, url, nil)
+	conn, _, err := dialer.DialContext(ctx, address, nil)
 	if stopDialCancel != nil {
 		stopDialCancel()
 	}
@@ -84,10 +88,10 @@ func dial(ctx context.Context, addr, query string) (Client, error) {
 		if conn != nil {
 			_ = conn.Close()
 		}
-		return nil, fmt.Errorf("dial %s: %w", url, ctxErr)
+		return nil, fmt.Errorf("dial %s: %w", address, ctxErr)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", url, err)
+		return nil, fmt.Errorf("dial %s: %w", address, err)
 	}
 
 	c := &wsClient{

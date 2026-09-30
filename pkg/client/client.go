@@ -8,7 +8,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
@@ -106,6 +110,69 @@ type SessionInfo struct {
 	CreatedAt time.Time             `json:"createdAt"`
 }
 
+func serverURL(addr, path string, query url.Values, websocket bool) (string, error) {
+	if strings.Contains(addr, "#") {
+		return "", errors.New("server address must not contain a fragment")
+	}
+	explicitScheme := strings.Contains(addr, "://")
+	if !explicitScheme {
+		_, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return "", fmt.Errorf("server address must be host:port: %w", err)
+		}
+		if port == "" {
+			return "", errors.New("server address must include a port")
+		}
+		addr = "https://" + addr
+	}
+
+	endpoint, err := url.Parse(addr)
+	if err != nil {
+		return "", fmt.Errorf("parse server address: %w", err)
+	}
+	if endpoint.Hostname() == "" || endpoint.User != nil || endpoint.Opaque != "" ||
+		endpoint.Path != "" || endpoint.RawQuery != "" || endpoint.ForceQuery ||
+		endpoint.Fragment != "" || endpoint.RawFragment != "" {
+		return "", errors.New("server address must contain only a host and optional port, without credentials, path, query, or fragment")
+	}
+	if strings.HasSuffix(endpoint.Host, ":") {
+		return "", errors.New("server address has an empty port")
+	}
+	if port := endpoint.Port(); port != "" {
+		number, err := strconv.Atoi(port)
+		if err != nil || number < 1 || number > 65535 {
+			return "", fmt.Errorf("invalid server port %q", port)
+		}
+	}
+
+	switch strings.ToLower(endpoint.Scheme) {
+	case "http", "ws":
+		endpoint.Scheme = "http"
+	case "https", "wss":
+		endpoint.Scheme = "https"
+	default:
+		return "", fmt.Errorf("unsupported server URL scheme %q", endpoint.Scheme)
+	}
+	// Plaintext is the local default only; remote endpoints require TLS unless
+	// the caller explicitly opted into plaintext for a trusted network.
+	if !explicitScheme {
+		ip := net.ParseIP(endpoint.Hostname())
+		if strings.EqualFold(endpoint.Hostname(), "localhost") || ip != nil && ip.IsLoopback() {
+			endpoint.Scheme = "http"
+		}
+	}
+	if websocket {
+		if endpoint.Scheme == "https" {
+			endpoint.Scheme = "wss"
+		} else {
+			endpoint.Scheme = "ws"
+		}
+	}
+	endpoint.Path = path
+	endpoint.RawQuery = query.Encode()
+	return endpoint.String(), nil
+}
+
 // ListSessions queries the server's REST API for all active sessions.
 func ListSessions(addr string) ([]SessionInfo, error) {
 	return ListSessionsContext(context.Background(), addr)
@@ -113,13 +180,19 @@ func ListSessions(addr string) ([]SessionInfo, error) {
 
 // ListSessionsContext queries the server's REST API for all active sessions.
 func ListSessionsContext(ctx context.Context, addr string) ([]SessionInfo, error) {
-	url := fmt.Sprintf("http://%s/api/sessions", addr)
+	address, err := serverURL(addr, "/api/sessions", nil, false)
+	if err != nil {
+		return nil, fmt.Errorf("list sessions: %w", err)
+	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil) //nolint:gosec // no auth by design
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, address, nil) //nolint:gosec // no auth by design
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: request: %w", err)
 	}
-	httpClient := http.Client{Timeout: listSessionsTimeout}
+	httpClient := http.Client{
+		Timeout:       listSessionsTimeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
@@ -144,7 +217,7 @@ func Create(addr string) (Client, error) {
 
 // CreateContext connects to the server and creates a new debug session.
 func CreateContext(ctx context.Context, addr string) (Client, error) {
-	return dial(ctx, addr, "create=1")
+	return dial(ctx, addr, url.Values{"create": {"1"}})
 }
 
 // Join connects to the server and joins an existing session by UUID.
@@ -154,5 +227,5 @@ func Join(addr, sessionID string) (Client, error) {
 
 // JoinContext connects to the server and joins an existing session by UUID.
 func JoinContext(ctx context.Context, addr, sessionID string) (Client, error) {
-	return dial(ctx, addr, fmt.Sprintf("session=%s", sessionID))
+	return dial(ctx, addr, url.Values{"session": {sessionID}})
 }
