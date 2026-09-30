@@ -110,39 +110,47 @@ type SessionInfo struct {
 	CreatedAt time.Time             `json:"createdAt"`
 }
 
-func serverURL(addr, path string, query url.Values, websocket bool) (string, error) {
+func parseServerAddress(addr string, explicitScheme bool) (*url.URL, error) {
 	if strings.Contains(addr, "#") {
-		return "", errors.New("server address must not contain a fragment")
+		return nil, errors.New("server address must not contain a fragment")
 	}
-	explicitScheme := strings.Contains(addr, "://")
 	if !explicitScheme {
 		_, port, err := net.SplitHostPort(addr)
 		if err != nil {
-			return "", fmt.Errorf("server address must be host:port: %w", err)
+			return nil, fmt.Errorf("server address must be host:port: %w", err)
 		}
 		if port == "" {
-			return "", errors.New("server address must include a port")
+			return nil, errors.New("server address must include a port")
 		}
 		addr = "https://" + addr
 	}
 
 	endpoint, err := url.Parse(addr)
 	if err != nil {
-		return "", fmt.Errorf("parse server address: %w", err)
+		return nil, fmt.Errorf("parse server address: %w", err)
 	}
 	if endpoint.Hostname() == "" || endpoint.User != nil || endpoint.Opaque != "" ||
 		endpoint.Path != "" || endpoint.RawQuery != "" || endpoint.ForceQuery ||
 		endpoint.Fragment != "" || endpoint.RawFragment != "" {
-		return "", errors.New("server address must contain only a host and optional port, without credentials, path, query, or fragment")
+		return nil, errors.New("server address must contain only a host and optional port, without credentials, path, query, or fragment")
 	}
 	if strings.HasSuffix(endpoint.Host, ":") {
-		return "", errors.New("server address has an empty port")
+		return nil, errors.New("server address has an empty port")
 	}
 	if port := endpoint.Port(); port != "" {
 		number, err := strconv.Atoi(port)
 		if err != nil || number < 1 || number > 65535 {
-			return "", fmt.Errorf("invalid server port %q", port)
+			return nil, fmt.Errorf("invalid server port %q", port)
 		}
+	}
+	return endpoint, nil
+}
+
+func serverURL(addr, path string, query url.Values, websocket bool) (string, error) {
+	explicitScheme := strings.Contains(addr, "://")
+	endpoint, err := parseServerAddress(addr, explicitScheme)
+	if err != nil {
+		return "", err
 	}
 
 	switch strings.ToLower(endpoint.Scheme) {
