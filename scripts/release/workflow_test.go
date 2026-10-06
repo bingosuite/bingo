@@ -215,8 +215,8 @@ func runUploadCase(t *testing.T, script string, tc uploadCase) {
 	}
 	uploaded, readErr := os.ReadFile(filepath.Join(root, "uploaded"))
 	if tc.succeeds {
-		if readErr != nil || !strings.Contains(string(uploaded), "darwin-arm64.vsix") ||
-			!strings.Contains(string(uploaded), "linux-x64.vsix") ||
+		if readErr != nil || !strings.Contains(string(uploaded), "darwin_arm64.tar.gz") ||
+			!strings.Contains(string(uploaded), "linux_amd64.tar.gz") ||
 			strings.Count(string(uploaded), "_SHA256SUMS.txt") != 2 {
 			t.Fatalf("missing platform assets: %v, %s", readErr, uploaded)
 		}
@@ -243,7 +243,7 @@ func newUploadFixture(t *testing.T, damage string) string {
 		{"darwin_arm64", "darwin-arm64"},
 	} {
 		base := "bingo_v0.7.0_" + platform.name
-		assets := []string{base + ".tar.gz", base + ".json", "bingo-neovim_v0.7.0_" + platform.name + ".tar.gz", "bingo-v0.7.0-" + platform.target + ".vsix"}
+		assets := []string{base + ".tar.gz", base + ".json"}
 		sums := base + "_SHA256SUMS.txt"
 		writeChecksumFixture(t, directory, sums, assets)
 		damageUploadFixture(t, directory, sums, assets[0], damage)

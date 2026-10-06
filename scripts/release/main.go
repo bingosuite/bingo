@@ -25,7 +25,6 @@ type metadata struct {
 	GOARCH              string `json:"goarch"`
 	GoVersion           string `json:"goVersion"`
 	WireProtocolVersion string `json:"wireProtocolVersion"`
-	VSCodeVersion       string `json:"vscodeVersion"`
 	Signing             string `json:"signing"`
 }
 
@@ -73,10 +72,10 @@ func packageRelease(root, output, version string) (retErr error) {
 	defer func() { retErr = errors.Join(retErr, os.RemoveAll(scratch)) }()
 
 	binaries := filepath.Join(scratch, "bin")
-	if err := buildReleaseBinaries(root, binaries, target, m); err != nil {
+	if err := buildReleaseBinaries(root, binaries, m); err != nil {
 		return err
 	}
-	assets, err := stageReleaseAssets(root, scratch, binaries, target, m)
+	assets, err := stageReleaseAssets(root, scratch, binaries, m)
 	if err != nil {
 		return err
 	}
@@ -96,25 +95,17 @@ func packageRelease(root, output, version string) (retErr error) {
 	return nil
 }
 
-func buildReleaseBinaries(root, binaries, target string, m metadata) error {
+func buildReleaseBinaries(root, binaries string, m metadata) error {
 	env := []string{
 		"BINGO_VERSION=" + m.Version,
 		"BINGO_COMMIT=" + m.Commit,
-		"BINGO_VSCODE_TARGET=" + target,
 		"BINGO_REPRODUCIBLE=1",
 	}
-	if err := run(root, env, "npm", "--prefix", "editors/vscode", "run", "package:reproducible"); err != nil {
-		return err
-	}
-	if err := run(root, env, "npm", "--prefix", "editors/vscode", "run", "package:verify"); err != nil {
-		return err
-	}
-
 	if err := os.Mkdir(binaries, 0o755); err != nil {
 		return err
 	}
 	server := filepath.Join(binaries, "bingo")
-	if err := copyFile(filepath.Join(root, "editors/vscode/bin/bingo"), server, 0o755); err != nil {
+	if err := buildReproducibleBinary(root, server, "bingo", env, m); err != nil {
 		return err
 	}
 	versionOutput, err := capture(root, nil, server, "-version")
@@ -126,19 +117,16 @@ func buildReleaseBinaries(root, binaries, target string, m metadata) error {
 	if versionOutput != expectedVersion {
 		return fmt.Errorf("packaged server has the wrong build identity: %s", versionOutput)
 	}
-	if err := verifyVSIXServer(filepath.Join(root, "dist/bingo-"+target+".vsix"), server); err != nil {
-		return err
-	}
 	for _, command := range []string{"cli", "dapcli", "wsmon"} {
 		binary := filepath.Join(binaries, "bingo-"+command)
-		if err := buildReproducibleClient(root, binary, command, env, m); err != nil {
+		if err := buildReproducibleBinary(root, binary, command, env, m); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func buildReproducibleClient(root, binary, command string, env []string, m metadata) error {
+func buildReproducibleBinary(root, binary, command string, env []string, m metadata) error {
 	args := []string{"scripts/build-binary.sh", command, binary, m.GOOS, m.GOARCH}
 	if err := run(root, env, "bash", args...); err != nil {
 		return err
@@ -161,10 +149,8 @@ func buildReproducibleClient(root, binary, command string, env []string, m metad
 	return err
 }
 
-func stageReleaseAssets(root, scratch, binaries, target string, m metadata) ([]string, error) {
+func stageReleaseAssets(root, scratch, binaries string, m metadata) ([]string, error) {
 	base := "bingo_" + m.Version + "_" + m.GOOS + "_" + m.GOARCH
-	neovimBase := "bingo-neovim_" + m.Version + "_" + m.GOOS + "_" + m.GOARCH
-	vsixName := "bingo-" + m.Version + "-" + target + ".vsix"
 	metadataBytes, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return nil, err
@@ -175,30 +161,15 @@ func stageReleaseAssets(root, scratch, binaries, target string, m metadata) ([]s
 		{name: "RELEASE.json", data: metadataBytes, mode: 0o644},
 	}
 	terminal := append([]archiveEntry{}, common...)
-	terminal = append(terminal, archiveEntry{name: "INSTALL.txt", data: []byte(installText(m, false)), mode: 0o644})
+	terminal = append(terminal, archiveEntry{name: "INSTALL.txt", data: []byte(installText(m)), mode: 0o644})
 	for _, name := range []string{"bingo", "bingo-cli", "bingo-dapcli", "bingo-wsmon"} {
 		terminal = append(terminal, archiveEntry{name: "bin/" + name, source: filepath.Join(binaries, name), mode: 0o755})
 	}
-	neovim := append([]archiveEntry{}, common...)
-	neovim = append(neovim,
-		archiveEntry{name: "INSTALL.txt", data: []byte(installText(m, true)), mode: 0o644},
-		archiveEntry{name: "README.md", source: filepath.Join(root, "editors/neovim/README.md"), mode: 0o644},
-		archiveEntry{name: "bin/bingo", source: filepath.Join(binaries, "bingo"), mode: 0o755},
-	)
-	for _, dir := range []string{"lua", "plugin"} {
-		entries, err := directoryEntries(filepath.Join(root, "editors/neovim"), dir)
-		if err != nil {
-			return nil, err
-		}
-		neovim = append(neovim, entries...)
-	}
-
 	for _, archive := range []struct {
 		name    string
 		entries []archiveEntry
 	}{
 		{base, terminal},
-		{neovimBase, neovim},
 	} {
 		path := filepath.Join(scratch, archive.name+".tar.gz")
 		if err := writeArchive(path, archive.name, archive.entries); err != nil {
@@ -208,13 +179,10 @@ func stageReleaseAssets(root, scratch, binaries, target string, m metadata) ([]s
 			return nil, err
 		}
 	}
-	if err := copyFile(filepath.Join(root, "dist/bingo-"+target+".vsix"), filepath.Join(scratch, vsixName), 0o644); err != nil {
-		return nil, err
-	}
 	if err := os.WriteFile(filepath.Join(scratch, base+".json"), metadataBytes, 0o644); err != nil {
 		return nil, err
 	}
-	assets := []string{base + ".tar.gz", neovimBase + ".tar.gz", vsixName, base + ".json"}
+	assets := []string{base + ".tar.gz", base + ".json"}
 	checksums := base + "_SHA256SUMS.txt"
 	if err := writeChecksums(scratch, checksums, assets); err != nil {
 		return nil, err
@@ -257,19 +225,6 @@ func sourceMetadata(root, version, expectedCommit string) (metadata, error) {
 	} else if status != "" {
 		commit += "-dirty"
 	}
-	var manifest struct {
-		Version string `json:"version"`
-	}
-	data, err := os.ReadFile(filepath.Join(root, "editors/vscode/package.json"))
-	if err != nil {
-		return metadata{}, err
-	}
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return metadata{}, err
-	}
-	if manifest.Version == "" {
-		return metadata{}, fmt.Errorf("VS Code manifest has no version")
-	}
 	signing := "none"
 	if runtime.GOOS == "darwin" {
 		signing = "ad-hoc; server has debugger entitlement; not notarized"
@@ -277,7 +232,7 @@ func sourceMetadata(root, version, expectedCommit string) (metadata, error) {
 	return metadata{
 		Version: version, Commit: commit, GOOS: runtime.GOOS, GOARCH: runtime.GOARCH,
 		GoVersion: runtime.Version(), WireProtocolVersion: protocol.Version,
-		VSCodeVersion: manifest.Version, Signing: signing,
+		Signing: signing,
 	}, nil
 }
 
@@ -292,7 +247,7 @@ func nativeTarget(goos, goarch string) (string, error) {
 	}
 }
 
-func installText(m metadata, neovim bool) string {
+func installText(m metadata) string {
 	revision := strings.TrimSuffix(m.Commit, "-dirty")
 	preamble := fmt.Sprintf("bingo %s (%s/%s)\nCommit: %s\nWire protocol: %s\n\n", m.Version, m.GOOS, m.GOARCH, m.Commit, m.WireProtocolVersion)
 	usage := `The bin/ directory contains:
@@ -308,14 +263,6 @@ In another terminal, run ./bin/bingo-dapcli (or ./bin/bingo-cli).
 Use ./bin/bingo-wsmon -session SESSION_ID to observe an existing session.
 Manual servers persist until stopped. Editors normally manage their own server.
 `
-	if neovim {
-		usage = `This is a ready-to-use Neovim runtime directory, including bin/bingo.
-Add the extracted directory to runtimepath or use it as a local plugin directory.
-Install nvim-dap separately; require("bingo").setup() then :BingoDebug [directory].
-No prepare hook or build is needed for this prebuilt bundle. Keep bin/ with lua/.
-The companion never kills a potentially shared server.
-`
-	}
 	return preamble + usage + `
 Prebuilt debugger/client binaries do not require Go. Debugging a source package
 does require a Go toolchain on the server's PATH; launching a prebuilt target does
@@ -331,8 +278,9 @@ Checksum names are relative to the directory containing the downloaded assets.
 
 Full setup and limitations:
 https://github.com/bingosuite/bingo/blob/` + revision + `/docs/SETUP.md
-Neovim usage:
-https://github.com/bingosuite/bingo/blob/` + revision + `/editors/neovim/README.md
+Editor plugins:
+https://github.com/bingosuite/bingo-vscode
+https://github.com/bingosuite/bingo-nvim
 `
 }
 

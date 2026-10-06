@@ -40,10 +40,7 @@ func TestReleasePinsCleanTagAndCommit(t *testing.T) {
 		return value
 	}
 	git("init", "-q")
-	if err := os.MkdirAll(filepath.Join(root, "editors/vscode"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	manifest := filepath.Join(root, "editors/vscode/package.json")
+	manifest := filepath.Join(root, "README.md")
 	if err := os.WriteFile(manifest, []byte(`{"version":"0.7.0"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +49,7 @@ func TestReleasePinsCleanTagAndCommit(t *testing.T) {
 	git("tag", "v0.7.0")
 	head := git("rev-parse", "HEAD")
 	m, err := sourceMetadata(root, "v0.7.0", head)
-	if err != nil || m.Commit != head || m.Version != "v0.7.0" || m.VSCodeVersion != "0.7.0" {
+	if err != nil || m.Commit != head || m.Version != "v0.7.0" {
 		t.Fatalf("clean tag metadata: %+v, %v", m, err)
 	}
 	if _, err := sourceMetadata(root, "v0.7.0", strings.Repeat("a", 40)); err == nil {
@@ -100,18 +97,13 @@ func TestNativeReleaseTargets(t *testing.T) {
 
 func TestBundledInstallInstructions(t *testing.T) {
 	m := metadata{Version: "v0.7.0", Commit: strings.Repeat("a", 40), GOOS: "darwin", GOARCH: "arm64", WireProtocolVersion: "1.4"}
-	for _, neovim := range []bool{false, true} {
-		text := installText(m, neovim)
-		for _, want := range []string{
-			"notarization", "do not require Go", "server's PATH", m.Commit + "/docs/SETUP.md",
-			"SHA256SUMS", "--ignore-missing", "exact filename\nis reported OK", "No verified files",
-		} {
-			if !strings.Contains(text, want) {
-				t.Fatalf("bundled onboarding is missing %q", want)
-			}
-		}
-		if neovim && (!strings.Contains(text, "bin/bingo") || !strings.Contains(text, "BingoDebug")) {
-			t.Fatal("Neovim bundle does not describe its prepared layout")
+	text := installText(m)
+	for _, want := range []string{
+		"notarization", "do not require Go", "server's PATH", m.Commit + "/docs/SETUP.md",
+		"SHA256SUMS", "--ignore-missing", "exact filename\nis reported OK", "No verified files",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("bundled onboarding is missing %q", want)
 		}
 	}
 }

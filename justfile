@@ -69,19 +69,6 @@ build-spawntree:
 	mkdir -p ./build
 	go build -gcflags="all=-N -l" -o ./build/spawntree ./examples/spawntree
 
-# Build the native server into the extension-local layout used by both an
-# Extension Development Host and the platform-specific VSIX.
-vscode-prepare:
-	bash ./scripts/preflight.sh vscode
-	npm --prefix editors/vscode run binary:prepare
-
-# Prepare an Extension Development Host; installed users need only vscode-install.
-vscode-dev:
-	bash ./scripts/preflight.sh vscode
-	npm --prefix editors/vscode ci --ignore-scripts
-	npm --prefix editors/vscode run binary:prepare
-	npm --prefix editors/vscode run build
-
 # ARGS: -addr string    server address (default "localhost:6060")
 #	  	-session string session ID to join (omit to create a new session)
 # Build and run the interactive CLI client
@@ -95,37 +82,6 @@ cli *ARGS:
 # clients can join and drive the same session concurrently.
 dapcli *ARGS:
 	go run ./cmd/dapcli {{ARGS}}
-
-# Reinstall from the lockfile so local checks exercise the same dependency graph
-# as CI rather than whatever happens to be present in node_modules.
-vscode-check:
-	bash ./scripts/preflight.sh vscode
-	npm --prefix editors/vscode ci --ignore-scripts
-	npm --prefix editors/vscode run check
-
-# Keep the install artifact under the repo-level ignored dist directory so
-# packaging never dirties the extension source tree.
-vscode-package: vscode-check
-	mkdir -p ./dist
-	npm --prefix editors/vscode run package:reproducible
-	npm --prefix editors/vscode run package:verify
-
-# One native VSIX build and exact archive verification; no profile changes.
-vscode-local-package:
-	bash ./scripts/package-vscode.sh
-
-# Fast local install: preflight, locked dependencies, one verified package.
-vscode-install:
-	bash ./scripts/package-vscode.sh install
-
-# Stage the host-native server where the Neovim companion resolves it before
-# falling back to PATH. The plugin-manager hook also works without just.
-neovim-prepare:
-	bash ./editors/neovim/scripts/prepare.sh
-
-# Parse all plugin files and run the contract tests in Neovim's Lua runtime.
-neovim-check:
-	nvim --headless -u NONE -i NONE -l ./editors/neovim/tests/run.lua
 
 # Run unit tests on the PKG (defaults to ./...)
 test PKG="./...":
@@ -143,12 +99,10 @@ coverage PKG="./...":
 integration:
 	{{go_test}} -v ./test/integration
 
-# Build all native release assets, retaining full VSIX and reproducibility gates.
+# Build reproducible native server and terminal-client release assets.
 # dev permits a dirty local preview; release tags require a clean matching checkout.
 release-package VERSION="dev":
 	bash ./scripts/preflight.sh release
-	npm --prefix editors/vscode ci --ignore-scripts
-	npm --prefix editors/vscode run check
 	go run ./scripts/release -version "{{VERSION}}"
 
 # Run the debugger E2E acceptance tests on linux/amd64 (native ptrace backend).

@@ -82,7 +82,6 @@ jobs:
     env:
       BINGO_VERSION: ${{ needs.resolve.outputs.tag }}
       BINGO_COMMIT: ${{ needs.resolve.outputs.commit }}
-      BINGO_VSCODE_TARGET: ${{ matrix.target }}
       GO_TAGS: ${{ matrix.go_tags }}
       EXPECTED_GOOS: ${{ matrix.goos }}
       EXPECTED_GOARCH: ${{ matrix.goarch }}
@@ -100,9 +99,7 @@ jobs:
           go-version-file: go.mod
       - uses: actions/setup-node@v4
         with:
-          node-version-file: editors/vscode/.nvmrc
-          cache: npm
-          cache-dependency-path: editors/vscode/package-lock.json
+          node-version-file: .nvmrc
       - name: Require the exact tag and a native builder
         run: |
           test "$(git rev-parse HEAD)" = "$BINGO_COMMIT"
@@ -117,14 +114,10 @@ jobs:
           go mod tidy -diff
           go vet -tags "$GO_TAGS" ./...
           go test -tags "$GO_TAGS" ./...
-      - name: Restore locked extension dependencies
-        run: npm --prefix editors/vscode ci --ignore-scripts
-      - name: Verify extension source
-        run: npm --prefix editors/vscode run check
-      - name: Build reproducible binaries, VSIX, companion and checksums
+      - name: Build reproducible native binaries and checksums
         run: go run ./scripts/release -version "$BINGO_VERSION"
       - name: Smoke packaged server health and idle exit (no native debug claim)
-        run: npm --prefix editors/vscode run smoke:server
+        run: node scripts/smoke-server.mjs dist/release
       - name: Ensure packaging left source unchanged
         run: test -z "$(git status --porcelain --untracked-files=normal)"
       - uses: actions/upload-artifact@v4
@@ -186,10 +179,9 @@ jobs:
           cd release-assets
           assets=()
           for platform in linux_amd64 darwin_arm64; do
-            if [[ "$platform" == linux_amd64 ]]; then target=linux-x64; else target=darwin-arm64; fi
             base="bingo_${RELEASE_TAG}_${platform}"
             sums="${base}_SHA256SUMS.txt"
-            expected=("${base}.tar.gz" "bingo-neovim_${RELEASE_TAG}_${platform}.tar.gz" "bingo-${RELEASE_TAG}-${target}.vsix" "${base}.json")
+            expected=("${base}.tar.gz" "${base}.json")
             printf '%s\n' "${expected[@]}" | LC_ALL=C sort > expected.txt
             awk 'length($1) != 64 || $1 ~ /[^0-9a-f]/ || NF != 2 { exit 1 } { print $2 }' "$sums" | LC_ALL=C sort > actual.txt
             diff -u expected.txt actual.txt

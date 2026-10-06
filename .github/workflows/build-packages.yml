@@ -1,0 +1,58 @@
+name: Build packages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    name: Native package (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: linux-x64
+            tags: ""
+          - runner: macos-15
+            target: darwin-arm64
+            tags: bingonative
+    env:
+      BINGO_VERSION: dev
+      BINGO_COMMIT: ${{ github.sha }}
+      GO_TAGS: ${{ matrix.tags }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      - name: Verify Go source and tooling
+        run: |
+          go mod tidy -diff
+          go vet -tags "$GO_TAGS" ./...
+          go test -tags "$GO_TAGS" ./...
+      - name: Build reproducible native packages
+        run: go run ./scripts/release -version dev
+      - name: Smoke packaged server health and idle exit
+        run: node scripts/smoke-server.mjs dist/release
+      - name: Ensure source remained unchanged
+        run: test -z "$(git status --porcelain --untracked-files=normal)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 90

@@ -176,82 +176,6 @@ func TestBuildBinaryRejectsDirectoryOutputBeforeWork(t *testing.T) {
 	}
 }
 
-func TestLocalVSIXUsesOneVerifiedPackage(t *testing.T) {
-	for _, install := range []bool{false, true} {
-		t.Run(map[bool]string{false: "package only", true: "explicit install"}[install], func(t *testing.T) {
-			f := newToolingFixture(t)
-			var args []string
-			if install {
-				args = []string{"install"}
-			}
-			out, err := f.runScript("package-vscode.sh", nil, args...)
-			if err != nil {
-				t.Fatalf("package: %v\n%s", err, out)
-			}
-			assertSingleVerifiedPackage(t, f.log(), install)
-		})
-	}
-}
-
-func assertSingleVerifiedPackage(t *testing.T, log string, install bool) {
-	t.Helper()
-	commands := []string{
-		"npm --prefix editors/vscode ci --ignore-scripts",
-		"npm --prefix editors/vscode run package\n",
-		"npm --prefix editors/vscode run package:verify",
-	}
-	previous := -1
-	for _, command := range commands {
-		index := strings.Index(log, command)
-		if index <= previous || strings.Count(log, command) != 1 {
-			t.Fatalf("wrong package order/count for %q:\n%s", command, log)
-		}
-		previous = index
-	}
-	for _, forbidden := range []string{"run check", "run build", "reproducible", "go cgo="} {
-		if strings.Contains(log, forbidden) {
-			t.Fatalf("local install performed full/redundant work:\n%s", log)
-		}
-	}
-	if install {
-		if strings.Index(log, "code --install-extension") <= previous || !strings.Contains(log, "dist/bingo-linux-x64.vsix --force") {
-			t.Fatalf("install did not follow exact package verification:\n%s", log)
-		}
-	} else if strings.HasPrefix(log, "code ") || strings.Contains(log, "\ncode ") {
-		t.Fatalf("packaging touched VS Code:\n%s", log)
-	}
-}
-
-func TestLocalInstallFailuresDoNotInstall(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		env  []string
-		want string
-	}{
-		{"code unavailable", []string{"FAKE_CODE_FAIL=1"}, "cannot run the VS Code CLI"},
-		{"old Node", []string{"FAKE_NODE_VERSION=v20.0.0"}, "Node.js 22.x"},
-		{"emulated Node", []string{"FAKE_NODE_HOST=darwin/x64"}, "Node.js must run natively"},
-		{"old Go", []string{"FAKE_GO_VERSION=go1.24.9"}, "Go 1.25.5"},
-		{"cross target", []string{"BINGO_VSCODE_TARGET=darwin-arm64"}, "must target this host"},
-		{"verify failed", []string{"FAKE_NPM_FAIL=package:verify"}, "injected npm failure"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newToolingFixture(t)
-			out, err := f.runScript("package-vscode.sh", tc.env, "install")
-			if err == nil || !strings.Contains(string(out), tc.want) {
-				t.Fatalf("wanted %q: %v\n%s", tc.want, err, out)
-			}
-			log := f.log()
-			if strings.Contains(log, "--install-extension") {
-				t.Fatalf("installed after failure:\n%s", log)
-			}
-			if tc.name != "verify failed" && strings.Contains(log, "npm ") {
-				t.Fatalf("preflight failed after expensive work:\n%s", log)
-			}
-		})
-	}
-}
-
 type toolingFixture struct {
 	t      *testing.T
 	root   string
@@ -263,12 +187,12 @@ func newToolingFixture(t *testing.T) toolingFixture {
 	t.Helper()
 	root := filepath.Join(t.TempDir(), "checkout with spaces")
 	f := toolingFixture{t: t, root: root, bin: filepath.Join(root, "fake-bin"), output: filepath.Join(root, "installed bingo")}
-	for _, dir := range []string{"scripts", "fake-bin", "editors/vscode"} {
+	for _, dir := range []string{"scripts", "fake-bin"} {
 		if err := os.MkdirAll(filepath.Join(root, dir), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, name := range []string{"build-binary.sh", "tooling.sh", "preflight.sh", "package-vscode.sh", "release-ref.sh"} {
+	for _, name := range []string{"build-binary.sh", "tooling.sh", "preflight.sh", "release-ref.sh"} {
 		content, err := os.ReadFile(name)
 		if err != nil {
 			t.Fatal(err)
@@ -276,7 +200,7 @@ func newToolingFixture(t *testing.T) toolingFixture {
 		f.write(filepath.Join("scripts", name), string(content))
 	}
 	f.write("go.mod", "module test.invalid/tooling\n\ngo 1.25.5\n")
-	f.write("editors/vscode/.nvmrc", "22\n")
+	f.write(".nvmrc", "22\n")
 	f.write("fake-bin/uname", `#!/bin/bash
 case "$1" in
   -s) echo "${FAKE_OS:-Linux}" ;;

@@ -42,10 +42,10 @@ bingo_check_go() {
 bingo_check_node() {
   bingo_require node
   local required actual
-  required=$(cat "$repository_root/editors/vscode/.nvmrc")
+  required=$(cat "$repository_root/.nvmrc")
   actual=$(node --version) || bingo_fail "cannot run Node.js"
   [[ "$actual" == "v${required}."* ]] ||
-    bingo_fail "Node.js ${required}.x is required for VSIX tooling; found $actual"
+    bingo_fail "Node.js ${required}.x is required for reproducible Darwin builds; found $actual"
 }
 
 bingo_check_darwin() {

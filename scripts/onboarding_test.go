@@ -43,11 +43,6 @@ func TestJustSeparatesStartupInstallAndRelease(t *testing.T) {
 	text := string(content)
 	for _, want := range []string{
 		"default:\n\t@just --list",
-		"vscode-install:\n\tbash ./scripts/package-vscode.sh install",
-		"vscode-local-package:\n\tbash ./scripts/package-vscode.sh",
-		"vscode-package: vscode-check",
-		"npm --prefix editors/vscode run package:reproducible",
-		"neovim-prepare:\n\tbash ./editors/neovim/scripts/prepare.sh",
 		"go run ./scripts/release",
 	} {
 		if !strings.Contains(text, want) {
