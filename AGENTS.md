@@ -1736,8 +1736,15 @@ all refs returned by `mach_port_get_refs`. Thread enumeration and exception
 adoption normally retain one credit per thread; a failed duplicate release keeps
 the extra credits recorded for retry. Both steady-state and final release check
 actual SEND/SEND_ONCE/DEAD_NAME type and tolerate one observed SEND-to-DEAD
-transition. Missing, insufficient, unexpected, or saturated refs are explicit
-errors, not evidence that cleanup succeeded.
+transition. `mach_port_get_refs` returns `KERN_SUCCESS` with **zero** refs when a
+valid name no longer has the queried right; it need not return
+`KERN_INVALID_RIGHT`. A zero SEND/SEND_ONCE read therefore re-observes the type
+within that same one-transition retry budget, requires DEAD_NAME, and validates
+its count before decrementing the exact owned credits. Zero is never successful
+retirement by itself. Missing, insufficient, unexpected, or saturated refs are
+explicit errors, not evidence that cleanup succeeded. Deterministic seam tests
+and a native test-owned RECEIVE/SEND port pin this race, independent coalesced
+credits, and retained obligations after a failed decrement; no victim is needed.
 
 A fired dead-name notification adds **one extra task dead-name uref**, even if
 Wait already consumed the notification. XNU adds it when converting the watched

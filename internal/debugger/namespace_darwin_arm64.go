@@ -245,6 +245,7 @@ func (b *darwinBackend) cancelMachNotification(ops darwinMachCalls) error {
 // Only the recorded urefs belong to this backend. task_for_pid, task_threads
 // and exception descriptors can coalesce with rights held by another owner.
 func releaseMachSendRefs(ops darwinMachCalls, port, owned uint32, once bool) error {
+	var zeroRefsErr error
 	for attempt := 0; attempt < 2; attempt++ {
 		kind, err := ops.portType(port)
 		if err != nil {
@@ -261,10 +262,20 @@ func releaseMachSendRefs(ops darwinMachCalls, port, owned uint32, once bool) err
 		default:
 			return fmt.Errorf("owned send right %#x has unexpected type %#x", port, kind)
 		}
+		if zeroRefsErr != nil && right != C.MACH_PORT_RIGHT_DEAD_NAME {
+			return zeroRefsErr
+		}
 		refs, err := ops.refs(port, right)
 		if err == nil {
 			if refs < owned || refs == darwinMaxUserRefs {
-				return fmt.Errorf("port %#x has %d urefs, cannot release %d owned urefs", port, refs, owned)
+				err = fmt.Errorf("port %#x has %d urefs, cannot release %d owned urefs", port, refs, owned)
+				// A valid name that lost the queried right returns zero refs,
+				// not KERN_INVALID_RIGHT. Only a proven death permits retry.
+				if refs == 0 && right != C.MACH_PORT_RIGHT_DEAD_NAME && attempt == 0 {
+					zeroRefsErr = err
+					continue
+				}
+				return err
 			}
 			err = ops.modRefs(port, right, -int32(owned))
 		}

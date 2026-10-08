@@ -109,9 +109,12 @@ func expectNamespaceVictimProgress(target *darwinAttachTarget, before darwinAtta
 			Expect(trap.CustomTraps).To(Equal(before.CustomTraps))
 		}
 	}
-	Eventually(func() uint64 { return target.command("status").WorkerProgress },
-		2*time.Second, 10*time.Millisecond).Should(BeNumerically(">", after.WorkerProgress))
-	Expect(target.command("status").Heartbeat).To(BeNumerically(">", after.Heartbeat))
+	// Progress can advance after the heartbeat in after was sampled, within one tick.
+	Eventually(func(g Gomega) {
+		progress := target.command("status")
+		g.Expect(progress.WorkerProgress).To(BeNumerically(">", after.WorkerProgress))
+		g.Expect(progress.Heartbeat).To(BeNumerically(">", after.Heartbeat))
+	}, 2*time.Second, 10*time.Millisecond).Should(Succeed())
 }
 
 func declareDarwinNamespaceSpec() {
