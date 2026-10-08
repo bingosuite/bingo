@@ -3100,7 +3100,13 @@ under `mu`, but the event write occurs after unlocking, preserving the
 no-lock-across-socket-write invariant. Go DAP clients must read through
 `internal/dapclient`, which recognizes this namespaced event before delegating
 standard messages to go-dap; `cmd/dapcli` and the native E2E client share that
-path. The VS
+path. Clients needing graph-to-thread identity use
+`ReadProtocolMessageWithThreadMetadata`, which preserves each real thread's
+`bingoGoroutineId` before go-dap drops extension fields. It returns the ordinary
+message plus an opaque-thread-handle → real-goid map; unannotated/synthetic
+entries claim no identity, and legacy IDs/names are never treated as proof.
+Malformed identity fields or ambiguous handles fail without partial results.
+The VS
 Code extension subscribes at
 activation and keys observers by `DebugSession.id`, never
 `activeDebugSession`.
