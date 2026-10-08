@@ -96,6 +96,27 @@ type channelLayout struct {
 	size   int
 }
 
+func validateChannelDWARFField(field *dwarf.StructField, name string, headerSize int64) error {
+	if field == nil || field.Type == nil || field.ByteOffset < 0 || field.BitSize != 0 {
+		return fmt.Errorf("channel DWARF field %s unavailable", name)
+	}
+	size := field.Type.Size()
+	if size != 2 && size != 4 && size != 8 {
+		return fmt.Errorf("unsupported channel DWARF field %s width", name)
+	}
+	if name == "buf" {
+		if ptr, ok := channelUnderlying(field.Type).(*dwarf.PtrType); !ok || ptr.Size() != 8 {
+			return fmt.Errorf("unsupported channel buffer pointer")
+		}
+	} else if _, ok := channelUnderlying(field.Type).(*dwarf.UintType); !ok {
+		return fmt.Errorf("unsupported channel DWARF field %s type", name)
+	}
+	if field.ByteOffset > maxScalarBytes-size || field.ByteOffset+size > headerSize {
+		return fmt.Errorf("channel DWARF field %s outside header", name)
+	}
+	return nil
+}
+
 func resolveChannelLayout(info channelType) (channelLayout, error) {
 	var layout channelLayout
 	if info.header == nil || info.elem == nil || info.header.Incomplete {
@@ -112,23 +133,10 @@ func resolveChannelLayout(info channelType) (channelLayout, error) {
 			}
 		}
 		field := layout.fields[i]
-		if field == nil || field.Type == nil || field.ByteOffset < 0 || field.BitSize != 0 {
-			return layout, fmt.Errorf("channel DWARF field %s unavailable", name)
+		if err := validateChannelDWARFField(field, name, info.header.Size()); err != nil {
+			return layout, err
 		}
 		size := field.Type.Size()
-		if size != 2 && size != 4 && size != 8 {
-			return layout, fmt.Errorf("unsupported channel DWARF field %s width", name)
-		}
-		if i == 2 {
-			if ptr, ok := channelUnderlying(field.Type).(*dwarf.PtrType); !ok || ptr.Size() != 8 {
-				return layout, fmt.Errorf("unsupported channel buffer pointer")
-			}
-		} else if _, ok := channelUnderlying(field.Type).(*dwarf.UintType); !ok {
-			return layout, fmt.Errorf("unsupported channel DWARF field %s type", name)
-		}
-		if field.ByteOffset > maxScalarBytes-size || field.ByteOffset+size > info.header.Size() {
-			return layout, fmt.Errorf("channel DWARF field %s outside header", name)
-		}
 		for _, previous := range layout.fields[:i] {
 			if field.ByteOffset < previous.ByteOffset+previous.Type.Size() &&
 				previous.ByteOffset < field.ByteOffset+size {
