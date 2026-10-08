@@ -196,9 +196,16 @@ func (r *dwarfReader) formatNode(name string, typ dwarf.Type, addr uint64, depth
 
 	concrete, display, special := unwrapType(typ)
 	out.Type = display
+	if channel, ok := r.channelTypeInfo(typ); ok {
+		r.formatChannel(&out, channel, addr, depth, ptrDepth, ctx)
+		return out
+	}
 
 	switch special {
-	case kindMap, kindChan:
+	case kindChan:
+		r.formatChannel(&out, channelType{}, addr, depth, ptrDepth, ctx)
+		return out
+	case kindMap:
 		out.Kind = special
 		out.Value = r.summaryPointer(ctx, addr, display)
 		return out
@@ -436,7 +443,7 @@ func (r *dwarfReader) readGoString(ctx *formatCtx, addr uint64) string {
 }
 
 // summaryPointer renders a value whose storage at addr is a single pointer word
-// (map/chan/func) as "<display> (0x...)" — or "nil".
+// (map/func) as "<display> (0x...)" — or "nil".
 func (r *dwarfReader) summaryPointer(ctx *formatCtx, addr uint64, display string) string {
 	buf, err := ctx.read(addr, 8)
 	if err != nil {

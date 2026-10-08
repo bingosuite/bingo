@@ -1951,12 +1951,32 @@ and remains required.
   ints of every width, bool, float32/64, complex64/128, `string` (reads the
   {ptr,len} header then bounded bytes), pointers (hex + one deref child), structs
   (fields), arrays and slices (slice = {ptr,len,cap} header → elements), plus
-  best-effort one-line summaries for map/chan/func/interface (a pointer/word hex;
+  read-only channels (metadata and typed buffered values in receive order), and
+  best-effort one-line summaries for map/func/interface (a pointer/word hex;
   no children). Type classification unwraps `TypedefType`/`QualType` and detects
   Go's higher-level kinds by typedef **name** (`map[`, `chan `, `interface {`)
   before unwrapping, because their underlying representation is a plain pointer/
   struct that would otherwise misclassify; a visited-typedef guard breaks the
   `interface {}` / `error` self-reference.
+- **Channel inspection** ([channels.go](internal/debugger/channels.go)) reuses
+  `Variable.Children` for `len`, `cap`, `closed`, and at most `maxChildren`
+  buffered values in FIFO order from `recvx`, including circular wrap. Resolve
+  kind/element types from Go's `DW_AT_go_kind` / `DW_AT_go_elem` and field
+  offsets/types from the channel's DWARF hchan representation, never display
+  names or fixed runtime offsets. Named/directional channels remain typed;
+  zero-sized elements have zero stride. Reads share the existing per-request
+  budgets and active-path cycle guard. Validate metadata, element size, and
+  address arithmetic before touching the buffer. No receive, send, close, lock,
+  or write is permitted; unbuffered channels have no stored contents and waiter
+  values are not buffered elements. Recheck metadata and the channel pointer
+  after expansion and discard children on detected change or failed recheck. This
+  detects visible movement, not ABA or mutations of pointees, and is **not an
+  atomic Linux snapshot**. Missing layout or corrupt/unreadable data degrades
+  explicitly without erroring the stop. DAP Variables/Watch and the VS Code
+  inspector expand the existing tree without a wire/version change.
+  `channels_test.go` pins bounds/layout/cycles and real Go DWARF;
+  `declareDAPChannelContentsSpec` (`channels`, `inspect`, `dap`) resumes the
+  native target and proves inspection left the original receive sequence intact.
 - **Bounds & fallback (never error the stop):** `maxValueDepth=4`,
   `maxChildren=100` (overflow appended as a synthetic `… N more` node),
   pointer-deref depth `1`, `maxStringBytes≈256`, and an **active recursion-path
@@ -2993,7 +3013,7 @@ target metadata, architecture, mode, and entitlements.
 The extension package version is the installed-runtime upgrade boundary:
 material shipped behavior changes must bump both `package.json` and the lockfile
 or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.7.1**) in source and VSIX
+and package verifier pin the current version (**0.7.2**) in source and VSIX
 metadata.
 The root Run and Debug dropdown exposes three `"type":"bingo"` choices:
 debug one of five progressive source packages through a `pickString`, debug the

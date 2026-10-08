@@ -56,6 +56,9 @@ type dwarfReader struct {
 	cacheMu    sync.Mutex
 	varAddrs   map[string]uint64       // package var name → runtime DW_OP_addr (slid); 0 means "resolved, absent"
 	structOffs map[string]structLayout // struct name → member offsets
+
+	channelTypesOnce sync.Once
+	channelTypes     map[dwarf.Type]channelType
 }
 
 // structLayout maps a struct's member names to their byte offsets. found is

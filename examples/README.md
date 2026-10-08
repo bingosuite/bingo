@@ -53,3 +53,14 @@ every level's final summary is sorted or otherwise deterministic.
 telemetry demo. Choose **bingo: Debug spawntree telemetry demo** in VS Code,
 or build it separately with `just build-spawntree` for terminal clients and follow
 [`docs/ConcurrencyTelemetry.md`](../docs/ConcurrencyTelemetry.md).
+
+## Channel contents
+
+Open [`channel-contents/main.go`](channel-contents/main.go), set a breakpoint on
+the `fmt.Printf("inspect jobs: ...")` line, and run **Bingo: Debug Go Package**.
+Expand `jobs` in Variables, a name-only Watch, or the Bingo inspector. It is a
+closed channel with `len:3`, `cap:3`, and typed `[0]` / `[1]` / `[2]` values
+`first`, `second`, `third` in receive order, despite its wrapped buffer.
+Continue to confirm the program still receives those same values: inspection
+never removes them. Unbuffered channels have no stored buffer to inspect;
+blocked sender values are not reported as buffered contents.
