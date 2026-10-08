@@ -14,16 +14,101 @@ on:
         type: boolean
   release:
     types: [published]
+  workflow_run:
+    workflows: ["Go"]
+    types: [completed]
+    branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  group: release-${{ github.event.release.tag_name || inputs.tag || 'auto' }}
   cancel-in-progress: false
 
 jobs:
+  # Automatic path only: pick the next patch version, tag the tested commit,
+  # and open a draft release. Skipped for manual and published-release runs.
+  prepare:
+    name: Pick next version, tag and create draft
+    if: >-
+      github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      !contains(github.event.workflow_run.head_commit.message, '[skip release]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # The build below checks out github.sha (latest main), so only release
+      # when the tested commit is still that commit.
+      - name: Skip if main already moved on
+        id: fresh
+        run: |
+          live=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if [ "$live" != "$HEAD_SHA" ] || [ "$GITHUB_SHA" != "$HEAD_SHA" ]; then
+            echo "main moved on; the newer commit will be released instead."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compute next patch version
+        id: version
+        if: steps.fresh.outputs.skip != 'true'
+        run: |
+          existing=$(git tag --points-at "$HEAD_SHA" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+          if [ -n "$existing" ]; then
+            echo "$HEAD_SHA is already tagged ($existing); nothing to do."
+            exit 0
+          fi
+
+          latest=$(git tag --list 'v*' --sort=-v:refname \
+            | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | head -1 || true)
+
+          # Docs-only changes since the last release don't need a new version.
+          if [ -n "$latest" ]; then
+            if ! git diff --name-only "$latest" "$HEAD_SHA" \
+              | grep -qvE '(^docs/|^\.github/ISSUE_TEMPLATE/|\.md$)'; then
+              echo "Only docs changed since $latest; skipping."
+              exit 0
+            fi
+          fi
+
+          if [ -z "$latest" ]; then
+            next=v0.0.1
+          else
+            IFS=. read -r major minor patch <<< "${latest#v}"
+            next="v$major.$minor.$((patch + 1))"
+          fi
+          echo "latest=${latest:-none} next=$next"
+          echo "tag=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Create tag and draft release
+        if: steps.version.outputs.tag != ''
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$TAG" -f sha="$HEAD_SHA" >/dev/null
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --draft --verify-tag --title "$TAG" --generate-notes
+
   resolve:
+    needs: prepare
+    if: >-
+      ${{ !cancelled() && needs.prepare.result != 'failure' &&
+      (github.event_name != 'workflow_run' || needs.prepare.outputs.tag != '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -38,7 +123,7 @@ jobs:
       - name: Validate tag before using it as a ref
         id: tag
         env:
-          REQUESTED_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          REQUESTED_TAG: ${{ github.event.release.tag_name || inputs.tag || needs.prepare.outputs.tag }}
         run: bash scripts/release-ref.sh "$REQUESTED_TAG" >> "$GITHUB_OUTPUT"
       - name: Require the tag to match the triggering revision
         id: commit
@@ -136,8 +221,10 @@ jobs:
 
   upload:
     name: Attach verified assets (never publish a draft)
-    needs: [resolve, build]
-    if: github.event_name == 'release' || inputs.upload_to_draft
+    needs: [prepare, resolve, build]
+    if: >-
+      ${{ !cancelled() && needs.resolve.result == 'success' && needs.build.result == 'success' &&
+      (github.event_name == 'release' || inputs.upload_to_draft || needs.prepare.outputs.tag != '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -176,10 +263,11 @@ jobs:
           check_release() {
             test "$(tag_commit)" = "$RELEASE_COMMIT"
             draft=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
-            if [[ "$RELEASE_EVENT" == workflow_dispatch ]]; then
-              test "$draft" = true || { echo "Manual uploads require an existing draft release." >&2; exit 1; }
-            else
+            # Only a human-published release is already public; every other path uploads to a draft.
+            if [[ "$RELEASE_EVENT" == release ]]; then
               test "$draft" = false || { echo "Published-release uploads require a published release." >&2; exit 1; }
+            else
+              test "$draft" = true || { echo "Draft uploads require an existing draft release." >&2; exit 1; }
             fi
           }
           check_release
@@ -198,3 +286,53 @@ jobs:
           done
           check_release
           gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
+
+  # Automatic path only: the draft becomes public once verified assets are attached.
+  publish:
+    name: Publish release after verified upload
+    needs: [prepare, resolve, upload]
+    if: ${{ needs.upload.result == 'success' && needs.prepare.outputs.tag != '' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
+        run: |
+          draft=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
+          test "$draft" = true
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+
+  # Automatic path only: a failed build leaves no draft or tag behind, so the
+  # next green commit reuses the same version number.
+  cleanup:
+    name: Remove unreleased draft and tag after a failed run
+    needs: [prepare, resolve, build, upload, publish]
+    if: >-
+      ${{ always() && needs.prepare.outputs.tag != '' &&
+      (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Delete the draft release and its tag (never a published one)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Refusing to clean up '$RELEASE_TAG'." >&2; exit 1; }
+          draft=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo missing)
+          if [ "$draft" = true ]; then
+            gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+            echo "Deleted draft and tag $RELEASE_TAG."
+          elif [ "$draft" = missing ]; then
+            # Tag was created but the draft never was.
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$RELEASE_TAG" || true
+            echo "Removed orphan tag $RELEASE_TAG."
+          else
+            echo "Release is already published; leaving it alone."
+          fi
