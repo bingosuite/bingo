@@ -33,7 +33,8 @@ func (b *inspectionMemoryBackend) inspectionStop(tid int) (StopEvent, bool) {
 	return b.stop, b.stop.TID == tid
 }
 
-func inspectionEngine() (*engine, *inspectionMemoryBackend) {
+func inspectionEngine(t *testing.T) (*engine, *inspectionMemoryBackend) {
+	t.Helper()
 	b := &inspectionMemoryBackend{
 		goroutineMemoryBackend: newGoroutineMemoryBackend(),
 		threadRegs: map[int]Registers{
@@ -56,6 +57,7 @@ func inspectionEngine() (*engine, *inspectionMemoryBackend) {
 		backend: b, state: stateSuspended, curTID: 100,
 		goLayout: l, bps: newBreakpointTable(),
 		dw: &dwarfReader{
+			data: syntheticScopeReader(t, []byte{1, 0}).data,
 			varAddrs: map[string]uint64{
 				"runtime.allglen": 0x100, "runtime.allgptr": 0x108, "runtime.allgs": 0,
 			},
@@ -72,7 +74,7 @@ func inspectionEngine() (*engine, *inspectionMemoryBackend) {
 
 func TestSelectedInspectionUsesSavedContextsOnlyUnderHold(t *testing.T) {
 	for _, status := range []uint32{1, 4, 9} {
-		e, b := inspectionEngine()
+		e, b := inspectionEngine(t)
 		b.seedU32(0x2000, status)
 		got, err := e.goroutineRegisters(42)
 		want := Registers{PC: 0x3000, SP: 0x8100, BP: 0x8200}
@@ -80,7 +82,7 @@ func TestSelectedInspectionUsesSavedContextsOnlyUnderHold(t *testing.T) {
 			t.Fatalf("status %d: registers=%+v, held=%v, error=%v", status, got, b.held, err)
 		}
 	}
-	e, b := inspectionEngine()
+	e, b := inspectionEngine(t)
 	b.seedU32(0x2000, 3)
 	b.seedU64(0x2050, 0x4000)
 	b.seedU64(0x2058, 0x8100)
@@ -92,7 +94,7 @@ func TestSelectedInspectionUsesSavedContextsOnlyUnderHold(t *testing.T) {
 }
 
 func TestSelectedInspectionNeverBorrowsRunningGobuf(t *testing.T) {
-	e, b := inspectionEngine()
+	e, b := inspectionEngine(t)
 	b.seedU32(0x2000, 2)
 	if _, err := e.goroutineRegisters(42); err == nil || !strings.Contains(err.Error(), "scheduler or signal stack") {
 		t.Fatalf("running goroutine borrowed saved gobuf: %v", err)
@@ -107,8 +109,7 @@ func TestSelectedInspectionNeverBorrowsRunningGobuf(t *testing.T) {
 func TestSelectedInspectionResolvesCurrentAnchorBeyondAllgsBound(t *testing.T) {
 	for _, scheduler := range []bool{false, true} {
 		t.Run(fmt.Sprintf("scheduler=%v", scheduler), func(t *testing.T) {
-			e, b := inspectionEngine()
-			e.dw.data = syntheticScopeReader(t, []byte{1, 0}).data
+			e, b := inspectionEngine(t)
 			b.seedU32(0x2000, 2)
 			b.seedU64(0x100, uint64(2*maxGoroutineScan+1))
 			regs := Registers{PC: 0x4444, SP: 0x8100, BP: 0x8200, TLS: 0x2000}
@@ -140,12 +141,12 @@ func TestSelectedInspectionResolvesCurrentAnchorBeyondAllgsBound(t *testing.T) {
 
 func TestSelectedInspectionRejectsInvalidAndUnretiredContexts(t *testing.T) {
 	for _, goid := range []int{-1, 0, 1 << 53} {
-		e, b := inspectionEngine()
+		e, b := inspectionEngine(t)
 		if _, err := e.goroutineRegisters(goid); err == nil || b.held {
 			t.Fatalf("invalid id %d acquired a hold: %v", goid, err)
 		}
 	}
-	e, b := inspectionEngine()
+	e, b := inspectionEngine(t)
 	e.wait = &engineWait{}
 	if _, err := e.goroutineRegisters(42); err == nil || b.held {
 		t.Fatalf("unretired waiter admitted inspection: %v", err)
@@ -155,7 +156,7 @@ func TestSelectedInspectionRejectsInvalidAndUnretiredContexts(t *testing.T) {
 	if _, err := e.goroutineRegisters(42); err == nil {
 		t.Fatal("unreadable stack bound accepted")
 	}
-	e, b = inspectionEngine()
+	e, b = inspectionEngine(t)
 	b.holdErr = ErrSessionInvalidated
 	if _, err := e.goroutineRegisters(42); !errors.Is(err, ErrSessionInvalidated) ||
 		e.inspectionOutcome == nil || e.inspectionFailure == nil || b.held {
@@ -164,7 +165,7 @@ func TestSelectedInspectionRejectsInvalidAndUnretiredContexts(t *testing.T) {
 }
 
 func TestSelectedInspectionNormalizesRetiredTrapCopyOnly(t *testing.T) {
-	e, b := inspectionEngine()
+	e, b := inspectionEngine(t)
 	b.seedU32(0x2000, 2)
 	pc := uint64(0x4444)
 	if runtime.GOARCH == "amd64" {
@@ -202,7 +203,7 @@ func TestSelectedInspectionNormalizesRetiredTrapCopyOnly(t *testing.T) {
 }
 
 func TestSelectedInspectionRejectsBadFrameChains(t *testing.T) {
-	e, b := inspectionEngine()
+	e, b := inspectionEngine(t)
 	regs := Registers{PC: 0x4444, SP: 0x8100, BP: 0x8200}
 	b.seedU64(0x8200, 0x8200)
 	b.seedU64(0x8208, 0x1234)
