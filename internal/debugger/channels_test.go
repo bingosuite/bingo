@@ -187,8 +187,17 @@ func TestChannelRejectsInvalidDWARFLayout(t *testing.T) {
 		{"missing field", func(h *dwarf.StructType) { h.Field = h.Field[1:] }},
 		{"negative offset", func(h *dwarf.StructType) { h.Field[0].ByteOffset = -1 }},
 		{"bitfield", func(h *dwarf.StructType) { h.Field[0].BitSize = 1 }},
+		{"nil type", func(h *dwarf.StructType) { h.Field[0].Type = nil }},
 		{"wrong type", func(h *dwarf.StructType) { h.Field[0].Type = testIntType() }},
+		{"unsupported width", func(h *dwarf.StructType) {
+			h.Field[0].Type = &dwarf.UintType{BasicType: dwarf.BasicType{CommonType: dwarf.CommonType{ByteSize: 1}}}
+		}},
+		{"non-pointer buffer", func(h *dwarf.StructType) { h.Field[3].Type = testIntType() }},
 		{"outside header", func(h *dwarf.StructType) { h.Field[0].ByteOffset = h.Size() }},
+		{"outside read budget", func(h *dwarf.StructType) {
+			h.ByteSize = maxScalarBytes + 8
+			h.Field[0].ByteOffset = maxScalarBytes
+		}},
 		{"overlap", func(h *dwarf.StructType) { h.Field[0].ByteOffset = h.Field[1].ByteOffset }},
 		{"duplicate", func(h *dwarf.StructType) { h.Field = append(h.Field, h.Field[0]) }},
 	} {
@@ -203,6 +212,23 @@ func TestChannelRejectsInvalidDWARFLayout(t *testing.T) {
 				t.Fatalf("invalid DWARF read a runtime header: %#v, bytes=%d", root, backend.bytes)
 			}
 		})
+	}
+}
+
+func TestChannelLayoutIgnoresUnrelatedFields(t *testing.T) {
+	_, _, info := channelFixture(testIntType())
+	want, err := resolveChannelLayout(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelated := &dwarf.StructField{Name: "sendx", ByteOffset: -1}
+	info.header.Field = append([]*dwarf.StructField{nil, unrelated, unrelated}, info.header.Field...)
+	got, err := resolveChannelLayout(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("layout = %#v, want %#v", got, want)
 	}
 }
 
