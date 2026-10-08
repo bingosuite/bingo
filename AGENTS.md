@@ -1970,13 +1970,18 @@ and remains required.
   or write is permitted; unbuffered channels have no stored contents and waiter
   values are not buffered elements. Recheck metadata and the channel pointer
   after expansion and discard children on detected change or failed recheck. This
-  detects visible movement, not ABA or mutations of pointees, and is **not an
-  atomic Linux snapshot**. Missing layout or corrupt/unreadable data degrades
+  detects visible movement, not ABA or mutations of pointees. Ordinary
+  current-context inspection is **not an atomic Linux snapshot**; explicit
+  selected-goroutine inspection first establishes its durable all-thread hold,
+  which subsequent locals/evaluate/channel expansion shares until resume.
+  Missing layout or corrupt/unreadable data degrades
   explicitly without erroring the stop. DAP Variables/Watch and the VS Code
   inspector expand the existing tree without a wire/version change.
   `channels_test.go` pins bounds/layout/cycles and real Go DWARF;
   `declareDAPChannelContentsSpec` (`channels`, `inspect`, `dap`) resumes the
   native target and proves inspection left the original receive sequence intact.
+  The selected native/DAP worker specs also require each non-current worker's
+  own buffered channel value through its locals and evaluate paths.
 - **Bounds & fallback (never error the stop):** `maxValueDepth=4`,
   `maxChildren=100` (overflow appended as a synthetic `… N more` node),
   pointer-deref depth `1`, `maxStringBytes≈256`, and an **active recursion-path
@@ -3013,7 +3018,7 @@ target metadata, architecture, mode, and entitlements.
 The extension package version is the installed-runtime upgrade boundary:
 material shipped behavior changes must bump both `package.json` and the lockfile
 or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.7.2**) in source and VSIX
+and package verifier pin the current version (**0.7.3**) in source and VSIX
 metadata.
 The root Run and Debug dropdown exposes three `"type":"bingo"` choices:
 debug one of five progressive source packages through a `pickString`, debug the
@@ -3121,12 +3126,19 @@ The extension host also owns a bounded read-only DAP inspector. On each DAP
 `stopped` event it requests `stackTrace`, then `scopes` and `variables` for the
 selected frame; selecting frames and expanding variables issues only those
 inspection requests. Results are bound to the exact session, telemetry snapshot,
-selected stopped goroutine, and stop generation so delayed responses cannot
-replace a newer stop. The adapter currently exposes stacks only for the stopped
-goroutine, so selecting another graph node reports that limit instead of
+selected goroutine, and stop generation so delayed responses cannot
+replace a newer stop. Native Call Stack and graph selection use the same
+selected stack/locals path; unavailable contexts report errors instead of
 fabricating frames. A stop with no DAP `threadId` is inspected with thread zero,
 which preserves stack/locals after cheap synthetic step stops even though the
-goroutine graph intentionally keeps its previous snapshot. No webview action
+goroutine graph intentionally keeps its previous snapshot. Explicit graph
+selection, including clicking that snapshot's old current goid, is distinct
+from automatic current-context inspection; a selection generation fences both.
+The graph resolves goids through `threads[].bingoGoroutineId`, never raw thread
+IDs or names, with at most two queries to get past the first unknown-stop
+collapsed reply. Its identity-only decoder admits 5,000 real goroutines plus
+one synthetic current handle without charging unused names against variable
+node/text budgets. Missing or ambiguous proof reports unavailable. No webview action
 sends Continue, Step, Pause, Kill, or any other run-control command.
 
 With `bingo.concurrency.autoReveal`, a session announcement opens one reusable
@@ -3460,7 +3472,8 @@ ignored** (WebSocket-only concurrency stream with no DAP equivalent; translating
 it would corrupt the `threads`→`EventGoroutines` FIFO — see the goroutine
 snapshot section).
 
-Suspending events carry the runtime goid when it is known. An ID-0 synthetic
+Suspending events carry an opaque DAP thread handle when the runtime goid is
+known. An ID-0 synthetic
 unknown omits DAP's optional `stopped.threadId`; never clamp an unresolved stop
 to 1, because that identifies the unrelated real g1. `threads` responses may
 still assign a synthetic entry a transport-only positive handle because DAP
@@ -3471,11 +3484,51 @@ identical `CmdFrames`, the first `threads` response after an unknown stop is
 collapsed to exactly one entry: the current goroutine if that explicit
 Goroutines query resolves it, otherwise a transport-only
 `stopped goroutine (unknown)`. A resolved query restores normal full responses
-for later requests. `stackTrace` returns the stopped stack only for that current
-handle or a request that preserves the omitted/non-positive stop id, and empty
-frames for every other positive thread id; bingo cannot unwind arbitrary
-goroutines yet. `cmd/dapcli` therefore retains an omitted stop id as zero
+for later requests. `stackTrace` uses the current context for thread zero and
+the current stopped handle; other positive IDs select their own goroutine.
+`cmd/dapcli` retains an omitted stop id as zero
 instead of carrying a stale positive id into `stackTrace`.
+
+**Selected goroutine inspection.** Existing `Frames`, `Locals`, and `Evaluate`
+commands carry an optional `goroutineId`; zero/absent preserves current-context
+behavior, and confirmations echo positive selections. Both DAP and the Go SDK
+reject a missing/mismatched echo rather than accepting an old wire-1.4 server's
+current data. This is additive, with no new event or wire-version bump. The
+optional native/SDK inspector helpers fail explicitly on legacy implementations.
+Selection still rides hub dispatch; no DAP-to-engine bypass exists.
+
+The engine requires suspended state and acknowledged waiter retirement. It
+finds the selected live goid within 16,384 DWARF-rooted allgs slots, retaining
+length-before-pointer publication ordering. Live user stacks use registers
+from a positively stopped thread; parked runnable/waiting/preempted stacks use
+DWARF-named gobuf PC/SP/BP only under a proven all-thread hold. Syscall contexts
+use the runtime's syscall PC/SP/BP; unavailable scheduler/signal-stack contexts,
+dead IDs, invalid stack bounds/chains, and missing DWARF report errors. Pending
+unreported software-breakpoint PCs are normalized in the inspection copy only.
+Never treat atomic `lastStopTID`, a saved gobuf, or repeated identical reads as
+proof that a running sibling's stack is stable.
+
+Darwin verifies every enumerated thread's suspension. Linux acquires a bounded
+normal-operation SEIZE/INTERRUPT hold only for explicit selected inspection,
+and retains it across stackTrace/scopes/locals/evaluate until a successful
+primary Continue/Step or teardown. Exact routed stops, two stable all-stopped
+task scans, and an empty owner queue establish the hold; partial acquisition
+does not declare success or discard owned interrupts. Real traps/signals/exits
+are retained in a bounded replay queue; clone ownership is captured while its
+parent stop exists and is never reread on replay. Only synthetic holds are
+released automatically. Primary resume rejection preserves the hold; release
+failure invalidates the session and uses the existing ownership-aware cleanup.
+Attached detach folds held stops and replay into its checked restoration
+transaction. Neither inspection nor this hold adds selective run control.
+
+Linux launches convert TRACEME to SEIZE before admitting entry: require the
+legacy cause-zero SI_USER SIGTRAP from that exact child, inject SIGSTOP at that
+proven signal-delivery stop, and require a routed EVENT_STOP/SIGSTOP group-stop
+acknowledgement before clearing the owned stop with SIGCONT. Entry PC/SP must
+remain unchanged. SEIZE installs the full clone/exec/exit option set. Failed
+startup retains the exact child and wait ownership until checked reaping, never
+re-registering a retired PID merely to retry cleanup. Ordinary current-only
+breakpoint queries do not acquire a wider hold.
 
 `EventContinued` → DAP `continued` **only for out-of-band resumes**. The Handler
 increments `pendingContinues` before enqueuing its OWN continue and decrements it
@@ -3580,24 +3633,28 @@ The deterministic termination suite and the
 native `dap-terminate` specs retain another observer throughout Stop, so
 last-client hub shutdown cannot mask missing lifecycle completion.
 
-`variablesReference = frameIndex+1`, `frameID = frameIndex+1` (both reversible
-via `frameIndexFromRef`, both non-zero since DAP reserves 0). threads =
-goroutines with id `max(id,1)`; empty list → synthetic `{1,"main"}`.
+DAP frame and variable references are opaque, monotonic handles above `1<<16`,
+never arithmetic frame indexes. Frame handles bind `{goroutineId,frameIndex}`
+to the current stop generation. New stops/restart discard mappings without
+rewinding the allocator, preventing cross-goroutine and cross-stop aliasing.
+Scope references must come from `scopes`; callers must not invent them.
+Each stop bounds cumulative frames/variable nodes/references to 65,536 and
+the allocator rejects values outside JavaScript's safe integer range. Late
+confirmations pop their FIFO debt but cannot populate a newer generation.
 
 **Structured (expandable) variables — eager tree + `varCache`.** bingo now
 computes a **bounded typed subtree** per local (children inline; see the DWARF
 reader notes). `EventLocals`/`EventEvaluate` carry it. `buildVarTree`
 (`translate.go`) walks that subtree and, for every node with children, allocates
-a fresh `variablesReference` from `varRefBase` (`1<<16`) upward via `allocVarRef`
+a fresh `variablesReference` from the shared opaque namespace via `allocVarRef`
 and caches the node's DAP children under it in `varCache` (`ref→[]godap.Variable`).
-Child refs start above `varRefBase` so they never collide with a frame-root ref
-(a scope's reference == `frameIndex+1`, bounded by the max stack depth), letting
-`onVariables` tell them apart by magnitude. A cached child ref is served
+Frame maps and child caches distinguish references by ownership, not magnitude.
+A cached child ref is served
 synchronously (no round-trip) only while the Handler believes the process is
 suspended; a child-range cache miss is rejected rather than reinterpreted as a
 frame root. An observed resume suppresses the still-resident cache until the
 next stop, where `resetVarsLocked` clears `varCache`/`nextVarRef` before the new
-snapshot is built. For an out-of-band Continue, the translated `EventContinued`
+snapshot is built without rewinding the handle allocator. For an out-of-band Continue, the translated `EventContinued`
 propagates that running state to the adapter. Steps deliberately emit no
 `EventContinued`, so a managed session's `EventSessionState(running)` provides
 the equivalent suppression while the step executes; the resulting

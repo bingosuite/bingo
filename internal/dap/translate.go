@@ -1,6 +1,7 @@
 package dap
 
 import (
+	"fmt"
 	"path/filepath"
 	"strconv"
 
@@ -9,17 +10,7 @@ import (
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
-// DAP thread-list entries require an id. A synthetic bingo goroutine has ID 0,
-// so threadID gives it a transport-only handle without claiming a runtime goid.
-func threadID(goroutineID int) int {
-	if goroutineID < 1 {
-		return 1
-	}
-	return goroutineID
-}
-
-// stopped.threadId is optional. Omit it when bingo cannot identify a runtime
-// goroutine instead of pointing the stop at an unrelated real goroutine.
+// An unresolved stop must not claim the unrelated real g1.
 func stoppedThreadID(goroutineID int) int {
 	if goroutineID < 1 {
 		return 0
@@ -53,18 +44,6 @@ func dapSource(loc protocol.Location) *godap.Source {
 	return &godap.Source{Name: filepath.Base(loc.File), Path: loc.File}
 }
 
-// frameID is the DAP stackFrame id assigned to a bingo frame. It is
-// deliberately frameIndex+1 so it is always non-zero (0 is reserved by DAP for
-// "no frame") and is trivially reversible to the bingo frame index — see
-// frameIndexFromRef, which the variables request uses to fetch that frame's
-// locals.
-func frameID(frameIndex int) int { return frameIndex + 1 }
-
-// frameIndexFromRef reverses the frameID / variablesReference encoding back to
-// the bingo frame index. scopes returns variablesReference == frameID, so the
-// same decode serves both stackTrace frame ids and variable references.
-func frameIndexFromRef(ref int) int { return ref - 1 }
-
 // dapStackFrames converts bingo frames to DAP stack frames.
 func dapStackFrames(frames []protocol.Frame) []godap.StackFrame {
 	out := make([]godap.StackFrame, 0, len(frames))
@@ -74,7 +53,6 @@ func dapStackFrames(frames []protocol.Frame) []godap.StackFrame {
 			name = "?"
 		}
 		out = append(out, godap.StackFrame{
-			Id:     frameID(f.Index),
 			Name:   name,
 			Source: dapSource(f.Location),
 			Line:   f.Location.Line,
@@ -90,51 +68,35 @@ func dapStackFrames(frames []protocol.Frame) []godap.StackFrame {
 // expands the node synchronously. This is the eager-tree analogue of DAP's lazy
 // child fetch: bingo already computed the bounded subtree, so we just index it.
 // Caller MUST hold h.mu (it mutates varCache/nextVarRef).
-func (h *Handler) buildVarTree(vars []protocol.Variable) []godap.Variable {
+func (h *Handler) buildVarTree(vars []protocol.Variable) ([]godap.Variable, error) {
 	out := make([]godap.Variable, 0, len(vars))
 	for _, v := range vars {
+		if h.inspectionObjects >= maxInspectionObjects {
+			return nil, fmt.Errorf("inspection value budget exhausted; resume to inspect a new stop")
+		}
+		h.inspectionObjects++
 		dv := godap.Variable{Name: v.Name, Value: v.Value, Type: v.Type}
 		if len(v.Children) > 0 {
-			ref := h.allocVarRef()
-			h.varCache[ref] = h.buildVarTree(v.Children)
+			ref, err := h.allocVarRef()
+			if err != nil {
+				return nil, err
+			}
+			children, err := h.buildVarTree(v.Children)
+			if err != nil {
+				return nil, err
+			}
+			h.varCache[ref] = children
 			dv.VariablesReference = ref
 		}
 		out = append(out, dv)
 	}
-	return out
+	return out, nil
 }
 
-// dapThreads converts bingo goroutines to DAP threads. An empty goroutine list
-// (the debugger could not enumerate any) yields a single synthetic main thread
-// so the client always has a thread to hang a stack trace off of.
-func dapThreads(gs []protocol.Goroutine) []godap.Thread {
-	if len(gs) == 0 {
-		return []godap.Thread{{Id: 1, Name: "main"}}
-	}
-	out := make([]godap.Thread, 0, len(gs))
-	for _, g := range gs {
-		out = append(out, dapThread(g))
-	}
-	return out
-}
-
-func dapThread(g protocol.Goroutine) godap.Thread {
+func dapThreadName(g protocol.Goroutine) string {
 	name := "goroutine " + strconv.Itoa(g.ID)
 	if g.Status != "" {
 		name += " (" + g.Status + ")"
 	}
-	return godap.Thread{Id: threadID(g.ID), Name: name}
-}
-
-// dapStoppedThread returns the one thread a client should inspect after a stop
-// whose event omitted threadId. A fresh Goroutines query can often resolve the
-// identity while the process is suspended; otherwise ID 1 is explicitly a
-// transport-only synthetic handle, not a claim that runtime g1 stopped.
-func dapStoppedThread(gs []protocol.Goroutine) (godap.Thread, bool) {
-	for _, g := range gs {
-		if g.Current && g.ID > 0 {
-			return dapThread(g), true
-		}
-	}
-	return godap.Thread{Id: 1, Name: "stopped goroutine (unknown)"}, false
+	return name
 }

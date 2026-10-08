@@ -3,6 +3,7 @@ import { describe, it, type TestContext } from "node:test";
 
 import {
   DebugInspectionController,
+  decodeGoroutineThread,
   decodeScopeReferences,
   decodeStackFrames,
   decodeVariables,
@@ -76,6 +77,7 @@ class RegistryStub implements InspectionRegistry {
     this.model = {
       ...this.model,
       selectedGoroutine,
+      selectionVersion: (this.model.selectionVersion ?? 0) + 1,
     };
     this.emit();
   }
@@ -139,6 +141,9 @@ class ControlledClient implements DebugSessionClient {
   }[] = [];
 
   public customRequest(command: string, args: unknown): Promise<unknown> {
+    if (command === "threads") {
+      return Promise.resolve(threadMapping);
+    }
     const result = deferred();
     this.requests.push({ command, args, result, answered: false });
     return result.promise;
@@ -178,11 +183,18 @@ const stack = {
   ],
 };
 
+const threadMapping = {
+  threads: [
+    { id: 10_001, name: "g1", bingoGoroutineId: 1 },
+    { id: 10_002, name: "g2", bingoGoroutineId: 2 },
+  ],
+};
+
 function variable(reference = 0, value = "value", name = "name") {
   return { name, value, type: "", variablesReference: reference };
 }
 
-function harness(context: TestContext) {
+async function harness(context: TestContext) {
   const registry = new RegistryStub(suspendedModel(snapshot([
     goroutine(1, 0, { current: true }),
     goroutine(2, 1),
@@ -195,16 +207,17 @@ function harness(context: TestContext) {
     clock.schedule,
   );
   context.after(() => { controller.dispose(); });
+  await settle();
   return { registry, client, clock, controller };
 }
 
-async function reachScopes(h: ReturnType<typeof harness>): Promise<void> {
+async function reachScopes(h: Awaited<ReturnType<typeof harness>>): Promise<void> {
   h.client.next("stackTrace").result.resolve(stack);
   await settle();
 }
 
 async function reachVariables(
-  h: ReturnType<typeof harness>,
+  h: Awaited<ReturnType<typeof harness>>,
   references: readonly number[] = [10],
 ): Promise<void> {
   await reachScopes(h);
@@ -215,7 +228,7 @@ async function reachVariables(
 }
 
 async function loadRoots(
-  h: ReturnType<typeof harness>,
+  h: Awaited<ReturnType<typeof harness>>,
   variables = [variable(99)],
 ): Promise<void> {
   await reachVariables(h);
@@ -234,6 +247,9 @@ describe("debug inspection controller", () => {
     const client: DebugSessionClient = {
       id: "debug",
       customRequest(command, args) {
+        if (command === "threads") {
+          return Promise.resolve(threadMapping);
+        }
         requests.push({ command, args });
         switch (command) {
           case "stackTrace":
@@ -304,7 +320,7 @@ describe("debug inspection controller", () => {
     assert.deepEqual(requests.slice(0, 3), [
       {
         command: "stackTrace",
-        args: { threadId: 1, startFrame: 0, levels: 200 },
+        args: { threadId: 10_001, startFrame: 0, levels: 200 },
       },
       { command: "scopes", args: { frameId: 1 } },
       { command: "variables", args: { variablesReference: 10 } },
@@ -324,7 +340,7 @@ describe("debug inspection controller", () => {
     controller.dispose();
   });
 
-  it("does not request an unsupported non-current goroutine stack", async () => {
+  it("requests the selected non-current goroutine without borrowing the stopped stack", async () => {
     const value = snapshot([
       goroutine(1, 0, { current: true }),
       goroutine(2, 1),
@@ -334,24 +350,30 @@ describe("debug inspection controller", () => {
       selectedGoroutine: 2,
     };
     const registry = new RegistryStub(model);
-    let requests = 0;
+    const requests: unknown[] = [];
     const controller = new DebugInspectionController(registry, () => ({
       id: "debug",
-      customRequest() {
-        requests += 1;
-        return Promise.resolve({});
+      customRequest(command, args) {
+        requests.push({ command, args });
+        if (command === "threads") {
+          return Promise.resolve(threadMapping);
+        }
+        return Promise.resolve({ stackFrames: [] });
       },
     }));
     await settle();
 
-    assert.equal(requests, 0);
+    assert.deepEqual(requests, [{ command: "threads", args: {} }, {
+      command: "stackTrace",
+      args: { threadId: 10_002, startFrame: 0, levels: 200 },
+    }]);
     assert.equal(
       registry.inspectionFor("debug")?.stackStatus,
       "unavailable",
     );
     assert.match(
       registry.inspectionFor("debug")?.stackMessage ?? "",
-      /stopped goroutine g1/,
+      /selected-goroutine inspection/,
     );
     controller.dispose();
   });
@@ -369,6 +391,9 @@ describe("debug inspection controller", () => {
     const client: DebugSessionClient = {
       id: "debug",
       customRequest(command) {
+        if (command === "threads") {
+          return Promise.resolve(threadMapping);
+        }
         if (command === "stackTrace") {
           stackRequests += 1;
           if (stackRequests === 1) {
@@ -398,6 +423,7 @@ describe("debug inspection controller", () => {
       registry,
       () => client,
     );
+    await settle();
     registry.replaceSnapshot(second, 2);
     await settle();
     resolveFirst?.({
@@ -435,6 +461,9 @@ describe("debug inspection controller", () => {
     const controller = new DebugInspectionController(registry, () => ({
       id: "debug",
       customRequest(command, args) {
+        if (command === "threads") {
+          return Promise.resolve(threadMapping);
+        }
         requests.push({ command, args });
         if (command === "stackTrace") {
           return Promise.resolve({
@@ -468,7 +497,7 @@ describe("debug inspection controller", () => {
     );
     registry.selectGoroutine(2);
     await settle();
-    assert.equal(registry.inspectionFor("debug")?.targetGoroutine, 0);
+    assert.equal(registry.inspectionFor("debug")?.targetGoroutine, 2);
     assert.equal(registry.model.selectedGoroutine, 2);
     controller.dispose();
   });
@@ -480,6 +509,9 @@ describe("debug inspection controller", () => {
     const controller = new DebugInspectionController(registry, () => ({
       id: "debug",
       customRequest(command, args) {
+        if (command === "threads") {
+          return Promise.resolve(threadMapping);
+        }
         if (command === "stackTrace") {
           return Promise.resolve({
             stackFrames: [
@@ -620,41 +652,41 @@ describe("debug inspection response codecs", () => {
 
 describe("inspection generations and deferred requests", () => {
   const transitions = {
-    resume(h: ReturnType<typeof harness>) {
+    resume(h: Awaited<ReturnType<typeof harness>>) {
       h.registry.setSessionState("running");
     },
-    "DAP resume before WebSocket state"(h: ReturnType<typeof harness>) {
+    "DAP resume before WebSocket state"(h: Awaited<ReturnType<typeof harness>>) {
       h.controller.resumed("debug");
     },
-    selection(h: ReturnType<typeof harness>) {
+    selection(h: Awaited<ReturnType<typeof harness>>) {
       h.registry.selectGoroutine(2);
     },
-    snapshot(h: ReturnType<typeof harness>) {
+    snapshot(h: Awaited<ReturnType<typeof harness>>) {
       h.registry.replaceSnapshot(snapshot([goroutine(1, 0, { current: true })]), 1);
     },
-    session(h: ReturnType<typeof harness>) {
+    session(h: Awaited<ReturnType<typeof harness>>) {
       h.registry.replaceSession("other", "other-session");
     },
-    "native session"(h: ReturnType<typeof harness>) {
+    "native session"(h: Awaited<ReturnType<typeof harness>>) {
       h.registry.replaceSession("debug", "replacement-session");
     },
-    forget(h: ReturnType<typeof harness>) {
+    forget(h: Awaited<ReturnType<typeof harness>>) {
       h.controller.forgetSession("debug");
     },
-    stop(h: ReturnType<typeof harness>) {
+    stop(h: Awaited<ReturnType<typeof harness>>) {
       h.controller.stopped("debug", 1);
     },
-    refresh(h: ReturnType<typeof harness>) {
+    refresh(h: Awaited<ReturnType<typeof harness>>) {
       h.controller.refresh();
     },
-    dispose(h: ReturnType<typeof harness>) {
+    dispose(h: Awaited<ReturnType<typeof harness>>) {
       h.controller.dispose();
     },
   };
   for (const phase of ["stack", "scopes", "variables", "children"] as const) {
     for (const [name, transition] of Object.entries(transitions)) {
       it(`ignores late ${phase} after ${name} without further requests`, async (t) => {
-        const h = harness(t);
+        const h = await harness(t);
         if (phase === "scopes") {
           await reachScopes(h);
         } else if (phase === "variables") {
@@ -677,14 +709,15 @@ describe("inspection generations and deferred requests", () => {
         assert.equal(h.client.requests.length, count);
         assert.equal(h.registry.updates, updates);
         assert.equal(h.clock.pending.size, name === "snapshot" ||
-          name === "native session" || name === "stop" || name === "refresh" ? 1 : 0);
+          name === "native session" || name === "stop" || name === "refresh" ||
+          name === "selection" ? 1 : 0);
       });
     }
   }
 
   for (const phase of ["scopes", "variables", "children"] as const) {
     it(`rejects an older frame's ${phase} while the new frame wins out of order`, async (t) => {
-      const h = harness(t);
+      const h = await harness(t);
       if (phase === "scopes") {
         await reachScopes(h);
       } else if (phase === "variables") {
@@ -713,7 +746,7 @@ describe("inspection generations and deferred requests", () => {
   }
 
   it("checks a generation after every scope's variable response, including synchronous state changes", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     await reachVariables(h, [10, 20, 30]);
     const response = h.client.next("variables");
     h.registry.setSessionState("running");
@@ -726,7 +759,7 @@ describe("inspection generations and deferred requests", () => {
   });
 
   it("does not issue locals when a registry listener resumes during stack publication", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     h.registry.onChange(() => {
       if (h.registry.inspectionFor("debug")?.stackStatus === "ready") {
         h.registry.setSessionState("running");
@@ -738,7 +771,7 @@ describe("inspection generations and deferred requests", () => {
   });
 
   it("checks disposal before all public actions and future registry callbacks", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     await loadRoots(h);
     h.controller.dispose();
     h.controller.dispose();
@@ -760,14 +793,14 @@ describe("inspection generations and deferred requests", () => {
   });
 
   it("does not change active inspection when an unrelated session is forgotten", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     h.controller.forgetSession("unrelated");
     await loadRoots(h);
     assert.equal(h.registry.inspectionFor("debug")?.localsStatus, "ready");
   });
 
   it("blocks all inspection while DAP is running but WebSocket still reports suspended", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     await loadRoots(h);
     h.controller.resumed("debug");
     assert.equal(h.registry.model.sessionState, "suspended");
@@ -785,7 +818,7 @@ describe("inspection generations and deferred requests", () => {
   });
 
   it("a later DAP stop reopens inspection and preserves unknown stopped identity", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     await loadRoots(h);
     h.controller.resumed("debug");
     h.controller.stopped("debug", 0);
@@ -805,7 +838,7 @@ describe("inspection generations and deferred requests", () => {
   });
 
   it("an inactive session's DAP resume does not invalidate the active session", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     await loadRoots(h);
     const inspection = h.registry.inspectionFor("debug");
     h.controller.resumed("other");
@@ -818,7 +851,7 @@ describe("inspection generations and deferred requests", () => {
   });
 
   it("rejects an old same-frame response even after frame selection returns to its original id", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     await reachScopes(h);
     const original = h.client.next("scopes");
     h.controller.selectFrame(2);
@@ -842,7 +875,7 @@ describe("inspection generations and deferred requests", () => {
 
 describe("inspection reference ownership", () => {
   it("deduplicates scopes and shares root, child, and cyclic references without more requests", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     await reachVariables(h, [10, 10, 0, 10]);
     h.client.next("variables").result.resolve({
       variables: [variable(99, "a"), variable(99, "b"), variable(10, "scope cycle")],
@@ -866,7 +899,7 @@ describe("inspection reference ownership", () => {
   });
 
   it("merges concurrent children that finish in reverse order", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     await loadRoots(h, [variable(98), variable(99)]);
     h.controller.expandVariable(98);
     h.controller.expandVariable(99);
@@ -883,7 +916,7 @@ describe("inspection reference ownership", () => {
   });
 
   it("rejects unknown, fractional, infinite, and otherwise malformed UI references", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     await loadRoots(h);
     const count = h.client.requests.length;
     for (const reference of [0, -1, 0.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, 10, 100]) {
@@ -895,7 +928,7 @@ describe("inspection reference ownership", () => {
   });
 
   it("does not repeat failed child requests or poison a later frame with their errors", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     await loadRoots(h);
     h.controller.expandVariable(99);
     h.client.next("variables").result.reject(new Error("child unavailable"));
@@ -918,7 +951,7 @@ describe("inspection reference ownership", () => {
   });
 
   it("a malformed scope reference fails before any variable request", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     await reachScopes(h);
     h.client.next("scopes").result.resolve({
       scopes: [{ variablesReference: 10 }, { variablesReference: 1.5 }],
@@ -933,7 +966,7 @@ describe("inspection reference ownership", () => {
 describe("aggregate inspection budgets", () => {
   for (const extraScope of [false, true]) {
     it(`keeps ${extraScope ? "over-limit" : "exact-limit"} scope roots bounded across the whole frame`, async (t) => {
-      const h = harness(t);
+      const h = await harness(t);
       const count = inspectionLimits.variableNodes / inspectionLimits.variablesPerResponse;
       await reachVariables(h, Array.from({ length: count + Number(extraScope) }, (_, i) => i + 10));
       for (let i = 0; i < count; i += 1) {
@@ -951,7 +984,7 @@ describe("aggregate inspection budgets", () => {
   }
 
   it("charges expanded descendants against the root budget and stops deep fanout before sending", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     const group = (reference: number) => Array.from(
       { length: inspectionLimits.variablesPerResponse },
       (_, index) => variable(index === 0 ? reference : 0),
@@ -975,7 +1008,7 @@ describe("aggregate inspection budgets", () => {
   });
 
   it("shares the remaining node budget between concurrently completing responses", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     const root = Array.from({ length: inspectionLimits.variablesPerResponse }, (_, i) => variable(i < 4 ? i + 100 : 0));
     await loadRoots(h, root);
     for (let i = 0; i < 4; i += 1) {
@@ -997,7 +1030,7 @@ describe("aggregate inspection budgets", () => {
   });
 
   it("charges a cached scope alias again before duplicating it into the outgoing model", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     await reachVariables(h, [10, 20, 30, 40]);
     for (let i = 0; i < 4; i += 1) {
       h.client.next("variables").result.resolve({
@@ -1019,7 +1052,7 @@ describe("aggregate inspection budgets", () => {
 
   for (const extra of [0, 1]) {
     it(`enforces ${extra === 0 ? "exact" : "overflow"} UTF-8 aggregate text bytes rather than UTF-16 length`, async (t) => {
-      const h = harness(t);
+      const h = await harness(t);
       const value = "😀".repeat(inspectionLimits.textBytes / 4);
       const count = inspectionLimits.variableBytes / inspectionLimits.textBytes;
       await loadRoots(h, Array.from({ length: count + extra }, () => variable(99, value, "")));
@@ -1037,7 +1070,7 @@ describe("aggregate inspection budgets", () => {
   }
 
   it("charges names and types, not just values, against the byte ceiling", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     const variables = Array.from({ length: 6 }, () => ({
       ...variable(0, "v".repeat(inspectionLimits.textBytes), "n".repeat(inspectionLimits.textBytes)),
       type: "t".repeat(inspectionLimits.textBytes),
@@ -1050,7 +1083,7 @@ describe("aggregate inspection budgets", () => {
 
   for (const extra of [0, 1]) {
     it(`caps ${extra === 0 ? "exact" : "overflow"} distinct references including scope roots`, async (t) => {
-      const h = harness(t);
+      const h = await harness(t);
       await loadRoots(h, Array.from(
         { length: inspectionLimits.references - 1 + extra },
         (_, i) => variable(1_000 + i),
@@ -1066,7 +1099,7 @@ describe("aggregate inspection budgets", () => {
   }
 
   it("caps aggregate empty-child requests without relying on node or byte limits", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     await loadRoots(h, Array.from({ length: inspectionLimits.requests }, (_, i) => variable(1_000 + i)));
     for (let i = 0; i < inspectionLimits.requests - 2; i += 1) {
       h.controller.expandVariable(1_000 + i);
@@ -1082,7 +1115,7 @@ describe("aggregate inspection budgets", () => {
   });
 
   it("caps a deep chain's requests and renews budgets for a new frame", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     await loadRoots(h, [variable(100)]);
     for (let i = 0; i < inspectionLimits.requests - 2; i += 1) {
       h.controller.expandVariable(100 + i);
@@ -1107,7 +1140,7 @@ describe("aggregate inspection budgets", () => {
 
 describe("inspection request lifetime and failures", () => {
   it("bounds concurrent expansions, clears rejected loading state, and permits an unsent retry", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     await loadRoots(h, Array.from({ length: inspectionLimits.inFlight + 1 }, (_, i) => variable(100 + i)));
     for (let i = 0; i <= inspectionLimits.inFlight; i += 1) {
       h.controller.expandVariable(100 + i);
@@ -1128,10 +1161,11 @@ describe("inspection request lifetime and failures", () => {
   });
 
   it("retains wire slots after deadlines so repeated refreshes cannot accumulate hung requests", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     for (let i = 0; i < inspectionLimits.inFlight; i += 1) {
       if (i > 0) {
         h.controller.refresh();
+        await settle();
       }
       assert.equal(h.clock.pending.size, 1);
       h.clock.expire();
@@ -1147,14 +1181,16 @@ describe("inspection request lifetime and failures", () => {
     h.client.next("stackTrace").result.reject(new Error("late transport failure"));
     await settle();
     h.controller.refresh();
+    await settle();
     assert.equal(h.client.requests.length, inspectionLimits.inFlight + 1);
     assert.equal(h.clock.pending.size, 1);
   });
 
   it("retains wire slots across stale generations even when none of their UI waiters remain", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     for (let i = 0; i < inspectionLimits.inFlight + 10; i += 1) {
       h.controller.refresh();
+      await settle();
     }
     await settle();
     assert.equal(h.client.requests.length, inspectionLimits.inFlight);
@@ -1170,7 +1206,7 @@ describe("inspection request lifetime and failures", () => {
 
   for (const phase of ["scopes", "variables", "children"] as const) {
     it(`reports ${phase} deadlines accurately without follow-up requests or permanent spinners`, async (t) => {
-      const h = harness(t);
+      const h = await harness(t);
       if (phase === "scopes") {
         await reachScopes(h);
       } else if (phase === "variables") {
@@ -1222,6 +1258,7 @@ describe("inspection request lifetime and failures", () => {
     let available = true;
     const controller = new DebugInspectionController(registry, () => available ? client : undefined);
     t.after(() => { controller.dispose(); });
+    await settle();
     available = false;
     client.next("stackTrace").result.resolve(stack);
     await settle();
@@ -1256,7 +1293,7 @@ describe("inspection request lifetime and failures", () => {
   }
 
   it("bounds adapter error strings", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     h.client.next("stackTrace").result.reject(new Error("x".repeat(100_000)));
     await settle();
     const message = h.registry.inspectionFor("debug")?.stackMessage ?? "";
@@ -1264,8 +1301,8 @@ describe("inspection request lifetime and failures", () => {
     assert.ok(message.length < 550);
   });
 
-  it("keeps malformed DAP stop ids synthetic instead of claiming a real goroutine", (t) => {
-    const h = harness(t);
+  it("keeps malformed DAP stop ids synthetic instead of claiming a real goroutine", async (t) => {
+    const h = await harness(t);
     h.registry.setSessionState("running");
     for (const threadId of [NaN, Infinity, 1.5, Number.MAX_SAFE_INTEGER + 1, -1, 0]) {
       h.controller.stopped("debug", threadId);
@@ -1278,6 +1315,51 @@ describe("inspection request lifetime and failures", () => {
 });
 
 describe("bounded inspection decoding", () => {
+  it("resolves an explicit click on a stale current graph node after an identity-less step", async (t) => {
+    const h = await harness(t);
+    h.controller.stopped("debug", 0);
+    await settle();
+    assert.equal(h.registry.inspectionFor("debug")?.targetGoroutine, 0);
+    h.registry.selectGoroutine(1);
+    await settle();
+    assert.equal(h.registry.inspectionFor("debug")?.targetGoroutine, 1);
+    assert.deepEqual(h.client.requests.at(-1)?.args, {
+      threadId: 10_001, startFrame: 0, levels: inspectionLimits.frames,
+    });
+  });
+
+  it("resolves graph goids only through unique explicit opaque thread mappings", () => {
+    assert.equal(decodeGoroutineThread(threadMapping, 1), 10_001);
+    assert.equal(decodeGoroutineThread({
+      threads: [{ id: 1, name: "goroutine 1" }],
+    }, 1), 0);
+    assert.equal(decodeGoroutineThread({
+      threads: [
+        { id: 100, name: "stopped goroutine (unknown)" },
+        { id: 101, name: "g1", bingoGoroutineId: 1 },
+      ],
+    }, 1), 101);
+    assert.throws(() => decodeGoroutineThread({
+      threads: [{ id: 1 }, { id: 1, bingoGoroutineId: 2 }],
+    }, 2), /handles must be unique/);
+    assert.throws(() => decodeGoroutineThread({
+      threads: [{ id: 1, bingoGoroutineId: 2 }, { id: 3, bingoGoroutineId: 2 }],
+    }, 2), /goroutine ids must be unique/);
+    for (const invalid of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      assert.throws(() => decodeGoroutineThread({
+        threads: [{ id: 100, bingoGoroutineId: invalid }],
+      }, 1), /goroutine id/);
+    }
+  });
+
+  it("accepts the full thread delivery bound and rejects one more before walking it", () => {
+    const threads = Array.from({ length: inspectionLimits.threads }, (_, i) => ({
+      id: i + 10_001, name: "g".repeat(inspectionLimits.textBytes + 1), bingoGoroutineId: i + 1,
+    }));
+    assert.equal(decodeGoroutineThread({ threads }, threads.length), threads.at(-1)?.id);
+    assert.throws(() => decodeGoroutineThread({ threads: [...threads, {}] }, 1), /threads exceeds/);
+  });
+
   const codecCases = [
     {
       name: "stackFrames",
@@ -1303,6 +1385,7 @@ describe("bounded inspection decoding", () => {
       assert.equal(decode({ [name]: Array.from({ length: limit }, (_, i) => item(i)) }).length, limit);
       assert.throws(() => decode({ [name]: Array.from({ length: limit + 1 }, (_, i) => item(i)) }), /entry limit/);
     });
+
     it(`rejects over-limit ${name} arrays before walking any element`, () => {
       for (const length of [limit + 1, inspectionLimits.responseNodes + 1]) {
         const values = new Array<unknown>(length);
@@ -1312,7 +1395,69 @@ describe("bounded inspection decoding", () => {
         assert.equal(reads, 0);
       }
     });
+
   }
+
+  describe("graph-to-DAP thread identity", () => {
+      it("reports unproven legacy mapping unavailable without borrowing a current stack", async (t) => {
+        const registry = new RegistryStub(suspendedModel(snapshot()));
+        const requests: string[] = [];
+        const controller = new DebugInspectionController(registry, () => ({
+          id: "debug",
+          customRequest(command) {
+            requests.push(command);
+            return Promise.resolve({ threads: [{ id: 1, name: "goroutine 1" }] });
+          },
+        }));
+        t.after(() => { controller.dispose(); });
+        await settle();
+        assert.deepEqual(requests, ["threads", "threads"]);
+        assert.equal(registry.inspectionFor("debug")?.stackStatus, "unavailable");
+        assert.match(registry.inspectionFor("debug")?.stackMessage ?? "", /proven DAP thread handle/);
+      });
+
+      it("handles the first collapsed unknown-stop listing before selecting a real graph goid", async (t) => {
+        const registry = new RegistryStub(suspendedModel(snapshot()));
+        const requests: { command: string; args: unknown }[] = [];
+        let lists = 0;
+        const controller = new DebugInspectionController(registry, () => ({
+          id: "debug",
+          customRequest(command, args) {
+            requests.push({ command, args });
+            if (command === "threads") {
+              lists++;
+              return Promise.resolve(lists === 1
+                ? { threads: [{ id: 777, name: "current g2", bingoGoroutineId: 2 }] }
+                : { threads: [{ id: 999, name: "g1", bingoGoroutineId: 1 }] });
+            }
+            return Promise.resolve({ stackFrames: [] });
+          },
+        }));
+        t.after(() => { controller.dispose(); });
+        await settle();
+        assert.deepEqual(requests.map(r => r.command), ["threads", "threads", "stackTrace"]);
+        assert.deepEqual(requests[2]?.args, { threadId: 999, startFrame: 0, levels: 200 });
+      });
+
+      it("does not send a stack request after a stale delayed thread mapping", async (t) => {
+        const registry = new RegistryStub(suspendedModel(snapshot()));
+        const pending = deferred();
+        const requests: string[] = [];
+        const controller = new DebugInspectionController(registry, () => ({
+          id: "debug",
+          customRequest(command) {
+            requests.push(command);
+            return pending.promise;
+          },
+        }));
+        t.after(() => { controller.dispose(); });
+        registry.setSessionState("running");
+        pending.resolve(threadMapping);
+        await settle();
+        assert.deepEqual(requests, ["threads"]);
+        assert.equal(registry.inspectionFor("debug")?.frames.length, 0);
+      });
+  });
 
   for (const field of ["name", "value", "type"] as const) {
     it(`enforces the UTF-8 boundary for variable ${field}`, () => {
@@ -1347,14 +1492,14 @@ describe("bounded inspection decoding", () => {
   });
 
   it("reports known stack truncation without claiming a complete stack", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     h.client.next("stackTrace").result.resolve({ ...stack, totalFrames: 500 });
     await settle();
     assert.match(h.registry.inspectionFor("debug")?.stackMessage ?? "", /showing 2 of 500/);
   });
 
   it("honestly labels a full page when the adapter does not provide a total", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     h.client.next("stackTrace").result.resolve({
       stackFrames: Array.from({ length: inspectionLimits.frames }, (_, i) => ({
         id: i + 1, name: "frame", line: 0, column: 0,
@@ -1439,7 +1584,7 @@ describe("bounded inspection decoding", () => {
   });
 
   it("surfaces oversized variable bodies as errors instead of reporting a silently clipped success", async (t) => {
-    const h = harness(t);
+    const h = await harness(t);
     await reachVariables(h);
     h.client.next("variables").result.resolve({
       variables: Array.from({ length: inspectionLimits.variablesPerResponse + 1 }, () => variable()),

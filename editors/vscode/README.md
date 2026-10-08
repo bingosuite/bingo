@@ -34,8 +34,9 @@ adds bounded creation-source previews, and bounds aggregate inspector work.
 builds, cancellable startup, and source-launch capability checks. **0.7.1**
 updates the WebSocket runtime and packaging dependencies for security fixes.
 **0.7.2** adds read-only channel metadata and typed buffered contents to
-Variables, Watch, and the Bingo inspector.
-Use a matching 0.7.2 companion and server for the source quick start.
+Variables, Watch, and the Bingo inspector. **0.7.3** retains channel contents
+and adds selected-goroutine stacks, frame locals, and name-only evaluate.
+Use a matching 0.7.3 companion and server for both features.
 Rerun the command to update, then run
 **Developer: Reload Window** once so the active extension host loads the new
 bundle. Package without installing with `just vscode-package`. Uninstall with:
@@ -144,11 +145,21 @@ in the selector; the status bar shows active goroutine/thread counts.
   **Open creation source** action. This works independently of stack inspection,
   including for a goroutine that is not stopped.
 - The debugger inspector shows runtime metadata,
-  clickable current/start/creation locations, the stopped goroutine's DAP call
-  stack, frame selection, locals, and lazy variable expansion. Stack and locals
-  are currently available only for the goroutine that is actually stopped;
-  selecting another node explains that limit and offers a shortcut back to the
-  stopped goroutine rather than showing misleading data.
+  clickable current/start/creation locations, the selected goroutine's DAP call
+  stack, frame selection, locals, and lazy variable expansion. Select any
+  existing goroutine in the graph or native Call Stack panel while stopped.
+  Unavailable, exited, malformed, or out-of-bound contexts report an error,
+  never another goroutine's frames. Name-only Watch/hover evaluation follows
+  the selected native frame. Register-allocated values remain optimized out.
+  On Linux, explicitly inspecting another goroutine acquires a bounded
+  all-thread hold that lasts through subsequent inspection requests until
+  Continue/Step/Kill; ordinary current-stack queries retain their old behavior.
+  Graph selection resolves goids through the adapter's explicit
+  `bingoGoroutineId` metadata, including full 5,000-goroutine lists and the
+  unknown-stop collapsed-reply race. Missing or ambiguous identity proof reports
+  unavailable instead of guessing. An explicit click remains selected after
+  steps; automatic identity-less stop inspection still uses the current stack.
+  This does not add selective goroutine stepping or resuming.
 - Source links in goroutine metadata and stack frames open the exact file and
   line in the editor. Thread cards and a bounded created/exited timeline provide
   physical and lifecycle context.
@@ -213,8 +224,9 @@ not consumed, and neither the graph nor its source preview drives execution.
 
 Expand a channel local or a name-only Watch expression to see `len`, `cap`,
 `closed`, and typed buffered values `[0]`, `[1]`, ... in receive/FIFO order.
-The Bingo inspector uses the same variable children. Nil channels are marked
-nil; closed channels retain any unread buffered values. Unbuffered channels
+The Bingo inspector uses the same variable children, including locals and Watch
+from a selected non-current goroutine's frame. Nil channels are marked nil;
+closed channels retain any unread buffered values. Unbuffered channels
 explicitly have **no stored values**; blocked senders and receivers are not
 inspected. Channel direction and named element types are preserved.
 
@@ -223,9 +235,12 @@ otherwise mutates a channel. At most **100 buffered elements** are expanded,
 subject to the debugger's existing depth and request-wide node/byte budgets;
 truncation is explicit. Missing DWARF layout, unreadable/corrupt headers, or
 detected metadata changes produce an unavailable value rather than guessed
-contents. On Linux only the reporting thread is stopped, so sibling mutation
-can race reads: metadata is rechecked, but this is **not an atomic snapshot**
-and cannot detect every ABA change or mutation of referenced objects.
+contents. Ordinary current-context queries on Linux stop only the reporting
+thread, so sibling mutation can race reads: metadata is rechecked, but this is
+**not an atomic snapshot** and cannot detect every ABA change or mutation of
+referenced objects. Explicit selected-goroutine inspection first acquires the
+all-thread hold described above; subsequent channel expansion uses that same
+hold until execution resumes.
 See the [wrapped-buffer example](../../examples/channel-contents/main.go).
 
 ### Large targets and the 1.4 telemetry contract

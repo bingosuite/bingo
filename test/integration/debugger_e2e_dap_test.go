@@ -465,13 +465,14 @@ func waitForSession(wsAddr string) string {
 // --- DAP test client (go-dap over TCP with response/event demux) ---
 
 type dapClient struct {
-	conn    net.Conn
-	reader  *bufio.Reader
-	mu      sync.Mutex
-	seq     int
-	pending map[int]chan godap.Message
-	events  chan godap.Message
-	done    chan struct{}
+	conn           net.Conn
+	reader         *bufio.Reader
+	mu             sync.Mutex
+	seq            int
+	pending        map[int]chan godap.Message
+	threadMetadata map[int]map[int]int64
+	events         chan godap.Message
+	done           chan struct{}
 }
 
 // dialDAP connects to the DAP server and starts the demux read loop. Cleanup
@@ -482,11 +483,12 @@ func dialDAP(addr string) *dapClient {
 	Expect(err).NotTo(HaveOccurred(), "dial DAP %s", addr)
 
 	c := &dapClient{
-		conn:    conn,
-		reader:  bufio.NewReader(conn),
-		pending: make(map[int]chan godap.Message),
-		events:  make(chan godap.Message, 256),
-		done:    make(chan struct{}),
+		conn:           conn,
+		reader:         bufio.NewReader(conn),
+		pending:        make(map[int]chan godap.Message),
+		threadMetadata: make(map[int]map[int]int64),
+		events:         make(chan godap.Message, 256),
+		done:           make(chan struct{}),
 	}
 	go c.readLoop()
 	DeferCleanup(func() {
@@ -499,7 +501,7 @@ func dialDAP(addr string) *dapClient {
 func (c *dapClient) readLoop() {
 	defer close(c.done)
 	for {
-		msg, err := dapclient.ReadProtocolMessage(c.reader)
+		msg, metadata, err := dapclient.ReadProtocolMessageWithThreadMetadata(c.reader)
 		if err != nil {
 			return
 		}
@@ -508,6 +510,9 @@ func (c *dapClient) readLoop() {
 			rs := m.GetResponse()
 			c.mu.Lock()
 			ch := c.pending[rs.RequestSeq]
+			if _, ok := msg.(*godap.ThreadsResponse); ok {
+				c.threadMetadata[rs.RequestSeq] = metadata
+			}
 			c.mu.Unlock()
 			// The waiter channel is buffered (cap 1) and never removed here, so
 			// a response that arrives before await() is called is retained until

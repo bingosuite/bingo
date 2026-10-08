@@ -468,7 +468,14 @@ func (c *wsClient) ClearBreakpoint(id int) error {
 }
 
 func (c *wsClient) Locals(frameIndex int) ([]protocol.Variable, error) {
-	cmd, err := newCommand(protocol.CmdLocals, protocol.LocalsPayloadCmd{FrameIndex: frameIndex})
+	return c.LocalsForGoroutine(0, frameIndex)
+}
+
+func (c *wsClient) LocalsForGoroutine(goid, frameIndex int) ([]protocol.Variable, error) {
+	if err := validateInspectionSelection(goid); err != nil {
+		return nil, err
+	}
+	cmd, err := newCommand(protocol.CmdLocals, protocol.LocalsPayloadCmd{FrameIndex: frameIndex, GoroutineID: goid})
 	if err != nil {
 		return nil, err
 	}
@@ -480,13 +487,24 @@ func (c *wsClient) Locals(frameIndex int) ([]protocol.Variable, error) {
 	if err := protocol.DecodeEventPayload(evt, &p); err != nil {
 		return nil, fmt.Errorf("decode Locals: %w", err)
 	}
+	if goid > 0 && (p.GoroutineID != goid || p.FrameIndex != frameIndex) {
+		return nil, fmt.Errorf("%w: locals context does not match request", ErrGoroutineInspectionUnsupported)
+	}
 	return p.Variables, nil
 }
 
 func (c *wsClient) Evaluate(frameIndex int, name string) (protocol.Variable, error) {
+	return c.EvaluateForGoroutine(0, frameIndex, name)
+}
+
+func (c *wsClient) EvaluateForGoroutine(goid, frameIndex int, name string) (protocol.Variable, error) {
+	if err := validateInspectionSelection(goid); err != nil {
+		return protocol.Variable{}, err
+	}
 	cmd, err := newCommand(protocol.CmdEvaluate, protocol.EvaluatePayloadCmd{
-		FrameIndex: frameIndex,
-		Name:       name,
+		FrameIndex:  frameIndex,
+		Name:        name,
+		GoroutineID: goid,
 	})
 	if err != nil {
 		return protocol.Variable{}, err
@@ -499,11 +517,21 @@ func (c *wsClient) Evaluate(frameIndex int, name string) (protocol.Variable, err
 	if err := protocol.DecodeEventPayload(evt, &p); err != nil {
 		return protocol.Variable{}, fmt.Errorf("decode Evaluate: %w", err)
 	}
+	if p.GoroutineID != goid {
+		return protocol.Variable{}, fmt.Errorf("%w: evaluate context does not match request", ErrGoroutineInspectionUnsupported)
+	}
 	return p.Result, nil
 }
 
 func (c *wsClient) StackFrames() ([]protocol.Frame, error) {
-	cmd, err := newCommand(protocol.CmdFrames, struct{}{})
+	return c.StackFramesForGoroutine(0)
+}
+
+func (c *wsClient) StackFramesForGoroutine(goid int) ([]protocol.Frame, error) {
+	if err := validateInspectionSelection(goid); err != nil {
+		return nil, err
+	}
+	cmd, err := newCommand(protocol.CmdFrames, protocol.FramesPayloadCmd{GoroutineID: goid})
 	if err != nil {
 		return nil, err
 	}
@@ -515,7 +543,17 @@ func (c *wsClient) StackFrames() ([]protocol.Frame, error) {
 	if err := protocol.DecodeEventPayload(evt, &p); err != nil {
 		return nil, fmt.Errorf("decode Frames: %w", err)
 	}
+	if p.GoroutineID != goid {
+		return nil, fmt.Errorf("%w: stack context does not match request", ErrGoroutineInspectionUnsupported)
+	}
 	return p.Frames, nil
+}
+
+func validateInspectionSelection(goid int) error {
+	if goid < 0 || uint64(goid) > 1<<53-1 {
+		return fmt.Errorf("invalid goroutine id %d", goid)
+	}
+	return nil
 }
 
 func (c *wsClient) Goroutines() ([]protocol.Goroutine, error) {

@@ -66,13 +66,14 @@ func dispatch(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, erro
 		if err := protocol.DecodeCommandPayload(cmd, &p); err != nil {
 			return dispatchResult{}, err
 		}
-		vars, err := dbg.Locals(p.FrameIndex)
+		vars, err := debugger.LocalsForGoroutine(dbg, p.GoroutineID, p.FrameIndex)
 		if err != nil {
 			return dispatchResult{}, err
 		}
 		evt, err := protocol.NewEvent(protocol.EventLocals, 0, protocol.LocalsPayload{
-			FrameIndex: p.FrameIndex,
-			Variables:  vars,
+			GoroutineID: p.GoroutineID,
+			FrameIndex:  p.FrameIndex,
+			Variables:   vars,
 		})
 		if err != nil {
 			return dispatchResult{}, err
@@ -84,12 +85,13 @@ func dispatch(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, erro
 		if err := protocol.DecodeCommandPayload(cmd, &p); err != nil {
 			return dispatchResult{}, err
 		}
-		result, err := dbg.Evaluate(p.FrameIndex, p.Name)
+		result, err := debugger.EvaluateForGoroutine(dbg, p.GoroutineID, p.FrameIndex, p.Name)
 		if err != nil {
 			return dispatchResult{}, err
 		}
 		evt, err := protocol.NewEvent(protocol.EventEvaluate, 0, protocol.EvaluatePayload{
-			Result: result,
+			GoroutineID: p.GoroutineID,
+			Result:      result,
 		})
 		if err != nil {
 			return dispatchResult{}, err
@@ -97,12 +99,19 @@ func dispatch(dbg debugger.Debugger, cmd protocol.Command) (dispatchResult, erro
 		return dispatchResult{event: &evt}, nil
 
 	case protocol.CmdFrames:
-		frames, err := dbg.StackFrames()
+		var p protocol.FramesPayloadCmd
+		if len(cmd.Payload) != 0 {
+			if err := protocol.DecodeCommandPayload(cmd, &p); err != nil {
+				return dispatchResult{}, err
+			}
+		}
+		frames, err := debugger.StackFramesForGoroutine(dbg, p.GoroutineID)
 		if err != nil {
 			return dispatchResult{}, err
 		}
 		evt, err := protocol.NewEvent(protocol.EventFrames, 0, protocol.FramesPayload{
-			Frames: frames,
+			GoroutineID: p.GoroutineID,
+			Frames:      frames,
 		})
 		if err != nil {
 			return dispatchResult{}, err

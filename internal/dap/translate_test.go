@@ -10,15 +10,6 @@ import (
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
-func TestThreadIDClampsToOne(t *testing.T) {
-	cases := map[int]int{-5: 1, 0: 1, 1: 1, 7: 7}
-	for in, want := range cases {
-		if got := threadID(in); got != want {
-			t.Errorf("threadID(%d) = %d, want %d", in, got, want)
-		}
-	}
-}
-
 func TestStoppedThreadIDOmittedWhenUnknown(t *testing.T) {
 	cases := map[int]int{-5: 0, 0: 0, 1: 1, 7: 7}
 	for in, want := range cases {
@@ -53,15 +44,25 @@ func TestStoppedReason(t *testing.T) {
 	}
 }
 
-func TestFrameIDRoundTrip(t *testing.T) {
-	for idx := 0; idx < 5; idx++ {
-		ref := frameID(idx)
-		if ref == 0 {
-			t.Errorf("frameID(%d) = 0, must be non-zero", idx)
-		}
-		if back := frameIndexFromRef(ref); back != idx {
-			t.Errorf("frameIndexFromRef(frameID(%d)) = %d, want %d", idx, back, idx)
-		}
+func TestInspectionHandlesRemainOpaqueAcrossStops(t *testing.T) {
+	h := &Handler{}
+	first, err := h.allocVarRef()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.resetVarsLocked()
+	second, err := h.allocVarRef()
+	if err != nil || second <= first || first <= varRefBase {
+		t.Fatalf("handles = %d, %d: %v", first, second, err)
+	}
+	h.inspectionObjects = maxInspectionObjects
+	if _, err := h.allocVarRef(); err == nil {
+		t.Fatal("handle budget was not enforced")
+	}
+	h.resetVarsLocked()
+	h.nextVarRef = 1<<53 - 1
+	if _, err := h.allocVarRef(); err == nil {
+		t.Fatal("safe integer handle limit was not enforced")
 	}
 }
 
@@ -84,63 +85,59 @@ func TestDapStackFrames(t *testing.T) {
 	if len(out) != 2 {
 		t.Fatalf("got %d frames, want 2", len(out))
 	}
-	if out[0].Id != 1 || out[0].Name != "main.inner" || out[0].Line != 3 {
+	if out[0].Id != 0 || out[0].Name != "main.inner" || out[0].Line != 3 {
 		t.Errorf("frame 0 = %+v", out[0])
 	}
-	if out[1].Id != 2 || out[1].Name != "?" {
-		t.Errorf("frame 1 = %+v (want Id=2 Name=?)", out[1])
+	if out[1].Id != 0 || out[1].Name != "?" {
+		t.Errorf("frame 1 = %+v (want unallocated ID, Name=?)", out[1])
 	}
 }
 
-func TestDapThreadsSyntheticWhenEmpty(t *testing.T) {
-	out := dapThreads(nil)
-	if len(out) != 1 || out[0].Id != 1 || out[0].Name != "main" {
-		t.Errorf("dapThreads(nil) = %+v, want [{1 main}]", out)
+func TestDapThreadsHaveDistinctSyntheticAndRealHandles(t *testing.T) {
+	h := &Handler{}
+	gs := []protocol.Goroutine{{ID: 1, Status: "waiting"}}
+	out, err := h.inspectionThreadsLocked(gs, true)
+	if err != nil || len(out) != 1 || out[0].GoroutineID != 0 || out[0].Id <= 0 {
+		t.Fatalf("synthetic current: %+v: %v", out, err)
 	}
-}
-
-func TestDapThreadsMapsGoroutines(t *testing.T) {
-	out := dapThreads([]protocol.Goroutine{
-		{ID: 0, Status: "running"},
-		{ID: 18, Status: "waiting"},
-	})
-	if len(out) != 2 {
-		t.Fatalf("got %d, want 2", len(out))
+	synthetic := out[0].Id
+	out, err = h.inspectionThreadsLocked(gs, false)
+	if err != nil || len(out) != 2 || out[0].Id != synthetic ||
+		out[1].GoroutineID != 1 || out[1].Id == synthetic || out[1].Id == 1 {
+		t.Fatalf("synthetic alongside real g1: %+v: %v", out, err)
 	}
-	if out[0].Id != 1 { // clamped
-		t.Errorf("goroutine 0 threadId = %d, want 1", out[0].Id)
+	oldReal := out[1].Id
+	out, err = h.inspectionThreadsLocked([]protocol.Goroutine{{ID: 1, Current: true}}, true)
+	if err != nil || len(out) != 1 || out[0].Id != oldReal ||
+		h.curThreadID != oldReal || h.curGoroutineID != 1 || h.stopThreadUnknown {
+		t.Fatalf("resolved current: %+v: %v", out, err)
 	}
-	if out[1].Id != 18 {
-		t.Errorf("goroutine 18 threadId = %d, want 18", out[1].Id)
+	raw, err := json.Marshal(bingoThread{Thread: godap.Thread{Id: synthetic}})
+	if err != nil || strings.Contains(string(raw), "bingoGoroutineId") {
+		t.Fatalf("synthetic claims a real goid: %s: %v", raw, err)
 	}
-}
-
-func TestDapStoppedThread(t *testing.T) {
-	resolved, ok := dapStoppedThread([]protocol.Goroutine{
-		{ID: 1, Status: "waiting"},
-		{ID: 7, Status: "running", Current: true},
-	})
-	if !ok || resolved.Id != 7 || resolved.Name != "goroutine 7 (running)" {
-		t.Fatalf("resolved stopped thread = %+v, %v", resolved, ok)
+	h.resetVarsLocked()
+	if _, exists := h.threadHandles[oldReal]; exists {
+		t.Fatal("new stop retained old thread handle")
 	}
-
-	unknown, ok := dapStoppedThread([]protocol.Goroutine{
-		{ID: 1, Status: "waiting"},
-	})
-	if ok || unknown.Id != 1 || unknown.Name != "stopped goroutine (unknown)" {
-		t.Fatalf("unknown stopped thread = %+v, %v", unknown, ok)
+	fresh, err := h.threadForGoroutineLocked(1)
+	if err != nil || fresh <= oldReal {
+		t.Fatalf("new stop reused thread handle %d: %d: %v", oldReal, fresh, err)
 	}
 }
 
 func TestBuildVarTree(t *testing.T) {
 	h := &Handler{varCache: make(map[int][]godap.Variable)}
-	out := h.buildVarTree([]protocol.Variable{
+	out, err := h.buildVarTree([]protocol.Variable{
 		{Name: "x", Value: "42", Type: "int"},
 		{Name: "p", Value: "main.Point{...}", Type: "main.Point", Children: []protocol.Variable{
 			{Name: "X", Value: "1", Type: "int"},
 			{Name: "Y", Value: "2", Type: "int"},
 		}},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(out) != 2 {
 		t.Fatalf("got %d vars, want 2", len(out))
 	}

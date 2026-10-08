@@ -9,6 +9,7 @@ import type { Snapshot } from "./telemetry.js";
 
 export const inspectionLimits = {
   frames: 200,
+  threads: 5_001,
   scopes: 32,
   variablesPerResponse: 500,
   textBytes: 16_384,
@@ -51,6 +52,7 @@ interface InspectionTarget {
   readonly selectedGoroutine: number;
   readonly stackThreadId: number;
   readonly stopVersion: number;
+  readonly selectionVersion: number;
 }
 
 interface FrameGeneration {
@@ -69,6 +71,7 @@ interface FrameGeneration {
 }
 
 class StaleInspectionError extends Error {}
+class UnavailableInspectionError extends Error {}
 
 export class DebugInspectionController {
   readonly #unsubscribe: () => void;
@@ -282,6 +285,7 @@ export class DebugInspectionController {
       this.#lastTarget.selectedGoroutine === target.selectedGoroutine &&
       this.#lastTarget.stackThreadId === target.stackThreadId &&
       this.#lastTarget.stopVersion === target.stopVersion
+      && this.#lastTarget.selectionVersion === target.selectionVersion
     ) {
       return;
     }
@@ -289,19 +293,6 @@ export class DebugInspectionController {
     const targetVersion = ++this.#targetVersion;
     this.#frame = undefined;
     this.#cancelPending();
-
-    if (
-      target.stackThreadId > 0 &&
-      target.selectedGoroutine !== target.stackThreadId
-    ) {
-      this.registry.updateInspection(target.debugSessionId, {
-        ...emptyInspection(inspectionGoroutine(target)),
-        stackStatus: "unavailable",
-        stackMessage: `Call stack and locals are currently available only for the stopped goroutine g${String(target.stackThreadId)}.`,
-        localsStatus: "unavailable",
-      });
-      return;
-    }
 
     if (!this.#sessionAvailable(target)) {
       this.registry.updateInspection(target.debugSessionId, {
@@ -325,12 +316,32 @@ export class DebugInspectionController {
     targetVersion: number,
   ): Promise<void> {
     try {
+      let threadId = 0;
+      const goid = inspectionGoroutine(target);
+      if (goid > 0) {
+        // An unknown stop's first threads response may intentionally contain
+        // only its synthetic-current handle. One more query exposes the list.
+        for (let attempt = 0; attempt < 2 && threadId === 0; attempt += 1) {
+          const threads = await this.#request(
+            target,
+            () => this.#isCurrent(target, targetVersion),
+            "threads",
+            {},
+          );
+          threadId = decodeGoroutineThread(threads, goid);
+        }
+        if (threadId === 0) {
+          throw new UnavailableInspectionError(
+            `The adapter did not provide a proven DAP thread handle for goroutine ${String(goid)}. Selected-goroutine inspection requires an updated Bingo server.`,
+          );
+        }
+      }
       const response = await this.#request(
         target,
         () => this.#isCurrent(target, targetVersion),
         "stackTrace",
         {
-          threadId: target.stackThreadId,
+          threadId,
           startFrame: 0,
           levels: inspectionLimits.frames,
         },
@@ -344,7 +355,7 @@ export class DebugInspectionController {
           ...emptyInspection(inspectionGoroutine(target)),
           stackStatus: "unavailable",
           stackMessage:
-            "No stack frames were returned for this stop. Select the stopped goroutine or pause in user code.",
+            "No stack frames were returned for this goroutine. The server may not support selected-goroutine inspection, or its context may be unavailable.",
           localsStatus: "unavailable",
         });
         return;
@@ -366,9 +377,9 @@ export class DebugInspectionController {
       }
       this.registry.updateInspection(target.debugSessionId, {
         ...emptyInspection(inspectionGoroutine(target)),
-        stackStatus: "error",
+        stackStatus: error instanceof UnavailableInspectionError ? "unavailable" : "error",
         stackMessage: `Cannot load the call stack: ${errorMessage(error)}`,
-        localsStatus: "error",
+        localsStatus: error instanceof UnavailableInspectionError ? "unavailable" : "error",
       });
     }
   }
@@ -513,6 +524,7 @@ export class DebugInspectionController {
         this.#stops.get(model.debugSessionId)?.threadId ??
         (validReference(model.snapshot.current) ? model.snapshot.current : 0),
       stopVersion: this.#stops.get(model.debugSessionId)?.version ?? 0,
+      selectionVersion: model.selectionVersion ?? 0,
     };
   }
 
@@ -529,6 +541,7 @@ export class DebugInspectionController {
       current.selectedGoroutine === target.selectedGoroutine &&
       current.stackThreadId === target.stackThreadId &&
       current.stopVersion === target.stopVersion
+      && current.selectionVersion === target.selectionVersion
     );
   }
 
@@ -748,7 +761,12 @@ async function completeRequest(
 }
 
 function inspectionGoroutine(target: InspectionTarget): number {
-  return target.stackThreadId > 0 ? target.selectedGoroutine : 0;
+  return target.stopVersion > 0 &&
+    target.selectionVersion === 0 &&
+    target.stackThreadId === 0 &&
+    target.selectedGoroutine === target.snapshot.current
+    ? 0
+    : target.selectedGoroutine;
 }
 
 function validReference(value: number): boolean {
@@ -802,6 +820,60 @@ export function decodeStackFrames(value: unknown): readonly DebugStackFrame[] {
       column: integer(frame.column, "stack frame column", 0),
     };
   });
+}
+
+export function decodeGoroutineThread(value: unknown, goid: number): number {
+  integer(goid, "selected goroutine id", 1);
+  const response = identityRecord(value, "threads response");
+  const threads = array(identityField(response, "threads"), "threads", inspectionLimits.threads);
+  const handles = new Set<number>();
+  const goroutines = new Set<number>();
+  let selected = 0;
+  for (let index = 0; index < threads.length; index++) {
+    const thread = identityRecord(identityField(threads, String(index)), "thread");
+    const id = integer(identityField(thread, "id"), "thread id", 1);
+    if (handles.has(id)) {
+      throw new TypeError("thread handles must be unique");
+    }
+    handles.add(id);
+    const identity = identityField(thread, "bingoGoroutineId");
+    if (identity === undefined) {
+      continue;
+    }
+    const goroutineId = integer(identity, "Bingo goroutine id", 1);
+    if (goroutines.has(goroutineId)) {
+      throw new TypeError("Bingo goroutine ids must be unique");
+    }
+    goroutines.add(goroutineId);
+    if (goroutineId === goid) {
+      selected = id;
+    }
+  }
+  return selected;
+}
+
+// Mapping needs only identity fields; walking unused names would apply variable
+// text/node budgets to a legal 5,000-goroutine reply.
+function identityRecord(value: unknown, label: string): object {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object`);
+  }
+  if (Object.keys(value).length > inspectionLimits.objectFields) {
+    throw new RangeError(`${label} exceeds the field limit`);
+  }
+  const prototype: unknown = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new TypeError(`${label} must be a plain JSON object`);
+  }
+  return value;
+}
+
+function identityField(value: object, field: string): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, field);
+  if (descriptor !== undefined && !("value" in descriptor)) {
+    throw new TypeError("thread identity fields must not be accessors");
+  }
+  return descriptor?.value;
 }
 
 export function decodeScopeReferences(value: unknown): readonly number[] {
@@ -920,6 +992,7 @@ function validateResponse(
   collection: string,
   maximum: number,
 ): void {
+  const maximumNodes = inspectionLimits.responseNodes;
   if (value !== null && typeof value === "object" && !Array.isArray(value)) {
     const descriptor = Object.getOwnPropertyDescriptor(value, collection);
     if (descriptor !== undefined && Object.hasOwn(descriptor, "value")) {
@@ -939,7 +1012,7 @@ function validateResponse(
     }
   };
   const visitArray = (value: readonly unknown[], depth: number): void => {
-    if (value.length > inspectionLimits.responseNodes - nodes) {
+    if (value.length > maximumNodes - nodes) {
       throw new RangeError("inspection response exceeds the node limit");
     }
     for (let index = 0; index < value.length; index += 1) {
@@ -975,7 +1048,7 @@ function validateResponse(
   const visit = (value: unknown, depth: number): void => {
     nodes += 1;
     if (
-      nodes > inspectionLimits.responseNodes ||
+      nodes > maximumNodes ||
       depth > inspectionLimits.responseDepth
     ) {
       throw new RangeError("inspection response exceeds the node or depth limit");

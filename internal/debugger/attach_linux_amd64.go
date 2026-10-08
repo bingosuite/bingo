@@ -211,6 +211,9 @@ func (b *linuxBackend) quiesceAttached(ctx context.Context) (bool, error) {
 		return b.attachGone, nil
 	}
 	b.attachCleanup = true
+	if err := b.foldInspectionForDetach(); err != nil {
+		return false, fmt.Errorf("fold inspection stops into detach: %w", err)
+	}
 	b.collectStepQueueForDetach()
 	stablePasses := 0
 
@@ -332,15 +335,17 @@ func (b *linuxBackend) recordAttachedQuiesceResult(result linuxWaitResult) error
 	if sig == syscall.SIGTRAP {
 		switch cause := ws.TrapCause(); cause {
 		case syscall.PTRACE_EVENT_CLONE:
-			child, err := b.eventMsg(tid)
-			if err != nil {
-				return fmt.Errorf("read cloned tid from quiesced parent %d: %w", tid, err)
+			if !result.cloneRegistered {
+				child, err := b.eventMsg(tid)
+				if err != nil {
+					return fmt.Errorf("read cloned tid from quiesced parent %d: %w", tid, err)
+				}
+				generation, err := b.waits.register(int(child))
+				if err != nil {
+					return fmt.Errorf("register quiesced clone tid %d: %w", child, err)
+				}
+				b.registerAttachedClone(int(child), generation)
 			}
-			generation, err := b.waits.register(int(child))
-			if err != nil {
-				return fmt.Errorf("register quiesced clone tid %d: %w", child, err)
-			}
-			b.registerAttachedClone(int(child), generation)
 			b.markAttachedStopped(tid, StopEvent{Reason: stopAttachedInternal, TID: tid}, false, 0, true)
 			return nil
 		case syscall.PTRACE_EVENT_EXEC:

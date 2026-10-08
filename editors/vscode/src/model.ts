@@ -30,6 +30,7 @@ export interface SessionModel {
   readonly lastSeq: number;
   readonly snapshot: Snapshot | undefined;
   readonly selectedGoroutine: number;
+  readonly selectionVersion?: number;
   readonly timeline: readonly TimelineEntry[];
 }
 

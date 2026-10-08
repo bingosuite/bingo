@@ -112,9 +112,16 @@ type linuxBackend struct {
 	// fields read as b.stepping / b.stepTID at every existing use site.
 	stepQueue
 
-	pid    int
-	tracer *tracerThread
-	waits  linuxWaitSource
+	pid                    int
+	tracer                 *tracerThread
+	waits                  linuxWaitSource
+	seized                 bool
+	inspection             *linuxInspectionHold
+	inspectionReplay       []linuxWaitResult
+	failedLaunch           *exec.Cmd
+	failedLaunchRegistered bool
+	startupRegistersFn     func(int) (Registers, error)
+	startupSignalInfoFn    func(int) (int32, int32, error)
 
 	// attachedTracees is non-nil only for a process bingo attached to rather
 	// than launched. Access is serialized by the engine waiter handoff: normal
@@ -196,6 +203,11 @@ func (b *linuxBackend) eventMsg(tid int) (uint, error) {
 // come from the process-global exact-TID broker; tests can still script the
 // serialized Wait state machine directly.
 func (b *linuxBackend) waitAny(ctx context.Context) (linuxWaitResult, error) {
+	if len(b.inspectionReplay) != 0 {
+		result := b.inspectionReplay[0]
+		b.inspectionReplay = b.inspectionReplay[1:]
+		return result, result.err
+	}
 	if b.waitFn != nil {
 		var ws syscall.WaitStatus
 		tid, err := b.waitFn(&ws)
@@ -354,31 +366,28 @@ func startTracedProcess(b Backend, binaryPath string, args []string, env []strin
 
 	pid := cmd.Process.Pid
 	lb.setPID(pid)
-	if _, err := lb.waits.register(pid); err != nil {
-		_ = cmd.Process.Kill()
-		return 0, nil, fmt.Errorf("register initial tid %d: %w", pid, err)
-	}
+	lb.failedLaunch = cmd
 	defer func() {
 		if retErr == nil {
+			lb.failedLaunch = nil
+			lb.failedLaunchRegistered = false
 			return
 		}
-		killErr := cmd.Process.Kill()
-		if errors.Is(killErr, os.ErrProcessDone) || isNoSuchProcess(killErr) {
-			killErr = nil
-		}
-		reapErr := lb.reapAfterKill()
-		lb.setPID(0)
-		if cleanupErr := errors.Join(killErr, reapErr); cleanupErr != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("discard failed launch: %w", cleanupErr))
+		if cleanupErr := lb.cleanupFailedLaunch(); cleanupErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("%w: discard failed launch: %w", ErrBackendCleanupIncomplete, cleanupErr))
 		}
 	}()
+	if _, err := lb.waits.register(pid); err != nil {
+		return 0, nil, fmt.Errorf("register initial tid %d: %w", pid, err)
+	}
+	lb.failedLaunchRegistered = true
 
 	result, err := lb.waitAny(context.Background())
 	if err != nil {
 		return 0, nil, fmt.Errorf("wait for execve stop: %w", err)
 	}
 	ws := result.status
-	if !ws.Stopped() || ws.StopSignal() != syscall.SIGTRAP {
+	if !ws.Stopped() || ws.StopSignal() != syscall.SIGTRAP || ws.TrapCause() != 0 {
 		return 0, nil, fmt.Errorf("unexpected initial stop: %v", ws)
 	}
 
@@ -390,7 +399,36 @@ func startTracedProcess(b Backend, binaryPath string, args []string, env []strin
 	if startErr != nil {
 		return 0, nil, startErr
 	}
+	if err := lb.seizeLaunchedProcess(pid); err != nil {
+		return 0, nil, err
+	}
 	return pid, cmd, nil
+}
+
+func (b *linuxBackend) cleanupFailedLaunch() error {
+	if b.failedLaunch == nil {
+		return nil
+	}
+	if !b.failedLaunchRegistered {
+		if _, err := b.waits.register(b.pid); err != nil {
+			return fmt.Errorf("retain failed launch wait ownership: %w", err)
+		}
+		b.failedLaunchRegistered = true
+	}
+	err := b.failedLaunch.Process.Kill()
+	if errors.Is(err, os.ErrProcessDone) || isNoSuchProcess(err) {
+		err = nil
+	}
+	if err != nil {
+		return fmt.Errorf("kill failed launch: %w", err)
+	}
+	if err := b.reapAfterKill(); err != nil {
+		return err
+	}
+	b.failedLaunch = nil
+	b.failedLaunchRegistered = false
+	b.setPID(0)
+	return nil
 }
 
 // killProcess terminates a launched tracee (SIGKILL) or detaches from an
@@ -449,12 +487,15 @@ func (b *linuxBackend) reapAfterKill() error {
 		if b.waits == nil {
 			return nil
 		}
-		result, err := b.waits.next(ctx)
+		result, err := b.waitAny(ctx)
+		if result.retired {
+			continue
+		}
 		switch {
 		case err == nil:
 			if result.status.Stopped() {
 				if result.status.StopSignal() == syscall.SIGTRAP &&
-					result.status.TrapCause() == syscall.PTRACE_EVENT_CLONE {
+					result.status.TrapCause() == syscall.PTRACE_EVENT_CLONE && !result.cloneRegistered {
 					if err := b.registerClone(result.tid); err != nil {
 						return err
 					}
@@ -520,6 +561,13 @@ func (b *linuxBackend) ContinueProcess() error {
 		return fmt.Errorf("PTRACE_CONT: stepped-thread exit is awaiting breakpoint reconciliation; kill or restart to recover")
 	}
 	b.endStep()
+	if b.inspection != nil {
+		if err := b.continueTID(b.traceTID()); err != nil {
+			return err
+		}
+		b.inspection.releasing = true
+		return nil
+	}
 	if b.attached() {
 		return b.continueAttached()
 	}
@@ -550,13 +598,18 @@ func (b *linuxBackend) SingleStep(tid int) error {
 	if b.attachCleanup {
 		return fmt.Errorf("PTRACE_SINGLESTEP: attached detach cleanup is pending; retry Kill")
 	}
+	wasStepping, priorTID := b.stepping, b.stepTID
 	b.beginStep(tid)
 	var err error
 	b.execPtrace(func() { err = b.ptraceSingleStep(tid) })
 	if err != nil {
+		b.stepping, b.stepTID = wasStepping, priorTID
 		return fmt.Errorf("PTRACE_SINGLESTEP tid %d: %w", tid, err)
 	}
 	b.markAttachedRunning(tid)
+	if b.inspection != nil {
+		b.inspection.releasing = true
+	}
 	return nil
 }
 
@@ -741,6 +794,9 @@ func (b *linuxBackend) Wait() (StopEvent, error) {
 
 //nolint:gocognit,gocyclo // The wait loop is one serialized ptrace state machine.
 func (b *linuxBackend) wait(ctx context.Context) (StopEvent, error) {
+	if err := b.releaseInspectionThreads(); err != nil {
+		return StopEvent{}, err
+	}
 	for {
 		// A stepped thread can die before reporting completion. Reconciling
 		// that needs a genuinely ptrace-stopped TID for the engine to reinstall
@@ -761,6 +817,12 @@ func (b *linuxBackend) wait(ctx context.Context) (StopEvent, error) {
 		}
 
 		result, err := b.waitAny(ctx)
+		if result.retired {
+			if err := b.recordAttachedRetirement(result.tid, result.generation); err != nil {
+				return StopEvent{}, err
+			}
+			continue
+		}
 		if err != nil {
 			if isNoChildProcess(err) {
 				b.purge()
@@ -770,12 +832,6 @@ func (b *linuxBackend) wait(ctx context.Context) (StopEvent, error) {
 				return StopEvent{}, err
 			}
 			return StopEvent{}, fmt.Errorf("wait4: %w", err)
-		}
-		if result.retired {
-			if err := b.recordAttachedRetirement(result.tid, result.generation); err != nil {
-				return StopEvent{}, err
-			}
-			continue
 		}
 		tid := result.tid
 		ws := result.status
@@ -824,9 +880,11 @@ func (b *linuxBackend) wait(ctx context.Context) (StopEvent, error) {
 
 			switch cause {
 			case syscall.PTRACE_EVENT_CLONE:
-				if err := b.registerClone(tid); err != nil {
-					b.abortStepForWaitFailure()
-					return StopEvent{}, err
+				if !result.cloneRegistered {
+					if err := b.registerClone(tid); err != nil {
+						b.abortStepForWaitFailure()
+						return StopEvent{}, err
+					}
 				}
 				if err := b.absorbStop(absorbClone, tid, 0); err != nil {
 					return StopEvent{}, fmt.Errorf("resume clone parent tid %d: %w", tid, err)
@@ -954,8 +1012,9 @@ func (b *linuxBackend) wait(ctx context.Context) (StopEvent, error) {
 
 			default:
 				// An unrecognised PTRACE_EVENT. With exactly TRACEEXIT,
-				// TRACEEXEC and TRACECLONE enabled — and PTRACE_TRACEME/ATTACH
-				// rather than SEIZE — the only causes the kernel can report are
+				// TRACEEXEC and TRACECLONE enabled, known lifecycle and SEIZE
+				// stops have already been handled above. An unknown cause
+				// cannot establish instruction-step completion.
 				// CLONE, EXEC and EXIT: FORK/VFORK/VFORK_DONE/SECCOMP each need
 				// an option we never set, and EVENT_STOP needs SEIZE. So this is
 				// unreachable in practice and there is nothing to reason about

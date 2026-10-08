@@ -18,11 +18,12 @@ import (
 const linuxWaitFallbackInterval = time.Second
 
 type linuxWaitResult struct {
-	tid        int
-	generation uint64
-	status     syscall.WaitStatus
-	retired    bool
-	err        error
+	tid             int
+	generation      uint64
+	status          syscall.WaitStatus
+	retired         bool
+	err             error
+	cloneRegistered bool
 }
 
 type linuxWaitSource interface {
@@ -143,7 +144,7 @@ func (o *linuxWaitOwner) next(ctx context.Context) (linuxWaitResult, error) {
 			result := o.popLocked()
 			o.mu.Unlock()
 			if result.err != nil {
-				return linuxWaitResult{}, result.err
+				return result, result.err
 			}
 			return result, nil
 		case o.closed:
@@ -170,7 +171,7 @@ func (o *linuxWaitOwner) tryNext() (linuxWaitResult, bool, error) {
 	case len(o.queue) > 0:
 		result := o.popLocked()
 		if result.err != nil {
-			return linuxWaitResult{}, false, result.err
+			return result, true, result.err
 		}
 		return result, true, nil
 	case o.closed, len(o.registered) == 0:

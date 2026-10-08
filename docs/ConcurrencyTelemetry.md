@@ -100,8 +100,10 @@ It is intentionally absent from the root Run and Debug dropdown.
    local source around the recorded `go` statement. The highlight is not a
    claim that local edits match the binary. Missing/outside-workspace/oversized
    source is explicitly unavailable. Call stack, frame locals, and expansion
-   are available for the stopped goroutine; other selections still show their
-   own spawn metadata and source.
+   follow the selected goroutine while the session is stopped. Select native
+   Call Stack frames for name-only Watch/hover evaluation. Unavailable contexts
+   report explicit errors rather than borrowed frames. On Linux a selected
+   query holds all owned threads until execution resumes or the session ends.
 7. **Open Concurrency Beside Source** reuses the editor panel. Closing it keeps
    it closed for the session; stops/restart do not steal focus or reopen it.
    Disable `bingo.concurrency.autoReveal` for manual-only access. The Activity

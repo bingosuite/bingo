@@ -125,18 +125,21 @@ type PausedPayload struct {
 type ContinuedPayload struct{}
 
 type LocalsPayload struct {
-	FrameIndex int        `json:"frameIndex"`
-	Variables  []Variable `json:"variables"`
+	GoroutineID int        `json:"goroutineId,omitempty"`
+	FrameIndex  int        `json:"frameIndex"`
+	Variables   []Variable `json:"variables"`
 }
 
 // EvaluatePayload carries the result of a CmdEvaluate: the resolved variable
 // subtree (with Children when it is an aggregate). See EvaluatePayloadCmd.
 type EvaluatePayload struct {
-	Result Variable `json:"result"`
+	GoroutineID int      `json:"goroutineId,omitempty"`
+	Result      Variable `json:"result"`
 }
 
 type FramesPayload struct {
-	Frames []Frame `json:"frames"`
+	GoroutineID int     `json:"goroutineId,omitempty"`
+	Frames      []Frame `json:"frames"`
 }
 
 // SnapshotTotals reports the ORIGINAL, untrimmed size of a goroutine event's
@@ -235,7 +238,8 @@ type ClearBreakpointPayload struct {
 
 // LocalsPayloadCmd asks for locals in a stack frame. FrameIndex 0 is innermost.
 type LocalsPayloadCmd struct {
-	FrameIndex int `json:"frameIndex"`
+	FrameIndex  int `json:"frameIndex"`
+	GoroutineID int `json:"goroutineId,omitempty"`
 }
 
 // EvaluatePayloadCmd asks the debugger to resolve a single variable NAME in a
@@ -247,8 +251,14 @@ type LocalsPayloadCmd struct {
 // whole image; a qualified global uses the whole-image lookup directly.
 // Answered with EventEvaluate.
 type EvaluatePayloadCmd struct {
-	FrameIndex int    `json:"frameIndex"`
-	Name       string `json:"name"`
+	FrameIndex  int    `json:"frameIndex"`
+	Name        string `json:"name"`
+	GoroutineID int    `json:"goroutineId,omitempty"`
+}
+
+// FramesPayloadCmd selects a runtime goid; zero preserves stopped-thread inspection.
+type FramesPayloadCmd struct {
+	GoroutineID int `json:"goroutineId,omitempty"`
 }
 
 // RestartPayload optionally overrides the args/env used for the relaunch.

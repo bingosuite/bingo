@@ -130,7 +130,10 @@ export class TelemetryObserver {
       this.#model.snapshot?.goroutines.some((goroutine) => goroutine.id === id) ===
       true
     ) {
-      this.#update({ selectedGoroutine: id });
+      this.#update({
+        selectedGoroutine: id,
+        selectionVersion: (this.#model.selectionVersion ?? 0) + 1,
+      });
     }
   }
 
@@ -297,6 +300,8 @@ export class TelemetryObserver {
           error: "",
           snapshot: event.snapshot,
           selectedGoroutine: selected,
+          selectionVersion: selected === this.#model.selectedGoroutine
+            ? this.#model.selectionVersion ?? 0 : 0,
           timeline: appendLifecycle(
             this.#model.timeline,
             event.snapshot,
