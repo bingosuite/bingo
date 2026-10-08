@@ -8,7 +8,7 @@ import {
   type ObserverDependencies,
   type Socket,
 } from "../src/observer.js";
-import { envelope, snapshot } from "./fixtures.js";
+import { envelope, goroutine, snapshot } from "./fixtures.js";
 
 class FakeSocket extends EventEmitter implements Socket {
   public readyState = 0;
@@ -139,6 +139,29 @@ describe("telemetry observer", () => {
     assert.equal(observer.model.sessionState, "exited");
     assert.equal(observer.model.seqGap, "out-of-order event 2 after 3");
     assert.equal(observer.model.lastSeq, 3);
+    observer.dispose();
+  });
+
+  it("retains explicit selection intent until its goroutine disappears", () => {
+    const { observer, sockets } = setup();
+    observer.start();
+    const socket = sockets[0]!;
+    socket.open();
+    socket.emit("message", envelope(1, "GoroutineSnapshot", snapshot([goroutine(1), goroutine(2)])));
+    assert.equal(observer.model.selectionVersion, 0);
+    observer.selectGoroutine(1);
+    assert.equal(observer.model.selectionVersion, 1);
+    observer.selectGoroutine(1);
+    assert.equal(observer.model.selectionVersion, 2);
+    socket.emit("message", envelope(2, "Stepped", { location: { file: "main.go", line: 5 } }));
+    socket.emit("message", envelope(3, "GoroutineSnapshot", snapshot([goroutine(2), goroutine(1)])));
+    assert.equal(observer.model.selectedGoroutine, 1);
+    assert.equal(observer.model.selectionVersion, 2);
+    observer.selectGoroutine(999);
+    assert.equal(observer.model.selectionVersion, 2);
+    socket.emit("message", envelope(4, "GoroutineSnapshot", snapshot([goroutine(2)])));
+    assert.equal(observer.model.selectedGoroutine, 2);
+    assert.equal(observer.model.selectionVersion, 0);
     observer.dispose();
   });
 

@@ -271,7 +271,7 @@ func (h *Handler) onConfigurationDone(req *godap.ConfigurationDoneRequest) {
 	startCmd := h.startCmd
 	stopOnEntry := h.stopOnEntry
 	joining := h.joining
-	tid := h.curThreadID
+	tid := h.stoppedThreadLocked()
 	if !joining && !stopOnEntry {
 		h.pendingContinues++
 		h.suspended = false
@@ -339,14 +339,14 @@ func (h *Handler) onThreads(req *godap.ThreadsRequest) {
 	h.mu.Lock()
 	suspended := h.suspended
 	if suspended {
-		h.threadsQ = append(h.threadsQ, req.Seq)
+		h.threadsQ = append(h.threadsQ, &threadsReq{seq: req.Seq, generation: h.stopGeneration})
 	}
 	h.mu.Unlock()
 
 	if !suspended {
 		h.send(&godap.ThreadsResponse{
 			Response: h.response(req.Seq, "threads"),
-			Body:     godap.ThreadsResponseBody{Threads: dapThreads(nil)},
+			Body:     godap.ThreadsResponseBody{Threads: []godap.Thread{}},
 		})
 		return
 	}
@@ -356,14 +356,30 @@ func (h *Handler) onThreads(req *godap.ThreadsRequest) {
 }
 
 func (h *Handler) onStackTrace(req *godap.StackTraceRequest) {
+	if req.Arguments.ThreadId < 0 || uint64(req.Arguments.ThreadId) > 1<<53-1 || req.Arguments.StartFrame < 0 || req.Arguments.Levels < 0 {
+		h.send(h.errorResponse(req.Seq, "stackTrace", "invalid thread or frame range"))
+		return
+	}
 	h.mu.Lock()
 	suspended := h.suspended
-	currentThreadID := h.curThreadID
-	requestedThreadID := req.Arguments.ThreadId
-	servable := suspended &&
-		(requestedThreadID <= 0 || currentThreadID > 0 && requestedThreadID == currentThreadID)
-	if servable {
-		h.framesQ = append(h.framesQ, req.Seq)
+	requestedThreadID := 0
+	if suspended && req.Arguments.ThreadId > 0 {
+		target, ok := h.threadHandles[req.Arguments.ThreadId]
+		if !ok {
+			h.mu.Unlock()
+			h.send(h.errorResponse(req.Seq, "stackTrace", "unknown or stale thread handle"))
+			return
+		}
+		requestedThreadID = target.goroutineID
+		if target.goroutineID == h.curGoroutineID {
+			requestedThreadID = 0
+		}
+	}
+	if suspended {
+		h.framesQ = append(h.framesQ, &framesReq{
+			seq: req.Seq, goroutineID: requestedThreadID, generation: h.stopGeneration,
+			start: req.Arguments.StartFrame, levels: req.Arguments.Levels,
+		})
 	}
 	h.mu.Unlock()
 
@@ -374,21 +390,20 @@ func (h *Handler) onStackTrace(req *godap.StackTraceRequest) {
 		})
 		return
 	}
-	if !servable {
-		h.send(&godap.StackTraceResponse{
-			Response: h.response(req.Seq, "stackTrace"),
-			Body:     godap.StackTraceResponseBody{StackFrames: []godap.StackFrame{}},
-		})
-		return
-	}
-	if cmd, err := marshalCommand(protocol.CmdFrames, nil); err == nil {
+	if cmd, err := marshalCommand(protocol.CmdFrames, protocol.FramesPayloadCmd{GoroutineID: requestedThreadID}); err == nil {
 		h.enqueue(cmd)
 	}
 }
 
 func (h *Handler) onScopes(req *godap.ScopesRequest) {
-	// One synthetic "Locals" scope per frame. Its variablesReference IS the
-	// frame id, which the variables request decodes back to a frame index.
+	h.mu.Lock()
+	_, ok := h.frameHandles[req.Arguments.FrameId]
+	valid := ok && h.suspended
+	h.mu.Unlock()
+	if !valid {
+		h.send(h.errorResponse(req.Seq, "scopes", "unknown or stale frame handle"))
+		return
+	}
 	h.send(&godap.ScopesResponse{
 		Response: h.response(req.Seq, "scopes"),
 		Body: godap.ScopesResponseBody{Scopes: []godap.Scope{{
@@ -414,22 +429,12 @@ func (h *Handler) onVariables(req *godap.VariablesRequest) {
 		})
 		return
 	}
-	if ref >= varRefBase {
-		h.mu.Unlock()
-		h.send(&godap.VariablesResponse{
-			Response: h.response(req.Seq, "variables"),
-			Body:     godap.VariablesResponseBody{Variables: []godap.Variable{}},
+	target, valid := h.frameHandles[ref]
+	if suspended && valid {
+		h.localsQ = append(h.localsQ, &varsReq{
+			seq: req.Seq, frameIndex: target.frameIndex,
+			goroutineID: target.goroutineID, generation: h.stopGeneration,
 		})
-		return
-	}
-	// Otherwise it is a frame-root ref (a scope's reference == frameIndex+1):
-	// fetch that frame's locals from the engine.
-	frameIndex := frameIndexFromRef(ref)
-	if frameIndex < 0 {
-		frameIndex = 0
-	}
-	if suspended {
-		h.localsQ = append(h.localsQ, &varsReq{seq: req.Seq, frameIndex: frameIndex})
 	}
 	h.mu.Unlock()
 
@@ -440,7 +445,13 @@ func (h *Handler) onVariables(req *godap.VariablesRequest) {
 		})
 		return
 	}
-	if cmd, err := marshalCommand(protocol.CmdLocals, protocol.LocalsPayloadCmd{FrameIndex: frameIndex}); err == nil {
+	if !valid {
+		h.send(h.errorResponse(req.Seq, "variables", "unknown or stale variable handle"))
+		return
+	}
+	if cmd, err := marshalCommand(protocol.CmdLocals, protocol.LocalsPayloadCmd{
+		FrameIndex: target.frameIndex, GoroutineID: target.goroutineID,
+	}); err == nil {
 		h.enqueue(cmd)
 	}
 }
@@ -451,15 +462,17 @@ func (h *Handler) onVariables(req *godap.VariablesRequest) {
 // best-effort empty response rather than blocking (matches threads/variables).
 func (h *Handler) onEvaluate(req *godap.EvaluateRequest) {
 	name := req.Arguments.Expression
-	frameIndex := frameIndexFromRef(req.Arguments.FrameId)
-	if frameIndex < 0 {
-		frameIndex = 0
-	}
-
 	h.mu.Lock()
 	suspended := h.suspended
-	if suspended {
-		h.evalQ = append(h.evalQ, req.Seq)
+	target, valid := h.frameHandles[req.Arguments.FrameId]
+	if req.Arguments.FrameId == 0 {
+		target, valid = frameTarget{}, true
+	}
+	if suspended && valid {
+		h.evalQ = append(h.evalQ, &varsReq{
+			seq: req.Seq, frameIndex: target.frameIndex,
+			goroutineID: target.goroutineID, generation: h.stopGeneration,
+		})
 	}
 	h.mu.Unlock()
 
@@ -470,7 +483,13 @@ func (h *Handler) onEvaluate(req *godap.EvaluateRequest) {
 		})
 		return
 	}
-	if cmd, err := marshalCommand(protocol.CmdEvaluate, protocol.EvaluatePayloadCmd{FrameIndex: frameIndex, Name: name}); err == nil {
+	if !valid {
+		h.send(h.errorResponse(req.Seq, "evaluate", "unknown or stale frame handle"))
+		return
+	}
+	if cmd, err := marshalCommand(protocol.CmdEvaluate, protocol.EvaluatePayloadCmd{
+		FrameIndex: target.frameIndex, GoroutineID: target.goroutineID, Name: name,
+	}); err == nil {
 		h.enqueue(cmd)
 	}
 }

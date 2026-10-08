@@ -73,8 +73,10 @@ type engine struct {
 	// goroutine's completion before taking over the backend's receive queue.
 	wait *engineWait
 
-	detachPending    bool
-	resourcesPending error
+	detachPending     bool
+	resourcesPending  error
+	inspectionFailure error
+	inspectionOutcome *stopResult
 
 	seq   uint64
 	state engineState
@@ -370,8 +372,14 @@ func (e *engine) retainBackendResources(err error) error {
 }
 
 func (e *engine) releaseBackendResources() error {
+	if cleaner, ok := e.backend.(interface{ cleanupFailedLaunch() error }); ok {
+		if err := cleaner.cleanupFailedLaunch(); err != nil {
+			return e.retainBackendResources(err)
+		}
+	}
 	releaser, ok := e.backend.(backendResourceReleaser)
 	if !ok {
+		e.resourcesPending = nil
 		return nil
 	}
 	if err := e.joinBackendTeardown(); err != nil {
@@ -769,6 +777,10 @@ func (e *engine) frameLocation(frameIndex int) (framePC, frameBase uint64, err e
 	if err != nil {
 		return 0, 0, fmt.Errorf("get registers: %w", err)
 	}
+	return e.frameLocationFromRegisters(frameIndex, regs)
+}
+
+func (e *engine) frameLocationFromRegisters(frameIndex int, regs Registers) (framePC, frameBase uint64, err error) {
 	framePCs := e.walkStack(regs)
 	if frameIndex < 0 || frameIndex >= len(framePCs) {
 		return 0, 0, fmt.Errorf("frame index %d out of range (have %d frames)",
@@ -876,6 +888,9 @@ func (e *engine) loop() {
 		select {
 		case cmd := <-e.cmdCh:
 			err := e.resourcesPending
+			if err == nil {
+				err = e.inspectionFailure
+			}
 			if err == nil || cmd.cleanup {
 				err = cmd.fn()
 			}
@@ -884,6 +899,13 @@ func (e *engine) loop() {
 			}
 			e.retainAttachedTeardown()
 			cmd.err <- err
+			if outcome := e.inspectionOutcome; outcome != nil {
+				e.inspectionOutcome = nil
+				if e.handleWaitResult(*outcome) && e.finishBackendTeardown() {
+					e.drainCmds()
+					return
+				}
+			}
 
 		case result := <-e.stopCh:
 			if e.handleWaitResult(result) && e.finishBackendTeardown() {

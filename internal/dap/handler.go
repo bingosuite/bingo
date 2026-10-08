@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -103,15 +104,17 @@ type Handler struct {
 	joining         bool
 	awaitingWelcome bool
 
-	startReqSeq   int
-	startCmd      string
-	restartReqSeq int
-	curThreadID   int
+	startReqSeq    int
+	startCmd       string
+	restartReqSeq  int
+	curThreadID    int
+	curGoroutineID int
 	// stopThreadUnknown records that the suspending event honestly omitted
 	// stopped.threadId. The first subsequent threads response is collapsed to
 	// one resolved or synthetic stopped-thread handle so clients do not request
 	// the same stopped stack once for every goroutine.
-	stopThreadUnknown bool
+	stopThreadUnknown       bool
+	unknownThreadsCollapsed bool
 
 	// restartWasSuspended is the suspended view this connection held when it
 	// issued the in-flight restart, captured before onRestart clears it
@@ -155,28 +158,27 @@ type Handler struct {
 	outbox [][]byte
 
 	// Data-request correlation FIFOs, one per bingo confirmation event kind.
-	threadsQ []int
-	framesQ  []int
-	localsQ  []*varsReq
-	evalQ    []int
-
-	cachedFrames []protocol.Frame
+	threadsQ         []*threadsReq
+	framesQ          []*framesReq
+	localsQ          []*varsReq
+	evalQ            []*varsReq
+	frameHandles     map[int]frameTarget
+	threadHandles    map[int]threadTarget
+	goroutineThreads map[int]int
+	stopGeneration   uint64
 
 	// varCache maps a child variablesReference to the DAP variables it expands
 	// to. It is populated eagerly from a typed EventLocals/EventEvaluate subtree
 	// (buildVarTree) and read synchronously by a follow-up variables request.
-	// nextVarRef allocates those child refs from varRefBase upward. Both reset
-	// at every stop — the tree reflects one memory snapshot, so refs from a
-	// prior suspension are stale. Since the reset happens at the next stop,
-	// onVariables also gates cache hits on the current suspended state.
-	varCache   map[int][]godap.Variable
-	nextVarRef int
+	// Frame and subtree handles share a monotonic allocator: an old reference
+	// must never alias a different goroutine or a replacement stop.
+	varCache          map[int][]godap.Variable
+	nextVarRef        int
+	inspectionObjects int
 }
 
-// varRefBase is the first child variablesReference. Child refs start well above
-// any frame-root ref (a scope's reference IS the frameID == frameIndex+1,
-// bounded by the max stack depth), so the two ranges never collide and
-// onVariables can distinguish a child ref from a frame-root ref by magnitude.
+// Frame and subtree references are opaque and share one connection-lifetime
+// allocator; a reference never aliases another goroutine or stop.
 const varRefBase = 1 << 16
 
 // bpSlot is one requested breakpoint within a setBreakpoints request, awaiting
@@ -252,8 +254,23 @@ func (r *bpRequest) ready() bool {
 
 // varsReq correlates a DAP variables request to its EventLocals confirmation.
 type varsReq struct {
-	seq        int
-	frameIndex int
+	seq         int
+	frameIndex  int
+	goroutineID int
+	generation  uint64
+}
+
+type framesReq struct {
+	seq         int
+	goroutineID int
+	generation  uint64
+	start       int
+	levels      int
+}
+
+type frameTarget struct {
+	goroutineID int
+	frameIndex  int
 }
 
 // launchConfig is the union of bingo's custom launch/attach arguments. DAP
@@ -284,18 +301,19 @@ func NewHandler(conn net.Conn, provider Provider, log *slog.Logger) *Handler {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Handler{
-		conn:        conn,
-		reader:      bufio.NewReader(conn),
-		provider:    provider,
-		log:         log,
-		cmdOut:      make(chan []byte, cmdBufferSize),
-		done:        make(chan struct{}),
-		ctx:         ctx,
-		cancel:      cancel,
-		artifacts:   &sourceArtifacts{},
-		buildSource: (sourceBuilder{}).build,
-		bpByFile:    make(map[string]map[int]*bpLine),
-		varCache:    make(map[int][]godap.Variable),
+		conn:         conn,
+		reader:       bufio.NewReader(conn),
+		provider:     provider,
+		log:          log,
+		cmdOut:       make(chan []byte, cmdBufferSize),
+		done:         make(chan struct{}),
+		ctx:          ctx,
+		cancel:       cancel,
+		artifacts:    &sourceArtifacts{},
+		buildSource:  (sourceBuilder{}).build,
+		bpByFile:     make(map[string]map[int]*bpLine),
+		varCache:     make(map[int][]godap.Variable),
+		frameHandles: make(map[int]frameTarget),
 	}
 }
 
@@ -517,16 +535,23 @@ func (h *Handler) flushCommands() {
 	}
 }
 
-// allocVarRef reserves the next child variablesReference. Caller MUST hold h.mu.
-func (h *Handler) allocVarRef() int {
+const maxInspectionObjects = 1 << 16
+
+// Frames and child references share a monotonic namespace; resetting it would
+// let a delayed request name a different goroutine or suspension.
+func (h *Handler) allocVarRef() (int, error) {
+	if h.inspectionObjects >= maxInspectionObjects || h.nextVarRef >= 1<<53-1 {
+		return 0, fmt.Errorf("inspection handle budget exhausted; resume to inspect a new stop")
+	}
 	if h.nextVarRef < varRefBase {
 		h.nextVarRef = varRefBase
 	}
 	h.nextVarRef++
-	return h.nextVarRef
+	h.inspectionObjects++
+	return h.nextVarRef, nil
 }
 
-// resetVarsLocked drops the cached variable subtrees and ref allocator. Child
+// resetVarsLocked drops frame mappings and cached variable subtrees. Child
 // references are only valid within one suspension (they expand a memory
 // snapshot taken at that stop); the cache is rebuilt from the next
 // EventLocals/EventEvaluate. Caller MUST hold h.mu.
@@ -534,7 +559,13 @@ func (h *Handler) resetVarsLocked() {
 	if len(h.varCache) > 0 {
 		h.varCache = make(map[int][]godap.Variable)
 	}
-	h.nextVarRef = 0
+	h.frameHandles = make(map[int]frameTarget)
+	h.threadHandles = make(map[int]threadTarget)
+	h.goroutineThreads = make(map[int]int)
+	h.curThreadID, h.curGoroutineID = 0, 0
+	h.unknownThreadsCollapsed = false
+	h.inspectionObjects = 0
+	h.stopGeneration++
 }
 
 // sessionEndedLocked reports whether the hub has told us there is no live

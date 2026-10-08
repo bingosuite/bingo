@@ -698,6 +698,7 @@ func (b *darwinBackend) GetRegisters(tid int) (Registers, error) {
 	if thread == 0 {
 		return Registers{}, fmt.Errorf("GetRegisters: invalid tid 0")
 	}
+
 	var pc, sp, fp, g C.uint64_t
 	kr := C.bingo_get_registers(thread, &pc, &sp, &fp, &g)
 	if kr != C.KERN_SUCCESS {
@@ -709,6 +710,26 @@ func (b *darwinBackend) GetRegisters(tid int) (Registers, error) {
 		BP:  uint64(fp),
 		TLS: uint64(g),
 	}, nil
+}
+
+func (b *darwinBackend) inspectionThreads() ([]int, error) {
+	tids, err := b.Threads()
+	if err != nil {
+		return nil, err
+	}
+	if len(tids) == 0 || len(tids) > maxThreadScan {
+		return nil, fmt.Errorf("goroutine inspection requires 1..%d stopped threads", maxThreadScan)
+	}
+	for _, tid := range tids {
+		var count C.int
+		if kr := C.bingo_thread_suspend_count(C.mach_port_t(tid), &count); kr != C.KERN_SUCCESS {
+			return nil, fmt.Errorf("goroutine inspection thread %d suspension: %s", tid, machErrString(kr))
+		}
+		if count < 1 {
+			return nil, fmt.Errorf("goroutine inspection thread %d is not suspended", tid)
+		}
+	}
+	return tids, nil
 }
 
 func (b *darwinBackend) SetRegisters(tid int, reg Registers) error {

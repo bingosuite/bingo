@@ -23,6 +23,47 @@ const listSessionsTimeout = 5 * time.Second
 // ErrClosed reports that a client operation was interrupted by connection teardown.
 var ErrClosed = errors.New("client closed")
 
+var ErrGoroutineInspectionUnsupported = errors.New("selected-goroutine inspection is not supported or confirmed")
+
+// GoroutineInspector is optional so existing Client implementations keep their
+// current-context contract. Selected replies must echo the requested identity;
+// wire-1.4 servers predating selection otherwise silently ignore goroutineId.
+type GoroutineInspector interface {
+	StackFramesForGoroutine(int) ([]protocol.Frame, error)
+	LocalsForGoroutine(int, int) ([]protocol.Variable, error)
+	EvaluateForGoroutine(int, int, string) (protocol.Variable, error)
+}
+
+func StackFramesForGoroutine(c Client, goid int) ([]protocol.Frame, error) {
+	if goid == 0 {
+		return c.StackFrames()
+	}
+	if inspector, ok := c.(GoroutineInspector); ok {
+		return inspector.StackFramesForGoroutine(goid)
+	}
+	return nil, ErrGoroutineInspectionUnsupported
+}
+
+func LocalsForGoroutine(c Client, goid, frame int) ([]protocol.Variable, error) {
+	if goid == 0 {
+		return c.Locals(frame)
+	}
+	if inspector, ok := c.(GoroutineInspector); ok {
+		return inspector.LocalsForGoroutine(goid, frame)
+	}
+	return nil, ErrGoroutineInspectionUnsupported
+}
+
+func EvaluateForGoroutine(c Client, goid, frame int, name string) (protocol.Variable, error) {
+	if goid == 0 {
+		return c.Evaluate(frame, name)
+	}
+	if inspector, ok := c.(GoroutineInspector); ok {
+		return inspector.EvaluateForGoroutine(goid, frame, name)
+	}
+	return protocol.Variable{}, ErrGoroutineInspectionUnsupported
+}
+
 // Client interacts with a bingo debug server. All methods are goroutine-safe.
 type Client interface {
 	SessionID() string

@@ -128,7 +128,7 @@ func stopGoroutine(evt protocol.Event) protocol.Goroutine {
 }
 
 func (h *Handler) onStop(evt protocol.Event) {
-	tid := stoppedThreadID(stopGoroutine(evt).ID)
+	goid := stoppedThreadID(stopGoroutine(evt).ID)
 
 	h.mu.Lock()
 	if h.terminated {
@@ -141,8 +141,14 @@ func (h *Handler) onStop(evt protocol.Event) {
 	launching := h.launching
 	restarting := h.restarting
 	stopOnEntry := h.stopOnEntry
+	h.curGoroutineID = goid
+	h.stopThreadUnknown = goid == 0
+	tid, err := h.threadForGoroutineLocked(goid)
+	if err != nil {
+		h.log.Error("allocate stopped thread handle", "err", err)
+	}
 	h.curThreadID = tid
-	h.stopThreadUnknown = tid == 0
+	tid = h.stoppedThreadLocked()
 
 	// The first stop after Launch/Attach is the entry stop: fire `initialized`
 	// (breakpoints can now resolve against the loaded image) but withhold the
@@ -211,7 +217,7 @@ func (h *Handler) onContinued() {
 	// IDE's UI reflects that the tracee is running again.
 	h.send(&godap.ContinuedEvent{
 		Event: h.event("continued"),
-		Body:  godap.ContinuedEventBody{ThreadId: threadID(tid), AllThreadsContinued: true},
+		Body:  godap.ContinuedEventBody{ThreadId: tid, AllThreadsContinued: true},
 	})
 }
 
@@ -336,21 +342,42 @@ func (h *Handler) onFrames(evt protocol.Event) {
 	_ = protocol.DecodeEventPayload(evt, &p)
 
 	h.mu.Lock()
-	h.cachedFrames = p.Frames
-	seq, ok := 0, false
-	if len(h.framesQ) > 0 {
-		seq, ok = h.framesQ[0], true
-		h.framesQ = h.framesQ[1:]
+	if len(h.framesQ) == 0 {
+		h.mu.Unlock()
+		return
+	}
+	request := h.framesQ[0]
+	h.framesQ = h.framesQ[1:]
+	if p.GoroutineID != request.goroutineID {
+		h.mu.Unlock()
+		h.send(h.errorResponse(request.seq, "stackTrace", "server did not confirm the requested goroutine context"))
+		return
+	}
+	if !h.suspended || request.generation != h.stopGeneration {
+		h.mu.Unlock()
+		h.send(h.errorResponse(request.seq, "stackTrace", "inspection stop changed"))
+		return
+	}
+	start, end := min(request.start, len(p.Frames)), len(p.Frames)
+	if request.levels > 0 {
+		end = start + min(request.levels, end-start)
+	}
+	frames := dapStackFrames(p.Frames[start:end])
+	for i := range frames {
+		id, err := h.allocVarRef()
+		if err != nil {
+			h.mu.Unlock()
+			h.send(h.errorResponse(request.seq, "stackTrace", err.Error()))
+			return
+		}
+		frames[i].Id = id
+		h.frameHandles[id] = frameTarget{goroutineID: request.goroutineID, frameIndex: p.Frames[start+i].Index}
 	}
 	h.mu.Unlock()
-
-	if !ok {
-		return // out-of-band Frames (another driver) — nothing to correlate
-	}
 	h.send(&godap.StackTraceResponse{
-		Response: h.response(seq, "stackTrace"),
+		Response: h.response(request.seq, "stackTrace"),
 		Body: godap.StackTraceResponseBody{
-			StackFrames: dapStackFrames(p.Frames),
+			StackFrames: frames,
 			TotalFrames: len(p.Frames),
 		},
 	})
@@ -359,36 +386,27 @@ func (h *Handler) onFrames(evt protocol.Event) {
 func (h *Handler) onGoroutines(evt protocol.Event) {
 	var p protocol.GoroutinesPayload
 	_ = protocol.DecodeEventPayload(evt, &p)
-	current, resolved := dapStoppedThread(p.Goroutines)
-
 	h.mu.Lock()
-	seq, ok := 0, false
-	if len(h.threadsQ) > 0 {
-		seq, ok = h.threadsQ[0], true
-		h.threadsQ = h.threadsQ[1:]
-	}
-	collapse := ok && h.stopThreadUnknown
-	if collapse {
-		h.curThreadID = current.Id
-		if resolved {
-			h.stopThreadUnknown = false
-		}
-	} else if ok && resolved {
-		h.curThreadID = current.Id
-	}
-	h.mu.Unlock()
-
-	if !ok {
+	if len(h.threadsQ) == 0 {
+		h.mu.Unlock()
 		return
 	}
-	threads := dapThreads(p.Goroutines)
-	if collapse {
-		threads = []godap.Thread{current}
+	request := h.threadsQ[0]
+	h.threadsQ = h.threadsQ[1:]
+	if !h.suspended || request.generation != h.stopGeneration {
+		h.mu.Unlock()
+		h.send(h.errorResponse(request.seq, "threads", "inspection stop changed"))
+		return
 	}
-	h.send(&godap.ThreadsResponse{
-		Response: h.response(seq, "threads"),
-		Body:     godap.ThreadsResponseBody{Threads: threads},
-	})
+	collapse := h.stopThreadUnknown && !h.unknownThreadsCollapsed
+	h.unknownThreadsCollapsed = h.unknownThreadsCollapsed || collapse
+	threads, err := h.inspectionThreadsLocked(p.Goroutines, collapse)
+	h.mu.Unlock()
+	if err != nil {
+		h.send(h.errorResponse(request.seq, "threads", err.Error()))
+		return
+	}
+	h.sendThreads(request.seq, threads)
 }
 
 func (h *Handler) onLocals(evt protocol.Event) {
@@ -401,12 +419,24 @@ func (h *Handler) onLocals(evt protocol.Event) {
 		vr = h.localsQ[0]
 		h.localsQ = h.localsQ[1:]
 	}
-	// Build the typed tree while holding mu: buildVarTree allocates child refs
-	// and populates varCache, both mu-guarded.
-	vars := h.buildVarTree(p.Variables)
-	h.mu.Unlock()
-
 	if vr == nil {
+		h.mu.Unlock()
+		return
+	}
+	if p.GoroutineID != vr.goroutineID || p.FrameIndex != vr.frameIndex {
+		h.mu.Unlock()
+		h.send(h.errorResponse(vr.seq, "variables", "server did not confirm the requested goroutine frame"))
+		return
+	}
+	if !h.suspended || vr.generation != h.stopGeneration {
+		h.mu.Unlock()
+		h.send(h.errorResponse(vr.seq, "variables", "inspection stop changed"))
+		return
+	}
+	vars, err := h.buildVarTree(p.Variables)
+	h.mu.Unlock()
+	if err != nil {
+		h.send(h.errorResponse(vr.seq, "variables", err.Error()))
 		return
 	}
 	h.send(&godap.VariablesResponse{
@@ -423,23 +453,39 @@ func (h *Handler) onEvaluated(evt protocol.Event) {
 	_ = protocol.DecodeEventPayload(evt, &p)
 
 	h.mu.Lock()
-	seq, ok := 0, false
-	if len(h.evalQ) > 0 {
-		seq, ok = h.evalQ[0], true
-		h.evalQ = h.evalQ[1:]
+	if len(h.evalQ) == 0 {
+		h.mu.Unlock()
+		return
+	}
+	request := h.evalQ[0]
+	h.evalQ = h.evalQ[1:]
+	if p.GoroutineID != request.goroutineID {
+		h.mu.Unlock()
+		h.send(h.errorResponse(request.seq, "evaluate", "server did not confirm the requested goroutine context"))
+		return
+	}
+	if !h.suspended || request.generation != h.stopGeneration {
+		h.mu.Unlock()
+		h.send(h.errorResponse(request.seq, "evaluate", "inspection stop changed"))
+		return
 	}
 	ref := 0
-	if ok && len(p.Result.Children) > 0 {
-		ref = h.allocVarRef()
-		h.varCache[ref] = h.buildVarTree(p.Result.Children)
+	if len(p.Result.Children) > 0 {
+		var err error
+		ref, err = h.allocVarRef()
+		if err == nil {
+			h.varCache[ref], err = h.buildVarTree(p.Result.Children)
+		}
+		if err != nil {
+			h.mu.Unlock()
+			h.send(h.errorResponse(request.seq, "evaluate", err.Error()))
+			return
+		}
 	}
 	h.mu.Unlock()
 
-	if !ok {
-		return // out-of-band evaluate (another driver) — nothing to correlate
-	}
 	h.send(&godap.EvaluateResponse{
-		Response: h.response(seq, "evaluate"),
+		Response: h.response(request.seq, "evaluate"),
 		Body: godap.EvaluateResponseBody{
 			Result:             p.Result.Value,
 			Type:               p.Result.Type,
@@ -456,6 +502,7 @@ func (h *Handler) onRestarted(evt protocol.Event) {
 	seq := h.restartReqSeq
 	h.restartReqSeq = 0
 	h.terminated = false
+	h.resetVarsLocked()
 	// The relaunch succeeded, so the captured pre-request view is obsolete: the
 	// new process reports its own state through its entry stop.
 	h.restartWasSuspended = false
@@ -560,23 +607,23 @@ func (h *Handler) onError(evt protocol.Event) {
 		h.mu.Lock()
 		seq, ok := 0, false
 		if len(h.threadsQ) > 0 {
-			seq, ok = h.threadsQ[0], true
+			seq, ok = h.threadsQ[0].seq, true
 			h.threadsQ = h.threadsQ[1:]
 		}
 		h.mu.Unlock()
 		if ok {
-			h.send(&godap.ThreadsResponse{Response: h.response(seq, "threads"), Body: godap.ThreadsResponseBody{Threads: dapThreads(nil)}})
+			h.send(h.errorResponse(seq, "threads", p.Message))
 		}
 	case protocol.CmdFrames:
 		h.mu.Lock()
 		seq, ok := 0, false
 		if len(h.framesQ) > 0 {
-			seq, ok = h.framesQ[0], true
+			seq, ok = h.framesQ[0].seq, true
 			h.framesQ = h.framesQ[1:]
 		}
 		h.mu.Unlock()
 		if ok {
-			h.send(&godap.StackTraceResponse{Response: h.response(seq, "stackTrace"), Body: godap.StackTraceResponseBody{StackFrames: []godap.StackFrame{}}})
+			h.send(h.errorResponse(seq, "stackTrace", p.Message))
 		}
 	case protocol.CmdLocals:
 		h.mu.Lock()
@@ -587,13 +634,13 @@ func (h *Handler) onError(evt protocol.Event) {
 		}
 		h.mu.Unlock()
 		if vr != nil {
-			h.send(&godap.VariablesResponse{Response: h.response(vr.seq, "variables"), Body: godap.VariablesResponseBody{Variables: []godap.Variable{}}})
+			h.send(h.errorResponse(vr.seq, "variables", p.Message))
 		}
 	case protocol.CmdEvaluate:
 		h.mu.Lock()
 		seq, ok := 0, false
 		if len(h.evalQ) > 0 {
-			seq, ok = h.evalQ[0], true
+			seq, ok = h.evalQ[0].seq, true
 			h.evalQ = h.evalQ[1:]
 		}
 		h.mu.Unlock()
@@ -665,7 +712,7 @@ func (h *Handler) failResume(kind protocol.CommandKind, msg string) {
 	if resync {
 		h.suspended = true
 	}
-	tid := threadID(h.curThreadID)
+	tid := h.stoppedThreadLocked()
 	h.mu.Unlock()
 
 	h.emitConsole(resumeCommandName(kind) + " failed: " + msg + "\n")
