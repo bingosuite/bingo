@@ -28,11 +28,11 @@ func (h *Handler) dispatchRequest(msg godap.Message) {
 	case *godap.ContinueRequest:
 		h.onContinue(r)
 	case *godap.NextRequest:
-		h.onStep(r.Seq, "next", protocol.CmdStepOver)
+		h.onStep(r.Seq, r.Arguments.ThreadId, "next", protocol.CmdStepOver)
 	case *godap.StepInRequest:
-		h.onStep(r.Seq, "stepIn", protocol.CmdStepInto)
+		h.onStep(r.Seq, r.Arguments.ThreadId, "stepIn", protocol.CmdStepInto)
 	case *godap.StepOutRequest:
-		h.onStep(r.Seq, "stepOut", protocol.CmdStepOut)
+		h.onStep(r.Seq, r.Arguments.ThreadId, "stepOut", protocol.CmdStepOut)
 	case *godap.PauseRequest:
 		h.onPause(r)
 	default:
@@ -315,8 +315,14 @@ func (h *Handler) onContinue(req *godap.ContinueRequest) {
 	})
 }
 
-func (h *Handler) onStep(reqSeq int, command string, kind protocol.CommandKind) {
+func (h *Handler) onStep(reqSeq, threadID int, command string, kind protocol.CommandKind) {
 	h.mu.Lock()
+	target, known := h.threadHandles[threadID]
+	if threadID != 0 && (!known || target.goroutineID != 0 && target.goroutineID != h.curGoroutineID) {
+		h.mu.Unlock()
+		h.send(h.errorResponse(reqSeq, command, "stepping requires the current stopped goroutine; the selected thread handle is stale, unknown, or non-current"))
+		return
+	}
 	h.suspended = false
 	h.mu.Unlock()
 

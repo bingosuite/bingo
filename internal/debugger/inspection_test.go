@@ -2,6 +2,7 @@ package debugger
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"runtime"
 	"strings"
@@ -103,6 +104,40 @@ func TestSelectedInspectionNeverBorrowsRunningGobuf(t *testing.T) {
 	}
 }
 
+func TestSelectedInspectionResolvesCurrentAnchorBeyondAllgsBound(t *testing.T) {
+	for _, scheduler := range []bool{false, true} {
+		t.Run(fmt.Sprintf("scheduler=%v", scheduler), func(t *testing.T) {
+			e, b := inspectionEngine()
+			e.dw.data = syntheticScopeReader(t, []byte{1, 0}).data
+			b.seedU32(0x2000, 2)
+			b.seedU64(0x100, uint64(2*maxGoroutineScan+1))
+			regs := Registers{PC: 0x4444, SP: 0x8100, BP: 0x8200, TLS: 0x2000}
+			b.seedU64(0x120, 0x4000)
+			e.dw.varAddrs["runtime.allm"] = 0x120
+			seedTestM(b.goroutineMemoryBackend, e.goLayout, 0x4000, 100, 0x2000, 0)
+			b.seedU64(0x2000+uint64(e.goLayout.gM), 0x4000)
+			if scheduler {
+				seedTestGoroutine(b.goroutineMemoryBackend, e.goLayout, 0x5000, 0, 0x6000, 0x7000)
+				b.seedU64(0x5000+uint64(e.goLayout.gM), 0x4000)
+				b.seedU64(0x4000+uint64(e.goLayout.mG0), 0x5000)
+				regs.SP, regs.BP, regs.TLS = 0x6100, 0, 0x5000
+			}
+			b.threadRegs[100] = regs
+			got, err := e.goroutineRegisters(42)
+			if scheduler {
+				if err == nil || !strings.Contains(err.Error(), "scheduler or signal stack") {
+					t.Fatalf("scheduler identity borrowed a user context: %+v: %v", got, err)
+				}
+			} else if err != nil || got != regs {
+				t.Fatalf("advertised current anchor rejected: %+v: %v", got, err)
+			}
+			if b.reads[0x1000] != 0 {
+				t.Fatal("verified current anchor fell back to the bounded allgs scan")
+			}
+		})
+	}
+}
+
 func TestSelectedInspectionRejectsInvalidAndUnretiredContexts(t *testing.T) {
 	for _, goid := range []int{-1, 0, 1 << 53} {
 		e, b := inspectionEngine()
@@ -137,7 +172,7 @@ func TestSelectedInspectionNormalizesRetiredTrapCopyOnly(t *testing.T) {
 	}
 	b.threadRegs[101] = Registers{PC: pc, SP: 0x8100, BP: 0x8200}
 	b.stop = StopEvent{Reason: StopBreakpoint, TID: 101}
-	restored := []byte{0x90, 0x90, 0x90, 0x90}
+	restored := []byte{0x90}
 	if runtime.GOARCH == "arm64" {
 		restored = []byte{0x1f, 0x20, 0x03, 0xd5}
 	}
@@ -155,6 +190,14 @@ func TestSelectedInspectionNormalizesRetiredTrapCopyOnly(t *testing.T) {
 	got, err = e.goroutineRegisters(42)
 	if err != nil || got.PC != pc {
 		t.Fatalf("genuine live trap was treated as retired: %+v: %v", got, err)
+	}
+	if runtime.GOARCH == "amd64" {
+		b.mem[0x4443], b.mem[0x4444] = 0xcd, 0x03
+		e.retiredClearedBreakpointBytes[0x4444] = [][]byte{{0x03}}
+		got, err = e.goroutineRegisters(42)
+		if err != nil || got.PC != pc {
+			t.Fatalf("cross-boundary CD 03 trap was treated as retired: %+v: %v", got, err)
+		}
 	}
 }
 

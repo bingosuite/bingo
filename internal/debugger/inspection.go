@@ -126,25 +126,18 @@ func (e *engine) goroutineRegisters(goid int) (Registers, error) {
 	if err != nil {
 		return Registers{}, err
 	}
-	tids := []int{tid}
-	worldStopped := false
-	if backend, ok := e.backend.(stoppedInspectionThreads); ok {
-		tids, err = backend.inspectionThreads()
-		if err != nil {
-			if errors.Is(err, ErrSessionInvalidated) {
-				e.inspectionFailure = err
-				var ended *inspectionEndedError
-				if errors.As(err, &ended) {
-					e.inspectionOutcome = &stopResult{evt: ended.stop}
-				} else {
-					e.inspectionOutcome = &stopResult{err: err}
-				}
-			}
-			return Registers{}, err
-		}
-		worldStopped = true
+	tids, worldStopped, err := e.heldInspectionThreads(tid)
+	if err != nil {
+		return Registers{}, err
 	}
-	gptr, err := e.findInspectionGoroutine(l, goid)
+	reporting, err := e.backend.GetRegisters(tid)
+	if err != nil {
+		return Registers{}, fmt.Errorf("goroutine inspection registers: %w", err)
+	}
+	// Runtime current anchors can lie beyond the allgs inspection window.
+	// Resolving the identity does not make a scheduler stack a user stack:
+	// the ordinary containment and saved-context checks below still apply.
+	gptr, err := e.inspectionGoroutinePointer(l, goid, tid, reporting)
 	if err != nil {
 		return Registers{}, err
 	}
@@ -153,34 +146,94 @@ func (e *engine) goroutineRegisters(goid int) (Registers, error) {
 	if !ok || !boundsOK || header.goid != int64(goid) || !header.included() || lo >= hi {
 		return Registers{}, fmt.Errorf("goroutine %d has inaccessible or inconsistent runtime context", goid)
 	}
-	for _, thread := range tids {
-		regs, err := e.backend.GetRegisters(thread)
-		if err != nil {
-			return Registers{}, fmt.Errorf("goroutine inspection registers: %w", err)
-		}
-		if stackContainsSP(lo, hi, regs.SP) {
-			if stopped, ok := e.backend.(interface {
-				inspectionStop(int) (StopEvent, bool)
-			}); ok && thread != tid {
-				if stop, known := stopped.inspectionStop(thread); known && stop.Reason == StopBreakpoint {
-					pc := archRewindPC(regs.PC)
-					owned, err := e.attachedBreakpointOwned(pc)
-					if err != nil {
-						return Registers{}, fmt.Errorf("goroutine %d pending breakpoint: %w", goid, err)
-					}
-					if owned {
-						regs.PC = pc
-					}
-				}
-			}
-			return e.checkedInspectionStack(goid, regs, lo, hi)
-		}
+	regs, found, err := e.liveInspectionRegisters(tids, tid, reporting, lo, hi)
+	if err != nil {
+		return Registers{}, fmt.Errorf("goroutine %d live context: %w", goid, err)
+	}
+	if found {
+		return e.checkedInspectionStack(goid, regs, lo, hi)
 	}
 	if !worldStopped {
 		return Registers{}, fmt.Errorf("goroutine %d cannot be inspected safely: this backend stops only the reporting thread; parked and sibling stacks may still change", goid)
 	}
+	regs, err = e.savedInspectionRegisters(l, goid, gptr, header.status)
+	if err != nil {
+		return Registers{}, err
+	}
+	return e.checkedInspectionStack(goid, regs, lo, hi)
+}
+
+func (e *engine) liveInspectionRegisters(tids []int, tid int, reporting Registers, lo, hi uint64) (Registers, bool, error) {
+	for _, thread := range tids {
+		regs := reporting
+		var err error
+		if thread != tid {
+			regs, err = e.backend.GetRegisters(thread)
+			if err != nil {
+				return Registers{}, false, fmt.Errorf("read registers: %w", err)
+			}
+		}
+		if stackContainsSP(lo, hi, regs.SP) {
+			regs, err = e.normalizeInspectionBreakpoint(thread, tid, regs)
+			return regs, true, err
+		}
+	}
+	return Registers{}, false, nil
+}
+
+func (e *engine) inspectionGoroutinePointer(l *goLayout, goid, tid int, reporting Registers) (uint64, error) {
+	currentGptr, _ := e.archCurrentGoroutinePointer(reporting)
+	current := e.resolveTargetedCurrentGoroutine(l, reporting.SP, reporting.PC, currentGptr, tid)
+	if current.Complete && current.Found && current.Item.ID == goid && current.GPtr != 0 {
+		return current.GPtr, nil
+	}
+	return e.findInspectionGoroutine(l, goid)
+}
+
+func (e *engine) heldInspectionThreads(tid int) ([]int, bool, error) {
+	backend, ok := e.backend.(stoppedInspectionThreads)
+	if !ok {
+		return []int{tid}, false, nil
+	}
+	tids, err := backend.inspectionThreads()
+	if errors.Is(err, ErrSessionInvalidated) {
+		e.inspectionFailure = err
+		var ended *inspectionEndedError
+		if errors.As(err, &ended) {
+			e.inspectionOutcome = &stopResult{evt: ended.stop}
+		} else {
+			e.inspectionOutcome = &stopResult{err: err}
+		}
+	}
+	return tids, err == nil, err
+}
+
+func (e *engine) normalizeInspectionBreakpoint(thread, reporting int, regs Registers) (Registers, error) {
+	stopped, ok := e.backend.(interface {
+		inspectionStop(int) (StopEvent, bool)
+	})
+	if !ok || thread == reporting {
+		return regs, nil
+	}
+	stop, known := stopped.inspectionStop(thread)
+	if !known || stop.Reason != StopBreakpoint {
+		return regs, nil
+	}
+	pc := archRewindPC(regs.PC)
+	owned, err := e.attachedBreakpointOwned(pc)
+	if err != nil {
+		return Registers{}, err
+	}
+	if owned {
+		regs.PC = pc
+	}
+	return regs, nil
+}
+
+func (e *engine) savedInspectionRegisters(l *goLayout, goid int, gptr uint64, status uint32) (Registers, error) {
 	var regs Registers
-	switch header.status {
+	var err error
+	switch status {
 	case 1, 4, 9:
 		pc, pcOK := e.dw.structMemberOffset("runtime.gobuf", "pc")
 		sp, spOK := e.dw.structMemberOffset("runtime.gobuf", "sp")
@@ -198,12 +251,12 @@ func (e *engine) goroutineRegisters(goid int) (Registers, error) {
 		}
 		regs, err = e.readInspectionRegisters(gptr, pc, sp, bp)
 	default:
-		return Registers{}, fmt.Errorf("goroutine %d is %s without a stopped user-stack context (scheduler or signal stack)", goid, goStatusString(header.status))
+		return Registers{}, fmt.Errorf("goroutine %d is %s without a stopped user-stack context (scheduler or signal stack)", goid, goStatusString(status))
 	}
 	if err != nil {
 		return Registers{}, fmt.Errorf("goroutine %d saved context: %w", goid, err)
 	}
-	return e.checkedInspectionStack(goid, regs, lo, hi)
+	return regs, nil
 }
 
 func (e *engine) findInspectionGoroutine(l *goLayout, goid int) (uint64, error) {

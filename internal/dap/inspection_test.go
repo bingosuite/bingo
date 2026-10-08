@@ -2,6 +2,8 @@ package dap
 
 import (
 	"encoding/json"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/bingosuite/bingo/pkg/protocol"
@@ -147,5 +149,118 @@ func TestThreadMappingMetadataDoesNotInventSyntheticGoids(t *testing.T) {
 	}
 	if _, exists := decoded.Body.Threads[0]["bingoGoroutineId"]; exists || string(decoded.Body.Threads[1]["bingoGoroutineId"]) != "1" {
 		t.Fatalf("invalid synthetic/real metadata: %s", wire)
+	}
+}
+
+func inspectionStepRequest(t *testing.T, hh *harness, request string, thread int) int {
+	t.Helper()
+	switch request {
+	case "next":
+		return hh.sendReq(request, &godap.NextRequest{Arguments: godap.NextArguments{ThreadId: thread}})
+	case "stepIn":
+		return hh.sendReq(request, &godap.StepInRequest{Arguments: godap.StepInArguments{ThreadId: thread}})
+	case "stepOut":
+		return hh.sendReq(request, &godap.StepOutRequest{Arguments: godap.StepOutArguments{ThreadId: thread}})
+	default:
+		t.Fatalf("unknown step %s", request)
+		return 0
+	}
+}
+
+func TestInspectionOnlyStepRejectsNonCurrentUnknownAndStaleHandles(t *testing.T) {
+	for _, request := range []string{"next", "stepIn", "stepOut"} {
+		for _, target := range []string{"non-current", "unknown", "stale", "restart-stale"} {
+			t.Run(request+"/"+target, func(t *testing.T) {
+				testRejectedInspectionStep(t, request, target)
+			})
+		}
+	}
+}
+
+func testRejectedInspectionStep(t *testing.T, request, target string) {
+	hh := newSuspendedHarness(t)
+	thread := selectedThread(t, hh, 1)
+	switch target {
+	case "unknown":
+		thread = 123
+	case "stale":
+		suspendAtBreakpoint(t, hh)
+	case "restart-stale":
+		hh.sendReq("restart", &godap.RestartRequest{})
+		hh.cmds.waitForCommand(t, protocol.CmdRestart)
+		hh.inject(protocol.EventRestarted, protocol.RestartedPayload{})
+		_ = recvType[*godap.RestartResponse](hh)
+		hh.inject(protocol.EventPaused, protocol.PausedPayload{Goroutine: protocol.Goroutine{ID: 7}})
+		_ = recvType[*godap.StoppedEvent](hh)
+	}
+	frame := inspectCurrentFrame(t, hh)
+	hh.handler.mu.Lock()
+	generation := hh.handler.stopGeneration
+	current := hh.handler.curThreadID
+	reference, err := hh.handler.allocVarRef()
+	if err != nil {
+		hh.handler.mu.Unlock()
+		t.Fatal(err)
+	}
+	cached := []godap.Variable{{Name: "retained", Value: "101"}}
+	hh.handler.varCache[reference] = cached
+	hh.handler.mu.Unlock()
+	before := hh.cmds.count(protocol.CmdStepOver) + hh.cmds.count(protocol.CmdStepInto) + hh.cmds.count(protocol.CmdStepOut)
+	seq := inspectionStepRequest(t, hh, request, thread)
+	response := recvType[*godap.ErrorResponse](hh)
+	if response.RequestSeq != seq || response.Success || response.Message == "" {
+		t.Fatalf("invalid step target accepted: %+v", response)
+	}
+	hh.handler.mu.Lock()
+	preserved := hh.handler.suspended && hh.handler.stopGeneration == generation &&
+		hh.handler.curThreadID == current && reflect.DeepEqual(hh.handler.varCache[reference], cached)
+	hh.handler.mu.Unlock()
+	if !preserved {
+		t.Fatal("rejected selection invalidated the suspended context or cache")
+	}
+	after := hh.cmds.count(protocol.CmdStepOver) + hh.cmds.count(protocol.CmdStepInto) + hh.cmds.count(protocol.CmdStepOut)
+	if after != before {
+		t.Fatal("rejected selected step reached the hub")
+	}
+	hh.sendReq("scopes", &godap.ScopesRequest{Arguments: godap.ScopesArguments{FrameId: frame}})
+	if scopes := recvType[*godap.ScopesResponse](hh); len(scopes.Body.Scopes) != 1 {
+		t.Fatal("rejected selected step invalidated the frame handle")
+	}
+	hh.sendReq("variables", &godap.VariablesRequest{Arguments: godap.VariablesArguments{VariablesReference: reference}})
+	if variables := recvType[*godap.VariablesResponse](hh); !reflect.DeepEqual(variables.Body.Variables, cached) {
+		t.Fatal("rejected selected step invalidated cached variable handles")
+	}
+}
+
+func TestInspectionOnlyStepPreservesCurrentAndSyntheticTargets(t *testing.T) {
+	for _, request := range []string{"next", "stepIn", "stepOut"} {
+		for _, target := range []string{"zero", "current", "synthetic", "resolved synthetic"} {
+			t.Run(request+"/"+target, func(t *testing.T) {
+				hh := newSuspendedHarness(t)
+				thread := 0
+				if strings.Contains(target, "synthetic") {
+					hh.inject(protocol.EventStepped, protocol.SteppedPayload{})
+					_ = recvType[*godap.StoppedEvent](hh)
+				}
+				if target != "zero" {
+					thread = currentThreadHandle(hh)
+				}
+				if target == "resolved synthetic" {
+					_ = selectedThread(t, hh, 7)
+				}
+				inspectionStepRequest(t, hh, request, thread)
+				switch request {
+				case "next":
+					_ = recvType[*godap.NextResponse](hh)
+					hh.cmds.waitForCommand(t, protocol.CmdStepOver)
+				case "stepIn":
+					_ = recvType[*godap.StepInResponse](hh)
+					hh.cmds.waitForCommand(t, protocol.CmdStepInto)
+				case "stepOut":
+					_ = recvType[*godap.StepOutResponse](hh)
+					hh.cmds.waitForCommand(t, protocol.CmdStepOut)
+				}
+			})
+		}
 	}
 }

@@ -168,7 +168,7 @@ func TestLinuxNativeInspectionSeizeAdmissionAndDurableHold(t *testing.T) {
 	var groupStop, seize bool
 	for _, result := range observed.results {
 		groupStop = groupStop || result.tid == pid && result.status.Stopped() &&
-			result.status.StopSignal() == syscall.SIGSTOP && result.status.TrapCause() == unix.PTRACE_EVENT_STOP
+			result.status.StopSignal() == syscall.SIGSTOP && int(uint32(result.status)>>16) == unix.PTRACE_EVENT_STOP
 	}
 	for _, call := range controls {
 		seize = seize || call.request == unix.PTRACE_SEIZE && call.tid == uintptr(pid) &&

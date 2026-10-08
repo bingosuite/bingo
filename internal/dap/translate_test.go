@@ -107,15 +107,30 @@ func TestDapThreadsHaveDistinctSyntheticAndRealHandles(t *testing.T) {
 		t.Fatalf("synthetic alongside real g1: %+v: %v", out, err)
 	}
 	oldReal := out[1].Id
-	out, err = h.inspectionThreadsLocked([]protocol.Goroutine{{ID: 1, Current: true}}, true)
+	assertResolvedInspectionCurrent(t, h, oldReal)
+	assertSyntheticThreadMetadata(t, synthetic)
+	assertInspectionThreadRetired(t, h, oldReal)
+}
+
+func assertResolvedInspectionCurrent(t *testing.T, h *Handler, oldReal int) {
+	t.Helper()
+	out, err := h.inspectionThreadsLocked([]protocol.Goroutine{{ID: 1, Current: true}}, true)
 	if err != nil || len(out) != 1 || out[0].Id != oldReal ||
 		h.curThreadID != oldReal || h.curGoroutineID != 1 || h.stopThreadUnknown {
 		t.Fatalf("resolved current: %+v: %v", out, err)
 	}
+}
+
+func assertSyntheticThreadMetadata(t *testing.T, synthetic int) {
+	t.Helper()
 	raw, err := json.Marshal(bingoThread{Thread: godap.Thread{Id: synthetic}})
 	if err != nil || strings.Contains(string(raw), "bingoGoroutineId") {
 		t.Fatalf("synthetic claims a real goid: %s: %v", raw, err)
 	}
+}
+
+func assertInspectionThreadRetired(t *testing.T, h *Handler, oldReal int) {
+	t.Helper()
 	h.resetVarsLocked()
 	if _, exists := h.threadHandles[oldReal]; exists {
 		t.Fatal("new stop retained old thread handle")

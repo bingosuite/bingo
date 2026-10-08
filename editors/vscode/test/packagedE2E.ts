@@ -199,6 +199,13 @@ async function assertExampleCoverage(config: BingoServerConfiguration): Promise<
   assert.ok(firstDepth <= lastDepth);
   assert.ok(creationSnippets > 0, "must render a real application's recorded go statement");
   assert.ok(expandedVariables > 0, "must expand at least one real structured local");
+  await runExample(config, {
+    name: "selected-goroutines",
+    sourceDirectory: resolve(repositoryRoot, "editors/vscode/test/fixtures/selected-goroutines"),
+    line: 21,
+    local: "ready",
+    minimumDepth: 1,
+  }, "debug-selected-goroutines");
 }
 
 interface ExampleResult {
@@ -211,9 +218,17 @@ interface ExampleResult {
   readonly expandedVariable: boolean;
 }
 
+interface NativeExample {
+  readonly name: string;
+  readonly line: number;
+  readonly local: string;
+  readonly minimumDepth: number;
+  readonly sourceDirectory?: string;
+}
+
 async function runExample(
   config: BingoServerConfiguration,
-  example: (typeof examples)[number],
+  example: NativeExample,
   debugSessionId: string,
 ): Promise<ExampleResult> {
   const { name, line } = example;
@@ -277,7 +292,7 @@ async function runExample(
       linesStartAt1: true,
       columnsStartAt1: true,
     });
-    const sourceDirectory = resolve(repositoryRoot, "examples", name);
+    const sourceDirectory = example.sourceDirectory ?? resolve(repositoryRoot, "examples", name);
     const sourceFile = join(sourceDirectory, "main.go");
     const workspace = { scheme: "file", fsPath: repositoryRoot };
     const launchConfig = await goPackageConfiguration({
@@ -365,10 +380,16 @@ async function runExample(
     const snapshot = stopped.snapshot!;
     const depth = applicationDepth(snapshot, name);
     const stackThreadId = stoppedThreadId(breakpointStop);
+    const currentGoroutine = snapshot.current;
+    assert.ok(currentGoroutine > 0, `${name} did not identify the stopped goroutine`);
     if (stackThreadId > 0) {
-      assert.ok(snapshot.goroutines.some((goroutine) => goroutine.id === stackThreadId));
-      click(document, `.tree-node[data-goid="${String(stackThreadId)}"]`);
+      const response = record(await client.customRequest("threads", {}), "threads");
+      assert.ok(Array.isArray(response.threads));
+      const binding = response.threads.map((thread) => record(thread, "thread"))
+        .find((thread) => thread.id === stackThreadId);
+      assert.equal(binding?.bingoGoroutineId, currentGoroutine, "stopped handle must prove its actual goid");
     }
+    click(document, `.tree-node[data-goid="${String(currentGoroutine)}"]`);
     const inspected = await waitForModel(
       registry,
       `${name} stack and locals`,
@@ -378,7 +399,7 @@ async function runExample(
       },
       15_000,
     );
-    assert.equal(inspected.inspection.targetGoroutine, stackThreadId);
+    assert.equal(inspected.inspection.targetGoroutine, currentGoroutine);
     const top = inspected.inspection.frames[0];
     assert.ok(top, `${name} returned no stack frames`);
     assert.equal(top.file, sourceFile);
@@ -439,7 +460,6 @@ async function runExample(
       (goroutine) =>
         goroutine.parentId > 0 &&
         goroutine.id !== snapshot.current &&
-        goroutine.id !== stackThreadId &&
         goroutine.createdLoc.file === sourceFile,
     );
     if (example.minimumDepth > 0) {
@@ -490,16 +510,9 @@ async function runExample(
       assert.equal(rendered[0]?.dataset.line, String(created.createdLoc.line));
       assert.equal(rendered[0]?.getAttribute("aria-current"), "location");
       assert.equal(rendered[0]?.textContent, `${String(created.createdLoc.line)}  ${recordedLine}\n`);
-      if (stackThreadId > 0) {
-        assert.equal(selected.inspection.stackStatus, "unavailable");
-        assert.equal(document.querySelectorAll(".stack-frame").length, 0);
-        assert.ok(
-          document.querySelector(".debug-inspection")?.textContent?.includes(
-            `only for the stopped goroutine g${String(stackThreadId)}`,
-          ),
-          "selecting a non-current goroutine must not misattribute the stopped stack",
-        );
-      }
+    }
+    if (name === "selected-goroutines") {
+      await assertSelectedWorkerInspection(registry, document, sourceFile);
     }
     if (name === "level5-workflow") {
       assert.ok(filterTree(stopped.tree, "inventory").nodes.length > 0);
@@ -584,6 +597,42 @@ async function runExample(
   throwFailures(failures, name);
   assert.ok(result);
   return result;
+}
+
+async function assertSelectedWorkerInspection(
+  registry: SessionRegistry,
+  document: Document,
+  sourceFile: string,
+): Promise<void> {
+  const snapshot = registry.activeModel()?.snapshot;
+  assert.ok(snapshot);
+  const workers = snapshot.goroutines.filter((goroutine) =>
+    goroutine.id !== snapshot.current && goroutine.createdLoc.file === sourceFile,
+  );
+  assert.equal(workers.length, 3, "all three fixture workers must remain parked");
+  const labels = new Set<string>();
+  for (const worker of workers) {
+    click(document, `.tree-node[data-goid="${String(worker.id)}"]`);
+    const selected = await waitForModel(registry, `g${String(worker.id)} worker stack`, (model) => {
+      assertInspectionHealthy(model);
+      return model.inspection.targetGoroutine === worker.id &&
+        model.inspection.stackStatus === "ready" && model.inspection.localsStatus === "ready";
+    }, 15_000);
+    const frame = selected.inspection.frames.find((candidate) => candidate.name === "main.selectedWorker");
+    assert.ok(frame, `g${String(worker.id)} must have its own worker frame, not main's stack`);
+    assert.equal(frame.file, sourceFile);
+    click(document, `.frame-name[data-frame-id="${String(frame.id)}"]`);
+    const inspected = await waitForModel(registry, `g${String(worker.id)} worker locals`, (model) => {
+      assertInspectionHealthy(model);
+      return model.inspection.selectedFrameId === frame.id && model.inspection.localsStatus === "ready";
+    }, 15_000);
+    const label = inspected.inspection.variables.find((variable) => variable.name === "label");
+    assert.ok(label, "selected worker frame must expose its own local");
+    labels.add(label.value);
+    assertVariablesDisplayed(document.querySelector(".variable-tree"), inspected.inspection.variables);
+    process.stdout.write(`[selected] g${String(worker.id)} frame=${String(frame.id)} label=${label.value}\n`);
+  }
+  assert.deepEqual([...labels].sort(), ["101", "202", "303"], "distinct workers must not share another goroutine's locals");
 }
 
 function applicationDepth(
