@@ -357,6 +357,177 @@ func TestDispatchRejectsInvalidFramesBeforeRequest(t *testing.T) {
 	}
 }
 
+func TestLocalsUsesReturnedDAPHandles(t *testing.T) {
+	frames := &godap.StackTraceResponse{
+		Body: godap.StackTraceResponseBody{
+			StackFrames: []godap.StackFrame{{Id: 901}, {Id: 407}},
+		},
+	}
+	scopes := &godap.ScopesResponse{
+		Body: godap.ScopesResponseBody{
+			Scopes: []godap.Scope{
+				{Name: "Globals", VariablesReference: 123},
+				{Name: "Locals", VariablesReference: 8123},
+			},
+		},
+	}
+	locals := &godap.VariablesResponse{
+		Body: godap.VariablesResponseBody{
+			Variables: []godap.Variable{{Name: "n", Type: "int", Value: "42"}},
+		},
+	}
+	h, requests := scriptedDAPCLI(t, frames, scopes, locals)
+	h.setThread(29)
+
+	output := captureStdout(t, func() { h.showLocals(1) })
+	got := requests()
+	if len(got) != 3 {
+		t.Fatalf("requests = %d, want stackTrace, scopes, variables", len(got))
+	}
+	stackRequest, ok := got[0].(*godap.StackTraceRequest)
+	if !ok || stackRequest.Arguments.ThreadId != 29 {
+		t.Fatalf("stackTrace = %#v, want thread 29", got[0])
+	}
+	scopesRequest, ok := got[1].(*godap.ScopesRequest)
+	if !ok || scopesRequest.Arguments.FrameId != 407 {
+		t.Fatalf("scopes = %#v, want returned frame handle 407", got[1])
+	}
+	variablesRequest, ok := got[2].(*godap.VariablesRequest)
+	if !ok || variablesRequest.Arguments.VariablesReference != 8123 {
+		t.Fatalf("variables = %#v, want returned locals reference 8123", got[2])
+	}
+	if output != "  n int = 42\n" {
+		t.Fatalf("output = %q", output)
+	}
+}
+
+func TestLocalsRejectsUnavailableFrame(t *testing.T) {
+	h, requests := scriptedDAPCLI(t, &godap.StackTraceResponse{
+		Body: godap.StackTraceResponseBody{StackFrames: []godap.StackFrame{{Id: 901}}},
+	})
+	_, err := h.localsForFrame(1)
+	if err == nil || !strings.Contains(err.Error(), "frame 1 is not available") {
+		t.Fatalf("error = %v, want unavailable frame", err)
+	}
+	if got := requests(); len(got) != 1 {
+		t.Fatalf("requests = %d, want no scopes or invented variables reference", len(got))
+	}
+}
+
+func TestLocalsReportsRejectedScopeHandle(t *testing.T) {
+	h, requests := scriptedDAPCLI(t,
+		&godap.StackTraceResponse{
+			Body: godap.StackTraceResponseBody{StackFrames: []godap.StackFrame{{Id: 901}}},
+		},
+		&godap.ErrorResponse{
+			Response: godap.Response{Command: "scopes", Message: "stale frame handle"},
+		},
+	)
+	_, err := h.localsForFrame(0)
+	if err == nil || !strings.Contains(err.Error(), "scopes: stale frame handle") {
+		t.Fatalf("error = %v, want stale scope error", err)
+	}
+	if got := requests(); len(got) != 2 {
+		t.Fatalf("requests = %d, want no variables request after rejection", len(got))
+	}
+}
+
+func TestLocalsDoesNotInventReferenceForEmptyScope(t *testing.T) {
+	for _, scopes := range [][]godap.Scope{nil, {{Name: "Locals", VariablesReference: 0}}} {
+		h, requests := scriptedDAPCLI(t,
+			&godap.StackTraceResponse{
+				Body: godap.StackTraceResponseBody{StackFrames: []godap.StackFrame{{Id: 901}}},
+			},
+			&godap.ScopesResponse{Body: godap.ScopesResponseBody{Scopes: scopes}},
+		)
+		locals, err := h.localsForFrame(0)
+		if err != nil || len(locals) != 0 {
+			t.Fatalf("locals = %#v, error = %v, want empty locals", locals, err)
+		}
+		if got := requests(); len(got) != 2 {
+			t.Fatalf("requests = %d, want no invented variables reference", len(got))
+		}
+	}
+}
+
+func TestStackTraceDisplaysIndexesNotHandles(t *testing.T) {
+	h, requests := scriptedDAPCLI(t, &godap.StackTraceResponse{
+		Body: godap.StackTraceResponseBody{
+			StackFrames: []godap.StackFrame{
+				{Id: 901, Name: "main.leaf", Source: &godap.Source{Name: "main.go"}, Line: 12},
+				{Id: 407, Name: "main.caller", Source: &godap.Source{Name: "main.go"}, Line: 20},
+			},
+		},
+	})
+	output := captureStdout(t, h.showStackTrace)
+	requests()
+	want := "  #0  main.leaf at main.go:12\n  #1  main.caller at main.go:20\n"
+	if output != want {
+		t.Fatalf("output = %q, want ordinal frame indexes %q", output, want)
+	}
+}
+
+func scriptedDAPCLI(t *testing.T, responses ...godap.ResponseMessage) (*dapCLI, func() []godap.Message) {
+	t.Helper()
+	server, client := net.Pipe()
+	if err := server.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	h := newTestDAPCLI(client, io.Discard, func() {})
+	go h.readLoop()
+	done := make(chan struct{})
+	var requests []godap.Message
+	go func() {
+		defer close(done)
+		reader := bufio.NewReader(server)
+		for i, response := range responses {
+			message, err := readDAPMessage(reader)
+			if err != nil {
+				t.Errorf("read request: %v", err)
+				_ = server.Close()
+				return
+			}
+			request, ok := message.(godap.RequestMessage)
+			if !ok {
+				t.Errorf("unexpected request %T", message)
+				_ = server.Close()
+				return
+			}
+			requests = append(requests, message)
+			r := response.GetResponse()
+			r.ProtocolMessage = godap.ProtocolMessage{Seq: i + 1, Type: "response"}
+			r.RequestSeq = request.GetRequest().Seq
+			r.Command = request.GetRequest().Command
+			_, failed := response.(*godap.ErrorResponse)
+			r.Success = !failed
+			if err := godap.WriteProtocolMessage(server, response); err != nil {
+				t.Errorf("write response: %v", err)
+				_ = server.Close()
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		h.close()
+		_ = server.Close()
+		<-h.readDone
+		<-done
+	})
+	return h, func() []godap.Message {
+		t.Helper()
+		select {
+		case <-done:
+			return requests
+		case <-time.After(3 * time.Second):
+			t.Fatal("scripted DAP requests did not complete")
+			return nil
+		}
+	}
+}
+
 func TestClearBreakpointRejectsNonPositiveIDs(t *testing.T) {
 	for _, id := range []int{0, -1} {
 		t.Run(fmt.Sprintf("id=%d", id), func(t *testing.T) {

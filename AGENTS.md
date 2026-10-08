@@ -3859,7 +3859,10 @@ non-empty edit but exits on an empty line; signals cancel connection setup and
 in-flight management requests before closing readline/transport; remote
 disconnects close readline to unblock the terminal; async events write through
 readline's redraw-aware writer; malformed/negative `locals` frame indexes are
-rejected before transport dispatch.
+rejected before transport dispatch. The displayed stack indexes are ordinals,
+not DAP frame handles. `locals N` resolves the current stack's Nth frame, asks
+for its scopes, and uses the returned Locals reference; never derive a frame
+handle or variables reference from N.
 
 **Option Y (rejected).** The alternative was teaching the hub about DAP directly
 (a second protocol path through `internal/hub`). Rejected: it would fork the most
