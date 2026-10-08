@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"strings"
 	"testing"
 
 	godap "github.com/google/go-dap"
+
+	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
 func TestDecodeThreadMetadataPreservesOpaqueHandles(t *testing.T) {
@@ -100,6 +103,10 @@ func TestDecodeThreadMetadataRejectsInvalidIdentityProof(t *testing.T) {
 			{"id":901,"name":"g1","bingoGoroutineId":1},
 			{"id":901,"name":"g2","bingoGoroutineId":2}
 		]`},
+		{"multiple handles claim the same goroutine", `[
+			{"id":901,"name":"g1","bingoGoroutineId":1},
+			{"id":407,"name":"g1","bingoGoroutineId":1}
+		]`},
 		{"synthetic handle aliases a real entry", `[
 			{"id":901,"name":"g1","bingoGoroutineId":1},
 			{"id":901,"name":"stopped goroutine (unknown)"}
@@ -119,6 +126,30 @@ func TestDecodeThreadMetadataRejectsInvalidIdentityProof(t *testing.T) {
 				t.Fatalf("failed decode returned partial success: message=%T identities=%v", message, identities)
 			}
 		})
+	}
+}
+
+func TestDecodeThreadMetadataAcceptsCompletePackedGoroutineList(t *testing.T) {
+	const count = protocol.MaxSnapshotGoroutines
+	threads := make([]string, count)
+	for i := range threads {
+		threads[i] = fmt.Sprintf(`{"id":%d,"name":"g%d","bingoGoroutineId":%d}`, 100_000+i, i+1, i+1)
+	}
+	message, identities, err := DecodeProtocolMessageWithThreadMetadata(threadMetadataResponse("[" + strings.Join(threads, ",") + "]"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, ok := message.(*godap.ThreadsResponse)
+	if !ok {
+		t.Fatalf("message type = %T", message)
+	}
+	if len(response.Body.Threads) != count || len(identities) != count {
+		t.Fatalf("decoded %d threads and %d identities, want %d", len(response.Body.Threads), len(identities), count)
+	}
+	for i := range threads {
+		if identities[100_000+i] != int64(i+1) {
+			t.Fatalf("thread %d maps to goid %d, want %d", 100_000+i, identities[100_000+i], i+1)
+		}
 	}
 }
 
