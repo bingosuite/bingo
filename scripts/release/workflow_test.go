@@ -114,11 +114,11 @@ func assertNativeReleaseBuild(t *testing.T, build workflowJob) {
 func assertReleaseUploadJob(t *testing.T, upload workflowJob) {
 	t.Helper()
 	if upload.Permissions["contents"] != "write" || len(upload.Permissions) != 1 ||
-		upload.If != "github.event_name == 'release' || inputs.upload_to_draft" {
+		upload.If != "${{ !cancelled() && needs.resolve.result == 'success' && needs.build.result == 'success' && (github.event_name == 'release' || inputs.upload_to_draft || needs.prepare.outputs.tag != '') }}" {
 		t.Fatalf("unexpected upload authority: %+v", upload)
 	}
 	needs, ok := upload.Needs.([]any)
-	if !ok || len(needs) != 2 || needs[0] != "resolve" || needs[1] != "build" {
+	if !ok || len(needs) != 3 || needs[0] != "prepare" || needs[1] != "resolve" || needs[2] != "build" {
 		t.Fatalf("upload does not wait for both native builds: %v", upload.Needs)
 	}
 	for _, step := range upload.Steps {
