@@ -159,7 +159,9 @@ in the selector; the status bar shows active goroutine/thread counts.
   unknown-stop collapsed-reply race. Missing or ambiguous identity proof reports
   unavailable instead of guessing. An explicit click remains selected after
   steps; automatic identity-less stop inspection still uses the current stack.
-  This does not add selective goroutine stepping or resuming.
+  This does not add selective goroutine stepping or resuming. Step commands
+  reject a selected non-current goroutine rather than stepping someone else;
+  Continue retains its global behavior.
 - Source links in goroutine metadata and stack frames open the exact file and
   line in the editor. Thread cards and a bounded created/exited timeline provide
   physical and lifecycle context.
@@ -453,7 +455,9 @@ build budget. The test explicitly enables `stopOnEntry` to preserve entry
 inspection, then checks real breakpoints, locals, a nested level-5 tree,
 displayed creation source and variable expansion, select/filter/copy/refresh,
 single-terminate behavior with the observer still connected, and server-owned
-idle exit. It signals only its exact captured server PID, and only on failure.
+idle exit. A separate parked-worker fixture selects three non-current graph
+nodes and verifies each worker's own frame and distinct local value through the
+packaged server. It signals only its exact captured server PID, and only on failure.
 
 ## Troubleshooting
 

@@ -1507,7 +1507,7 @@ func TestStepEmitsStoppedStep(t *testing.T) {
 	hh.inject(protocol.EventBreakpointHit, protocol.BreakpointHitPayload{Goroutine: protocol.Goroutine{ID: 1}})
 	_ = recvType[*godap.StoppedEvent](hh)
 
-	hh.sendReq("next", &godap.NextRequest{Arguments: godap.NextArguments{ThreadId: 1}})
+	hh.sendReq("next", &godap.NextRequest{Arguments: godap.NextArguments{ThreadId: currentThreadHandle(hh)}})
 	_ = recvType[*godap.NextResponse](hh)
 	hh.cmds.waitForCommand(t, protocol.CmdStepOver)
 
@@ -1770,13 +1770,13 @@ func sendStepRequest(t *testing.T, hh *harness, request string) {
 	t.Helper()
 	switch request {
 	case "next":
-		hh.sendReq(request, &godap.NextRequest{Arguments: godap.NextArguments{ThreadId: 7}})
+		hh.sendReq(request, &godap.NextRequest{Arguments: godap.NextArguments{ThreadId: currentThreadHandle(hh)}})
 		_ = recvType[*godap.NextResponse](hh)
 	case "stepIn":
-		hh.sendReq(request, &godap.StepInRequest{Arguments: godap.StepInArguments{ThreadId: 7}})
+		hh.sendReq(request, &godap.StepInRequest{Arguments: godap.StepInArguments{ThreadId: currentThreadHandle(hh)}})
 		_ = recvType[*godap.StepInResponse](hh)
 	case "stepOut":
-		hh.sendReq(request, &godap.StepOutRequest{Arguments: godap.StepOutArguments{ThreadId: 7}})
+		hh.sendReq(request, &godap.StepOutRequest{Arguments: godap.StepOutArguments{ThreadId: currentThreadHandle(hh)}})
 		_ = recvType[*godap.StepOutResponse](hh)
 	default:
 		t.Fatalf("unknown step request %q", request)

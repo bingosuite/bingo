@@ -562,16 +562,17 @@ async function assertDisplayedInspection(
   await api.testUI!("selectGoroutine", 2);
   await changedAndRendered(api, revision, (model) =>
     model.selectedGoroutine === 2 &&
-    model.inspection.stackStatus === "unavailable" &&
+    model.inspection.stackStatus === "ready" &&
+    model.inspection.localsStatus === "ready" &&
     model.spawnSource.status === "ready",
   );
   const foreign = await api.testUI!("inspect");
   assert.match(foreign.inspector, /g2/u);
   assert.match(foreign.inspector, /g1/u);
   assert.match(foreign.inspector, /102/u);
-  assert.match(foreign.inspector, /only for the stopped goroutine/u);
-  assert.deepEqual(foreign.frames, []);
-  assert.deepEqual(foreign.variables, []);
+  assert.match(foreign.inspector, /worker context/u);
+  assert.deepEqual(foreign.frames, ["main.consume"]);
+  assert.deepEqual(foreign.variables, ["workerLabel"]);
   assertCreationLine(foreign.highlightedLine, fixture);
 
   revision = api.getConcurrencyState().revision;
@@ -847,7 +848,7 @@ class FakeDAPServer {
       case "bingoTestStop":
       case "restart":
         this.#respond(socket, request, {});
-        this.#event(socket, "continued", { threadId: 1, allThreadsContinued: true });
+        this.#event(socket, "continued", { threadId: this.#threadID(1), allThreadsContinued: true });
         if (request.command === "restart") {
           this.#announce(socket);
         }
@@ -859,10 +860,32 @@ class FakeDAPServer {
         break;
       case "threads":
         this.#respond(socket, request, {
-          threads: [{ id: 1, name: "producer" }, { id: 2, name: "worker" }],
+          threads: [
+            { id: this.#threadID(1), name: "producer", bingoGoroutineId: 1 },
+            { id: this.#threadID(2), name: "worker", bingoGoroutineId: 2 },
+          ],
         });
         break;
       case "stackTrace":
+        assert.ok(
+          request.arguments?.threadId === 0 ||
+          request.arguments?.threadId === this.#threadID(1) ||
+          request.arguments?.threadId === this.#threadID(2),
+          "stackTrace must use a proven current-generation DAP handle",
+        );
+        if (request.arguments?.threadId === this.#threadID(2)) {
+          this.#respond(socket, request, {
+            stackFrames: [{
+              id: 3,
+              name: "main.consume",
+              source: { name: "main.go", path: this.fixture.uri.fsPath },
+              line: this.fixture.callerLine,
+              column: 1,
+            }],
+            totalFrames: 1,
+          });
+          break;
+        }
         this.#respond(socket, request, {
           stackFrames: [
             {
@@ -887,7 +910,8 @@ class FakeDAPServer {
         this.#respond(socket, request, {
           scopes: [{
             name: "Locals",
-            variablesReference: request.arguments?.frameId === 2 ? 200 : 100,
+            variablesReference: request.arguments?.frameId === 3
+              ? 300 : request.arguments?.frameId === 2 ? 200 : 100,
             expensive: false,
           }],
         });
@@ -938,6 +962,8 @@ class FakeDAPServer {
         ];
       case 2000:
         return [variable("capacity", "128", "int")];
+      case 300:
+        return [variable("workerLabel", '"worker context"', "string")];
       default:
         return [];
     }
@@ -947,9 +973,13 @@ class FakeDAPServer {
     this.stopGeneration += 1;
     this.#event(socket, "stopped", {
       reason,
-      threadId: 1,
+      threadId: this.#threadID(1),
       allThreadsStopped: true,
     });
+  }
+
+  #threadID(goid: number): number {
+    return this.stopGeneration * 1000 + goid;
   }
 
   #announce(socket: Socket): void {

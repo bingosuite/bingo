@@ -14,19 +14,7 @@ func TestSelectedInspectionRequiresMatchingEcho(t *testing.T) {
 		for _, echo := range []int{0, 41, 42} {
 			t.Run(fmt.Sprintf("%s/echo-%d", kind, echo), func(t *testing.T) {
 				h := newLoopbackClient(t)
-				result := make(chan error, 1)
-				go func() {
-					var err error
-					switch kind {
-					case protocol.CmdFrames:
-						_, err = h.client.StackFramesForGoroutine(42)
-					case protocol.CmdLocals:
-						_, err = h.client.LocalsForGoroutine(42, 2)
-					case protocol.CmdEvaluate:
-						_, err = h.client.EvaluateForGoroutine(42, 2, "label")
-					}
-					result <- err
-				}()
+				result := selectedInspectionRequest(h, kind)
 				cmd := h.readCommand(t)
 				assertCommandKind(t, cmd, kind)
 				var selection struct {
@@ -35,14 +23,7 @@ func TestSelectedInspectionRequiresMatchingEcho(t *testing.T) {
 				if err := protocol.DecodeCommandPayload(cmd, &selection); err != nil || selection.GoroutineID != 42 {
 					t.Fatalf("selection = %+v: %v", selection, err)
 				}
-				switch kind {
-				case protocol.CmdFrames:
-					h.writeEvent(t, protocol.MustEvent(protocol.EventFrames, 2, protocol.FramesPayload{GoroutineID: echo}))
-				case protocol.CmdLocals:
-					h.writeEvent(t, protocol.MustEvent(protocol.EventLocals, 2, protocol.LocalsPayload{GoroutineID: echo, FrameIndex: 2}))
-				case protocol.CmdEvaluate:
-					h.writeEvent(t, protocol.MustEvent(protocol.EventEvaluate, 2, protocol.EvaluatePayload{GoroutineID: echo}))
-				}
+				h.writeEvent(t, selectedInspectionResponse(kind, echo))
 				select {
 				case err := <-result:
 					if echo == 42 && err != nil {
@@ -56,6 +37,34 @@ func TestSelectedInspectionRequiresMatchingEcho(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func selectedInspectionRequest(h *loopbackClient, kind protocol.CommandKind) <-chan error {
+	result := make(chan error, 1)
+	go func() {
+		var err error
+		switch kind {
+		case protocol.CmdFrames:
+			_, err = h.client.StackFramesForGoroutine(42)
+		case protocol.CmdLocals:
+			_, err = h.client.LocalsForGoroutine(42, 2)
+		case protocol.CmdEvaluate:
+			_, err = h.client.EvaluateForGoroutine(42, 2, "label")
+		}
+		result <- err
+	}()
+	return result
+}
+
+func selectedInspectionResponse(kind protocol.CommandKind, echo int) protocol.Event {
+	switch kind {
+	case protocol.CmdFrames:
+		return protocol.MustEvent(protocol.EventFrames, 2, protocol.FramesPayload{GoroutineID: echo})
+	case protocol.CmdLocals:
+		return protocol.MustEvent(protocol.EventLocals, 2, protocol.LocalsPayload{GoroutineID: echo, FrameIndex: 2})
+	default:
+		return protocol.MustEvent(protocol.EventEvaluate, 2, protocol.EvaluatePayload{GoroutineID: echo})
 	}
 }
 

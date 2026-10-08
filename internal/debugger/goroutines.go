@@ -262,6 +262,7 @@ type threadWalkResult struct {
 
 type currentGoroutineResult struct {
 	Item     protocol.Goroutine
+	GPtr     uint64
 	Found    bool
 	Complete bool
 }
@@ -611,6 +612,7 @@ func (e *engine) currentGoroutineFromRegister(
 		if result.Include && result.Item.Current {
 			return currentGoroutineResult{
 				Item:     result.Item,
+				GPtr:     gptr,
 				Found:    true,
 				Complete: true,
 			}
@@ -693,6 +695,7 @@ func (e *engine) readCurrentGoroutineFromM(
 	current.CurrentLoc = e.locForPC(livePC)
 	return currentGoroutineResult{
 		Item:     current,
+		GPtr:     gptr,
 		Found:    true,
 		Complete: true,
 	}
@@ -732,6 +735,7 @@ func (e *engine) findCurrentGoroutine(
 		if result.Include && result.Item.Current {
 			return currentGoroutineResult{
 				Item:     result.Item,
+				GPtr:     gptr,
 				Found:    true,
 				Complete: true,
 			}

@@ -3499,7 +3499,10 @@ Selection still rides hub dispatch; no DAP-to-engine bypass exists.
 
 The engine requires suspended state and acknowledged waiter retirement. It
 finds the selected live goid within 16,384 DWARF-rooted allgs slots, retaining
-length-before-pointer publication ordering. Live user stacks use registers
+length-before-pointer publication ordering, or reuses a verified stopped-current
+runtime anchor outside that window without another scan. A scheduler-stack
+anchor proves identity only, not that its registers describe the user's stack.
+Live user stacks use registers
 from a positively stopped thread; parked runnable/waiting/preempted stacks use
 DWARF-named gobuf PC/SP/BP only under a proven all-thread hold. Syscall contexts
 use the runtime's syscall PC/SP/BP; unavailable scheduler/signal-stack contexts,
@@ -3529,6 +3532,13 @@ remain unchanged. SEIZE installs the full clone/exec/exit option set. Failed
 startup retains the exact child and wait ownership until checked reaping, never
 re-registering a retired PID merely to retry cleanup. Ordinary current-only
 breakpoint queries do not acquire a wider hold.
+
+`next`, `stepIn`, and `stepOut` validate their opaque `threadId` before clearing
+the suspended view or enqueueing a command. Unknown, stale, and non-current
+targets are rejected without invalidating handles or cached locals. Zero, the
+current handle, and a synthetic current-context handle retain existing behavior,
+including after that synthetic context resolves to a real goid. Continue remains
+global; inspecting another goroutine never authorizes stepping it.
 
 `EventContinued` → DAP `continued` **only for out-of-band resumes**. The Handler
 increments `pendingContinues` before enqueuing its OWN continue and decrements it
@@ -3981,7 +3991,9 @@ translator keeps DAP entirely outside the hub — a strictly additive package.
   a fake adapter's namespaced custom event, while `packagedE2E.ts` drives the
   actual native packaged server's source-package build/launch path, DAP,
   WebSocket observer, and graphical model for all five progressive examples
-  without prebuilt target binaries.
+  without prebuilt target binaries. A separate three-worker fixture selects each
+  non-current graph node, opens its worker frame, and requires distinct local
+  labels from the real packaged server; no goid/opaque-handle equality is assumed.
   The
   dedicated [vscode-extension.yml](.github/workflows/vscode-extension.yml)
   workflow lints, typechecks, tests, bundles, and builds the local VSIX without

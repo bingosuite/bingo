@@ -55,30 +55,7 @@ func (b *linuxBackend) holdInspectionThreads(ctx context.Context) ([]int, error)
 	if b.stepping || b.stepExitPending {
 		return nil, fmt.Errorf("inspection cannot overlap an unresolved hardware step")
 	}
-	if b.inspection == nil {
-		b.inspection = &linuxInspectionHold{
-			stopped:     map[int]bool{b.traceTID(): true},
-			interrupt:   make(map[int]bool),
-			synthetic:   make(map[int]bool),
-			priorResume: make(map[int]bool),
-		}
-		for _, stop := range b.parked {
-			b.inspection.stopped[stop.TID] = true
-		}
-		for tid, state := range b.attachedTracees {
-			if state.stopped {
-				b.inspection.stopped[tid] = true
-				if state.resumeAllowed && tid != b.traceTID() && state.stop.Reason == stopAttachedInternal {
-					b.inspection.priorResume[tid] = true
-				}
-			}
-		}
-		for _, result := range b.inspectionReplay {
-			if result.status.Stopped() {
-				b.inspection.stopped[result.tid] = true
-			}
-		}
-	}
+	b.beginInspectionHold()
 	origin := b.traceTID()
 	defer b.recordStop(origin)
 	stable := 0
@@ -94,50 +71,13 @@ func (b *linuxBackend) holdInspectionThreads(ctx context.Context) ([]int, error)
 			return nil, fmt.Errorf("inspection thread count %d outside 1..%d", len(tids), maxThreadScan)
 		}
 		sort.Ints(tids)
-		allStopped := true
-		for _, tid := range tids {
-			if b.inspection.stopped[tid] {
-				continue
-			}
-			allStopped = false
-			if b.inspection.interrupt[tid] {
-				continue
-			}
-			tracer, err := b.attachedTracerPID(tid)
-			if err != nil {
-				return nil, fmt.Errorf("inspection verify tid %d ownership: %w", tid, err)
-			}
-			if tracer != b.tracer.threadID() {
-				return nil, fmt.Errorf("inspection tid %d is not owned by this tracer", tid)
-			}
-			generation, err := b.waits.register(tid)
-			if err != nil {
-				return nil, fmt.Errorf("inspection register tid %d: %w", tid, err)
-			}
-			b.registerAttachedClone(tid, generation)
-			var interruptErr error
-			b.execPtrace(func() { interruptErr = b.ptraceControl(unix.PTRACE_INTERRUPT, tid, 0, 0) })
-			if interruptErr != nil && !errors.Is(interruptErr, syscall.EIO) && !isNoSuchProcess(interruptErr) {
-				return nil, fmt.Errorf("inspection interrupt tid %d: %w", tid, interruptErr)
-			}
-			b.inspection.interrupt[tid] = true
+		allStopped, err := b.interruptInspectionThreads(tids)
+		if err != nil {
+			return nil, err
 		}
-		drained := false
-		for {
-			if err := ctx.Err(); err != nil {
-				return nil, fmt.Errorf("inspection drain deadline: %w", err)
-			}
-			result, ok, err := b.waits.tryNext()
-			if !ok {
-				if err != nil {
-					return nil, fmt.Errorf("%w: inspection drain: %v", ErrSessionInvalidated, err)
-				}
-				break
-			}
-			drained = true
-			if err := b.recordInspectionResult(result); err != nil {
-				return nil, err
-			}
+		drained, err := b.drainInspectionResults(ctx)
+		if err != nil {
+			return nil, err
 		}
 		if drained {
 			stable = 0
@@ -151,71 +91,127 @@ func (b *linuxBackend) holdInspectionThreads(ctx context.Context) ([]int, error)
 			continue
 		}
 		stable = 0
-		result, err := b.waits.next(ctx)
-		if err != nil {
-			if result.tid != 0 {
-				if resultErr := b.recordInspectionResult(result); resultErr != nil {
-					return nil, resultErr
-				}
-				continue
-			}
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("inspection wait: %w", err)
-			}
-			return nil, fmt.Errorf("%w: inspection wait: %v", ErrSessionInvalidated, err)
-		}
-		if err := b.recordInspectionResult(result); err != nil {
+		if err := b.waitInspectionResult(ctx); err != nil {
 			return nil, err
 		}
 	}
 }
 
+func (b *linuxBackend) waitInspectionResult(ctx context.Context) error {
+	result, err := b.waits.next(ctx)
+	if err == nil || result.tid != 0 {
+		return b.recordInspectionResult(result)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("inspection wait: %w", err)
+	}
+	return fmt.Errorf("%w: inspection wait: %v", ErrSessionInvalidated, err)
+}
+
+func (b *linuxBackend) beginInspectionHold() {
+	if b.inspection != nil {
+		return
+	}
+	b.inspection = &linuxInspectionHold{
+		stopped:     map[int]bool{b.traceTID(): true},
+		interrupt:   make(map[int]bool),
+		synthetic:   make(map[int]bool),
+		priorResume: make(map[int]bool),
+	}
+	for _, stop := range b.parked {
+		b.inspection.stopped[stop.TID] = true
+	}
+	for tid, state := range b.attachedTracees {
+		if !state.stopped {
+			continue
+		}
+		b.inspection.stopped[tid] = true
+		if state.resumeAllowed && tid != b.traceTID() && state.stop.Reason == stopAttachedInternal {
+			b.inspection.priorResume[tid] = true
+		}
+	}
+	for _, result := range b.inspectionReplay {
+		if result.status.Stopped() {
+			b.inspection.stopped[result.tid] = true
+		}
+	}
+}
+
+func (b *linuxBackend) interruptInspectionThreads(tids []int) (bool, error) {
+	allStopped := true
+	for _, tid := range tids {
+		if b.inspection.stopped[tid] {
+			continue
+		}
+		allStopped = false
+		if b.inspection.interrupt[tid] {
+			continue
+		}
+		if err := b.interruptInspectionThread(tid); err != nil {
+			return false, err
+		}
+	}
+	return allStopped, nil
+}
+
+func (b *linuxBackend) interruptInspectionThread(tid int) error {
+	tracer, err := b.attachedTracerPID(tid)
+	if err != nil {
+		return fmt.Errorf("inspection verify tid %d ownership: %w", tid, err)
+	}
+	if tracer != b.tracer.threadID() {
+		return fmt.Errorf("inspection tid %d is not owned by this tracer", tid)
+	}
+	generation, err := b.waits.register(tid)
+	if err != nil {
+		return fmt.Errorf("inspection register tid %d: %w", tid, err)
+	}
+	b.registerAttachedClone(tid, generation)
+	b.execPtrace(func() { err = b.ptraceControl(unix.PTRACE_INTERRUPT, tid, 0, 0) })
+	if err != nil && !errors.Is(err, syscall.EIO) && !isNoSuchProcess(err) {
+		return fmt.Errorf("inspection interrupt tid %d: %w", tid, err)
+	}
+	b.inspection.interrupt[tid] = true
+	return nil
+}
+
+func (b *linuxBackend) drainInspectionResults(ctx context.Context) (bool, error) {
+	drained := false
+	for {
+		if err := ctx.Err(); err != nil {
+			return drained, fmt.Errorf("inspection drain deadline: %w", err)
+		}
+		result, ok, err := b.waits.tryNext()
+		if !ok {
+			if err != nil {
+				return drained, fmt.Errorf("%w: inspection drain: %v", ErrSessionInvalidated, err)
+			}
+			return drained, nil
+		}
+		drained = true
+		if err := b.recordInspectionResult(result); err != nil {
+			return drained, err
+		}
+	}
+}
+
 func (b *linuxBackend) recordInspectionResult(result linuxWaitResult) error {
-	hold := b.inspection
 	if result.err != nil && !result.retired {
 		b.inspectionReplay = append(b.inspectionReplay, result)
 		return fmt.Errorf("%w: inspection wait result: %v", ErrSessionInvalidated, result.err)
 	}
 	if result.retired || result.status.Exited() || result.status.Signaled() {
-		if result.retired {
-			if err := b.recordAttachedRetirement(result.tid, result.generation); err != nil {
-				return fmt.Errorf("%w: inspection retirement: %v", ErrSessionInvalidated, err)
-			}
-		}
-		delete(hold.stopped, result.tid)
-		delete(hold.synthetic, result.tid)
-		delete(hold.interrupt, result.tid)
-		delete(hold.priorResume, result.tid)
-		if result.tid == b.pid {
-			b.inspectionReplay = append(b.inspectionReplay, result)
-			if !result.retired && result.status.Exited() {
-				return &inspectionEndedError{stop: StopEvent{Reason: StopExited, TID: result.tid, ExitCode: result.status.ExitStatus()}}
-			}
-			if !result.retired && result.status.Signaled() {
-				return &inspectionEndedError{stop: StopEvent{Reason: StopKilled, TID: result.tid}}
-			}
-			return fmt.Errorf("%w: reporting process exited during inspection", ErrSessionInvalidated)
+		if err := b.retireInspectionThread(result); err != nil {
+			return err
 		}
 		if result.retired {
 			return nil
 		}
 	}
 	if result.status.Stopped() {
-		hold.stopped[result.tid] = true
-		delete(hold.interrupt, result.tid)
-		b.markAttachedStopped(result.tid, StopEvent{Reason: stopAttachedInternal, TID: result.tid}, false, 0, false)
-		if result.status.StopSignal() == syscall.SIGTRAP && result.status.TrapCause() == unix.PTRACE_EVENT_STOP {
-			hold.synthetic[result.tid] = true
-			if state := b.attachedTracees[result.tid]; state != nil {
-				state.initialStopPending = false
-			}
-			return nil
-		}
-		if result.status.StopSignal() == syscall.SIGTRAP && result.status.TrapCause() == syscall.PTRACE_EVENT_CLONE {
-			if err := b.registerClone(result.tid); err != nil {
-				return fmt.Errorf("%w: inspection clone: %v", ErrSessionInvalidated, err)
-			}
-			result.cloneRegistered = true
+		synthetic, err := b.recordInspectionStop(&result)
+		if err != nil || synthetic {
+			return err
 		}
 	}
 	if len(b.inspectionReplay) >= 4*maxThreadScan {
@@ -228,6 +224,52 @@ func (b *linuxBackend) recordInspectionResult(result linuxWaitResult) error {
 		return fmt.Errorf("%w: process image replaced while acquiring inspection hold", ErrImageReplaced)
 	}
 	return nil
+}
+
+func (b *linuxBackend) retireInspectionThread(result linuxWaitResult) error {
+	if result.retired {
+		if err := b.recordAttachedRetirement(result.tid, result.generation); err != nil {
+			return fmt.Errorf("%w: inspection retirement: %v", ErrSessionInvalidated, err)
+		}
+	}
+	delete(b.inspection.stopped, result.tid)
+	delete(b.inspection.synthetic, result.tid)
+	delete(b.inspection.interrupt, result.tid)
+	delete(b.inspection.priorResume, result.tid)
+	if result.tid != b.pid {
+		return nil
+	}
+	b.inspectionReplay = append(b.inspectionReplay, result)
+	if !result.retired && result.status.Exited() {
+		return &inspectionEndedError{stop: StopEvent{Reason: StopExited, TID: result.tid, ExitCode: result.status.ExitStatus()}}
+	}
+	if !result.retired && result.status.Signaled() {
+		return &inspectionEndedError{stop: StopEvent{Reason: StopKilled, TID: result.tid}}
+	}
+	return fmt.Errorf("%w: reporting process exited during inspection", ErrSessionInvalidated)
+}
+
+func (b *linuxBackend) recordInspectionStop(result *linuxWaitResult) (bool, error) {
+	b.inspection.stopped[result.tid] = true
+	delete(b.inspection.interrupt, result.tid)
+	b.markAttachedStopped(result.tid, StopEvent{Reason: stopAttachedInternal, TID: result.tid}, false, 0, false)
+	if result.status.StopSignal() != syscall.SIGTRAP {
+		return false, nil
+	}
+	switch result.status.TrapCause() {
+	case unix.PTRACE_EVENT_STOP:
+		b.inspection.synthetic[result.tid] = true
+		if state := b.attachedTracees[result.tid]; state != nil {
+			state.initialStopPending = false
+		}
+		return true, nil
+	case syscall.PTRACE_EVENT_CLONE:
+		if err := b.registerClone(result.tid); err != nil {
+			return false, fmt.Errorf("%w: inspection clone: %v", ErrSessionInvalidated, err)
+		}
+		result.cloneRegistered = true
+	}
+	return false, nil
 }
 
 func (b *linuxBackend) releaseInspectionThreads() error {
@@ -316,20 +358,7 @@ func (b *linuxBackend) seizeLaunchedProcess(pid int) error {
 			return fmt.Errorf("launch seize unexpected tid %d status %v", result.tid, ws)
 		}
 		if ws.StopSignal() == syscall.SIGSTOP && int(uint32(ws)>>16) == unix.PTRACE_EVENT_STOP {
-			if err := b.requeueSignal(pid, int(syscall.SIGCONT)); err != nil {
-				return fmt.Errorf("launch clear owned group stop: %w", err)
-			}
-			after, err := b.startupRegisters(pid)
-			if err != nil {
-				return fmt.Errorf("launch after seize: %w", err)
-			}
-			if after.PC != before.PC || after.SP != before.SP {
-				return fmt.Errorf("launch seize changed entry context: before pc=%#x sp=%#x, after pc=%#x sp=%#x",
-					before.PC, before.SP, after.PC, after.SP)
-			}
-			b.seized = true
-			b.recordStop(pid)
-			return nil
+			return b.admitSeizedLaunch(pid, before)
 		}
 		signal := 0
 		if ws.StopSignal() == syscall.SIGSTOP && ws.TrapCause() == -1 {
@@ -342,6 +371,23 @@ func (b *linuxBackend) seizeLaunchedProcess(pid int) error {
 			return fmt.Errorf("launch seize rendezvous resume: %w", controlErr)
 		}
 	}
+}
+
+func (b *linuxBackend) admitSeizedLaunch(pid int, before Registers) error {
+	if err := b.requeueSignal(pid, int(syscall.SIGCONT)); err != nil {
+		return fmt.Errorf("launch clear owned group stop: %w", err)
+	}
+	after, err := b.startupRegisters(pid)
+	if err != nil {
+		return fmt.Errorf("launch after seize: %w", err)
+	}
+	if after.PC != before.PC || after.SP != before.SP {
+		return fmt.Errorf("launch seize changed entry context: before pc=%#x sp=%#x, after pc=%#x sp=%#x",
+			before.PC, before.SP, after.PC, after.SP)
+	}
+	b.seized = true
+	b.recordStop(pid)
+	return nil
 }
 
 func (b *linuxBackend) startupSignalInfo(pid int) (int32, int32, error) {
