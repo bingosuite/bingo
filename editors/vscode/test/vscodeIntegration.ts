@@ -906,16 +906,22 @@ class FakeDAPServer {
           totalFrames: 2,
         });
         break;
-      case "scopes":
+      case "scopes": {
+        let variablesReference = 100;
+        if (request.arguments?.frameId === 3) {
+          variablesReference = 300;
+        } else if (request.arguments?.frameId === 2) {
+          variablesReference = 200;
+        }
         this.#respond(socket, request, {
           scopes: [{
             name: "Locals",
-            variablesReference: request.arguments?.frameId === 3
-              ? 300 : request.arguments?.frameId === 2 ? 200 : 100,
+            variablesReference,
             expensive: false,
           }],
         });
         break;
+      }
       case "variables":
         this.#respond(socket, request, {
           variables: this.#variables(request.arguments?.variablesReference),

@@ -337,6 +337,8 @@ func (h *Handler) liveLineLocked(op *bpOp) *bpLine {
 	return st
 }
 
+const inspectionStopChanged = "inspection stop changed"
+
 func (h *Handler) onFrames(evt protocol.Event) {
 	var p protocol.FramesPayload
 	_ = protocol.DecodeEventPayload(evt, &p)
@@ -355,7 +357,7 @@ func (h *Handler) onFrames(evt protocol.Event) {
 	}
 	if !h.suspended || request.generation != h.stopGeneration {
 		h.mu.Unlock()
-		h.send(h.errorResponse(request.seq, "stackTrace", "inspection stop changed"))
+		h.send(h.errorResponse(request.seq, "stackTrace", inspectionStopChanged))
 		return
 	}
 	start, end := min(request.start, len(p.Frames)), len(p.Frames)
@@ -395,7 +397,7 @@ func (h *Handler) onGoroutines(evt protocol.Event) {
 	h.threadsQ = h.threadsQ[1:]
 	if !h.suspended || request.generation != h.stopGeneration {
 		h.mu.Unlock()
-		h.send(h.errorResponse(request.seq, "threads", "inspection stop changed"))
+		h.send(h.errorResponse(request.seq, "threads", inspectionStopChanged))
 		return
 	}
 	collapse := h.stopThreadUnknown && !h.unknownThreadsCollapsed
@@ -430,7 +432,7 @@ func (h *Handler) onLocals(evt protocol.Event) {
 	}
 	if !h.suspended || vr.generation != h.stopGeneration {
 		h.mu.Unlock()
-		h.send(h.errorResponse(vr.seq, "variables", "inspection stop changed"))
+		h.send(h.errorResponse(vr.seq, "variables", inspectionStopChanged))
 		return
 	}
 	vars, err := h.buildVarTree(p.Variables)
@@ -466,7 +468,7 @@ func (h *Handler) onEvaluated(evt protocol.Event) {
 	}
 	if !h.suspended || request.generation != h.stopGeneration {
 		h.mu.Unlock()
-		h.send(h.errorResponse(request.seq, "evaluate", "inspection stop changed"))
+		h.send(h.errorResponse(request.seq, "evaluate", inspectionStopChanged))
 		return
 	}
 	ref := 0

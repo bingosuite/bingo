@@ -3140,6 +3140,10 @@ collapsed reply. Its identity-only decoder admits 5,000 real goroutines plus
 one synthetic current handle without charging unused names against variable
 node/text budgets. Missing or ambiguous proof reports unavailable. No webview action
 sends Continue, Step, Pause, Kill, or any other run-control command.
+The mapping queries are deliberately sequential: the first response must consume
+the unknown-stop collapse before its follow-up can prove a full mapping. Native
+packaged worker checks likewise inspect one graph selection at a time; concurrent
+clicks invalidate earlier pending results and would skip their DOM proof.
 
 With `bingo.concurrency.autoReveal`, a session announcement opens one reusable
 **editor WebviewPanel beside source**, using public `ViewColumn.Beside` and

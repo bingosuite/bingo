@@ -9,6 +9,11 @@ import (
 	"github.com/bingosuite/bingo/pkg/protocol"
 )
 
+const (
+	inspectionGobufType = "runtime.gobuf"
+	inspectionGType     = "runtime.g"
+)
+
 type goroutineInspector interface {
 	StackFramesForGoroutine(int) ([]protocol.Frame, error)
 	LocalsForGoroutine(int, int) ([]protocol.Variable, error)
@@ -101,10 +106,10 @@ func (e *engine) EvaluateForGoroutine(goid, frame int, name string) (protocol.Va
 	return result, err
 }
 
-// stoppedInspectionThreads must prove the whole runtime cannot schedule or
+// inspectionThreadHolder must prove the whole runtime cannot schedule or
 // copy a parked stack. A sampled status, or a second identical read, is not that
 // proof: Linux siblings can resume a goroutine between the two reads.
-type stoppedInspectionThreads interface {
+type inspectionThreadHolder interface {
 	inspectionThreads() ([]int, error)
 }
 
@@ -191,7 +196,7 @@ func (e *engine) inspectionGoroutinePointer(l *goLayout, goid, tid int, reportin
 }
 
 func (e *engine) heldInspectionThreads(tid int) ([]int, bool, error) {
-	backend, ok := e.backend.(stoppedInspectionThreads)
+	backend, ok := e.backend.(inspectionThreadHolder)
 	if !ok {
 		return []int{tid}, false, nil
 	}
@@ -235,17 +240,17 @@ func (e *engine) savedInspectionRegisters(l *goLayout, goid int, gptr uint64, st
 	var err error
 	switch status {
 	case 1, 4, 9:
-		pc, pcOK := e.dw.structMemberOffset("runtime.gobuf", "pc")
-		sp, spOK := e.dw.structMemberOffset("runtime.gobuf", "sp")
-		bp, bpOK := e.dw.structMemberOffset("runtime.gobuf", "bp")
+		pc, pcOK := e.dw.structMemberOffset(inspectionGobufType, "pc")
+		sp, spOK := e.dw.structMemberOffset(inspectionGobufType, "sp")
+		bp, bpOK := e.dw.structMemberOffset(inspectionGobufType, "bp")
 		if !pcOK || !spOK || !bpOK {
 			return Registers{}, fmt.Errorf("goroutine %d saved gobuf layout unavailable", goid)
 		}
 		regs, err = e.readInspectionRegisters(gptr+uint64(l.gSched), pc, sp, bp)
 	case 3:
-		pc, pcOK := e.dw.structMemberOffset("runtime.g", "syscallpc")
-		sp, spOK := e.dw.structMemberOffset("runtime.g", "syscallsp")
-		bp, bpOK := e.dw.structMemberOffset("runtime.g", "syscallbp")
+		pc, pcOK := e.dw.structMemberOffset(inspectionGType, "syscallpc")
+		sp, spOK := e.dw.structMemberOffset(inspectionGType, "syscallsp")
+		bp, bpOK := e.dw.structMemberOffset(inspectionGType, "syscallbp")
 		if !pcOK || !spOK || !bpOK {
 			return Registers{}, fmt.Errorf("goroutine %d syscall context layout unavailable", goid)
 		}

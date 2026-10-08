@@ -887,18 +887,7 @@ func (e *engine) loop() {
 	for {
 		select {
 		case cmd := <-e.cmdCh:
-			err := e.resourcesPending
-			if err == nil {
-				err = e.inspectionFailure
-			}
-			if err == nil || cmd.cleanup {
-				err = cmd.fn()
-			}
-			if errors.Is(err, ErrBackendCleanupIncomplete) {
-				e.resourcesPending = err
-			}
-			e.retainAttachedTeardown()
-			cmd.err <- err
+			e.executeEngineCommand(cmd)
 			if outcome := e.inspectionOutcome; outcome != nil {
 				e.inspectionOutcome = nil
 				if e.handleWaitResult(*outcome) && e.finishBackendTeardown() {
@@ -914,6 +903,21 @@ func (e *engine) loop() {
 			}
 		}
 	}
+}
+
+func (e *engine) executeEngineCommand(cmd engineCmd) {
+	err := e.resourcesPending
+	if err == nil {
+		err = e.inspectionFailure
+	}
+	if err == nil || cmd.cleanup {
+		err = cmd.fn()
+	}
+	if errors.Is(err, ErrBackendCleanupIncomplete) {
+		e.resourcesPending = err
+	}
+	e.retainAttachedTeardown()
+	cmd.err <- err
 }
 
 // A terminal wait result can precede namespace retirement; failed cleanup must

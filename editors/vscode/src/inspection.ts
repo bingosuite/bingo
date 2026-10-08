@@ -319,8 +319,8 @@ export class DebugInspectionController {
       let threadId = 0;
       const goid = inspectionGoroutine(target);
       if (goid > 0) {
-        // An unknown stop's first threads response may intentionally contain
-        // only its synthetic-current handle. One more query exposes the list.
+        // The first unknown-stop reply is intentionally collapsed. The follow-up
+        // must wait for it to consume that collapse before resolving selection.
         for (let attempt = 0; attempt < 2 && threadId === 0; attempt += 1) {
           const threads = await this.#request(
             target,

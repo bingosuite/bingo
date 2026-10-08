@@ -63,35 +63,16 @@ func declareGoroutineInspectionSpec() {
 		waiting := make(map[string]bool)
 		running := false
 		for _, g := range list.Goroutines {
-			if g.StartLoc.Function != "main.main.gowrap1" && g.StartLoc.Function != "main.main.gowrap2" &&
-				g.StartLoc.Function != "main.main.gowrap3" {
+			if !isInspectionFixtureWorker(g.StartLoc.Function) {
 				continue
 			}
-			frames, err := debugger.StackFramesForGoroutine(h.d, g.ID)
-			Expect(err).NotTo(HaveOccurred(), "selected stack g%d: %v", g.ID, err)
-			found := false
-			for _, frame := range frames {
-				if frame.Location.Function != "main.waitingWorker" && frame.Location.Function != "main.runningWorker" {
-					continue
-				}
-				found = true
-				vars, err := debugger.LocalsForGoroutine(h.d, g.ID, frame.Index)
-				Expect(err).NotTo(HaveOccurred())
-				value, err := debugger.EvaluateForGoroutine(h.d, g.ID, frame.Index, "label")
-				Expect(err).NotTo(HaveOccurred())
-				Expect(vars).To(ContainElement(And(HaveField("Name", "label"), HaveField("Value", value.Value))))
-				if frame.Location.Function == "main.waitingWorker" {
-					waiting[value.Value] = true
-				} else {
-					Expect(value.Value).To(Equal("303"))
-					running = true
-				}
-				again, err := debugger.StackFramesForGoroutine(h.d, g.ID)
-				Expect(err).NotTo(HaveOccurred())
-				Expect(again).To(Equal(frames), "selected context must remain stable across requests")
-				break
+			label, isRunning := inspectNativeFixtureWorker(h.d, g.ID)
+			if isRunning {
+				Expect(label).To(Equal("303"))
+				running = true
+			} else {
+				waiting[label] = true
 			}
-			Expect(found).To(BeTrue(), "g%d must have its own worker frame", g.ID)
 		}
 		Expect(waiting).To(Equal(map[string]bool{"101": true, "202": true}))
 		Expect(running).To(BeTrue())
@@ -103,6 +84,38 @@ func declareGoroutineInspectionSpec() {
 		h.waitFor(20*time.Second, protocol.EventBreakpointHit)
 		Expect(h.d.Kill()).To(Succeed(), "Kill must retire the retained inspection hold")
 	})
+}
+
+func isInspectionFixtureWorker(function string) bool {
+	switch function {
+	case "main.main.gowrap1", "main.main.gowrap2", "main.main.gowrap3":
+		return true
+	default:
+		return false
+	}
+}
+
+func inspectNativeFixtureWorker(d debugger.Debugger, goid int) (string, bool) {
+	frames, err := debugger.StackFramesForGoroutine(d, goid)
+	Expect(err).NotTo(HaveOccurred(), "selected stack g%d: %v", goid, err)
+	var worker protocol.Frame
+	found := false
+	for _, frame := range frames {
+		if frame.Location.Function == "main.waitingWorker" || frame.Location.Function == "main.runningWorker" {
+			worker, found = frame, true
+			break
+		}
+	}
+	Expect(found).To(BeTrue(), "g%d must have its own worker frame", goid)
+	vars, err := debugger.LocalsForGoroutine(d, goid, worker.Index)
+	Expect(err).NotTo(HaveOccurred())
+	value, err := debugger.EvaluateForGoroutine(d, goid, worker.Index, "label")
+	Expect(err).NotTo(HaveOccurred())
+	Expect(vars).To(ContainElement(And(HaveField("Name", "label"), HaveField("Value", value.Value))))
+	again, err := debugger.StackFramesForGoroutine(d, goid)
+	Expect(err).NotTo(HaveOccurred())
+	Expect(again).To(Equal(frames), "selected context must remain stable across requests")
+	return value.Value, worker.Location.Function == "main.runningWorker"
 }
 
 func declareDAPGoroutineInspectionSpec() {
@@ -150,27 +163,31 @@ func declareDAPGoroutineInspectionSpec() {
 			if !selected {
 				continue
 			}
-			response := dc.request("stackTrace", &godap.StackTraceRequest{
-				Arguments: godap.StackTraceArguments{ThreadId: thread.Id},
-			})
-			stack, ok := response.(*godap.StackTraceResponse)
-			Expect(ok).To(BeTrue(), "unexpected selected stack response %T", response)
-			for _, frame := range stack.Body.StackFrames {
-				if frame.Name != "main.waitingWorker" && frame.Name != "main.runningWorker" {
-					continue
-				}
-				Expect(handles[frame.Id]).To(BeFalse(), "frames of distinct goroutines must not alias")
-				handles[frame.Id] = true
-				scope := dc.scopes(frame.Id)
-				Expect(scope.Body.Scopes).To(HaveLen(1))
-				vars := dc.variables(scope.Body.Scopes[0].VariablesReference)
-				Expect(vars.GetResponse().Success).To(BeTrue())
-				value := dc.evaluate("label", frame.Id, "watch")
-				Expect(vars.(*godap.VariablesResponse).Body.Variables).To(ContainElement(And(HaveField("Name", "label"), HaveField("Value", value.Body.Result))))
-				Expect(value.Body.Result).To(Equal(label), "graph goid %d resolved to handle %d", goid, thread.Id)
-				values[goid] = value.Body.Result
-			}
+			inspectDAPFixtureWorker(dc, thread.Id, goid, label, handles, values)
 		}
 		Expect(values).To(Equal(expected))
 	})
+}
+
+func inspectDAPFixtureWorker(dc *dapClient, threadID int, goid int64, label string, handles map[int]bool, values map[int64]string) {
+	response := dc.request("stackTrace", &godap.StackTraceRequest{
+		Arguments: godap.StackTraceArguments{ThreadId: threadID},
+	})
+	stack, ok := response.(*godap.StackTraceResponse)
+	Expect(ok).To(BeTrue(), "unexpected selected stack response %T", response)
+	for _, frame := range stack.Body.StackFrames {
+		if frame.Name != "main.waitingWorker" && frame.Name != "main.runningWorker" {
+			continue
+		}
+		Expect(handles[frame.Id]).To(BeFalse(), "frames of distinct goroutines must not alias")
+		handles[frame.Id] = true
+		scope := dc.scopes(frame.Id)
+		Expect(scope.Body.Scopes).To(HaveLen(1))
+		vars := dc.variables(scope.Body.Scopes[0].VariablesReference)
+		Expect(vars.GetResponse().Success).To(BeTrue())
+		value := dc.evaluate("label", frame.Id, "watch")
+		Expect(vars.(*godap.VariablesResponse).Body.Variables).To(ContainElement(And(HaveField("Name", "label"), HaveField("Value", value.Body.Result))))
+		Expect(value.Body.Result).To(Equal(label), "graph goid %d resolved to handle %d", goid, threadID)
+		values[goid] = value.Body.Result
+	}
 }

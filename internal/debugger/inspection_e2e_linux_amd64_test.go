@@ -101,7 +101,11 @@ func buildNativeInspectionTarget(t *testing.T) (string, map[string]uint64) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			t.Errorf("close inspection target: %v", err)
+		}
+	}()
 	symbols, err := file.Symbols()
 	if err != nil {
 		t.Fatal(err)
@@ -128,8 +132,8 @@ func nativeInspectionWord(t *testing.T, pid int, addresses map[string]uint64, na
 	return binary.LittleEndian.Uint64(buf)
 }
 
-func TestLinuxNativeInspectionSeizeAdmissionAndDurableHold(t *testing.T) {
-	bin, addresses := buildNativeInspectionTarget(t)
+func startObservedInspectionProcess(t *testing.T, bin string) (*linuxBackend, int, *observedInspectionWaits) {
+	t.Helper()
 	b := newBackend().(*linuxBackend)
 	observed := &observedInspectionWaits{linuxWaitSource: b.waits}
 	b.waits = observed
@@ -146,22 +150,33 @@ func TestLinuxNativeInspectionSeizeAdmissionAndDurableHold(t *testing.T) {
 	}
 	pid, cmd, err := startTracedProcess(b, bin, nil, nil, "")
 	t.Cleanup(func() {
-		if cmd != nil {
-			_ = cmd.Process.Kill()
-			if err := b.reapAfterKill(); err != nil {
-				t.Errorf("reap exact test-owned target: %v", err)
-			}
-		} else if b.failedLaunch != nil {
-			if err := b.cleanupFailedLaunch(); err != nil {
-				t.Errorf("cleanup partial start: %v", err)
-			}
-		}
-		b.closeTracer()
+		cleanupNativeLaunchedInspection(t, b, cmd)
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	b.setPID(pid)
+	assertObservedInspectionAdmission(t, startup, observed, controls, pid)
+	return b, pid, observed
+}
+
+func cleanupNativeLaunchedInspection(t *testing.T, b *linuxBackend, cmd *exec.Cmd) {
+	t.Helper()
+	if cmd != nil {
+		_ = cmd.Process.Kill()
+		if err := b.reapAfterKill(); err != nil {
+			t.Errorf("reap exact test-owned target: %v", err)
+		}
+	} else if b.failedLaunch != nil {
+		if err := b.cleanupFailedLaunch(); err != nil {
+			t.Errorf("cleanup partial start: %v", err)
+		}
+	}
+	b.closeTracer()
+}
+
+func assertObservedInspectionAdmission(t *testing.T, startup []Registers, observed *observedInspectionWaits, controls []linuxResumeCall, pid int) {
+	t.Helper()
 	if len(startup) != 2 || startup[0].PC != startup[1].PC || startup[0].SP != startup[1].SP {
 		t.Fatalf("entry context changed across transfer: %+v", startup)
 	}
@@ -177,16 +192,10 @@ func TestLinuxNativeInspectionSeizeAdmissionAndDurableHold(t *testing.T) {
 	if !groupStop || !seize {
 		t.Fatalf("missing exact group-stop acknowledgement or inherited option set: stops=%+v controls=%+v", observed.results, controls)
 	}
-	read := func(name string) uint64 {
-		t.Helper()
-		return nativeInspectionWord(t, pid, addresses, name)
-	}
+}
 
-	if read("entered") != 0 {
-		t.Fatal("user code escaped before initial admission")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
+func waitNativeInspectionReady(t *testing.T, b *linuxBackend, pid int, observed *observedInspectionWaits, ctx context.Context) {
+	t.Helper()
 	if err := b.SingleStep(pid); err != nil {
 		t.Fatal(err)
 	}
@@ -209,6 +218,11 @@ func TestLinuxNativeInspectionSeizeAdmissionAndDurableHold(t *testing.T) {
 	if !cloneStop {
 		t.Fatal("no inherited SEIZE clone EVENT_STOP was observed")
 	}
+}
+
+func assertNativeDurableInspectionHold(t *testing.T, b *linuxBackend, pid int, addresses map[string]uint64) ([]int, uint64) {
+	t.Helper()
+	read := func(name string) uint64 { return nativeInspectionWord(t, pid, addresses, name) }
 	tids, err := b.inspectionThreads()
 	if err != nil || len(tids) != 3 || len(b.inspection.synthetic) != 2 {
 		t.Fatalf("native all-TID hold lacks acknowledgements: %v, %v", tids, err)
@@ -232,6 +246,20 @@ func TestLinuxNativeInspectionSeizeAdmissionAndDurableHold(t *testing.T) {
 			t.Fatalf("held tid %d changed context: %+v, %v", tid, current, err)
 		}
 	}
+	return tids, before
+}
+
+func TestLinuxNativeInspectionSeizeAdmissionAndDurableHold(t *testing.T) {
+	bin, addresses := buildNativeInspectionTarget(t)
+	b, pid, observed := startObservedInspectionProcess(t, bin)
+	read := func(name string) uint64 { return nativeInspectionWord(t, pid, addresses, name) }
+	if read("entered") != 0 {
+		t.Fatal("user code escaped before initial admission")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	waitNativeInspectionReady(t, b, pid, observed, ctx)
+	tids, before := assertNativeDurableInspectionHold(t, b, pid, addresses)
 	foreign := tids[0]
 	if foreign == pid {
 		foreign = tids[1]
@@ -242,7 +270,7 @@ func TestLinuxNativeInspectionSeizeAdmissionAndDurableHold(t *testing.T) {
 	if err := b.ContinueProcess(); err != nil {
 		t.Fatal(err)
 	}
-	stop, err = b.wait(ctx)
+	stop, err := b.wait(ctx)
 	if err != nil || stop.TID != foreign || stop.Signal != int(syscall.SIGUSR2) {
 		t.Fatalf("held real signal was lost or misrouted: %+v, %v", stop, err)
 	}
@@ -252,6 +280,11 @@ func TestLinuxNativeInspectionSeizeAdmissionAndDurableHold(t *testing.T) {
 	if err := b.ContinueProcess(); err != nil {
 		t.Fatal(err)
 	}
+	assertNativeInspectionResumeProgress(t, read, before)
+}
+
+func assertNativeInspectionResumeProgress(t *testing.T, read func(string) uint64, before uint64) {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for read("handled") != 2 || read("heartbeat") <= before {
 		if time.Now().After(deadline) {
@@ -271,22 +304,55 @@ func TestLinuxNativeInspectionAttachedHoldRestoresAndDetaches(t *testing.T) {
 	b := newBackend().(*linuxBackend)
 	joined := false
 	t.Cleanup(func() {
-		if !joined {
-			_ = cmd.Process.Kill()
-			if b.attached() {
-				if err := b.reapAfterKill(); err != nil {
-					t.Errorf("reap exact test-owned attached target: %v", err)
-				}
-				_ = cmd.Process.Release()
-			} else {
-				_ = cmd.Wait()
-			}
-		}
-		b.closeTracer()
+		cleanupNativeAttachedInspection(t, b, cmd, joined)
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	taskPath := filepath.Join("/proc", strconv.Itoa(pid), "task")
+	waitNativeInspectionWorkerThreads(t, ctx, taskPath)
+	tids, heartbeat, handled := holdNativeAttachedInspection(t, b, pid, addresses, ctx)
+	original := make([]byte, 1)
+	if err := b.ReadMemory(addresses["tick"], original); err != nil {
+		t.Fatal(err)
+	}
+	bps := newBreakpointTable()
+	if _, err := bps.set(b, "target.c", 1, addresses["tick"]); err != nil {
+		t.Fatal(err)
+	}
+	foreign := tids[0]
+	if foreign == pid {
+		foreign = tids[1]
+	}
+	if err := syscall.Tgkill(pid, foreign, syscall.SIGUSR2); err != nil {
+		t.Fatal(err)
+	}
+	restoreNativeInspectionBreakpoints(t, b, bps, addresses["tick"], original, ctx)
+	if err := b.detachAttachedWithContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	read := func(name string) uint64 { return nativeInspectionWord(t, pid, addresses, name) }
+	assertNativeDetachedInspectionProgress(t, taskPath, tids, read, handled, heartbeat, ctx)
+	joinNativeInspectionTarget(t, cmd, &joined, ctx)
+}
+
+func cleanupNativeAttachedInspection(t *testing.T, b *linuxBackend, cmd *exec.Cmd, joined bool) {
+	t.Helper()
+	if !joined {
+		_ = cmd.Process.Kill()
+		if b.attached() {
+			if err := b.reapAfterKill(); err != nil {
+				t.Errorf("reap exact test-owned attached target: %v", err)
+			}
+			_ = cmd.Process.Release()
+		} else {
+			_ = cmd.Wait()
+		}
+	}
+	b.closeTracer()
+}
+
+func waitNativeInspectionWorkerThreads(t *testing.T, ctx context.Context, taskPath string) {
+	t.Helper()
 	for {
 		tasks, err := os.ReadDir(taskPath)
 		if err != nil {
@@ -300,6 +366,10 @@ func TestLinuxNativeInspectionAttachedHoldRestoresAndDetaches(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+func holdNativeAttachedInspection(t *testing.T, b *linuxBackend, pid int, addresses map[string]uint64, ctx context.Context) ([]int, uint64, uint64) {
+	t.Helper()
 	if err := attachToProcess(b, pid); err != nil {
 		t.Fatal(err)
 	}
@@ -324,21 +394,11 @@ func TestLinuxNativeInspectionAttachedHoldRestoresAndDetaches(t *testing.T) {
 	if read("heartbeat") != heartbeat {
 		t.Fatal("attached hold released a worker between inspections")
 	}
-	original := make([]byte, 1)
-	if err := b.ReadMemory(addresses["tick"], original); err != nil {
-		t.Fatal(err)
-	}
-	bps := newBreakpointTable()
-	if _, err := bps.set(b, "target.c", 1, addresses["tick"]); err != nil {
-		t.Fatal(err)
-	}
-	foreign := tids[0]
-	if foreign == pid {
-		foreign = tids[1]
-	}
-	if err := syscall.Tgkill(pid, foreign, syscall.SIGUSR2); err != nil {
-		t.Fatal(err)
-	}
+	return tids, heartbeat, handled
+}
+
+func restoreNativeInspectionBreakpoints(t *testing.T, b *linuxBackend, bps *breakpointTable, address uint64, original []byte, ctx context.Context) {
+	t.Helper()
 	if _, err := b.quiesceAttached(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -352,12 +412,13 @@ func TestLinuxNativeInspectionAttachedHoldRestoresAndDetaches(t *testing.T) {
 		t.Fatal(err)
 	}
 	restored := make([]byte, 1)
-	if err := b.ReadMemory(addresses["tick"], restored); err != nil || !reflect.DeepEqual(restored, original) {
+	if err := b.ReadMemory(address, restored); err != nil || !reflect.DeepEqual(restored, original) {
 		t.Fatalf("attached instruction restoration: %x, %v", restored, err)
 	}
-	if err := b.detachAttachedWithContext(ctx); err != nil {
-		t.Fatal(err)
-	}
+}
+
+func assertNativeDetachedInspectionProgress(t *testing.T, taskPath string, tids []int, read func(string) uint64, handled, heartbeat uint64, ctx context.Context) {
+	t.Helper()
 	for _, tid := range tids {
 		raw, err := os.ReadFile(filepath.Join(taskPath, strconv.Itoa(tid), "status"))
 		if err != nil || !strings.Contains(string(raw), "TracerPid:\t0\n") {
@@ -370,6 +431,10 @@ func TestLinuxNativeInspectionAttachedHoldRestoresAndDetaches(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
+}
+
+func joinNativeInspectionTarget(t *testing.T, cmd *exec.Cmd, joined *bool, ctx context.Context) {
+	t.Helper()
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		t.Fatal(err)
 	}
@@ -377,14 +442,14 @@ func TestLinuxNativeInspectionAttachedHoldRestoresAndDetaches(t *testing.T) {
 	go func() { waited <- cmd.Wait() }()
 	select {
 	case err := <-waited:
-		joined = true
+		*joined = true
 		if err != nil {
 			t.Fatal(err)
 		}
 	case <-ctx.Done():
 		_ = cmd.Process.Kill()
 		err := <-waited
-		joined = true
+		*joined = true
 		t.Fatalf("detached target failed to exit normally: %v, %v", ctx.Err(), err)
 	}
 }

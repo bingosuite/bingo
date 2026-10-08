@@ -109,33 +109,38 @@ func TestSelectedInspectionNeverBorrowsRunningGobuf(t *testing.T) {
 func TestSelectedInspectionResolvesCurrentAnchorBeyondAllgsBound(t *testing.T) {
 	for _, scheduler := range []bool{false, true} {
 		t.Run(fmt.Sprintf("scheduler=%v", scheduler), func(t *testing.T) {
-			e, b := inspectionEngine(t)
-			b.seedU32(0x2000, 2)
-			b.seedU64(0x100, uint64(2*maxGoroutineScan+1))
-			regs := Registers{PC: 0x4444, SP: 0x8100, BP: 0x8200, TLS: 0x2000}
-			b.seedU64(0x120, 0x4000)
-			e.dw.varAddrs["runtime.allm"] = 0x120
-			seedTestM(b.goroutineMemoryBackend, e.goLayout, 0x4000, 100, 0x2000, 0)
-			b.seedU64(0x2000+uint64(e.goLayout.gM), 0x4000)
-			if scheduler {
-				seedTestGoroutine(b.goroutineMemoryBackend, e.goLayout, 0x5000, 0, 0x6000, 0x7000)
-				b.seedU64(0x5000+uint64(e.goLayout.gM), 0x4000)
-				b.seedU64(0x4000+uint64(e.goLayout.mG0), 0x5000)
-				regs.SP, regs.BP, regs.TLS = 0x6100, 0, 0x5000
-			}
-			b.threadRegs[100] = regs
-			got, err := e.goroutineRegisters(42)
-			if scheduler {
-				if err == nil || !strings.Contains(err.Error(), "scheduler or signal stack") {
-					t.Fatalf("scheduler identity borrowed a user context: %+v: %v", got, err)
-				}
-			} else if err != nil || got != regs {
-				t.Fatalf("advertised current anchor rejected: %+v: %v", got, err)
-			}
-			if b.reads[0x1000] != 0 {
-				t.Fatal("verified current anchor fell back to the bounded allgs scan")
-			}
+			assertInspectionCurrentAnchor(t, scheduler)
 		})
+	}
+}
+
+func assertInspectionCurrentAnchor(t *testing.T, scheduler bool) {
+	t.Helper()
+	e, b := inspectionEngine(t)
+	b.seedU32(0x2000, 2)
+	b.seedU64(0x100, uint64(2*maxGoroutineScan+1))
+	regs := Registers{PC: 0x4444, SP: 0x8100, BP: 0x8200, TLS: 0x2000}
+	b.seedU64(0x120, 0x4000)
+	e.dw.varAddrs["runtime.allm"] = 0x120
+	seedTestM(b.goroutineMemoryBackend, e.goLayout, 0x4000, 100, 0x2000, 0)
+	b.seedU64(0x2000+uint64(e.goLayout.gM), 0x4000)
+	if scheduler {
+		seedTestGoroutine(b.goroutineMemoryBackend, e.goLayout, 0x5000, 0, 0x6000, 0x7000)
+		b.seedU64(0x5000+uint64(e.goLayout.gM), 0x4000)
+		b.seedU64(0x4000+uint64(e.goLayout.mG0), 0x5000)
+		regs.SP, regs.BP, regs.TLS = 0x6100, 0, 0x5000
+	}
+	b.threadRegs[100] = regs
+	got, err := e.goroutineRegisters(42)
+	if scheduler {
+		if err == nil || !strings.Contains(err.Error(), "scheduler or signal stack") {
+			t.Fatalf("scheduler identity borrowed a user context: %+v: %v", got, err)
+		}
+	} else if err != nil || got != regs {
+		t.Fatalf("advertised current anchor rejected: %+v: %v", got, err)
+	}
+	if b.reads[0x1000] != 0 {
+		t.Fatal("verified current anchor fell back to the bounded allgs scan")
 	}
 }
 
