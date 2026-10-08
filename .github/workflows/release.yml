@@ -58,7 +58,7 @@ jobs:
         id: fresh
         run: |
           live=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
-          if [ "$live" != "$HEAD_SHA" ] || [ "$GITHUB_SHA" != "$HEAD_SHA" ]; then
+          if [[ "$live" != "$HEAD_SHA" || "$GITHUB_SHA" != "$HEAD_SHA" ]]; then
             echo "main moved on; the newer commit will be released instead."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           fi
@@ -68,7 +68,7 @@ jobs:
         if: steps.fresh.outputs.skip != 'true'
         run: |
           existing=$(git tag --points-at "$HEAD_SHA" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
-          if [ -n "$existing" ]; then
+          if [[ -n "$existing" ]]; then
             echo "$HEAD_SHA is already tagged ($existing); nothing to do."
             exit 0
           fi
@@ -77,7 +77,7 @@ jobs:
             | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | head -1 || true)
 
           # Docs-only changes since the last release don't need a new version.
-          if [ -n "$latest" ]; then
+          if [[ -n "$latest" ]]; then
             if ! git diff --name-only "$latest" "$HEAD_SHA" \
               | grep -qvE '(^docs/|^\.github/ISSUE_TEMPLATE/|\.md$)'; then
               echo "Only docs changed since $latest; skipping."
@@ -85,7 +85,7 @@ jobs:
             fi
           fi
 
-          if [ -z "$latest" ]; then
+          if [[ -z "$latest" ]]; then
             next=v0.0.1
           else
             IFS=. read -r major minor patch <<< "${latest#v}"
@@ -303,7 +303,7 @@ jobs:
           RELEASE_TAG: ${{ needs.resolve.outputs.tag }}
         run: |
           draft=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)
-          test "$draft" = true
+          [[ "$draft" == true ]]
           gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
 
   # Automatic path only: a failed build leaves no draft or tag behind, so the
@@ -326,10 +326,10 @@ jobs:
         run: |
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Refusing to clean up '$RELEASE_TAG'." >&2; exit 1; }
           draft=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null || echo missing)
-          if [ "$draft" = true ]; then
+          if [[ "$draft" == true ]]; then
             gh release delete "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
             echo "Deleted draft and tag $RELEASE_TAG."
-          elif [ "$draft" = missing ]; then
+          elif [[ "$draft" == missing ]]; then
             # Tag was created but the draft never was.
             gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$RELEASE_TAG" || true
             echo "Removed orphan tag $RELEASE_TAG."
