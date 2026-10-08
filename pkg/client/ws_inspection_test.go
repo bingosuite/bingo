@@ -13,30 +13,35 @@ func TestSelectedInspectionRequiresMatchingEcho(t *testing.T) {
 	for _, kind := range []protocol.CommandKind{protocol.CmdFrames, protocol.CmdLocals, protocol.CmdEvaluate} {
 		for _, echo := range []int{0, 41, 42} {
 			t.Run(fmt.Sprintf("%s/echo-%d", kind, echo), func(t *testing.T) {
-				h := newLoopbackClient(t)
-				result := selectedInspectionRequest(h, kind)
-				cmd := h.readCommand(t)
-				assertCommandKind(t, cmd, kind)
-				var selection struct {
-					GoroutineID int `json:"goroutineId"`
-				}
-				if err := protocol.DecodeCommandPayload(cmd, &selection); err != nil || selection.GoroutineID != 42 {
-					t.Fatalf("selection = %+v: %v", selection, err)
-				}
-				h.writeEvent(t, selectedInspectionResponse(kind, echo))
-				select {
-				case err := <-result:
-					if echo == 42 && err != nil {
-						t.Fatal(err)
-					}
-					if echo != 42 && !errors.Is(err, ErrGoroutineInspectionUnsupported) {
-						t.Fatalf("unproven selection accepted: %v", err)
-					}
-				case <-time.After(2 * time.Second):
-					t.Fatal("selected inspection did not settle")
-				}
+				assertSelectedInspectionEcho(t, kind, echo)
 			})
 		}
+	}
+}
+
+func assertSelectedInspectionEcho(t *testing.T, kind protocol.CommandKind, echo int) {
+	t.Helper()
+	h := newLoopbackClient(t)
+	result := selectedInspectionRequest(h, kind)
+	cmd := h.readCommand(t)
+	assertCommandKind(t, cmd, kind)
+	var selection struct {
+		GoroutineID int `json:"goroutineId"`
+	}
+	if err := protocol.DecodeCommandPayload(cmd, &selection); err != nil || selection.GoroutineID != 42 {
+		t.Fatalf("selection = %+v: %v", selection, err)
+	}
+	h.writeEvent(t, selectedInspectionResponse(kind, echo))
+	select {
+	case err := <-result:
+		if echo == 42 && err != nil {
+			t.Fatal(err)
+		}
+		if echo != 42 && !errors.Is(err, ErrGoroutineInspectionUnsupported) {
+			t.Fatalf("unproven selection accepted: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("selected inspection did not settle")
 	}
 }
 

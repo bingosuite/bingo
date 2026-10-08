@@ -68,7 +68,22 @@ func DecodeProtocolMessageWithThreadMetadata(content []byte) (godap.Message, map
 	if !ok || !response.Success {
 		return message, nil, nil
 	}
+	goroutineIDs, err := decodeThreadGoroutineIDs(content, response.Body.Threads)
+	if err != nil {
+		return nil, nil, err
+	}
+	if goroutineIDs == nil {
+		return message, nil, nil
+	}
+	if err := validateThreadMetadataHandles(response.Body.Threads); err != nil {
+		return nil, nil, err
+	}
+	return message, goroutineIDs, nil
+}
 
+const maximumSafeThreadID = 1<<53 - 1
+
+func decodeThreadGoroutineIDs(content []byte, threads []godap.Thread) (map[int]int64, error) {
 	var metadata struct {
 		Body struct {
 			Threads []struct {
@@ -77,48 +92,55 @@ func DecodeProtocolMessageWithThreadMetadata(content []byte) (godap.Message, map
 		} `json:"body"`
 	}
 	if err := json.Unmarshal(content, &metadata); err != nil {
-		return nil, nil, fmt.Errorf("decode DAP thread metadata: %w", err)
+		return nil, fmt.Errorf("decode DAP thread metadata: %w", err)
 	}
-	if len(metadata.Body.Threads) != len(response.Body.Threads) {
-		return nil, nil, fmt.Errorf("decode DAP thread metadata: thread count differs from decoded response")
+	if len(metadata.Body.Threads) != len(threads) {
+		return nil, fmt.Errorf("decode DAP thread metadata: thread count differs from decoded response")
 	}
 
-	const maximumSafeID = 1<<53 - 1
 	var goroutineIDs map[int]int64
 	seenGoroutines := make(map[int64]struct{})
 	for i, thread := range metadata.Body.Threads {
 		if len(thread.GoroutineID) == 0 {
 			continue
 		}
-		var goid int64
-		if err := json.Unmarshal(thread.GoroutineID, &goid); err != nil {
-			return nil, nil, fmt.Errorf("decode DAP thread %d goroutine identity: %w", i, err)
-		}
-		if goid <= 0 || goid > maximumSafeID {
-			return nil, nil, fmt.Errorf("decode DAP thread %d goroutine identity: expected a positive safe integer", i)
+		goid, err := decodeThreadGoroutineID(thread.GoroutineID, i)
+		if err != nil {
+			return nil, err
 		}
 		if _, duplicate := seenGoroutines[goid]; duplicate {
-			return nil, nil, fmt.Errorf("decode DAP thread metadata: duplicate goroutine identity %d", goid)
+			return nil, fmt.Errorf("decode DAP thread metadata: duplicate goroutine identity %d", goid)
 		}
 		seenGoroutines[goid] = struct{}{}
 		if goroutineIDs == nil {
 			goroutineIDs = make(map[int]int64)
 		}
-		goroutineIDs[response.Body.Threads[i].Id] = goid
+		goroutineIDs[threads[i].Id] = goid
 	}
-	if goroutineIDs == nil {
-		return message, nil, nil
-	}
+	return goroutineIDs, nil
+}
 
-	seen := make(map[int]struct{}, len(response.Body.Threads))
-	for _, thread := range response.Body.Threads {
-		if thread.Id <= 0 || int64(thread.Id) > maximumSafeID {
-			return nil, nil, fmt.Errorf("decode DAP thread metadata: thread handle %d is not a positive safe integer", thread.Id)
+func decodeThreadGoroutineID(raw json.RawMessage, index int) (int64, error) {
+	var goid int64
+	if err := json.Unmarshal(raw, &goid); err != nil {
+		return 0, fmt.Errorf("decode DAP thread %d goroutine identity: %w", index, err)
+	}
+	if goid <= 0 || goid > maximumSafeThreadID {
+		return 0, fmt.Errorf("decode DAP thread %d goroutine identity: expected a positive safe integer", index)
+	}
+	return goid, nil
+}
+
+func validateThreadMetadataHandles(threads []godap.Thread) error {
+	seen := make(map[int]struct{}, len(threads))
+	for _, thread := range threads {
+		if thread.Id <= 0 || int64(thread.Id) > maximumSafeThreadID {
+			return fmt.Errorf("decode DAP thread metadata: thread handle %d is not a positive safe integer", thread.Id)
 		}
 		if _, duplicate := seen[thread.Id]; duplicate {
-			return nil, nil, fmt.Errorf("decode DAP thread metadata: duplicate thread handle %d", thread.Id)
+			return fmt.Errorf("decode DAP thread metadata: duplicate thread handle %d", thread.Id)
 		}
 		seen[thread.Id] = struct{}{}
 	}
-	return message, goroutineIDs, nil
+	return nil
 }

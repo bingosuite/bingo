@@ -611,6 +611,8 @@ async function assertSelectedWorkerInspection(
   );
   assert.equal(workers.length, 3, "all three fixture workers must remain parked");
   const labels = new Set<string>();
+  // The graph has one selection; concurrent clicks would invalidate earlier
+  // workers' pending inspection and skip their stack/locals DOM assertions.
   for (const worker of workers) {
     click(document, `.tree-node[data-goid="${String(worker.id)}"]`);
     const selected = await waitForModel(registry, `g${String(worker.id)} worker stack`, (model) => {
@@ -632,7 +634,7 @@ async function assertSelectedWorkerInspection(
     assertVariablesDisplayed(document.querySelector(".variable-tree"), inspected.inspection.variables);
     process.stdout.write(`[selected] g${String(worker.id)} frame=${String(frame.id)} label=${label.value}\n`);
   }
-  assert.deepEqual([...labels].sort(), ["101", "202", "303"], "distinct workers must not share another goroutine's locals");
+  assert.deepEqual([...labels].sort((left, right) => left.localeCompare(right)), ["101", "202", "303"], "distinct workers must not share another goroutine's locals");
 }
 
 function applicationDepth(

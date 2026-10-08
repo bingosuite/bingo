@@ -236,31 +236,36 @@ func TestInspectionOnlyStepPreservesCurrentAndSyntheticTargets(t *testing.T) {
 	for _, request := range []string{"next", "stepIn", "stepOut"} {
 		for _, target := range []string{"zero", "current", "synthetic", "resolved synthetic"} {
 			t.Run(request+"/"+target, func(t *testing.T) {
-				hh := newSuspendedHarness(t)
-				thread := 0
-				if strings.Contains(target, "synthetic") {
-					hh.inject(protocol.EventStepped, protocol.SteppedPayload{})
-					_ = recvType[*godap.StoppedEvent](hh)
-				}
-				if target != "zero" {
-					thread = currentThreadHandle(hh)
-				}
-				if target == "resolved synthetic" {
-					_ = selectedThread(t, hh, 7)
-				}
-				inspectionStepRequest(t, hh, request, thread)
-				switch request {
-				case "next":
-					_ = recvType[*godap.NextResponse](hh)
-					hh.cmds.waitForCommand(t, protocol.CmdStepOver)
-				case "stepIn":
-					_ = recvType[*godap.StepInResponse](hh)
-					hh.cmds.waitForCommand(t, protocol.CmdStepInto)
-				case "stepOut":
-					_ = recvType[*godap.StepOutResponse](hh)
-					hh.cmds.waitForCommand(t, protocol.CmdStepOut)
-				}
+				assertInspectionCurrentStepTarget(t, request, target)
 			})
 		}
+	}
+}
+
+func assertInspectionCurrentStepTarget(t *testing.T, request, target string) {
+	t.Helper()
+	hh := newSuspendedHarness(t)
+	thread := 0
+	if strings.Contains(target, "synthetic") {
+		hh.inject(protocol.EventStepped, protocol.SteppedPayload{})
+		_ = recvType[*godap.StoppedEvent](hh)
+	}
+	if target != "zero" {
+		thread = currentThreadHandle(hh)
+	}
+	if target == "resolved synthetic" {
+		_ = selectedThread(t, hh, 7)
+	}
+	inspectionStepRequest(t, hh, request, thread)
+	switch request {
+	case "next":
+		_ = recvType[*godap.NextResponse](hh)
+		hh.cmds.waitForCommand(t, protocol.CmdStepOver)
+	case "stepIn":
+		_ = recvType[*godap.StepInResponse](hh)
+		hh.cmds.waitForCommand(t, protocol.CmdStepInto)
+	case "stepOut":
+		_ = recvType[*godap.StepOutResponse](hh)
+		hh.cmds.waitForCommand(t, protocol.CmdStepOut)
 	}
 }

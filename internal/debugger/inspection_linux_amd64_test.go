@@ -197,42 +197,47 @@ func TestLinuxInspectionRetirementCannotFabricateExitZero(t *testing.T) {
 func TestLinuxInspectionLaunchRequiresGroupStopAndUnchangedContext(t *testing.T) {
 	for _, changed := range []bool{false, true} {
 		t.Run(map[bool]string{false: "stable", true: "changed"}[changed], func(t *testing.T) {
-			b, calls := inspectionBackend(t, []int{100},
-				linuxWaitResult{tid: 100, status: stoppedAt(syscall.SIGTRAP, unix.PTRACE_EVENT_STOP)},
-				linuxWaitResult{tid: 100, status: stoppedAt(syscall.SIGSTOP, 0)},
-				linuxWaitResult{tid: 100, status: stoppedAt(syscall.SIGSTOP, unix.PTRACE_EVENT_STOP)},
-			)
-			b.seized = false
-			b.startupSignalInfoFn = func(int) (int32, int32, error) { return 0, 100, nil }
-			reads := 0
-			b.startupRegistersFn = func(int) (Registers, error) {
-				reads++
-				pc := uint64(0x1000)
-				if changed && reads == 2 {
-					pc++
-				}
-				return Registers{PC: pc, SP: 0x8000}, nil
-			}
-			var signals []linuxTgkillCall
-			b.tgkillFn = recordingTgkill(&signals)
-			err := b.seizeLaunchedProcess(100)
-			if changed && (err == nil || b.seized) {
-				t.Fatal("changed entry context admitted")
-			}
-			if !changed && (err != nil || !b.seized) {
-				t.Fatalf("stable launch rejected: %v", err)
-			}
-			want := []linuxResumeCall{
-				wantLinuxResume(syscall.PTRACE_DETACH, 100, int(syscall.SIGSTOP)),
-				wantLinuxResume(unix.PTRACE_SEIZE, 100, linuxPtraceOptions),
-				wantLinuxResume(unix.PTRACE_INTERRUPT, 100, 0),
-				wantLinuxResume(syscall.PTRACE_CONT, 100, 0),
-				wantLinuxResume(syscall.PTRACE_CONT, 100, int(syscall.SIGSTOP)),
-			}
-			if !reflect.DeepEqual(*calls, want) || !reflect.DeepEqual(signals, []linuxTgkillCall{{100, 100, int(syscall.SIGCONT)}}) {
-				t.Fatalf("startup ownership sequence: %+v, signals=%+v", *calls, signals)
-			}
+			assertInspectionLaunchContext(t, changed)
 		})
+	}
+}
+
+func assertInspectionLaunchContext(t *testing.T, changed bool) {
+	t.Helper()
+	b, calls := inspectionBackend(t, []int{100},
+		linuxWaitResult{tid: 100, status: stoppedAt(syscall.SIGTRAP, unix.PTRACE_EVENT_STOP)},
+		linuxWaitResult{tid: 100, status: stoppedAt(syscall.SIGSTOP, 0)},
+		linuxWaitResult{tid: 100, status: stoppedAt(syscall.SIGSTOP, unix.PTRACE_EVENT_STOP)},
+	)
+	b.seized = false
+	b.startupSignalInfoFn = func(int) (int32, int32, error) { return 0, 100, nil }
+	reads := 0
+	b.startupRegistersFn = func(int) (Registers, error) {
+		reads++
+		pc := uint64(0x1000)
+		if changed && reads == 2 {
+			pc++
+		}
+		return Registers{PC: pc, SP: 0x8000}, nil
+	}
+	var signals []linuxTgkillCall
+	b.tgkillFn = recordingTgkill(&signals)
+	err := b.seizeLaunchedProcess(100)
+	if changed && (err == nil || b.seized) {
+		t.Fatal("changed entry context admitted")
+	}
+	if !changed && (err != nil || !b.seized) {
+		t.Fatalf("stable launch rejected: %v", err)
+	}
+	want := []linuxResumeCall{
+		wantLinuxResume(syscall.PTRACE_DETACH, 100, int(syscall.SIGSTOP)),
+		wantLinuxResume(unix.PTRACE_SEIZE, 100, linuxPtraceOptions),
+		wantLinuxResume(unix.PTRACE_INTERRUPT, 100, 0),
+		wantLinuxResume(syscall.PTRACE_CONT, 100, 0),
+		wantLinuxResume(syscall.PTRACE_CONT, 100, int(syscall.SIGSTOP)),
+	}
+	if !reflect.DeepEqual(*calls, want) || !reflect.DeepEqual(signals, []linuxTgkillCall{{100, 100, int(syscall.SIGCONT)}}) {
+		t.Fatalf("startup ownership sequence: %+v, signals=%+v", *calls, signals)
 	}
 }
 

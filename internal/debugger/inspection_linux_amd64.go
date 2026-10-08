@@ -63,19 +63,7 @@ func (b *linuxBackend) holdInspectionThreads(ctx context.Context) ([]int, error)
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("inspection hold for pid %d: %w; retained holds can be resumed or killed", b.pid, err)
 		}
-		tids, err := b.Threads()
-		if err != nil {
-			return nil, fmt.Errorf("inspection enumerate threads: %w", err)
-		}
-		if len(tids) == 0 || len(tids) > maxThreadScan {
-			return nil, fmt.Errorf("inspection thread count %d outside 1..%d", len(tids), maxThreadScan)
-		}
-		sort.Ints(tids)
-		allStopped, err := b.interruptInspectionThreads(tids)
-		if err != nil {
-			return nil, err
-		}
-		drained, err := b.drainInspectionResults(ctx)
+		tids, allStopped, drained, err := b.scanInspectionHold(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -95,6 +83,23 @@ func (b *linuxBackend) holdInspectionThreads(ctx context.Context) ([]int, error)
 			return nil, err
 		}
 	}
+}
+
+func (b *linuxBackend) scanInspectionHold(ctx context.Context) ([]int, bool, bool, error) {
+	tids, err := b.Threads()
+	if err != nil {
+		return nil, false, false, fmt.Errorf("inspection enumerate threads: %w", err)
+	}
+	if len(tids) == 0 || len(tids) > maxThreadScan {
+		return nil, false, false, fmt.Errorf("inspection thread count %d outside 1..%d", len(tids), maxThreadScan)
+	}
+	sort.Ints(tids)
+	allStopped, err := b.interruptInspectionThreads(tids)
+	if err != nil {
+		return nil, false, false, err
+	}
+	drained, err := b.drainInspectionResults(ctx)
+	return tids, allStopped, drained, err
 }
 
 func (b *linuxBackend) waitInspectionResult(ctx context.Context) error {
