@@ -723,32 +723,85 @@ func (h *dapCLI) showStackTrace() {
 		fmt.Println("  (no frames)")
 		return
 	}
-	for _, f := range resp.Body.StackFrames {
+	for i, f := range resp.Body.StackFrames {
 		src := ""
 		if f.Source != nil {
 			src = f.Source.Name
 		}
-		fmt.Printf("  #%d  %s at %s:%d\n", f.Id-1, f.Name, src, f.Line)
+		fmt.Printf("  #%d  %s at %s:%d\n", i, f.Name, src, f.Line)
 	}
 }
 
 func (h *dapCLI) showLocals(frame int) {
-	// variablesReference == frameIndex+1 (the adapter decodes it back).
-	msg, err := h.request("variables", &godap.VariablesRequest{
-		Arguments: godap.VariablesArguments{VariablesReference: frame + 1},
-	})
+	variables, err := h.localsForFrame(frame)
 	if err != nil {
 		h.printRequestError("", err)
 		return
 	}
-	resp, ok := msg.(*godap.VariablesResponse)
-	if !ok || len(resp.Body.Variables) == 0 {
+	if len(variables) == 0 {
 		fmt.Println("  (no locals)")
 		return
 	}
-	for _, v := range resp.Body.Variables {
+	for _, v := range variables {
 		fmt.Printf("  %s %s = %s\n", v.Name, v.Type, v.Value)
 	}
+}
+
+func (h *dapCLI) localsForFrame(frame int) ([]godap.Variable, error) {
+	if frame < 0 {
+		return nil, fmt.Errorf("invalid frame index %d", frame)
+	}
+	msg, err := h.request("stackTrace", &godap.StackTraceRequest{
+		Arguments: godap.StackTraceArguments{ThreadId: h.thread()},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("stackTrace: %w", err)
+	}
+	stack, ok := msg.(*godap.StackTraceResponse)
+	if !ok {
+		return nil, fmt.Errorf("unexpected stackTrace response %T", msg)
+	}
+	if frame >= len(stack.Body.StackFrames) {
+		return nil, fmt.Errorf("frame %d is not available", frame)
+	}
+	frameID := stack.Body.StackFrames[frame].Id
+	if frameID <= 0 {
+		return nil, fmt.Errorf("invalid frame handle %d", frameID)
+	}
+	msg, err = h.request("scopes", &godap.ScopesRequest{
+		Arguments: godap.ScopesArguments{FrameId: frameID},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("scopes: %w", err)
+	}
+	scopes, ok := msg.(*godap.ScopesResponse)
+	if !ok {
+		return nil, fmt.Errorf("unexpected scopes response %T", msg)
+	}
+	var variables []godap.Variable
+	for _, scope := range scopes.Body.Scopes {
+		if scope.Name != "Locals" && scope.PresentationHint != "locals" {
+			continue
+		}
+		if scope.VariablesReference == 0 {
+			continue
+		}
+		if scope.VariablesReference < 0 {
+			return nil, fmt.Errorf("invalid locals reference %d", scope.VariablesReference)
+		}
+		msg, err = h.request("variables", &godap.VariablesRequest{
+			Arguments: godap.VariablesArguments{VariablesReference: scope.VariablesReference},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("variables: %w", err)
+		}
+		locals, ok := msg.(*godap.VariablesResponse)
+		if !ok {
+			return nil, fmt.Errorf("unexpected variables response %T", msg)
+		}
+		variables = append(variables, locals.Body.Variables...)
+	}
+	return variables, nil
 }
 
 // --- small helpers -------------------------------------------------------------
