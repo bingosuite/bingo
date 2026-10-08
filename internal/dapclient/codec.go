@@ -85,6 +85,7 @@ func DecodeProtocolMessageWithThreadMetadata(content []byte) (godap.Message, map
 
 	const maximumSafeID = 1<<53 - 1
 	var goroutineIDs map[int]int64
+	seenGoroutines := make(map[int64]struct{})
 	for i, thread := range metadata.Body.Threads {
 		if len(thread.GoroutineID) == 0 {
 			continue
@@ -96,6 +97,10 @@ func DecodeProtocolMessageWithThreadMetadata(content []byte) (godap.Message, map
 		if goid <= 0 || goid > maximumSafeID {
 			return nil, nil, fmt.Errorf("decode DAP thread %d goroutine identity: expected a positive safe integer", i)
 		}
+		if _, duplicate := seenGoroutines[goid]; duplicate {
+			return nil, nil, fmt.Errorf("decode DAP thread metadata: duplicate goroutine identity %d", goid)
+		}
+		seenGoroutines[goid] = struct{}{}
 		if goroutineIDs == nil {
 			goroutineIDs = make(map[int]int64)
 		}
