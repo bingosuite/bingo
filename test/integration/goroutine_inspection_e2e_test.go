@@ -25,16 +25,21 @@ var parked = make(chan struct{})
 var counter int64
 func waitingWorker(tag int) {
 	label := tag
+	queue := make(chan int, 1)
+	queue <- label
 	ready <- struct{}{}
 	<-parked
-	fmt.Println(label)
+	fmt.Println(label, <-queue)
 }
 func runningWorker(tag int) {
 	runtime.LockOSThread()
 	label := tag
+	queue := make(chan int, 1)
+	queue <- label
 	ready <- struct{}{}
 	for {
 		atomic.AddInt64(&counter, int64(label))
+		runtime.KeepAlive(queue)
 	}
 }
 func main() {
@@ -112,10 +117,21 @@ func inspectNativeFixtureWorker(d debugger.Debugger, goid int) (string, bool) {
 	value, err := debugger.EvaluateForGoroutine(d, goid, worker.Index, "label")
 	Expect(err).NotTo(HaveOccurred())
 	Expect(vars).To(ContainElement(And(HaveField("Name", "label"), HaveField("Value", value.Value))))
+	assertNativeFixtureChannel(d, goid, worker.Index, vars, value.Value)
 	again, err := debugger.StackFramesForGoroutine(d, goid)
 	Expect(err).NotTo(HaveOccurred())
 	Expect(again).To(Equal(frames), "selected context must remain stable across requests")
 	return value.Value, worker.Location.Function == "main.runningWorker"
+}
+
+func assertNativeFixtureChannel(d debugger.Debugger, goid, frame int, vars []protocol.Variable, label string) {
+	GinkgoHelper()
+	queue, err := debugger.EvaluateForGoroutine(d, goid, frame, "queue")
+	Expect(err).NotTo(HaveOccurred())
+	Expect(queue.Kind).To(Equal("chan"))
+	Expect(queue.Value).To(ContainSubstring("len:1 cap:1 closed:false"))
+	Expect(queue.Children).To(ContainElement(And(HaveField("Name", "[0]"), HaveField("Value", label))))
+	Expect(vars).To(ContainElement(And(HaveField("Name", "queue"), HaveField("Children", queue.Children))))
 }
 
 func declareDAPGoroutineInspectionSpec() {
@@ -188,6 +204,22 @@ func inspectDAPFixtureWorker(dc *dapClient, threadID int, goid int64, label stri
 		value := dc.evaluate("label", frame.Id, "watch")
 		Expect(vars.(*godap.VariablesResponse).Body.Variables).To(ContainElement(And(HaveField("Name", "label"), HaveField("Value", value.Body.Result))))
 		Expect(value.Body.Result).To(Equal(label), "graph goid %d resolved to handle %d", goid, threadID)
+		assertDAPFixtureChannel(dc, frame.Id, vars.(*godap.VariablesResponse), label)
 		values[goid] = value.Body.Result
 	}
+}
+
+func assertDAPFixtureChannel(dc *dapClient, frame int, vars *godap.VariablesResponse, label string) {
+	GinkgoHelper()
+	watch := dc.evaluate("queue", frame, "watch")
+	Expect(watch.GetResponse().Success).To(BeTrue())
+	Expect(watch.Body.Result).To(ContainSubstring("len:1 cap:1 closed:false"))
+	Expect(channelDAPVariables(dc, watch.Body.VariablesReference)["[0]"].Value).To(Equal(label))
+	for _, variable := range vars.Body.Variables {
+		if variable.Name == "queue" {
+			Expect(channelDAPVariables(dc, variable.VariablesReference)["[0]"].Value).To(Equal(label))
+			return
+		}
+	}
+	Fail("selected worker locals must include its own channel")
 }
