@@ -243,6 +243,47 @@ describe("concurrency webview DOM", () => {
     );
   });
 
+  it("expands channel metadata and typed buffered values without run-control actions", () => {
+    const { document } = parseHTML("<html><body><div id=app></div></body></html>");
+    const messages: Record<string, unknown>[] = [];
+    const inspection: DebugInspection = {
+      ...emptyInspection(1),
+      stackStatus: "ready",
+      localsStatus: "ready",
+      variables: [{
+        name: "jobs", value: "chan main.job len:1 cap:3 closed:true",
+        type: "chan main.job", variablesReference: 65_536,
+      }],
+    };
+    const render = mountConcurrencyView(document, {
+      postMessage: (message) => messages.push(content(message)),
+    });
+    render(model({}, inspection));
+    const expand = document.querySelector<HTMLButtonElement>(".variable-expand");
+    assert.ok(expand);
+    expand.click();
+    assert.deepEqual(messages.at(-1), { type: "expandVariable", reference: 65_536 });
+    render(model({}, {
+      ...inspection,
+      variablesByReference: {
+        "65536": [
+          { name: "len", value: "1", type: "int", variablesReference: 0 },
+          { name: "cap", value: "3", type: "int", variablesReference: 0 },
+          { name: "closed", value: "true", type: "bool", variablesReference: 0 },
+          { name: "[0]", value: "main.job", type: "main.job", variablesReference: 65_537 },
+        ],
+        "65537": [
+          { name: "Name", value: '"first"', type: "string", variablesReference: 0 },
+        ],
+      },
+    }));
+    const text = document.querySelector(".variable-tree")?.textContent ?? "";
+    assert.match(text, /closed.*true/u);
+    assert.match(text, /\[0\]/u);
+    assert.match(text, /Name.*"first"/u);
+    assert.ok(messages.every((message) => message.type === "rendered" || message.type === "expandVariable"));
+  });
+
   it("moves DOM focus with keyboard tree selection", () => {
     const { document, window } = parseHTML(
       "<html><body><div id=app></div></body></html>",

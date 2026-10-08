@@ -33,7 +33,9 @@ adds bounded creation-source previews, and bounds aggregate inspector work.
 **0.7.0** adds configuration-free Go-package debugging, server-owned automatic
 builds, cancellable startup, and source-launch capability checks. **0.7.1**
 updates the WebSocket runtime and packaging dependencies for security fixes.
-Use a matching 0.7.1 companion and server for the source quick start.
+**0.7.2** adds read-only channel metadata and typed buffered contents to
+Variables, Watch, and the Bingo inspector.
+Use a matching 0.7.2 companion and server for the source quick start.
 Rerun the command to update, then run
 **Developer: Reload Window** once so the active extension host loads the new
 bundle. Package without installing with `just vscode-package`. Uninstall with:
@@ -206,6 +208,25 @@ settle. Resume invalidates inspection immediately, even before WebSocket state
 catches up, and stale scopes cannot fan out more variable requests.
 Inspection remains read-only DAP; unused WebSocket Frames/Locals broadcasts are
 not consumed, and neither the graph nor its source preview drives execution.
+
+### Channel contents
+
+Expand a channel local or a name-only Watch expression to see `len`, `cap`,
+`closed`, and typed buffered values `[0]`, `[1]`, ... in receive/FIFO order.
+The Bingo inspector uses the same variable children. Nil channels are marked
+nil; closed channels retain any unread buffered values. Unbuffered channels
+explicitly have **no stored values**; blocked senders and receivers are not
+inspected. Channel direction and named element types are preserved.
+
+Inspection performs memory reads only: it never receives, sends, closes, or
+otherwise mutates a channel. At most **100 buffered elements** are expanded,
+subject to the debugger's existing depth and request-wide node/byte budgets;
+truncation is explicit. Missing DWARF layout, unreadable/corrupt headers, or
+detected metadata changes produce an unavailable value rather than guessed
+contents. On Linux only the reporting thread is stopped, so sibling mutation
+can race reads: metadata is rechecked, but this is **not an atomic snapshot**
+and cannot detect every ABA change or mutation of referenced objects.
+See the [wrapped-buffer example](../../examples/channel-contents/main.go).
 
 ### Large targets and the 1.4 telemetry contract
 
