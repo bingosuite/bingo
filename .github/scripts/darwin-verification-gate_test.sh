@@ -524,18 +524,19 @@ run_case() {
   other_sha=$(printf 'fe%038x' "$case_id")
 
   local live_base_sha_value=$base_sha
-  [ "$live_base_sha" = "other" ] && live_base_sha_value=$other_sha
-  [ "$live_base_sha" != "same" ] && [ "$live_base_sha" != "other" ] && live_base_sha_value=$live_base_sha
+  [[ "$live_base_sha" = "other" ]] && live_base_sha_value=$other_sha
+  [[ "$live_base_sha" != "same" ]] && [[ "$live_base_sha" != "other" ]] && live_base_sha_value=$live_base_sha
 
   local live_head_sha_value=$head_sha
-  [ "$live_head_sha" = "other" ] && live_head_sha_value=$other_sha
-  [ "$live_head_sha" != "same" ] && [ "$live_head_sha" != "other" ] && live_head_sha_value=$live_head_sha
+  [[ "$live_head_sha" = "other" ]] && live_head_sha_value=$other_sha
+  [[ "$live_head_sha" != "same" ]] && [[ "$live_head_sha" != "other" ]] && live_head_sha_value=$live_head_sha
 
   local live_head_repo_value=$head_repo
-  [ "$live_head_repo" != "same" ] && live_head_repo_value=$live_head_repo
+  [[ "$live_head_repo" != "same" ]] && live_head_repo_value=$live_head_repo
+  [[ "$live_head_repo" != "same" ]] && live_head_repo_value=$live_head_repo
 
   local perm_login_value=$actor
-  [ -n "$perm_login" ] && perm_login_value=$perm_login
+  [[ -n "$perm_login" ]] && perm_login_value=$perm_login
 
   if [ -z "$labels_json" ]; then
     if [ "$has_label" = "true" ]; then
@@ -595,7 +596,7 @@ run_case() {
     }')
 
   local stack_fixture='' stack_anchor=''
-  if [ -n "$stack_shape" ]; then
+  if [[ -n "$stack_shape" ]]; then
     stack_fixture="$work/stack.json"
     if ! make_stack_fixture "$event" "$stack_shape" "$work/stack-original.json" "$labels_json" ||
       ! jq "$stack_transform" "$work/stack-original.json" > "$stack_fixture"; then
@@ -606,7 +607,7 @@ run_case() {
     head_sha=$(jq -r '.event.pull_request.head.sha' "$stack_fixture")
     pr_number=$(jq -r '.event.pull_request.number' "$stack_fixture")
     stack_anchor=$(jq -r '.anchor_sha' "$stack_fixture")
-    [ -n "$stack_policy_sha" ] || stack_policy_sha=$(jq -r '.policy_sha' "$stack_fixture")
+    [[ -n "$stack_policy_sha" ]] || stack_policy_sha=$(jq -r '.policy_sha' "$stack_fixture")
   fi
 
   local permission_json
@@ -668,39 +669,39 @@ run_case() {
 
   local ok=1
 
-  if [ "$actual_exit" != "$expect_exit" ]; then
+  if [[ "$actual_exit" != "$expect_exit" ]]; then
     fail "$name: expected exit $expect_exit, got $actual_exit"
     ok=0
   fi
 
   local actual_states=''
-  if [ -f "$work/states.log" ]; then
+  if [[ -f "$work/states.log" ]]; then
     actual_states=$(paste -sd, - < "$work/states.log")
   fi
-  if [ "$actual_states" != "$expect_states" ]; then
+  if [[ "$actual_states" != "$expect_states" ]]; then
     fail "$name: expected states '$expect_states', got '$actual_states'"
     ok=0
   fi
 
   local actual_decision=''
-  [ -f "$decision" ] && actual_decision=$(cat "$decision")
-  if [ "$actual_decision" != "$expect_decision" ]; then
+  [[ -f "$decision" ]] && actual_decision=$(cat "$decision")
+  if [[ "$actual_decision" != "$expect_decision" ]]; then
     fail "$name: expected decision '$expect_decision', got '$actual_decision'"
     ok=0
   fi
 
-  if [ -n "$expect_output" ] && ! grep -Fq "$expect_output" "$out"; then
+  if [[ -n "$expect_output" ]] && ! grep -Fq "$expect_output" "$out"; then
     fail "$name: expected output to contain '$expect_output'"
     ok=0
   fi
 
-  if [ -n "$expect_missing_output" ] && grep -Fq "$expect_missing_output" "$out"; then
+  if [[ -n "$expect_missing_output" ]] && grep -Fq "$expect_missing_output" "$out"; then
     fail "$name: output unexpectedly contains '$expect_missing_output'"
     ok=0
   fi
 
   touch "$work/statuses.log"
-  if [ -n "$expect_description" ] &&
+  if [[ -n "$expect_description" ]] &&
     ! grep -Fq "$expect_description" "$work/statuses.log"; then
     fail "$name: expected a status description containing '$expect_description'"
     ok=0
@@ -708,24 +709,24 @@ run_case() {
 
   touch "$work/gh.log"
 
-  if [ -n "$gh_expect" ] && ! grep -Fq "$gh_expect" "$work/gh.log"; then
+  if [[ -n "$gh_expect" ]] && ! grep -Fq "$gh_expect" "$work/gh.log"; then
     fail "$name: expected gh call containing '$gh_expect'"
     ok=0
   fi
 
-  if [ -n "$gh_missing" ] && grep -Fq "$gh_missing" "$work/gh.log"; then
+  if [[ -n "$gh_missing" ]] && grep -Fq "$gh_missing" "$work/gh.log"; then
     fail "$name: gh log unexpectedly contains '$gh_missing'"
     ok=0
   fi
 
-  if [ -n "$expect_label_query" ]; then
+  if [[ -n "$expect_label_query" ]]; then
     if grep -Fq "/issues/$pr_number/labels" "$work/gh.log"; then
-      if [ "$expect_label_query" != "true" ]; then
+      if [[ "$expect_label_query" != "true" ]]; then
         fail "$name: gate queried live labels but should not have"
         ok=0
       fi
     else
-      if [ "$expect_label_query" = "true" ]; then
+      if [[ "$expect_label_query" = "true" ]]; then
         fail "$name: gate did not query live labels"
         ok=0
       fi
@@ -750,16 +751,16 @@ run_case() {
     fail "$name: gate consumed untrusted pull request content"
     ok=0
   fi
-  if [ -n "$stack_shape" ] && grep -Fq "$untrusted_token" "$out"; then
+  if [[ -n "$stack_shape" ]] && grep -Fq "$untrusted_token" "$out"; then
     fail "$name: native diagnostics echoed untrusted pull request content"
     ok=0
   fi
 
-  if [ -n "$stack_shape" ] && [ "$actual_states" = "pending,success" ]; then
-    if [ "$(cat "$work/stack-pass")" != "2" ] ||
-      [ "$(grep -Fc 'api repos/bingosuite/bingo/stacks/264' "$work/gh.log")" != "2" ] ||
-      [ "$(grep -Fc 'api repos/bingosuite/bingo/git/ref/heads/main' "$work/gh.log")" != "2" ] ||
-      [ "$(grep -Fxc "api repos/bingosuite/bingo/compare/$stack_anchor...$stack_policy_sha" "$work/gh.log")" != "2" ]; then
+  if [[ -n "$stack_shape" ]] && [[ "$actual_states" = "pending,success" ]]; then
+    if [[ "$(cat "$work/stack-pass")" != "2" ]] ||
+      [[ "$(grep -Fc 'api repos/bingosuite/bingo/stacks/264' "$work/gh.log")" != "2" ]] ||
+      [[ "$(grep -Fc 'api repos/bingosuite/bingo/git/ref/heads/main' "$work/gh.log")" != "2" ]] ||
+      [[ "$(grep -Fxc "api repos/bingosuite/bingo/compare/$stack_anchor...$stack_policy_sha" "$work/gh.log")" != "2" ]]; then
       fail "$name: successful native attestation did not revalidate its proof"
       ok=0
     fi
@@ -769,14 +770,14 @@ run_case() {
     fi
   fi
 
-  if [ -f "$work/targets.log" ] && [ -s "$work/targets.log" ]; then
+  if [[ -f "$work/targets.log" ]] && [[ -s "$work/targets.log" ]]; then
     if grep -vq '^https://github.com/bingosuite/bingo/actions/runs/4242$' "$work/targets.log"; then
       fail "$name: status target_url did not point at this run"
       ok=0
     fi
   fi
 
-  if [ -f "$work/statuses.log" ] && [ -s "$work/statuses.log" ]; then
+  if [[ -f "$work/statuses.log" ]] && [[ -s "$work/statuses.log" ]]; then
     if grep -vq '^Darwin E2E verified|' "$work/statuses.log"; then
       fail "$name: gate published an unexpected status context"
       ok=0
@@ -2198,14 +2199,14 @@ gate_authorizes_before_publishing_success() {
       *require_authorized_labeler) authorized=1 ;;
       *"post_status success 'Darwin E2E verified"*)
         sites=$((sites + 1))
-        [ "$authorized" = "1" ] || return 1
+        [[ "$authorized" = "1" ]] || return 1
         ;;
     esac
     last=1
   done <<EOF
 $(grep -E "require_authorized_labeler\$|post_status success 'Darwin E2E verified" "$gate")
 EOF
-  [ "$last" = "1" ] && [ "$sites" -ge 1 ]
+  [[ "$last" = "1" ]] && [[ "$sites" -ge 1 ]]
 }
 
 gate_never_publishes_success_from_an_unlabel() {
@@ -2213,7 +2214,7 @@ gate_never_publishes_success_from_an_unlabel() {
   arm=$(grep -n '^  labeled | unlabeled)' "$gate" | head -1 | cut -d: -f1)
   withdraw=$(grep -n "post_status failure 'Darwin verification was withdrawn" \
     "$gate" | head -1 | cut -d: -f1)
-  [ -n "$arm" ] && [ -n "$withdraw" ] || return 1
+  [[ -n "$arm" ]] && [[ -n "$withdraw" ]] || return 1
 
   # The unlabeled branch must terminate the arm before any success can be
   # reached, so no `post_status success` may appear between them.
@@ -2289,7 +2290,7 @@ gate_publishes_only_from_the_top_level_shell() {
     inside && !/^[[:space:]]*#/ {print}
   ' "$gate" > "$region"
 
-  [ -s "$region" ] || return 1
+  [[ -s "$region" ]] || return 1
 
   # Count per line, not per matching line: `a=$(trap - ERR; x); b=$(y)` would
   # survive a line-granular filter because the guarded substitution deletes the
@@ -2297,7 +2298,7 @@ gate_publishes_only_from_the_top_level_shell() {
   local total guarded
   total=$(grep -o '\$(' "$region" | wc -l | tr -d ' ')
   guarded=$(grep -o '\$(trap - ERR;' "$region" | wc -l | tr -d ' ')
-  if [ "$total" != "$guarded" ]; then
+  if [[ "$total" != "$guarded" ]]; then
     printf 'unguarded command substitution in the ERR-trap region (%s of %s):\n' \
       "$((total - guarded))" "$total" >&2
     grep -n '\$(' "$region" >&2
@@ -2365,4 +2366,4 @@ check "gate publishes only from the top level shell" gate_publishes_only_from_th
 check "gate records a decision for every final status" gate_records_a_decision_for_every_final_status
 
 printf '\n%d cases, %d failures\n' "$cases" "$failures"
-[ "$failures" -eq 0 ]
+[[ "$failures" -eq 0 ]]
