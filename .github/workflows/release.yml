@@ -29,12 +29,17 @@ concurrency:
 jobs:
   # Automatic path only: pick the next patch version, tag the tested commit,
   # and open a draft release. Skipped for manual and published-release runs.
+  #
+  # This job holds contents: write and runs from a workflow_run trigger, so it
+  # deliberately has NO checkout. It only talks to the GitHub API, which means
+  # no repository code (fork or otherwise) is ever on disk next to the token.
   prepare:
     name: Pick next version, tag and create draft
     if: >-
       github.event_name == 'workflow_run' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
       !contains(github.event.workflow_run.head_commit.message, '[skip release]')
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -46,14 +51,9 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.workflow_run.head_sha }}
-          fetch-depth: 0
-          persist-credentials: false
-
       # The build below checks out github.sha (latest main), so only release
-      # when the tested commit is still that commit.
+      # when the tested commit is still that commit. HEAD_SHA is used purely as
+      # a string here, never as a ref to check out.
       - name: Skip if main already moved on
         id: fresh
         run: |
@@ -67,19 +67,30 @@ jobs:
         id: version
         if: steps.fresh.outputs.skip != 'true'
         run: |
-          existing=$(git tag --points-at "$HEAD_SHA" | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+
+          tags=$(gh api --paginate "repos/$GITHUB_REPOSITORY/tags?per_page=100" \
+            --jq '.[] | [.name, .commit.sha] | @tsv')
+
+          existing=$(awk -F'\t' -v sha="$HEAD_SHA" '$2 == sha {print $1}' <<< "$tags" \
+            | grep -E "$semver" || true)
           if [[ -n "$existing" ]]; then
             echo "$HEAD_SHA is already tagged ($existing); nothing to do."
             exit 0
           fi
 
-          latest=$(git tag --list 'v*' --sort=-v:refname \
-            | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | head -1 || true)
+          latest=$(cut -f1 <<< "$tags" | grep -E "$semver" | sort -V | tail -1 || true)
 
           # Docs-only changes since the last release don't need a new version.
           if [[ -n "$latest" ]]; then
-            if ! git diff --name-only "$latest" "$HEAD_SHA" \
-              | grep -qvE '(^docs/|^\.github/ISSUE_TEMPLATE/|\.md$)'; then
+            files=$(gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/compare/$latest...$HEAD_SHA?per_page=100" \
+              --jq '.files[].filename')
+            count=$(printf '%s\n' "$files" | grep -c . || true)
+            # The compare API caps its file list at 300, so a list that long
+            # may be incomplete; treat it as "not docs-only" to stay safe.
+            if [[ "$count" -lt 300 ]] &&
+              ! printf '%s' "$files" | grep -qvE '(^docs/|^\.github/ISSUE_TEMPLATE/|\.md$)'; then
               echo "Only docs changed since $latest; skipping."
               exit 0
             fi
@@ -111,11 +122,15 @@ jobs:
       (github.event_name != 'workflow_run' || needs.prepare.outputs.tag != '') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       commit: ${{ steps.commit.outputs.commit }}
     steps:
-      - uses: actions/checkout@v4
+      # github.sha is the trusted default-branch tip for workflow_run, and the
+      # triggering revision for dispatch/release. Never an event-supplied ref.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -146,6 +161,8 @@ jobs:
     needs: resolve
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -174,13 +191,13 @@ jobs:
       EXPECTED_UNAME_OS: ${{ matrix.uname_os }}
       EXPECTED_UNAME_ARCH: ${{ matrix.uname_arch }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           # Actions cache authority follows the event ref, not a separately selected tag.
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
         with:
           go-version-file: go.mod
       - uses: actions/setup-node@v4
@@ -212,7 +229,7 @@ jobs:
         run: npm --prefix editors/vscode run smoke:server
       - name: Ensure packaging left source unchanged
         run: test -z "$(git status --porcelain --untracked-files=normal)"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-${{ matrix.target }}
           path: dist/release/*
