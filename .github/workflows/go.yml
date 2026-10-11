@@ -24,7 +24,7 @@ jobs:
       - name: Check imports formatting
         run: |
           unformatted=$(go tool goimports -l .)
-          if [ -n "$unformatted" ]; then
+          if [[ -n "$unformatted" ]]; then
             echo "The following files need goimports formatting:"
             echo "$unformatted"
             exit 1

@@ -100,7 +100,7 @@ jobs:
             "repos/$GITHUB_REPOSITORY/contents/.github/scripts/darwin-verification-gate.sh?ref=$POLICY_SHA" \
             --jq '.content' | base64 -d > "$policy" || fetched=false
 
-          if [ "$fetched" != true ] || [ ! -s "$policy" ]; then
+          if [[ "$fetched" != true ]] || [[ ! -s "$policy" ]]; then
             head_sha=$(jq -er '.pull_request.head.sha' "$GITHUB_EVENT_PATH")
             run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
             gh api --method POST "repos/$GITHUB_REPOSITORY/statuses/$head_sha" \
@@ -127,7 +127,7 @@ jobs:
           DARWIN_GATE_DECISION_FILE: ${{ runner.temp }}/darwin-gate-decision
         run: |
           set -euo pipefail
-          if [ -s "$DARWIN_GATE_DECISION_FILE" ]; then
+          if [[ -s "$DARWIN_GATE_DECISION_FILE" ]]; then
             printf 'Darwin verification gate decided: %s\n' \
               "$(cat "$DARWIN_GATE_DECISION_FILE")"
             exit 0
