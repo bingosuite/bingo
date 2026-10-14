@@ -111,7 +111,7 @@ func expectNamespaceVictimProgress(target *darwinAttachTarget, before darwinAtta
 	}
 	Eventually(func() uint64 { return target.command("status").WorkerProgress },
 		2*time.Second, 10*time.Millisecond).Should(BeNumerically(">", after.WorkerProgress))
-	Expect(target.command("status").Heartbeat).To(BeNumerically(">", after.Heartbeat))
+	target.waitForHeartbeat(after.Heartbeat)
 }
 
 func declareDarwinNamespaceSpec() {
@@ -201,7 +201,7 @@ func declareDarwinNamespaceSpec() {
 				if stopped {
 					h.waitFor(3*time.Second, protocol.EventBreakpointHit)
 				} else {
-					Expect(target.command("status").Heartbeat).To(BeNumerically(">", before.Heartbeat))
+					target.waitForHeartbeat(before.Heartbeat)
 				}
 				owned := inspectDarwinNamespace(h.d)
 				Expect(debugger.DarwinTryNamespaceRelease(h.d)).NotTo(Succeed(),
