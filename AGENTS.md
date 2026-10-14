@@ -1785,6 +1785,12 @@ retain exact prior handlers/bytes, genuine post-detach traps, heartbeat/worker
 progress, and normal exit. The existing `hygiene` per-stop uref gate is separate
 and remains required.
 
+The native attach fixture increments heartbeat before entering its breakpoint
+site and worker progress after it. A restored worker can therefore advance
+progress without a new heartbeat until its next iteration. Both attach-restoration
+and namespace specs poll for a strict heartbeat increase with a bounded deadline;
+a status reply or worker-progress increase alone is not that acknowledgement.
+
 ### Linux / amd64 ([backend_linux_amd64.go](internal/debugger/backend_linux_amd64.go))
 
 - Pure ptrace, funnelled through one dedicated tracer thread

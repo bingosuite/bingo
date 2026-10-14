@@ -138,6 +138,18 @@ func (target *darwinAttachTarget) command(command string) darwinAttachStatus {
 	return target.read(command)
 }
 
+// Finishing a restored breakpoint advances worker_progress before the next
+// worker iteration increments heartbeat; a status reply does not synchronize them.
+func (target *darwinAttachTarget) waitForHeartbeat(after uint64) darwinAttachStatus {
+	GinkgoHelper()
+	var status darwinAttachStatus
+	Eventually(func() uint64 {
+		status = target.command("status")
+		return status.Heartbeat
+	}, 2*time.Second, 10*time.Millisecond).Should(BeNumerically(">", after))
+	return status
+}
+
 func (target *darwinAttachTarget) waitForExit() error {
 	select {
 	case <-target.exited:
@@ -283,8 +295,7 @@ func declareDarwinAttachRestorationSpec() {
 						stop := h.waitFor(3*time.Second, protocol.EventBreakpointHit, protocol.EventError)
 						Expect(stop.Kind).To(Equal(protocol.EventBreakpointHit), "%s", stop.Payload)
 					} else {
-						running := target.command("status")
-						Expect(running.Heartbeat).To(BeNumerically(">", before.Heartbeat))
+						running := target.waitForHeartbeat(before.Heartbeat)
 						Expect(running.Port).NotTo(Equal(before.Port))
 						Expect(running.Instruction).To(Equal(uint32(0xd4200000)))
 					}
@@ -310,8 +321,7 @@ func declareDarwinAttachRestorationSpec() {
 					}
 					Eventually(func() uint64 { return target.command("status").WorkerProgress },
 						2*time.Second, 10*time.Millisecond).Should(BeNumerically(">", after.WorkerProgress))
-					progress := target.command("status")
-					Expect(progress.Heartbeat).To(BeNumerically(">", after.Heartbeat))
+					progress := target.waitForHeartbeat(after.Heartbeat)
 					Expect(expectDarwinDetachComplete(d).Exceptions).To(Equal(complete.Exceptions),
 						"no retired waiter may receive a post-detach BRK")
 					AddReportEntry("restored-handler", progress)
