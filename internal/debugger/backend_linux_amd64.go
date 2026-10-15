@@ -498,19 +498,8 @@ func (b *linuxBackend) reapAfterKill() error {
 		}
 		switch {
 		case err == nil:
-			if result.status.Stopped() {
-				if result.status.StopSignal() == syscall.SIGTRAP &&
-					result.status.TrapCause() == syscall.PTRACE_EVENT_CLONE && !result.cloneRegistered {
-					if err := b.registerClone(result.tid); err != nil {
-						if err := b.recoverCloneRead(ctx, err); err != nil {
-							return err
-						}
-						continue
-					}
-				}
-				if err := b.continueWithoutPendingSignals(result.tid); err != nil {
-					return fmt.Errorf("resume killed tid %d: %w", result.tid, err)
-				}
+			if err := b.handleKilledStop(ctx, result); err != nil {
+				return err
 			}
 		case isNoChildProcess(err):
 			b.cloneRecovery = nil
@@ -521,6 +510,22 @@ func (b *linuxBackend) reapAfterKill() error {
 			return fmt.Errorf("reap killed process %d: %w", b.pid, err)
 		}
 	}
+}
+
+func (b *linuxBackend) handleKilledStop(ctx context.Context, result linuxWaitResult) error {
+	if !result.status.Stopped() {
+		return nil
+	}
+	if result.status.StopSignal() == syscall.SIGTRAP &&
+		result.status.TrapCause() == syscall.PTRACE_EVENT_CLONE && !result.cloneRegistered {
+		if err := b.registerClone(result.tid); err != nil {
+			return b.recoverCloneRead(ctx, err)
+		}
+	}
+	if err := b.continueWithoutPendingSignals(result.tid); err != nil {
+		return fmt.Errorf("resume killed tid %d: %w", result.tid, err)
+	}
+	return nil
 }
 
 func (b *linuxBackend) registerClone(parentTID int) error {
