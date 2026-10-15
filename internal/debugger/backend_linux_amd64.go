@@ -107,6 +107,8 @@ func (t *tracerThread) closed() bool {
 }
 
 type linuxBackend struct {
+	cloneRecovery *linuxCloneRecovery
+	tracedTIDsFn  func(context.Context) ([]int, error)
 	// stepQueue carries the single-step bookkeeping (stepping/stepTID) and the
 	// queue of stops held back while a step is in flight. Embedded so those
 	// fields read as b.stepping / b.stepTID at every existing use site.
@@ -482,12 +484,15 @@ func killProcess(b Backend, pid int, cmd *exec.Cmd, running bool) error {
 func (b *linuxBackend) reapAfterKill() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if b.cloneRecovery != nil {
+		b.cloneRecovery.deadline, _ = ctx.Deadline()
+	}
 
 	for {
 		if b.waits == nil {
 			return nil
 		}
-		result, err := b.waitAny(ctx)
+		result, err := b.waitWithCloneRecovery(ctx)
 		if result.retired {
 			continue
 		}
@@ -497,7 +502,10 @@ func (b *linuxBackend) reapAfterKill() error {
 				if result.status.StopSignal() == syscall.SIGTRAP &&
 					result.status.TrapCause() == syscall.PTRACE_EVENT_CLONE && !result.cloneRegistered {
 					if err := b.registerClone(result.tid); err != nil {
-						return err
+						if err := b.recoverCloneRead(ctx, err); err != nil {
+							return err
+						}
+						continue
 					}
 				}
 				if err := b.continueWithoutPendingSignals(result.tid); err != nil {
@@ -505,6 +513,7 @@ func (b *linuxBackend) reapAfterKill() error {
 				}
 			}
 		case isNoChildProcess(err):
+			b.cloneRecovery = nil
 			return nil
 		case errors.Is(err, context.DeadlineExceeded):
 			return fmt.Errorf("timed out reaping killed process %d", b.pid)
@@ -520,8 +529,7 @@ func (b *linuxBackend) registerClone(parentTID int) error {
 	}
 	childTID, err := b.eventMsg(parentTID)
 	if err != nil {
-		return fmt.Errorf("%w: read cloned tid from parent %d: %v",
-			ErrSessionInvalidated, parentTID, err)
+		return &linuxCloneReadError{parentTID: parentTID, cause: err}
 	}
 	generation, err := b.waits.register(int(childTID))
 	if err != nil {
@@ -529,6 +537,9 @@ func (b *linuxBackend) registerClone(parentTID int) error {
 			ErrSessionInvalidated, childTID, parentTID, err)
 	}
 	b.registerAttachedClone(int(childTID), generation)
+	if b.cloneRecovery != nil {
+		b.cloneRecovery.known[int(childTID)] = generation
+	}
 	return nil
 }
 
@@ -816,7 +827,7 @@ func (b *linuxBackend) wait(ctx context.Context) (StopEvent, error) {
 			return ev, nil
 		}
 
-		result, err := b.waitAny(ctx)
+		result, err := b.waitWithCloneRecovery(ctx)
 		if result.retired {
 			if err := b.recordAttachedRetirement(result.tid, result.generation); err != nil {
 				return StopEvent{}, err
@@ -825,6 +836,11 @@ func (b *linuxBackend) wait(ctx context.Context) (StopEvent, error) {
 		}
 		if err != nil {
 			if isNoChildProcess(err) {
+				if b.cloneRecovery != nil {
+					b.abortStepForWaitFailure()
+					return StopEvent{}, fmt.Errorf("%w: no real leader terminal: %w",
+						b.cloneRecovery.cause, err)
+				}
 				b.purge()
 				return b.commitLeaderExit(StopEvent{Reason: StopExited, TID: b.pid}, false), nil
 			}
@@ -838,6 +854,7 @@ func (b *linuxBackend) wait(ctx context.Context) (StopEvent, error) {
 
 		if ws.Exited() {
 			if tid == b.pid {
+				b.cloneRecovery = nil
 				b.removeAttachedTracee(tid)
 				b.purge()
 				b.recordStop(tid)
@@ -857,6 +874,7 @@ func (b *linuxBackend) wait(ctx context.Context) (StopEvent, error) {
 				b.interruptStepIfStepped(tid)
 				continue
 			}
+			b.cloneRecovery = nil
 			b.removeAttachedTracee(tid)
 			b.purge()
 			b.recordStop(tid)
@@ -882,8 +900,11 @@ func (b *linuxBackend) wait(ctx context.Context) (StopEvent, error) {
 			case syscall.PTRACE_EVENT_CLONE:
 				if !result.cloneRegistered {
 					if err := b.registerClone(tid); err != nil {
-						b.abortStepForWaitFailure()
-						return StopEvent{}, err
+						if err := b.recoverCloneRead(ctx, err); err != nil {
+							b.abortStepForWaitFailure()
+							return StopEvent{}, err
+						}
+						continue
 					}
 				}
 				if err := b.absorbStop(absorbClone, tid, 0); err != nil {
@@ -921,7 +942,7 @@ func (b *linuxBackend) wait(ctx context.Context) (StopEvent, error) {
 				// or ECHILD) and retracted if an exec proves retirement.
 				msg, msgErr := b.eventMsg(tid)
 				b.noteLeaderExit(msg, msgErr == nil)
-				if err := b.registerThreadGroup(); err != nil && !isNoSuchProcess(err) {
+				if err := b.registerRetiringThreadGroup(); err != nil && !isNoSuchProcess(err) {
 					b.abortStepForWaitFailure()
 					return StopEvent{}, fmt.Errorf(
 						"%w: register threads while retiring leader tid %d: %v",

@@ -28,6 +28,8 @@ type linuxWaitResult struct {
 
 type linuxWaitSource interface {
 	register(tid int) (uint64, error)
+	discover(tid int, previous uint64) (uint64, error)
+	knownTIDs() map[int]uint64
 	release(tid int, generation uint64) bool
 	next(context.Context) (linuxWaitResult, error)
 	tryNext() (linuxWaitResult, bool, error)
@@ -97,6 +99,18 @@ func (b *linuxWaitBroker) newOwner() *linuxWaitOwner {
 }
 
 func (o *linuxWaitOwner) register(tid int) (uint64, error) {
+	return o.registerTID(tid, 0, false)
+}
+
+var errLinuxDiscoveryRetired = errors.New("discovered tid has a retired wait identity")
+
+// Discovery cannot discard queued evidence or replace an earlier generation.
+// A still-visible retired name must disappear before the census can succeed.
+func (o *linuxWaitOwner) discover(tid int, previous uint64) (uint64, error) {
+	return o.registerTID(tid, previous, true)
+}
+
+func (o *linuxWaitOwner) registerTID(tid int, previous uint64, discovery bool) (uint64, error) {
 	if tid <= 0 {
 		return 0, fmt.Errorf("invalid tid %d", tid)
 	}
@@ -105,18 +119,33 @@ func (o *linuxWaitOwner) register(tid int) (uint64, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	if current, ok := b.registrations[tid]; ok {
+	current, registered := b.registrations[tid]
+	if discovery {
+		if previous != 0 && (!registered || current.owner != o || current.generation != previous) {
+			return 0, errLinuxDiscoveryRetired
+		}
+		o.mu.Lock()
+		queued := false
+		for _, result := range o.queue {
+			queued = queued || result.tid == tid
+		}
+		o.mu.Unlock()
+		if !registered && queued {
+			return 0, errLinuxDiscoveryRetired
+		}
+	}
+	if registered {
 		if current.owner == o {
 			return current.generation, nil
 		}
 		current.owner.mu.Lock()
 		stale := current.owner.closed
-		if stale {
+		if stale && !discovery {
 			delete(current.owner.registered, tid)
 			current.owner.signalLocked()
 		}
 		current.owner.mu.Unlock()
-		if !stale {
+		if !stale || discovery {
 			return 0, fmt.Errorf("tid %d is already owned by another debugger", tid)
 		}
 	}
@@ -134,6 +163,21 @@ func (o *linuxWaitOwner) register(tid int) (uint64, error) {
 	b.registrations[tid] = linuxWaitRegistration{owner: o, generation: generation}
 	b.signal()
 	return generation, nil
+}
+
+// Queued terminals still own their identity even after the broker retired the
+// registration. Rediscovery must not register them again and erase that status.
+func (o *linuxWaitOwner) knownTIDs() map[int]uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	known := make(map[int]uint64, len(o.registered)+len(o.queue))
+	for tid, generation := range o.registered {
+		known[tid] = generation
+	}
+	for _, result := range o.queue {
+		known[result.tid] = result.generation
+	}
+	return known
 }
 
 func (o *linuxWaitOwner) next(ctx context.Context) (linuxWaitResult, error) {

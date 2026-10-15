@@ -428,6 +428,18 @@ func (s *recordingWaitSource) register(tid int) (uint64, error) {
 
 func (*recordingWaitSource) release(int, uint64) bool { return true }
 
+func (s *recordingWaitSource) discover(tid int, _ uint64) (uint64, error) {
+	return s.register(tid)
+}
+
+func (s *recordingWaitSource) knownTIDs() map[int]uint64 {
+	known := make(map[int]uint64)
+	for _, result := range s.results {
+		known[result.tid] = result.generation
+	}
+	return known
+}
+
 func (s *recordingWaitSource) next(context.Context) (linuxWaitResult, error) {
 	if len(s.results) == 0 {
 		return linuxWaitResult{}, syscall.ECHILD

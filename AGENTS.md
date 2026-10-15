@@ -1812,6 +1812,22 @@ a status reply or worker-progress increase alone is not that acknowledgement.
   group-continue, which would release a sibling parked at a breakpoint. The
   clone TID from `PTRACE_GETEVENTMSG` is registered with the same wait owner
   before the parent resumes.
+- **A lost clone stop is not a terminal.** Fatal group teardown can make
+  `PTRACE_GETEVENTMSG` return `ESRCH` after the broker observed the clone.
+  Launched `Wait` preserves that error while a deadline-bounded `/proc` census
+  admits every task naming this backend's exact tracer TID, including clone
+  children outside the parent's thread group. Discovery never replaces another
+  owner, resets a generation, or erases queued terminals. A rediscovered retired
+  identity must disappear, not be re-registered. The stale parent is not resumed.
+  Normal stop/signal/step-owner handling continues, but only an actual leader
+  `Exited`/`Signaled` clears the error; bare `ECHILD`, a stashed leader exit, or
+  timeout never fabricates death. Suspended Kill uses its own bounded reaping
+  interval and the same discovery without emitting a process-exit event.
+  Other metadata errors, attached quiescence, and inspection remain strict.
+  Deterministic broker-backed tests and the native
+  `TestLinuxNativeCloneMetadataLostDuringFatalTeardown` pin this boundary; the
+  existing `signals` acceptance still requires one forwarded fatal signal and
+  its genuine terminal.
 - **One process-global exact-TID wait broker owns every Linux wait syscall.**
   Each backend creates a wait owner and registers its root PID before consuming
   the launch/attach stop; clone TIDs join that owner before resume. The broker

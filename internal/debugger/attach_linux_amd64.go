@@ -165,7 +165,11 @@ func (b *linuxBackend) attachedTracerPID(tid int) (int, error) {
 	if b.tracerPIDFn != nil {
 		return b.tracerPIDFn(tid)
 	}
-	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/status", b.pid, tid))
+	return linuxStatusTracerPID(fmt.Sprintf("/proc/%d/task/%d/status", b.pid, tid))
+}
+
+func linuxStatusTracerPID(path string) (int, error) {
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return 0, err
 	}
