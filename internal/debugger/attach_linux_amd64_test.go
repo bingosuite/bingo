@@ -45,6 +45,23 @@ func (s *attachWaitSource) register(tid int) (uint64, error) {
 	return s.nextGen, nil
 }
 
+func (s *attachWaitSource) knownTIDs() map[int]uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	known := make(map[int]uint64)
+	for tid, generation := range s.registered {
+		known[tid] = generation
+	}
+	for _, result := range s.queue {
+		known[result.tid] = result.generation
+	}
+	return known
+}
+
+func (s *attachWaitSource) discover(tid int, _ uint64) (uint64, error) {
+	return s.register(tid)
+}
+
 func (s *attachWaitSource) release(tid int, generation uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

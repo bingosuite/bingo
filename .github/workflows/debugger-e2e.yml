@@ -66,6 +66,9 @@ jobs:
       - name: E2E inspection admission, durable hold and attached detach
         run: go test -tags e2e -race -count=1 -v -timeout 120s ./internal/debugger -run '^TestLinuxNativeInspection'
 
+      - name: E2E clone metadata loss during fatal teardown
+        run: go test -tags e2e -race -count=5 -v -timeout 120s ./internal/debugger -run '^TestLinuxNativeCloneMetadataLostDuringFatalTeardown$'
+
       - name: E2E basic (continue + step-over correctness)
         run: go test -tags e2e -race -count=1 -v -timeout 300s ./test/integration -ginkgo.label-filter=basic
 
