@@ -163,15 +163,15 @@ func TestLinuxCloneRecoveryPreservesAnInterveningSignal(t *testing.T) {
 		t.Fatalf("intervening signal lost: %+v, %v", stop, err)
 	}
 	forwarded := 0
-	b.contFn = func(tid, signal int) error {
-		if tid != 101 {
-			t.Fatalf("signal moved to tid %d", tid)
+	b.ptraceSyscall6Fn = func(trap, request, tid, addr, signal, a5, a6 uintptr) (uintptr, uintptr, syscall.Errno) {
+		if request != syscall.PTRACE_CONT || tid != 101 {
+			t.Fatalf("signal resume request=%d tid=%d", request, tid)
 		}
-		forwarded = signal
+		forwarded = int(signal)
 		script.add(100, signaledBy(syscall.SIGABRT))
-		return nil
+		return 0, 0, 0
 	}
-	if err := b.continueIfTraceeExists(stop.TID, 0); err != nil {
+	if err := b.ContinueProcess(); err != nil {
 		t.Fatal(err)
 	}
 	stop, err = b.Wait()

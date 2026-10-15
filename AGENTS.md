@@ -1825,9 +1825,11 @@ a status reply or worker-progress increase alone is not that acknowledgement.
   interval and the same discovery without emitting a process-exit event.
   Other metadata errors, attached quiescence, and inspection remain strict.
   Deterministic broker-backed tests and the native
-  `TestLinuxNativeCloneMetadataLostDuringFatalTeardown` pin this boundary; the
-  existing `signals` acceptance still requires one forwarded fatal signal and
-  its genuine terminal.
+  `TestLinuxNativeCloneMetadataLossRecoversFatalTeardown` pin this boundary.
+  The native test injects metadata loss over a real clone/SIGKILL transaction;
+  it does not claim to reproduce the original kernel interleaving. The existing
+  `signals` acceptance still requires one forwarded fatal signal and its genuine
+  terminal.
 - **One process-global exact-TID wait broker owns every Linux wait syscall.**
   Each backend creates a wait owner and registers its root PID before consuming
   the launch/attach stop; clone TIDs join that owner before resume. The broker
