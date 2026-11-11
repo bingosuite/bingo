@@ -23,15 +23,15 @@ go run -race ./examples/level5-workflow
 go test -race ./examples/...
 ```
 
-In VS Code, install the bingo extension, set a suggested breakpoint, choose
-**bingo: Debug example**, press F5, and select a level from the picker. The
+In VS Code, install the bingo extension, open a target's `main.go`, set a suggested
+breakpoint, choose **bingo: Debug active Go package**, and press F5. The
 server builds only the selected source directory with `-gcflags="all=-N -l"`;
 no manual build, `just`, or pre-launch task is required for F5. Alternatively,
 open a level's `main.go` and run **Bingo: Debug Go Package** without a launch
 configuration. Execution runs to your breakpoints by default; add
 `"stopOnEntry": true` only when you want the early entry stop.
-The other root choices launch the spawntree demo from source or join an
-existing bingo session. **Bingo Concurrency** automatically joins the selected
+The other root choice joins an existing bingo session. New examples need no
+launch configuration changes. **Bingo Concurrency** automatically joins the selected
 DAP session and makes the increasing hierarchy visible from level 1's single
 application goroutine through level 5's nested workflows and stages.
 
@@ -50,7 +50,7 @@ worker and workflow status lines can interleave differently between runs, but
 every level's final summary is sorted or otherwise deterministic.
 
 [`spawntree`](spawntree/) remains the dedicated advanced hierarchy and lifecycle
-telemetry demo. Choose **bingo: Debug spawntree telemetry demo** in VS Code,
+telemetry demo. Open its `main.go` and use the same active-package launch in VS Code,
 or build it separately with `just build-spawntree` for terminal clients and follow
 [`docs/ConcurrencyTelemetry.md`](../docs/ConcurrencyTelemetry.md).
 
@@ -64,3 +64,26 @@ closed channel with `len:3`, `cap:3`, and typed `[0]` / `[1]` / `[2]` values
 Continue to confirm the program still receives those same values: inspection
 never removes them. Unbuffered channels have no stored buffer to inspect;
 blocked sender values are not reported as buffered contents.
+
+## Nested goroutine graph
+
+Open [`nested-goroutines/main.go`](nested-goroutines/main.go), set a breakpoint
+on `fmt.Printf("round %d: all %d nested goroutines are ready\n", round, nodes)`,
+choose **bingo: Debug active Go package**, and press F5.
+You can also click the Go editor's **Bingo: Debug Go Package** button.
+The server builds the example for you.
+
+At that breakpoint, all 14 spawned goroutines are alive: `main` has two
+children, each child has two children, and each grandchild has two children.
+The application tree has four levels including `main` (plus any runtime
+goroutines shown by the graph). Select a branch to inspect its `path` local,
+such as `left/right/left`, and its creation site.
+
+Continue to release the entire tree and build a fresh one. The breakpoint hits
+three times, letting you compare parent links and created/exited lifecycle
+deltas between rounds. Without a debugger, each round stays alive for two
+seconds before exiting cleanly:
+
+```sh
+go run -race ./examples/nested-goroutines
+```

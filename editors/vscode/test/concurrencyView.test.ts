@@ -446,6 +446,17 @@ describe("concurrency host surfaces", () => {
   });
   after(() => { delete globals.__bingoViewTest; });
 
+  it("fills available graph height while keeping tall inspectors and small panels scrollable", () => {
+    assert.match(module.styles, /\.app \{[^}]*height: 100vh;[^}]*flex-direction: column;/);
+    assert.match(module.styles, /\.session \{[^}]*flex: 1;[^}]*min-height: 0;[^}]*overflow: auto;/);
+    assert.match(module.styles, /\.workspace \{[^}]*flex: 1 0 340px;[^}]*min-height: 0;[^}]*grid-template-rows: minmax\(0, 1fr\);/);
+    assert.match(module.styles, /\.graph-panel \{[^}]*display: flex;[^}]*flex-direction: column;/);
+    assert.match(module.styles, /\.graph-viewport \{[^}]*flex: 1;[^}]*min-height: 0;/);
+    assert.doesNotMatch(module.styles, /\.graph-viewport \{[^}]*\bheight: \d+px/);
+    assert.match(module.styles, /\.inspector \{[^}]*min-height: 0;[^}]*overflow: auto;/);
+    assert.match(module.styles, /@media \(max-width: 520px\)[^\n]*grid-template-rows: auto minmax\(330px, 1fr\)/);
+  });
+
   function harness(registry = new FakeRegistry(), testing = false) {
     const calls: unknown[][] = [];
     const sources: SourceRequest[] = [];

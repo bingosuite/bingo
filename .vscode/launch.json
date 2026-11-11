@@ -2,18 +2,10 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "bingo: Debug example",
+      "name": "bingo: Debug active Go package",
       "type": "bingo",
       "request": "launch",
-      "mode": "debug",
-      "program": "${workspaceFolder}/examples/${input:bingoExample}"
-    },
-    {
-      "name": "bingo: Debug spawntree telemetry demo",
-      "type": "bingo",
-      "request": "launch",
-      "mode": "debug",
-      "program": "${workspaceFolder}/examples/spawntree"
+      "mode": "debug"
     },
     {
       "name": "bingo: Join running session",
@@ -23,19 +15,6 @@
     }
   ],
   "inputs": [
-    {
-      "id": "bingoExample",
-      "type": "pickString",
-      "description": "Progressive debugger example",
-      "options": [
-        "level1-loop",
-        "level2-channel",
-        "level3-worker-pool",
-        "level4-pipeline",
-        "level5-workflow"
-      ],
-      "default": "level1-loop"
-    },
     {
       "id": "bingoSession",
       "type": "promptString",

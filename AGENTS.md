@@ -2906,10 +2906,16 @@ to `::1` without falling back to IPv4.
 **Bingo: Debug Go Package**, the Go editor action, and F5 with no launch
 configuration select the active saved Go file's directory, or an explicitly
 selected/single workspace root that contains Go source. Never guess a nested
-package or one of several roots. Generated configurations explicitly set
+package or one of several roots. Resolved configurations explicitly set
 `mode:"debug"` and an absolute package `program`/`cwd`; the server owns the Go
 build, its progress/errors, and artifact lifetime. Existing program configurations
 with no mode retain `exec` semantics. `stopOnEntry` remains false by default.
+Persisted initial/source configurations and dynamic choices omit `program`:
+`type:"bingo", request:"launch", mode:"debug"` resolves the active package on
+every launch, preserving explicit args/env/cwd/stopOnEntry and endpoint options.
+Only the resolved DAP request contains the absolute program/cwd. Explicit program
+paths remain fixed. `connectOnly` requires an explicit server-local program and
+never infers one from a local editor.
 The extension validates launch (`program`, `mode`, `cwd`), existing-session join (`session`),
 and OS-process attach (`pid`, optional `binaryPath`) before connecting.
 `serverMode`/management/DAP/timing fields are client-owned and remain in VS
@@ -3028,6 +3034,15 @@ VSIXes are platform-specific: `linux-x64` contains only linux/amd64 bingo;
 [entitlements.plist](entitlements.plist). Runtime resolves only
 `bin/bingo` + `bin/target.json` inside the installed/development extension,
 checks the target, and repairs executable mode if extraction lost it.
+Before spawning on Darwin it also verifies the native code signature and the
+enabled `com.apple.security.cs.debugger` entitlement with bounded argv-based
+codesign calls. A failure reports reinstall/rebuild rather than starting an
+unsigned debugger. This is not a task-access authorization check and does not
+replace health reuse: existing shared servers are never killed or replaced.
+`task_for_pid` failure reports the native result and signing/Developer Tools/
+Developer Mode guidance, never diagnoses a missing entitlement from that result
+alone. Reloading an extension after update does not restart a shared server;
+sessions/observers must retire and managed idle shutdown must complete.
 `prepare-binary.mjs` delegates native build/sign/version metadata to
 `scripts/build-binary.sh` with `BINGO_REPRODUCIBLE=1`, then writes the VSIX target
 marker. Preparation never deletes the prior binary/marker before invoking the
@@ -3042,11 +3057,11 @@ target metadata, architecture, mode, and entitlements.
 The extension package version is the installed-runtime upgrade boundary:
 material shipped behavior changes must bump both `package.json` and the lockfile
 or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.7.3**) in source and VSIX
+and package verifier pin the current version (**0.7.5**) in source and VSIX
 metadata.
-The root Run and Debug dropdown exposes three `"type":"bingo"` choices:
-debug one of five progressive source packages through a `pickString`, debug the
-spawntree source package, and join a running session. Normal F5 uses the installed
+The root Run and Debug dropdown exposes two `"type":"bingo"` choices:
+debug the active Go package, and join a running session. There is no curated
+examples picker: opening any example's `main.go` selects its package. Normal F5 uses the installed
 VSIX and asks the server to build only the selected package, with no pre-launch
 task or `just` dependency; the build tasks are optional terminal-client helpers.
 Contributor source-extension development runs
@@ -3179,6 +3194,9 @@ restart never open/refocus panels. A user-closed panel stays closed for that
 session until explicitly reopened; another session may auto-open it. Each surface
 owns its own delivery generation/listeners and shares the registry/renderer/CSP,
 so closing one never disposes the observer or other surface.
+The graph fills the workspace's remaining height; tall inspectors scroll within
+that row. Pointer capture for background panning must never intercept node
+selection, whose metadata and inspection stay bound to the clicked goid.
 The Activity Bar title Fit routes to `bingo.concurrency.fitSidebar` and fits only
 its own provider, without opening/revealing the editor. The explicit
 `bingo.concurrency.fit` command opens/fits the editor; in-webview Fit stays local.

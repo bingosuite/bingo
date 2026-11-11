@@ -400,6 +400,12 @@ function renderGraph(
   viewport.addEventListener("pointerup", () => {
     dragging = undefined;
   });
+  viewport.addEventListener("pointercancel", () => {
+    dragging = undefined;
+  });
+  viewport.addEventListener("lostpointercapture", () => {
+    dragging = undefined;
+  });
   viewport.addEventListener("keydown", (event) => {
     if (!["ArrowDown", "ArrowRight", "ArrowUp", "ArrowLeft"].includes(event.key)) {
       return;
@@ -532,6 +538,10 @@ function renderNode(
     current.textContent = "current";
     group.append(current);
   }
+  // Capturing on the viewport retargets the ensuing click away from this node.
+  group.addEventListener("pointerdown", (event) => {
+    event.stopPropagation();
+  });
   group.addEventListener("click", () => {
     group.focus();
     host.postMessage({ type: "selectGoroutine", id: node.goroutine.id });

@@ -12,6 +12,7 @@ import { basename, join, resolve } from "node:path";
 import { parseHTML } from "linkedom";
 
 import type { BingoServerConfiguration } from "../src/configuration.js";
+import { resolveBundledBinary } from "../src/binary.js";
 import { probeBingoHealth } from "../src/health.js";
 import { DebugInspectionController, type DebugSessionClient } from "../src/inspection.js";
 import { decodeAction } from "../src/messages.js";
@@ -79,10 +80,7 @@ async function main(): Promise<void> {
     const extracted = join(scratch, "vsix");
     mkdirSync(extracted);
     run("unzip", ["-q", vsix, "-d", extracted]);
-    const binary = join(extracted, "extension", "bin", "bingo");
-    if (process.platform === "darwin") {
-      run("codesign", ["--verify", "--strict", binary]);
-    }
+    const binary = await resolveBundledBinary(join(extracted, "extension"), target!);
 
     const managementPort = await freePort();
     const dapPort = await freePort();

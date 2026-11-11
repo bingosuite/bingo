@@ -125,6 +125,67 @@ describe("concurrency webview DOM", () => {
     assert.deepEqual(messages.at(-1), { type: "selectGoroutine", id: 2 });
   });
 
+  it("keeps pointer clicks on nodes instead of capturing them for graph panning", () => {
+    const { document, window } = parseHTML("<html><body><div id=app></div></body></html>");
+    const messages: Record<string, unknown>[] = [];
+    const render = mountConcurrencyView(document, {
+      postMessage: (message) => messages.push(content(message)),
+    });
+    render(model());
+    const viewport = document.querySelector<HTMLElement>(".graph-viewport")!;
+    let captured = false;
+    viewport.setPointerCapture = () => { captured = true; };
+    const node = document.querySelector<SVGGElement>('[data-goid="2"]')!;
+    const body = node.querySelector("rect")!;
+    body.dispatchEvent(new window.Event("pointerdown", { bubbles: true }));
+    body.dispatchEvent(new window.Event("pointerup", { bubbles: true }));
+    // Browsers dispatch click to the capture owner, not the original hit target.
+    (captured ? viewport : body).dispatchEvent(new window.Event("click", { bubbles: true }));
+    assert.equal(captured, false);
+    assert.deepEqual(messages.at(-1), { type: "selectGoroutine", id: 2 });
+
+    render(model({ selectedGoroutine: 2 }, {
+      ...emptyInspection(2),
+      stackStatus: "ready",
+      frames: [{ id: 42, name: "main.child", file: "/workspace/child.go", line: 12, column: 1 }],
+      selectedFrameId: 42,
+      localsStatus: "ready",
+      variables: [{ name: "path", value: '"left/right"', type: "string", variablesReference: 0 }],
+    }));
+    assert.equal(document.querySelector('[data-goid="2"]')?.getAttribute("aria-selected"), "true");
+    assert.equal(document.querySelector('[data-goid="1"]')?.getAttribute("aria-selected"), "false");
+    assert.match(document.querySelector(".inspector-title")?.textContent ?? "", /^g2/);
+    assert.match(document.querySelector(".debug-inspection")?.textContent ?? "", /main\.child/);
+    assert.match(document.querySelector(".variable-tree")?.textContent ?? "", /left\/right/);
+    const source = document.querySelector<HTMLButtonElement>(".stack-frame .source-link");
+    assert.ok(source);
+    source.click();
+    assert.deepEqual(messages.at(-1), { type: "openSource", target: "frame", frameId: 42 });
+
+    const background = document.querySelector<HTMLElement>(".graph-viewport")!;
+    const svg = background.querySelector<SVGSVGElement>("svg")!;
+    svg.getScreenCTM = () => null;
+    background.setPointerCapture = () => { captured = true; };
+    const pointer = (type: string, x: number) => Object.assign(
+      new window.Event(type, { bubbles: true }),
+      { pointerId: 1, clientX: x, clientY: 0 },
+    );
+    background.dispatchEvent(pointer("pointerdown", 0));
+    assert.equal(captured, true);
+    const scene = svg.querySelector("g")!;
+    const before = scene.getAttribute("transform");
+    background.dispatchEvent(pointer("pointermove", 1));
+    const moved = scene.getAttribute("transform");
+    assert.notEqual(moved, before);
+    background.dispatchEvent(pointer("pointercancel", 1));
+    background.dispatchEvent(pointer("pointermove", 2));
+    assert.equal(scene.getAttribute("transform"), moved);
+    background.dispatchEvent(pointer("pointerdown", 2));
+    background.dispatchEvent(pointer("lostpointercapture", 2));
+    background.dispatchEvent(pointer("pointermove", 3));
+    assert.equal(scene.getAttribute("transform"), moved);
+  });
+
   it("renders interactive stack frames, locals, expansion, and source navigation", () => {
     const { document } = parseHTML(
       "<html><body><div id=app></div></body></html>",
