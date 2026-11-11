@@ -1,15 +1,18 @@
+import { execFile } from "node:child_process";
 import {
   chmod,
   readFile,
   stat,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { promisify } from "node:util";
 
 import type { SupportedTarget } from "./platform.js";
 
 export async function resolveBundledBinary(
   extensionPath: string,
   expectedTarget: SupportedTarget,
+  verifySignature: (path: string) => Promise<void> = verifyDarwinSignature,
 ): Promise<string> {
   const binaryPath = join(extensionPath, "bin", "bingo");
   const markerPath = join(extensionPath, "bin", "target.json");
@@ -52,7 +55,34 @@ export async function resolveBundledBinary(
       );
     }
   }
+  if (expectedTarget === "darwin-arm64") {
+    await verifySignature(binaryPath);
+  }
   return binaryPath;
+}
+
+export async function verifyDarwinSignature(
+  binaryPath: string,
+  run: (args: readonly string[]) => Promise<string> = async (args) => {
+    const { stdout } = await promisify(execFile)("/usr/bin/codesign", [...args], {
+      timeout: 5000,
+      maxBuffer: 64 * 1024,
+    });
+    return stdout;
+  },
+): Promise<void> {
+  try {
+    await run(["--verify", "--strict", binaryPath]);
+    const entitlements = await run(["--display", "--entitlements", "-", "--xml", binaryPath]);
+    if (!/<key>com\.apple\.security\.cs\.debugger<\/key>\s*<true\s*\/>/u.test(entitlements)) {
+      throw new Error("com.apple.security.cs.debugger entitlement is missing or disabled");
+    }
+  } catch (error: unknown) {
+    throw new Error(
+      `Cannot use bundled macOS debugger ${binaryPath}: ${errorMessage(error)}. Reinstall the darwin-arm64 Bingo VSIX and reload VS Code. For source development, rebuild with scripts/build-binary.sh; do not use an unsigned go build output.`,
+      { cause: error },
+    );
+  }
 }
 
 function errorMessage(error: unknown): string {

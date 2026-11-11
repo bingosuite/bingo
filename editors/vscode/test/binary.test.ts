@@ -10,7 +10,7 @@ import {
 import { join, resolve } from "node:path";
 import { afterEach, describe, it } from "node:test";
 
-import { resolveBundledBinary } from "../src/binary.js";
+import { resolveBundledBinary, verifyDarwinSignature } from "../src/binary.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -45,11 +45,51 @@ async function extensionFixture(
 describe("bundled binary resolution", () => {
   it("finds the extension-local binary and repairs executable mode", async () => {
     const fixture = await extensionFixture();
+    const verified: string[] = [];
     assert.equal(
-      await resolveBundledBinary(fixture.root, "darwin-arm64"),
+      await resolveBundledBinary(fixture.root, "darwin-arm64", (path) => {
+        verified.push(path);
+        return Promise.resolve();
+      }),
       fixture.binary,
     );
+    assert.deepEqual(verified, [fixture.binary]);
     assert.notEqual((await stat(fixture.binary)).mode & 0o111, 0);
+  });
+
+  it("does not run macOS signing tools for the Linux package", async () => {
+    const fixture = await extensionFixture("linux-x64");
+    assert.equal(await resolveBundledBinary(fixture.root, "linux-x64", () => {
+      throw new Error("Linux must not use codesign");
+    }), fixture.binary);
+  });
+
+  it("verifies the signature before checking the debugger entitlement", async () => {
+    const calls: string[][] = [];
+    await verifyDarwinSignature("/extension path/bin/bingo", (args) => {
+      calls.push([...args]);
+      return Promise.resolve("<plist><dict><key>com.apple.security.cs.debugger</key><true/></dict></plist>");
+    });
+    assert.deepEqual(calls, [
+      ["--verify", "--strict", "/extension path/bin/bingo"],
+      ["--display", "--entitlements", "-", "--xml", "/extension path/bin/bingo"],
+    ]);
+  });
+
+  for (const entitlement of ["", "<key>com.apple.security.cs.debugger</key><false/>"]) {
+    it(`rejects a missing or disabled debugger entitlement: ${entitlement}`, async () => {
+      await assert.rejects(verifyDarwinSignature("/extension/bin/bingo", () => Promise.resolve(entitlement)),
+        /entitlement is missing or disabled.*Reinstall the darwin-arm64/);
+    });
+  }
+
+  it("reports signature failure without attempting launch or entitlement inspection", async () => {
+    let calls = 0;
+    await assert.rejects(verifyDarwinSignature("/extension/bin/bingo", () => {
+      calls += 1;
+      return Promise.reject(new Error("invalid signature"));
+    }), /invalid signature.*Reinstall the darwin-arm64/);
+    assert.equal(calls, 1);
   });
 
   it("rejects the wrong package target", async () => {

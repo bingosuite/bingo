@@ -69,12 +69,11 @@ describe("repository VS Code integration", () => {
     const configurations = requireArray(launch.configurations).map(requireRecord);
     const serialized = JSON.stringify(configurations);
 
-    assert.equal(configurations.length, 3);
+    assert.equal(configurations.length, 2);
     assert.deepEqual(
       configurations.map((configuration) => configuration.name),
       [
-        "bingo: Debug example",
-        "bingo: Debug spawntree telemetry demo",
+        "bingo: Debug active Go package",
         "bingo: Join running session",
       ],
     );
@@ -96,41 +95,19 @@ describe("repository VS Code integration", () => {
     const sourceLaunches = configurations.filter(
       (configuration) => configuration.request === "launch",
     );
-    assert.equal(sourceLaunches.length, 2);
+    assert.equal(sourceLaunches.length, 1);
     for (const launch of sourceLaunches) {
       assert.equal(launch.mode, "debug");
       assert.equal("stopOnEntry" in launch, false);
     }
-    const exampleLaunch = sourceLaunches.find(
-      (configuration) =>
-        configuration.name === "bingo: Debug example",
-    );
-    assert.notEqual(exampleLaunch, undefined);
-    assert.equal(
-      exampleLaunch?.program,
-      "${workspaceFolder}/examples/${input:bingoExample}",
-    );
-
-    const spawntreeLaunch = sourceLaunches.find(
-      (configuration) =>
-        configuration.name === "bingo: Debug spawntree telemetry demo",
-    );
-    assert.notEqual(spawntreeLaunch, undefined);
-    assert.equal(spawntreeLaunch?.program, "${workspaceFolder}/examples/spawntree");
+    assert.equal("program" in sourceLaunches[0]!, false);
+    assert.equal("cwd" in sourceLaunches[0]!, false);
+    assert.doesNotMatch(serialized, /examples\/|input:bingoExample/);
 
     const inputs = requireArray(launch.inputs).map(requireRecord);
-    assert.equal(inputs.length, 2);
-    const examplePicker = inputs.find((input) => input.id === "bingoExample");
-    assert.notEqual(examplePicker, undefined);
-    assert.equal(examplePicker?.type, "pickString");
-    assert.equal(examplePicker?.default, "level1-loop");
-    assert.deepEqual(examplePicker?.options, [
-      "level1-loop",
-      "level2-channel",
-      "level3-worker-pool",
-      "level4-pipeline",
-      "level5-workflow",
-    ]);
+    assert.equal(inputs.length, 1);
+    assert.equal(inputs[0]?.id, "bingoSession");
+    assert.equal(inputs.some((input) => input.type === "pickString"), false);
 
     const sessionJoin = configurations.find(
       (configuration) => configuration.request === "attach",

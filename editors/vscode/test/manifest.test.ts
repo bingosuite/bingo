@@ -12,7 +12,7 @@ const manifest = requireRecord(
 const contributes = requireRecord(manifest.contributes);
 const debuggers = requireArray(contributes.debuggers);
 const debuggerContribution = requireRecord(debuggers[0]);
-const expectedExtensionVersion = "0.7.4";
+const expectedExtensionVersion = "0.7.5";
 
 describe("extension manifest", () => {
   it("versions the managed-server runtime as an installable upgrade", () => {
@@ -115,7 +115,7 @@ describe("extension manifest", () => {
     assert.ok(initialConfigurations.length > 0);
     for (const configuration of initialConfigurations) {
       assert.equal(configuration.mode, "debug");
-      assert.equal(configuration.program, "${workspaceFolder}");
+      assert.equal("program" in configuration, false);
       assertMinimalConfiguration(configuration);
     }
   });
@@ -127,6 +127,10 @@ describe("extension manifest", () => {
     assert.equal(requireRecord(properties.mode).default, "exec");
     assert.equal(requireRecord(properties.cwd).type, "string");
     assert.equal(requireRecord(properties.stopOnEntry).default, false);
+    assert.deepEqual(requireRecord(attributes.launch).anyOf, [
+      { required: ["program"] },
+      { required: ["mode"], properties: { mode: { enum: ["debug"] } } },
+    ]);
   });
 
   it("ships minimal source, binary, join, and PID attach snippets", () => {
@@ -140,7 +144,7 @@ describe("extension manifest", () => {
 
     assert.ok(
       bodies.some(
-        (body) => body.request === "launch" && body.mode === "debug" && typeof body.program === "string",
+        (body) => body.request === "launch" && body.mode === "debug" && !("program" in body),
       ),
     );
     assert.ok(bodies.some((body) => body.request === "launch" && body.mode === "exec"));

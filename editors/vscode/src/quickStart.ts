@@ -36,6 +36,10 @@ type ReadPackageDirectory = (path: string) => Promise<readonly DirectoryEntry[]>
 export function needsGoPackageConfiguration(
   config: Readonly<Record<string, unknown>>,
 ): boolean {
+  if (config.type === "bingo" && config.request === "launch" &&
+    config.mode === "debug" && config.program === undefined) {
+    return true;
+  }
   return Object.entries(config).every(([key, value]) =>
     (key === "type" && (value === "bingo" || value === "" || value === undefined)) ||
     ((key === "name" || key === "request") && (value === "" || value === undefined)),

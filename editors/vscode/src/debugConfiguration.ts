@@ -9,6 +9,7 @@ import {
   goPackageConfiguration,
   needsGoPackageConfiguration,
   type GoPackageContext,
+  type GoPackageDebugConfiguration,
 } from "./quickStart.js";
 import { type ServerManager, ServerManagerError } from "./serverManager.js";
 
@@ -28,20 +29,39 @@ export class BingoDebugConfigurationProvider
     token?: vscode.CancellationToken,
   ): Promise<vscode.DebugConfiguration[]> {
     const config = await this.#defaultConfiguration(folder, token);
-    return config === undefined ? [] : [config];
+    return config === undefined ? [] : [{
+      type: config.type,
+      request: config.request,
+      name: config.name,
+      mode: config.mode,
+    }];
   }
 
-  public resolveDebugConfiguration(
+  public async resolveDebugConfiguration(
     folder: vscode.WorkspaceFolder | undefined,
     config: vscode.DebugConfiguration,
     token?: vscode.CancellationToken,
-  ): vscode.ProviderResult<vscode.DebugConfiguration> {
+  ): Promise<vscode.DebugConfiguration | undefined> {
     if (this.#cancelled(token)) {
       return undefined;
     }
-    return needsGoPackageConfiguration(config)
-      ? this.#defaultConfiguration(folder, token)
-      : config;
+    if (!needsGoPackageConfiguration(config)) {
+      return config;
+    }
+    if (config.serverMode === "connectOnly") {
+      this.#reportError(new ConfigurationError(
+        'Set an explicit server-local program directory for source debugging with serverMode "connectOnly".',
+      ));
+      return undefined;
+    }
+    const defaults = await this.#defaultConfiguration(folder, token);
+    const cwd: unknown = config.cwd;
+    return defaults === undefined ? undefined : {
+      ...config,
+      ...defaults,
+      name: config.name || defaults.name,
+      cwd: cwd === undefined ? defaults.cwd : cwd,
+    };
   }
 
   public async resolveDebugConfigurationWithSubstitutedVariables(
@@ -145,7 +165,7 @@ export class BingoDebugConfigurationProvider
   async #defaultConfiguration(
     folder: vscode.WorkspaceFolder | undefined,
     token?: vscode.CancellationToken,
-  ): Promise<vscode.DebugConfiguration | undefined> {
+  ): Promise<GoPackageDebugConfiguration | undefined> {
     if (this.#cancelled(token)) {
       return undefined;
     }

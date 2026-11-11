@@ -284,8 +284,7 @@ func (b *darwinBackend) acquirePorts(pid int) (err error) {
 		time.Sleep(1 * time.Millisecond)
 	}
 	if kr != C.KERN_SUCCESS {
-		return fmt.Errorf("task_for_pid(%d): %s — debugger entitlement required",
-			pid, machErrString(kr))
+		return taskPortAccessError(pid, machErrString(kr))
 	}
 	b.taskMu.Lock()
 	b.taskPort = task
@@ -1328,8 +1327,7 @@ func (b *darwinBackend) task() (C.mach_port_t, error) {
 	var task C.mach_port_t
 	kr := C.bingo_task_for_pid(C.int(b.pid), &task)
 	if kr != C.KERN_SUCCESS {
-		return 0, fmt.Errorf("task_for_pid(%d): %s — debugger entitlement required",
-			b.pid, machErrString(kr))
+		return 0, taskPortAccessError(b.pid, machErrString(kr))
 	}
 	b.taskPort = task
 	b.taskOK = true
@@ -1338,4 +1336,8 @@ func (b *darwinBackend) task() (C.mach_port_t, error) {
 
 func machErrString(kr C.kern_return_t) string {
 	return C.GoString(C.mach_error_string(kr))
+}
+
+func taskPortAccessError(pid int, detail string) error {
+	return fmt.Errorf("task_for_pid(%d): %s — macOS denied debugger access; this does not by itself prove a missing entitlement. Use the signed Bingo server, allow your editor/terminal in System Settings > Privacy & Security > Developer Tools, and check Developer Mode with DevToolsSecurity -status. After a server update, end its debug sessions and let managed idle shutdown finish before retrying; reloading the editor does not replace a shared running server. Protected processes may not permit attach", pid, detail)
 }
