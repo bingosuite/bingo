@@ -74,12 +74,15 @@ async function runQuickStarts(api: BingoExtensionAPI, fixture: SourceFixture): P
   assert.notEqual(root, undefined);
   const parent = join(root!.uri.fsPath, "dist", "test-artifacts");
   await mkdir(parent, { recursive: true });
-  const directory = await mkdtemp(join(parent, "Go quick start with spaces-"));
-  const uri = vscode.Uri.file(join(directory, "main.go"));
-  await writeFile(uri.fsPath, await readFile(fixture.uri.fsPath));
-  const sourceFixture = { ...fixture, uri };
+  const scratchDirectory = await mkdtemp(join(parent, "Go quick start with spaces-"));
   try {
-    for (const kind of ["command", "no-launch", "explicit-source"] as const) {
+    for (const kind of ["command", "no-launch", "workspace", "active-source", "explicit-source"] as const) {
+      const directory = join(scratchDirectory, kind);
+      await mkdir(directory);
+      const uri = vscode.Uri.file(join(directory, "main.go"));
+      await writeFile(uri.fsPath, await readFile(fixture.uri.fsPath));
+      const sourceFixture = { ...fixture, uri };
+      const cwd = kind === "active-source" ? root!.uri.fsPath : directory;
       const buildDelayMs = kind === "command" ? 12_000 : 0;
       const dap = await FakeDAPServer.start(sourceFixture, buildDelayMs);
       const telemetry = await FakeTelemetryServer.start(sourceFixture);
@@ -96,8 +99,16 @@ async function runQuickStarts(api: BingoExtensionAPI, fixture: SourceFixture): P
           // Assert generation happened first rather than masking a missing provider.
           assert.equal(config.mode, "debug");
           assert.equal(config.program, directory);
-          assert.equal(config.cwd, directory);
-          assert.equal(config.stopOnEntry, kind === "explicit-source" ? true : undefined);
+          assert.equal(config.cwd, cwd);
+          assert.equal(config.stopOnEntry,
+            kind === "explicit-source" || kind === "active-source" ? true : undefined);
+          if (kind === "active-source") {
+            assert.equal(config.name, "Active package with options");
+            assert.deepEqual(config.args, ["worker"]);
+            assert.deepEqual(config.env, ["BINGO_QUICK_START=1"]);
+            assert.equal(config.managementPort, telemetry.port);
+            assert.equal(config.dapPort, dap.port);
+          }
           resolved += 1;
           return {
             ...config,
@@ -114,8 +125,13 @@ async function runQuickStarts(api: BingoExtensionAPI, fixture: SourceFixture): P
         const beforeStart = Date.now();
         const start = kind === "command"
           ? vscode.commands.executeCommand<boolean>("bingo.debugGoPackage")
-          : vscode.debug.startDebugging(root, kind === "no-launch" ? {
+          : vscode.debug.startDebugging(root, kind === "workspace"
+            ? "bingo: Debug active Go package" : kind === "no-launch" ? {
             type: "bingo", request: "", name: "",
+          } : kind === "active-source" ? {
+            type: "bingo", request: "launch", name: "Active package with options",
+            mode: "debug", args: ["worker"], env: ["BINGO_QUICK_START=1"], stopOnEntry: true,
+            cwd, managementPort: telemetry.port, dapPort: dap.port,
           } : {
             type: "bingo", request: "launch", name: "Explicit source",
             mode: "debug", program: directory, cwd: directory, stopOnEntry: true,
@@ -133,9 +149,10 @@ async function runQuickStarts(api: BingoExtensionAPI, fixture: SourceFixture): P
         assert.equal(resolved, 1, "dynamic configuration registration must not duplicate resolution");
         assert.equal(dap.lastLaunchArguments?.mode, "debug");
         assert.equal(dap.lastLaunchArguments?.program, directory);
-        assert.equal(dap.lastLaunchArguments?.cwd, directory);
+        assert.equal(dap.lastLaunchArguments?.cwd, cwd);
         assert.equal(
-          dap.lastLaunchArguments?.stopOnEntry, kind === "explicit-source" ? true : undefined,
+          dap.lastLaunchArguments?.stopOnEntry,
+          kind === "explicit-source" || kind === "active-source" ? true : undefined,
         );
         assert.equal(dap.lastLaunchArguments?.preLaunchTask, undefined);
         await vscode.debug.stopDebugging(current);
@@ -158,7 +175,7 @@ async function runQuickStarts(api: BingoExtensionAPI, fixture: SourceFixture): P
     }
   } finally {
     await vscode.commands.executeCommand("workbench.action.closeAllEditors");
-    await rm(directory, { recursive: true, force: true });
+    await rm(scratchDirectory, { recursive: true, force: true });
   }
 }
 

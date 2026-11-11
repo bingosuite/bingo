@@ -60,8 +60,8 @@ architecture behind this.
 Source debugging needs Go on the server's PATH; using a prebuilt debugger/target
 does not. See [Setup](SETUP.md) for the installation prerequisites.
 
-The [progressive example suite](../examples/README.md) is available from the
-**bingo: Debug example** workspace launch picker. `level5-workflow` gives the richest hierarchy:
+Open any target's `main.go` from the [progressive example suite](../examples/README.md)
+and use **bingo: Debug active Go package**. `level5-workflow` gives the richest hierarchy:
 **main → workflow×3 → stage×3**, including a deterministic canceled workflow.
 The intended telemetry breakpoint is the result send in `inventoryStage`
 (`examples/level5-workflow/main.go:83`). The workspace launch sends the selected
@@ -71,7 +71,7 @@ There is no pre-launch task, and F5 does not rebuild the extension.
 `examples/spawntree` remains the dedicated long-running lifecycle demo. It
 churns a deterministic **main → supervisor → worker×3** tree so consecutive
 snapshots show workers appearing in `created` and leaving in `exited`. Build it
-with **bingo: Debug spawntree telemetry demo**, or compile it with
+by opening its `main.go` and using the same active-package launch, or compile it with
 `just build-spawntree` for `cmd/dapcli` as shown below.
 Contributor source-extension work is a separate command-line path: run
 `just vscode-dev`, then
@@ -81,9 +81,9 @@ It is intentionally absent from the root Run and Debug dropdown.
 ## 2. Drive with VS Code (DAP, automatic server)
 
 1. Open this repo in VS Code.
-2. Select **bingo: Debug example**. A separate choice debugs spawntree, and
+2. Open `examples/level5-workflow/main.go` and select **bingo: Debug active Go package**;
    **bingo: Join running session** joins an existing session.
-3. Press F5 and choose **level5-workflow**. The companion
+3. Press F5 (or click the Go editor's **Bingo: Debug Go Package** button). The companion
    health-checks `127.0.0.1:6060`,
    reuses a compatible server or starts its detached bundled server, waits up
    to `serverReadyTimeoutMs` (five seconds by default) for compatible readiness,

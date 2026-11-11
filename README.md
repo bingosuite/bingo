@@ -69,8 +69,9 @@ different path.
 Without a launch configuration, F5 can also select bingo to debug a Go package.
 The server compiles the selected source directory with debugging information
 and launches it; no `just`, pre-launch build task, separate server terminal, or
-extension-development host is needed. In this checkout, **bingo: Debug example**
-lets you choose one of the five progressive examples.
+extension-development host is needed. In this checkout, **bingo: Debug active Go
+package** follows whichever Go file is open, including new examples; there is no
+target list to maintain.
 
 Use the native Debug UI for breakpoints, stepping, stacks, and variables.
 **Bingo Concurrency** opens beside source and follows the same session's

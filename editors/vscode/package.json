@@ -2,7 +2,7 @@
   "name": "bingo",
   "displayName": "bingo Debugger",
   "description": "Debug Go concurrency with bingo's DAP adapter and live goroutine visualization.",
-  "version": "0.7.4",
+  "version": "0.7.5",
   "publisher": "bingosuite",
   "license": "MIT",
   "private": true,
@@ -144,8 +144,9 @@
         ],
         "configurationAttributes": {
           "launch": {
-            "required": [
-              "program"
+            "anyOf": [
+              { "required": ["program"] },
+              { "required": ["mode"], "properties": { "mode": { "enum": ["debug"] } } }
             ],
             "properties": {
               "serverMode": {
@@ -197,7 +198,7 @@
               },
               "program": {
                 "type": "string",
-                "description": "Server-local Go package directory in debug mode, or compiled binary in exec mode. Relative paths resolve against cwd."
+                "description": "Server-local Go package directory in debug mode, or compiled binary in exec mode. Omit in local debug mode to follow the active Go file's package on every launch. Relative paths resolve against cwd."
               },
               "mode": {
                 "type": "string",
@@ -323,20 +324,18 @@
             "name": "bingo: Debug Go Package",
             "type": "bingo",
             "request": "launch",
-            "mode": "debug",
-            "program": "${workspaceFolder}"
+            "mode": "debug"
           }
         ],
         "configurationSnippets": [
           {
             "label": "bingo: Debug Go Package",
-            "description": "Build and debug a Go package directory without a pre-launch task.",
+            "description": "Build and debug the active Go file's package on every launch, without a maintained target list.",
             "body": {
               "name": "bingo: Debug Go Package",
               "type": "bingo",
               "request": "launch",
-              "mode": "debug",
-              "program": "${workspaceFolder}"
+              "mode": "debug"
             }
           },
           {

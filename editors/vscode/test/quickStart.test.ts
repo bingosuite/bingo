@@ -24,11 +24,17 @@ describe("Go package quick start", () => {
     for (const config of [{}, { type: "bingo" }, { type: "bingo", request: "", name: "" }]) {
       assert.equal(needsGoPackageConfiguration(config), true);
     }
+    assert.equal(needsGoPackageConfiguration({
+      type: "bingo", request: "launch", name: "Active package",
+      mode: "debug", args: ["worker"], stopOnEntry: true,
+    }), true);
     for (const config of [
       { type: "go" },
       { request: "launch", program: "/workspace/target" },
       { request: "launch", mode: "exec", program: "/workspace/target" },
       { request: "launch", mode: "debug", program: "/workspace/app" },
+      { type: "bingo", request: "launch", mode: "debug", program: "" },
+      { type: "bingo", request: "launch", mode: "exec" },
       { request: "launch" },
       { mode: "debug" },
       { program: "/workspace/target" },

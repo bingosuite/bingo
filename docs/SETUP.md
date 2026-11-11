@@ -63,10 +63,25 @@ binary for the session's lifetime. The extension starts or reuses a compatible
 server automatically. There is no pre-launch `just` task and no manual binary
 path for source debugging.
 
-In this repository, **bingo: Debug example** selects one of the five progressive
-examples; **bingo: Debug spawntree telemetry demo** opens the long-running
-concurrency demo. Both launch source directories. See the
+In this repository, open any example's `main.go` and use **bingo: Debug active Go
+package** or the Go editor's **Bingo: Debug Go Package** button. New packages need
+no picker changes. See the
 [examples guide](../examples/README.md) for useful breakpoints.
+
+On macOS, the extension verifies its bundled server's signature and debugger
+entitlement before starting it. If `task_for_pid` still fails, macOS has denied
+access; the error alone does not establish that an entitlement is missing. Check
+**System Settings > Privacy & Security > Developer Tools** for the editor or
+terminal starting the server, and check Developer Mode with
+`/usr/sbin/DevToolsSecurity -status`. If it is disabled, an administrator can enable
+it with `sudo /usr/sbin/DevToolsSecurity -enable`. Protected system processes may
+still refuse attach. Disabling SIP is not part of setup.
+
+An extension update or window reload does not replace an already-running shared
+server. End its debug sessions and disconnect observers, then allow its managed
+idle grace (normally 30 seconds) to expire before retrying. Manually started
+servers without idle shutdown remain their operator's responsibility. The
+extension never kills another client's server.
 
 The source install path restores the exact npm lockfile with lifecycle scripts
 disabled, packages the native server and extension **once**, verifies the exact

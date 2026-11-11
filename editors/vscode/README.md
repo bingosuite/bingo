@@ -36,7 +36,10 @@ updates the WebSocket runtime and packaging dependencies for security fixes.
 **0.7.2** adds read-only channel metadata and typed buffered contents to
 Variables, Watch, and the Bingo inspector. **0.7.3** retains channel contents
 and adds selected-goroutine stacks, frame locals, and name-only evaluate.
-Use a matching 0.7.3 companion and server for both features.
+**0.7.5** makes saved source configurations follow the active Go package instead
+of a fixed examples list, verifies macOS debugger signing before startup, and
+clarifies native access failures.
+Use a matching 0.7.5 companion and server for these features.
 Rerun the command to update, then run
 **Developer: Reload Window** once so the active extension host loads the new
 bundle. Package without installing with `just vscode-package`. Uninstall with:
@@ -69,10 +72,28 @@ not a bundled Go toolchain. Build progress and compiler errors come through DAP
 in the native Debug Console. Execution runs to your breakpoints by default;
 `"stopOnEntry": true` remains available for an explicit early stop.
 
-In this repository, **bingo: Debug example** offers the five progressive source
-packages. **bingo: Debug spawntree telemetry demo** and **bingo: Join running
-session** are the other Run and Debug choices. F5 builds only the selected
-package. The optional workspace build tasks remain for terminal binary clients.
+In this repository, **bingo: Debug active Go package** follows the open Go file.
+Open any example's `main.go`, including a new example, and press F5 or the editor's
+**Bingo: Debug Go Package** button. No examples list needs updating.
+**bingo: Join running session** is the other Run and Debug choice.
+The optional workspace build tasks remain for terminal binary clients.
+
+The generated source configuration intentionally omits `program`:
+
+```json
+{
+  "name": "bingo: Debug Go Package",
+  "type": "bingo",
+  "request": "launch",
+  "mode": "debug"
+}
+```
+
+The provider selects the active Go package afresh on each launch and preserves
+your `args`, `env`, `cwd`, and `stopOnEntry` overrides. Set `program` explicitly
+to pin a different package. Existing configurations with a program and no mode
+remain binary launches. Remote `connectOnly` configurations always require an
+explicit server-local program; they never guess a path from the local editor.
 
 ## Connect or start
 
@@ -112,6 +133,15 @@ open the **bingo Server** output channel and find the absolute server log path. 
 extension never kills a server, including one it spawned. Closing VS Code only
 disconnects its client; bingo's `-idle-timeout` owns managed shutdown so DAP and
 WebSocket clients can share the process safely.
+
+On macOS, startup also checks the bundled binary's signature and debugger
+entitlement, reporting a reinstall/rebuild action before spawning if either is
+invalid. A correctly signed server can still be denied `task_for_pid` by macOS
+authorization or target protection; that error does not prove a missing
+entitlement. See [macOS access troubleshooting](../../docs/SETUP.md#vs-code).
+After an update, end the old server's sessions and disconnect observers, then
+allow its managed idle grace to finish. A window reload alone cannot replace a
+shared running server, and the extension never kills it.
 
 If the management port answers with non-bingo HTTP or an incompatible bingo,
 F5 fails without spawning over it. Update that server or configure a different
