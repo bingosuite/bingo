@@ -64,3 +64,25 @@ closed channel with `len:3`, `cap:3`, and typed `[0]` / `[1]` / `[2]` values
 Continue to confirm the program still receives those same values: inspection
 never removes them. Unbuffered channels have no stored buffer to inspect;
 blocked sender values are not reported as buffered contents.
+
+## Nested goroutine graph
+
+Open [`nested-goroutines/main.go`](nested-goroutines/main.go), set a breakpoint
+on `fmt.Printf("round %d: all %d nested goroutines are ready\n", round, nodes)`,
+and run **Bingo: Debug Go Package** from the Command Palette or Go editor button.
+The server builds the example for you; the existing example picker is not needed.
+
+At that breakpoint, all 14 spawned goroutines are alive: `main` has two
+children, each child has two children, and each grandchild has two children.
+The application tree has four levels including `main` (plus any runtime
+goroutines shown by the graph). Select a branch to inspect its `path` local,
+such as `left/right/left`, and its creation site.
+
+Continue to release the entire tree and build a fresh one. The breakpoint hits
+three times, letting you compare parent links and created/exited lifecycle
+deltas between rounds. Without a debugger, each round stays alive for two
+seconds before exiting cleanly:
+
+```sh
+go run -race ./examples/nested-goroutines
+```

@@ -3042,7 +3042,7 @@ target metadata, architecture, mode, and entitlements.
 The extension package version is the installed-runtime upgrade boundary:
 material shipped behavior changes must bump both `package.json` and the lockfile
 or VS Code can retain an older bundle under the same identity. The manifest test
-and package verifier pin the current version (**0.7.3**) in source and VSIX
+and package verifier pin the current version (**0.7.4**) in source and VSIX
 metadata.
 The root Run and Debug dropdown exposes three `"type":"bingo"` choices:
 debug one of five progressive source packages through a `pickString`, debug the
@@ -3179,6 +3179,9 @@ restart never open/refocus panels. A user-closed panel stays closed for that
 session until explicitly reopened; another session may auto-open it. Each surface
 owns its own delivery generation/listeners and shares the registry/renderer/CSP,
 so closing one never disposes the observer or other surface.
+The graph fills the workspace's remaining height; tall inspectors scroll within
+that row. Pointer capture for background panning must never intercept node
+selection, whose metadata and inspection stay bound to the clicked goid.
 The Activity Bar title Fit routes to `bingo.concurrency.fitSidebar` and fits only
 its own provider, without opening/revealing the editor. The explicit
 `bingo.concurrency.fit` command opens/fits the editor; in-webview Fit stays local.
