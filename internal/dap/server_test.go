@@ -43,7 +43,10 @@ func TestServerCloseWithIdleClient(t *testing.T) {
 	go func() { done <- s.Close() }()
 
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Server.Close hung with an idle connected client")
 	}
@@ -84,7 +87,10 @@ func TestServerCloseAfterInitialize(t *testing.T) {
 	go func() { done <- s.Close() }()
 
 	select {
-	case <-done:
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("close: %v", err)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("Server.Close hung after initialize with no session")
 	}
