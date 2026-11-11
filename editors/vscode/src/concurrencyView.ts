@@ -461,13 +461,14 @@ button, select, input { border: 1px solid var(--vscode-input-border, transparent
 button { cursor: pointer; padding: 5px 9px; }
 button:hover { background: var(--vscode-toolbar-hoverBackground); }
 button:focus-visible, input:focus-visible, select:focus-visible, .graph-viewport:focus-visible { outline: 2px solid var(--vscode-focusBorder); outline-offset: 1px; }
-.app { min-height: 100vh; }
-.topbar { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 12px; justify-content: space-between; padding: 12px; background: var(--vscode-sideBar-background); border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border, transparent); }
+.app { height: 100vh; display: flex; flex-direction: column; }
+.topbar { flex-shrink: 0; position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 12px; justify-content: space-between; padding: 12px; background: var(--vscode-sideBar-background); border-bottom: 1px solid var(--vscode-sideBarSectionHeader-border, transparent); }
 .brand { display: grid; gap: 2px; }
 .brand strong { font-size: 14px; }
 .brand span, .muted { color: var(--vscode-descriptionForeground); font-size: 11px; }
 .session-selector { min-width: 120px; max-width: 48%; padding: 4px; }
-.session { padding: 10px; display: grid; gap: 10px; }
+.session { flex: 1; min-height: 0; padding: 10px; display: flex; flex-direction: column; gap: 10px; overflow: auto; }
+.session > * { flex-shrink: 0; }
 .cards { display: grid; grid-template-columns: repeat(4, minmax(58px, 1fr)); gap: 7px; }
 .card { display: grid; padding: 9px; border: 1px solid var(--vscode-widget-border); border-radius: 8px; background: var(--vscode-editorWidget-background); }
 .card strong { font-size: 18px; color: var(--vscode-charts-blue); }
@@ -475,10 +476,12 @@ button:focus-visible, input:focus-visible, select:focus-visible, .graph-viewport
 .last-stop { grid-column: 1 / -1; padding: 7px 9px; border-left: 3px solid var(--vscode-debugIcon-breakpointCurrentStackframeForeground); background: var(--vscode-textBlockQuote-background); overflow-wrap: anywhere; }
 .toolbar { display: flex; gap: 6px; }
 .toolbar input { flex: 1; min-width: 80px; padding: 6px 8px; }
-.workspace { display: grid; grid-template-columns: minmax(0, 2fr) minmax(270px, 1.2fr); gap: 10px; }
+.workspace { flex: 1 0 340px; min-height: 0; display: grid; grid-template-columns: minmax(0, 2fr) minmax(270px, 1.2fr); grid-template-rows: minmax(0, 1fr); gap: 10px; }
 .graph-panel, .inspector, .threads, .timeline { position: relative; min-width: 0; border: 1px solid var(--vscode-widget-border); border-radius: 9px; background: var(--vscode-editorWidget-background); overflow: hidden; }
+.graph-panel { display: flex; flex-direction: column; }
+.inspector { min-height: 0; overflow: auto; }
 .graph-controls { position: absolute; right: 7px; top: 7px; z-index: 2; display: flex; gap: 4px; }
-.graph-viewport { height: 410px; overflow: hidden; touch-action: none; }
+.graph-viewport { flex: 1; min-height: 0; overflow: hidden; touch-action: none; }
 .graph-viewport svg { width: 100%; height: 100%; }
 .tree-edge { fill: none; stroke: var(--vscode-editorIndentGuide-background); stroke-width: 1.5; }
 .tree-node { cursor: pointer; }
@@ -543,6 +546,6 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .callout { display: grid; gap: 3px; padding: 8px; border-radius: 6px; }
 .callout.error { border-left: 3px solid var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground); }
 .callout.warning { border-left: 3px solid var(--vscode-editorWarning-foreground); background: var(--vscode-inputValidation-warningBackground); }
-@media (max-width: 520px) { .workspace { grid-template-columns: 1fr; } .inspector { order: -1; } .graph-viewport { height: 330px; } .cards { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 520px) { .workspace { flex-basis: auto; grid-template-columns: 1fr; grid-template-rows: auto minmax(330px, 1fr); } .inspector { order: -1; max-height: 50vh; } .cards { grid-template-columns: repeat(2, 1fr); } }
 @media (forced-colors: active) { .tree-node rect, .graph-panel, .inspector, .threads, .timeline, .card { border: 1px solid CanvasText; } }
 `;
